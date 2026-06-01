@@ -739,15 +739,15 @@ impl DocumentEditor {
 
     /// Save the document to an in-memory byte vector with specific options.
     pub fn save_to_bytes_with_options(&mut self, options: SaveOptions) -> Result<Vec<u8>> {
-        use std::io::Cursor;
+        use crate::host::positioned_write::SeekWriter;
         if options.incremental {
             return Err(Error::InvalidPdf(
                 "Incremental saves are not supported for in-memory output".to_string(),
             ));
         }
-        let mut cursor = Cursor::new(Vec::new());
-        self.write_full_to_writer(&mut cursor, &options)?;
-        Ok(cursor.into_inner())
+        let mut writer = SeekWriter::new(std::io::Cursor::new(Vec::new()));
+        self.write_full_to_writer(&mut writer, &options)?;
+        Ok(writer.into_inner().into_inner())
     }
 
     /// Find the maximum object ID in the document.
@@ -868,6 +868,15 @@ impl DocumentEditor {
     pub fn is_modified(&self) -> bool {
         self.is_modified
     }
+
+    // ── pdf_manipulator patch: internal state accessors for dispatch ──
+    pub fn set_modified(&mut self, v: bool) { self.is_modified = v; }
+    pub fn page_order_visible(&self) -> Vec<i32> {
+        self.page_order.iter().filter(|&&i| i >= 0).copied().collect()
+    }
+    pub fn page_order_mut(&mut self) -> &mut Vec<i32> { &mut self.page_order }
+    pub fn modified_objects_mut(&mut self) -> &mut HashMap<u32, Object> { &mut self.modified_objects }
+    // ── end pdf_manipulator patch ──
 
     /// Get the source file path.
     pub fn source_path(&self) -> &str {
@@ -1341,21 +1350,25 @@ impl DocumentEditor {
     /// Number of pages merged from the source PDF.
     pub fn merge_from_bytes(&mut self, data: &[u8]) -> Result<usize> {
         let mut source_doc = PdfDocument::from_bytes(data.to_vec())?;
+        self.merge_from_document(&mut source_doc)
+    }
+
+    // ── pdf_manipulator patch: O(1)-memory merge via reader ──
+    pub fn merge_from_reader(&mut self, reader: Box<dyn crate::document::ReadSeek>) -> Result<usize> {
+        let mut source_doc = PdfDocument::from_external_reader(reader)?;
+        self.merge_from_document(&mut source_doc)
+    }
+    fn merge_from_document(&mut self, source_doc: &mut PdfDocument) -> Result<usize> {
         let source_page_count = source_doc.page_count()?;
-
-        if source_page_count == 0 {
-            return Ok(0);
-        }
-
-        // Import each page from the source document
+        if source_page_count == 0 { return Ok(0); }
         for page_idx in 0..source_page_count {
-            let page_data = self.import_page_from_document(&mut source_doc, page_idx)?;
+            let page_data = self.import_page_from_document(source_doc, page_idx)?;
             self.merged_pages.push(page_data);
         }
-
         self.is_modified = true;
         Ok(source_page_count)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Import a single page and all its dependent objects from a source document.
     ///
@@ -1766,31 +1779,37 @@ impl DocumentEditor {
     /// Write a full rewrite of the PDF.
     #[cfg(not(target_arch = "wasm32"))]
     fn write_full(&mut self, path: impl AsRef<Path>, options: &SaveOptions) -> Result<()> {
+        use crate::host::positioned_write::SeekWriter;
         let file = File::create(path.as_ref())?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = SeekWriter::new(BufWriter::new(file));
         self.write_full_to_writer(&mut writer, options)
     }
 
+    // ── pdf_manipulator patch: zero-clone BFS for GC + trimmed pages staging ──
     /// Collect all object IDs reachable from the catalog root via BFS.
     ///
     /// Used by garbage collection: any source-document object not in this set is
     /// an orphan and can be omitted from the output.  Modified objects are
     /// consulted first so that references introduced by edits are honoured.
+    ///
+    /// Zero-clone: borrows cached objects via collect_refs_of() instead of
+    /// cloning every Object. For modified objects, borrows from the HashMap
+    /// directly. Uses a bit-vec for O(1) membership checks.
     fn collect_reachable_ids(&self) -> std::collections::HashSet<u32> {
-        use std::collections::{HashSet, VecDeque};
-
-        fn traverse(obj: &Object, queue: &mut VecDeque<u32>) {
+        fn push_refs(obj: &Object, out: &mut Vec<u32>) {
             match obj {
-                Object::Reference(r) => queue.push_back(r.id),
-                Object::Array(arr) => arr.iter().for_each(|o| traverse(o, queue)),
-                Object::Dictionary(d) => d.values().for_each(|o| traverse(o, queue)),
-                Object::Stream { dict, .. } => dict.values().for_each(|o| traverse(o, queue)),
-                _ => {},
+                Object::Reference(r) => out.push(r.id),
+                Object::Array(arr) => arr.iter().for_each(|o| push_refs(o, out)),
+                Object::Dictionary(d) => d.values().for_each(|o| push_refs(o, out)),
+                Object::Stream { dict, .. } => dict.values().for_each(|o| push_refs(o, out)),
+                _ => {}
             }
         }
 
-        let mut reachable: HashSet<u32> = HashSet::new();
-        let mut queue: VecDeque<u32> = VecDeque::new();
+        let max_id = self.next_object_id as usize + 1;
+        let mut seen = vec![false; max_id];
+        let mut queue: Vec<u32> = Vec::with_capacity(256);
+        let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
 
         if let Some(r) = self
             .source
@@ -1799,7 +1818,7 @@ impl DocumentEditor {
             .and_then(|d| d.get("Root"))
             .and_then(|v| v.as_reference())
         {
-            queue.push_back(r.id);
+            queue.push(r.id);
         }
         if let Some(r) = self
             .source
@@ -1808,30 +1827,78 @@ impl DocumentEditor {
             .and_then(|d| d.get("Info"))
             .and_then(|v| v.as_reference())
         {
-            queue.push_back(r.id);
+            queue.push(r.id);
         }
 
-        while let Some(id) = queue.pop_front() {
-            if !reachable.insert(id) {
+        while let Some(id) = queue.pop() {
+            let idx = id as usize;
+            if idx >= max_id || seen[idx] {
                 continue;
             }
-            let obj = if let Some(m) = self.modified_objects.get(&id) {
-                Some(m.clone())
+            seen[idx] = true;
+
+            refs_buf.clear();
+            if let Some(m) = self.modified_objects.get(&id) {
+                push_refs(m, &mut refs_buf);
             } else {
-                self.source.load_object(ObjectRef { id, gen: 0 }).ok()
-            };
-            if let Some(obj) = obj {
-                traverse(&obj, &mut queue);
+                self.source.collect_refs_of(id, &mut refs_buf);
             }
+            queue.extend_from_slice(&refs_buf);
         }
 
-        reachable
+        seen.iter()
+            .enumerate()
+            .filter(|(_, &v)| v)
+            .map(|(i, _)| i as u32)
+            .collect()
     }
 
+    /// Stage a trimmed /Pages dict into modified_objects so that
+    /// collect_reachable_ids() only walks kept pages. Returns the
+    /// prior value to restore after GC completes.
+    pub(crate) fn stage_trimmed_pages_for_gc(&mut self) -> Option<(u32, Option<Object>)> {
+        let pages_ref = self
+            .source
+            .trailer()
+            .as_dict()
+            .and_then(|d| d.get("Root"))
+            .and_then(|r| r.as_reference())
+            .and_then(|catalog_ref| self.source.load_object(catalog_ref).ok())
+            .and_then(|catalog_obj| {
+                catalog_obj.as_dict()
+                    .and_then(|d| d.get("Pages"))
+                    .and_then(|p| p.as_reference())
+            })?;
+
+        let all_refs = self.source.all_page_refs().unwrap_or_default();
+        let pages_obj = self.source.load_object(pages_ref).ok()?;
+        let pages_dict = pages_obj.as_dict()?.clone();
+
+        let mut new_dict = pages_dict;
+        let mut kids: Vec<Object> = Vec::new();
+        for &idx in &self.page_order {
+            if idx >= 0 {
+                let i = idx as usize;
+                if i < all_refs.len() {
+                    kids.push(Object::Reference(all_refs[i]));
+                }
+            }
+        }
+        new_dict.insert("Count".to_string(), Object::Integer(kids.len() as i64));
+        new_dict.insert("Kids".to_string(), Object::Array(kids));
+
+        let prior = self.modified_objects.insert(pages_ref.id, Object::Dictionary(new_dict));
+        Some((pages_ref.id, prior))
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Write a full rewrite of the PDF to a generic writer.
-    fn write_full_to_writer(
+    // ── pdf_manipulator patch: expose write_full_to_writer for dispatch ──
+    // (visibility change only — pub(crate) instead of private)
+    // ── end pdf_manipulator patch ──
+    pub(crate) fn write_full_to_writer(
         &mut self,
-        writer: &mut (impl Write + Seek),
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
         options: &SaveOptions,
     ) -> Result<()> {
         use crate::encryption::{
@@ -1956,7 +2023,7 @@ impl DocumentEditor {
         let encrypt_obj_id = if let Some(ref enc_dict) = encrypt_dict {
             let enc_id = self.allocate_object_id();
             let enc_obj = enc_dict.to_object();
-            let offset = writer.stream_position()?;
+            let offset = writer.position();
             // Encryption dict is NOT encrypted
             let bytes = serializer.serialize_indirect(enc_id, 0, &enc_obj);
             writer.write_all(&bytes)?;
@@ -2165,7 +2232,7 @@ impl DocumentEditor {
                     dict: stream_dict,
                     data: file.data.clone().into(),
                 };
-                let offset = writer.stream_position()?;
+                let offset = writer.position();
                 let bytes =
                     serialize_obj(&serializer, stream_id, 0, &stream_obj, &encryption_handler);
                 writer.write_all(&bytes)?;
@@ -2178,7 +2245,7 @@ impl DocumentEditor {
                 };
                 let filespec_dict = file.build_filespec(stream_ref);
                 let filespec_obj = Object::Dictionary(filespec_dict);
-                let offset = writer.stream_position()?;
+                let offset = writer.position();
                 let bytes =
                     serialize_obj(&serializer, filespec_id, 0, &filespec_obj, &encryption_handler);
                 writer.write_all(&bytes)?;
@@ -2223,7 +2290,7 @@ impl DocumentEditor {
             }
         }
 
-        let offset = writer.stream_position()?;
+        let offset = writer.position();
         let bytes =
             serialize_obj(&serializer, catalog_ref.id, 0, &catalog_obj, &encryption_handler);
         writer.write_all(&bytes)?;
@@ -2276,7 +2343,7 @@ impl DocumentEditor {
                     pages_obj.clone()
                 };
 
-                let offset = writer.stream_position()?;
+                let offset = writer.position();
                 let bytes = serialize_obj(
                     &serializer,
                     pages_ref.id,
@@ -2303,6 +2370,7 @@ impl DocumentEditor {
                         let source_page_count = source_indices.len();
 
                         let mut page_index = 0;
+                        let cached_page_refs = self.get_page_refs().unwrap_or_default();
                         for kid in kids {
                             if let Some(page_ref) = kid.as_reference() {
                                 let page_obj = self.source.load_object(page_ref)?;
@@ -2820,7 +2888,7 @@ impl DocumentEditor {
                                     }
                                 }
 
-                                let offset = writer.stream_position()?;
+                                let offset = writer.position();
                                 let bytes = serialize_obj(
                                     &serializer,
                                     page_ref.id,
@@ -2856,7 +2924,7 @@ impl DocumentEditor {
                                                 // Build XObject stream for the image
                                                 let xobj_stream =
                                                     Self::build_image_xobject(&pending_image.image);
-                                                let offset = writer.stream_position()?;
+                                                let offset = writer.position();
                                                 let bytes = serialize_obj(
                                                     &serializer,
                                                     xobj_id,
@@ -2881,7 +2949,7 @@ impl DocumentEditor {
 
                                             // Use the pre-allocated content ID (page /Contents already updated)
                                             if let Some(content_id) = modified_content_id {
-                                                let offset = writer.stream_position()?;
+                                                let offset = writer.position();
                                                 let bytes = serialize_obj(
                                                     &serializer,
                                                     content_id,
@@ -2923,7 +2991,7 @@ impl DocumentEditor {
                                                                         dict: HashMap::new(),
                                                                         data: modified_content.into(),
                                                                     };
-                                                                    let offset = writer.stream_position()?;
+                                                                    let offset = writer.position();
                                                                     let bytes = serialize_obj(&serializer,
                                                                         contents_ref.id,
                                                                         0,
@@ -2935,7 +3003,7 @@ impl DocumentEditor {
                                                                 }
                                                                 Err(_) => {
                                                                     // Fallback to original content on error
-                                                                    let offset = writer.stream_position()?;
+                                                                    let offset = writer.position();
                                                                     let bytes = serialize_obj(&serializer,
                                                                         contents_ref.id,
                                                                         0,
@@ -2949,7 +3017,7 @@ impl DocumentEditor {
                                                         } else {
                                                             // Can't decode, write original
                                                             let offset =
-                                                                writer.stream_position()?;
+                                                                writer.position();
                                                             let bytes = serialize_obj(
                                                                 &serializer,
                                                                 contents_ref.id,
@@ -2987,7 +3055,7 @@ impl DocumentEditor {
                                                                                 dict: HashMap::new(),
                                                                                 data: modified_content.into(),
                                                                             };
-                                                                            let offset = writer.stream_position()?;
+                                                                            let offset = writer.position();
                                                                             let bytes = serialize_obj(&serializer,
                                                                                 ref_obj.id,
                                                                                 0,
@@ -2998,7 +3066,7 @@ impl DocumentEditor {
                                                                             xref_entries.push((ref_obj.id, offset, 0, true));
                                                                         }
                                                                         Err(_) => {
-                                                                            let offset = writer.stream_position()?;
+                                                                            let offset = writer.position();
                                                                             let bytes = serialize_obj(&serializer,
                                                                                 ref_obj.id,
                                                                                 0,
@@ -3011,7 +3079,7 @@ impl DocumentEditor {
                                                                     }
                                                                 } else {
                                                                     let offset =
-                                                                        writer.stream_position()?;
+                                                                        writer.position();
                                                                     let bytes = serialize_obj(
                                                                         &serializer,
                                                                         ref_obj.id,
@@ -3043,7 +3111,7 @@ impl DocumentEditor {
                                             {
                                                 let contents_obj =
                                                     self.source.load_object(contents_ref)?;
-                                                let offset = writer.stream_position()?;
+                                                let offset = writer.position();
                                                 let bytes = serialize_obj(
                                                     &serializer,
                                                     contents_ref.id,
@@ -3099,7 +3167,7 @@ impl DocumentEditor {
                                             }
                                         }
 
-                                        let offset = writer.stream_position()?;
+                                        let offset = writer.position();
                                         let bytes = serialize_obj(
                                             &serializer,
                                             resources_ref.id,
@@ -3169,7 +3237,7 @@ impl DocumentEditor {
                                                                     });
                                                                 if let Ok(font_obj) = font_obj {
                                                                     let offset =
-                                                                        writer.stream_position()?;
+                                                                        writer.position();
                                                                     let bytes = serialize_obj(
                                                                         &serializer,
                                                                         ref_obj.id,
@@ -3202,7 +3270,7 @@ impl DocumentEditor {
                                                         if !written_ids.contains(&r.id) {
                                                             if let Some(ref obj) = loaded {
                                                                 let offset =
-                                                                    writer.stream_position()?;
+                                                                    writer.position();
                                                                 let bytes = serialize_obj(
                                                                     &serializer,
                                                                     r.id,
@@ -3230,7 +3298,7 @@ impl DocumentEditor {
                                                                     self.source.load_object(ref_obj)
                                                                 {
                                                                     let offset =
-                                                                        writer.stream_position()?;
+                                                                        writer.position();
                                                                     let bytes = serialize_obj(
                                                                         &serializer,
                                                                         ref_obj.id,
@@ -3263,7 +3331,7 @@ impl DocumentEditor {
                                                         if !written_ids.contains(&r.id) {
                                                             if let Some(ref obj) = loaded {
                                                                 let offset =
-                                                                    writer.stream_position()?;
+                                                                    writer.position();
                                                                 let bytes = serialize_obj(
                                                                     &serializer,
                                                                     r.id,
@@ -3290,7 +3358,7 @@ impl DocumentEditor {
                                                                     self.source.load_object(ref_obj)
                                                                 {
                                                                     let offset =
-                                                                        writer.stream_position()?;
+                                                                        writer.position();
                                                                     let bytes = serialize_obj(
                                                                         &serializer,
                                                                         ref_obj.id,
@@ -3323,7 +3391,7 @@ impl DocumentEditor {
                                             dict: HashMap::new(),
                                             data: overlay_content.into(),
                                         };
-                                        let offset = writer.stream_position()?;
+                                        let offset = writer.position();
                                         let bytes = serialize_obj(
                                             &serializer,
                                             overlay_obj_id,
@@ -3356,7 +3424,7 @@ impl DocumentEditor {
                                                 dict: HashMap::new(),
                                                 data: content_bytes.into(),
                                             };
-                                            let offset = writer.stream_position()?;
+                                            let offset = writer.position();
                                             let bytes = serialize_obj(
                                                 &serializer,
                                                 additions_id,
@@ -3372,8 +3440,7 @@ impl DocumentEditor {
 
                                 // Write new annotation objects
                                 if !new_annotation_ids.is_empty() {
-                                    // Get page refs for building annotations (needed for link destinations)
-                                    let page_refs = self.get_page_refs().unwrap_or_default();
+                                    let page_refs = &cached_page_refs;
 
                                     // Build the annotation dictionaries first, in
                                     // a scope that releases the `modified_annotations`
@@ -3404,7 +3471,9 @@ impl DocumentEditor {
                                             &mut self.next_object_id,
                                         );
                                         for (stream_id, stream_obj) in hoisted {
-                                            let offset = writer.stream_position()?;
+                                            // ── pdf_manipulator patch: PositionedWrite, not Seek ──
+                                            let offset = writer.position();
+                                            // ── end pdf_manipulator patch ──
                                             let bytes = serialize_obj(
                                                 &serializer,
                                                 stream_id,
@@ -3417,7 +3486,9 @@ impl DocumentEditor {
                                         }
 
                                         // Write the annotation object
-                                        let offset = writer.stream_position()?;
+                                        // ── pdf_manipulator patch: PositionedWrite, not Seek ──
+                                        let offset = writer.position();
+                                        // ── end pdf_manipulator patch ──
                                         let bytes = serialize_obj(
                                             &serializer,
                                             annot_id,
@@ -3443,7 +3514,7 @@ impl DocumentEditor {
                                             wrapper.build_field_dict(page_ref_for_fields);
 
                                         // Write the form field object
-                                        let offset = writer.stream_position()?;
+                                        let offset = writer.position();
                                         let bytes = serialize_obj(
                                             &serializer,
                                             *field_id,
@@ -3513,7 +3584,7 @@ impl DocumentEditor {
                                             data: appearance.content.clone().into(),
                                         };
 
-                                        let offset = writer.stream_position()?;
+                                        let offset = writer.position();
                                         let bytes = serialize_obj(
                                             &serializer,
                                             *obj_id,
@@ -3527,7 +3598,9 @@ impl DocumentEditor {
                                         // Write any indirect objects this appearance depends
                                         // on (e.g. an embedded fallback-font graph).
                                         for (extra_id, extra_obj) in &appearance.extra_objects {
-                                            let off = writer.stream_position()?;
+                                            // ── pdf_manipulator patch: PositionedWrite, not Seek ──
+                                            let off = writer.position();
+                                            // ── end pdf_manipulator patch ──
                                             let b = serialize_obj(
                                                 &serializer,
                                                 *extra_id,
@@ -3551,7 +3624,7 @@ impl DocumentEditor {
                                         data: overlay_content.into(),
                                     };
 
-                                    let offset = writer.stream_position()?;
+                                    let offset = writer.position();
                                     let bytes = serialize_obj(
                                         &serializer,
                                         overlay_id,
@@ -3573,7 +3646,7 @@ impl DocumentEditor {
                                         data: overlay_content.into(),
                                     };
 
-                                    let offset = writer.stream_position()?;
+                                    let offset = writer.position();
                                     let bytes = serialize_obj(
                                         &serializer,
                                         redact_overlay_id,
@@ -3596,7 +3669,7 @@ impl DocumentEditor {
                                         dict: HashMap::new(),
                                         data: redacted_bytes.clone().into(),
                                     };
-                                    let offset = writer.stream_position()?;
+                                    let offset = writer.position();
                                     let bytes = serialize_obj(
                                         &serializer,
                                         *redacted_id,
@@ -3667,7 +3740,7 @@ impl DocumentEditor {
                                             data: appearance.content.clone().into(),
                                         };
 
-                                        let offset = writer.stream_position()?;
+                                        let offset = writer.position();
                                         let bytes = serialize_obj(
                                             &serializer,
                                             *obj_id,
@@ -3681,7 +3754,9 @@ impl DocumentEditor {
                                         // Write any indirect objects this appearance depends
                                         // on (e.g. an embedded fallback-font graph).
                                         for (extra_id, extra_obj) in &appearance.extra_objects {
-                                            let off = writer.stream_position()?;
+                                            // ── pdf_manipulator patch: PositionedWrite, not Seek ──
+                                            let off = writer.position();
+                                            // ── end pdf_manipulator patch ──
                                             let b = serialize_obj(
                                                 &serializer,
                                                 *extra_id,
@@ -3707,7 +3782,7 @@ impl DocumentEditor {
                                         data: overlay_content.into(),
                                     };
 
-                                    let offset = writer.stream_position()?;
+                                    let offset = writer.position();
                                     let bytes = serialize_obj(
                                         &serializer,
                                         form_overlay_id,
@@ -3722,6 +3797,12 @@ impl DocumentEditor {
                                 page_index += 1;
                             }
                         }
+                        if page_index > 10 {
+
+
+                        }
+
+
                     }
                 }
             }
@@ -3749,7 +3830,7 @@ impl DocumentEditor {
             };
 
             // Write the page object
-            let offset = writer.stream_position()?;
+            let offset = writer.position();
             let bytes =
                 serialize_obj(&serializer, page_id, 0, &final_page_obj, &encryption_handler);
             writer.write_all(&bytes)?;
@@ -3762,7 +3843,7 @@ impl DocumentEditor {
                 if written_ids.contains(obj_id) {
                     continue;
                 }
-                let offset = writer.stream_position()?;
+                let offset = writer.position();
                 let bytes = serialize_obj(&serializer, *obj_id, 0, obj, &encryption_handler);
                 writer.write_all(&bytes)?;
                 xref_entries.push((*obj_id, offset, 0, true));
@@ -3778,7 +3859,7 @@ impl DocumentEditor {
                 let field_dict = wrapper.build_parent_dict();
 
                 // Write the parent field object
-                let offset = writer.stream_position()?;
+                let offset = writer.position();
                 let bytes = serialize_obj(
                     &serializer,
                     *field_id,
@@ -3796,7 +3877,7 @@ impl DocumentEditor {
             let info = self.modified_info.clone().unwrap();
             let info_id = self.allocate_object_id();
             let info_obj = info.to_object();
-            let offset = writer.stream_position()?;
+            let offset = writer.position();
             let bytes = serialize_obj(&serializer, info_id, 0, &info_obj, &encryption_handler);
             writer.write_all(&bytes)?;
             xref_entries.push((info_id, offset, 0, true));
@@ -3836,11 +3917,29 @@ impl DocumentEditor {
         written_ids.clear();
         written_ids.extend(xref_entries.iter().map(|(id, _, _, _)| *id));
 
+        // Stage a trimmed /Pages dict so GC sees only kept pages.
+        // Without this, GC walks the original page tree and marks every
+        // object reachable — dropping almost nothing.
+        let staged_pages_prior: Option<(u32, Option<Object>)> =
+            if options.garbage_collect {
+                self.stage_trimmed_pages_for_gc()
+            } else {
+                None
+            };
+
         let reachable_ids = if options.garbage_collect {
             Some(self.collect_reachable_ids())
         } else {
             None
         };
+
+        // Restore original /Pages so the page-loop rebuild is unaffected.
+        if let Some((pages_id, prior)) = staged_pages_prior {
+            match prior {
+                Some(prev) => { self.modified_objects.insert(pages_id, prev); }
+                None => { self.modified_objects.remove(&pages_id); }
+            }
+        }
 
         let all_source_ids = self.source.all_object_ids();
         for obj_id in all_source_ids {
@@ -3855,7 +3954,6 @@ impl DocumentEditor {
             }
             if let Some(ref reachable) = reachable_ids {
                 if !reachable.contains(&obj_id) {
-                    log::debug!("write_full_to_writer: GC dropping unreachable object {}", obj_id);
                     continue;
                 }
             }
@@ -3872,7 +3970,7 @@ impl DocumentEditor {
                     } else {
                         obj
                     };
-                    let offset = writer.stream_position()?;
+                    let offset = writer.position();
                     let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
                     writer.write_all(&bytes)?;
                     xref_entries.push((obj_id, offset, 0, true));
@@ -3888,6 +3986,9 @@ impl DocumentEditor {
             }
         }
 
+
+
+
         // Write any new objects from modified_objects whose IDs are not in the
         // original source xref (e.g. XMP streams allocated by the PDF/A converter).
         {
@@ -3900,7 +4001,7 @@ impl DocumentEditor {
                 .map(|(&id, obj)| (id, obj.clone()))
                 .collect();
             for (obj_id, obj) in new_objs {
-                let offset = writer.stream_position()?;
+                let offset = writer.position();
                 let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
                 writer.write_all(&bytes)?;
                 xref_entries.push((obj_id, offset, 0, true));
@@ -3911,7 +4012,7 @@ impl DocumentEditor {
         xref_entries.sort_by_key(|(id, _, _, _)| *id);
 
         // Write xref table
-        let xref_offset = writer.stream_position()?;
+        let xref_offset = writer.position();
         write!(writer, "xref\n")?;
 
         // Find max object ID
@@ -3970,6 +4071,8 @@ impl DocumentEditor {
 
         writer.flush()?;
         self.is_modified = false;
+
+
         Ok(())
     }
 
@@ -4169,6 +4272,29 @@ impl DocumentEditor {
         self.modified_annotations.contains_key(&page_index)
     }
 
+    /// Append an annotation to a page without parsing page content.
+    // ── pdf_manipulator patch: fast annotation append + bulk media boxes ──
+    /// Avoids the HierarchicalExtractor cost of get_page().
+    pub fn add_page_annotation<A: Into<crate::writer::Annotation>>(
+        &mut self,
+        page_index: usize,
+        annotation: A,
+    ) {
+        let source_page = self.output_to_source_index(page_index);
+        let wrapper = crate::editor::dom::AnnotationWrapper::from_write(annotation);
+        self.modified_annotations
+            .entry(source_page)
+            .or_insert_with(|| {
+                self.source.get_annotations(source_page)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(crate::editor::dom::AnnotationWrapper::from_read)
+                    .collect()
+            })
+            .push(wrapper);
+        self.is_modified = true;
+    }
+
     /// Edit a page with a closure, automatically saving changes.
     ///
     /// # Example
@@ -4342,6 +4468,51 @@ impl DocumentEditor {
         // Default to Letter size
         Ok([0.0, 0.0, 612.0, 792.0])
     }
+
+    /// Fetch all page media boxes in one pass. Calls get_page_refs() once
+    /// instead of once per page, avoiding O(N²) for bulk operations.
+    pub fn all_media_boxes(&mut self) -> Vec<[f32; 4]> {
+        let count = self.current_page_count();
+        let source_indices: Vec<usize> = self.page_order
+            .iter()
+            .filter(|&&i| i >= 0)
+            .map(|&i| i as usize)
+            .collect();
+        let page_refs = self.get_page_refs().unwrap_or_default();
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let source_index = if i < source_indices.len() {
+                source_indices[i]
+            } else {
+                i
+            };
+            if let Some(props) = self.modified_page_props.get(&source_index) {
+                if let Some(media_box) = props.media_box {
+                    result.push(media_box);
+                    continue;
+                }
+            }
+            if source_index < page_refs.len() {
+                if let Ok(page_obj) = self.source.load_object(page_refs[source_index]) {
+                    if let Some(dict) = page_obj.as_dict() {
+                        if let Some(mb) = dict.get("MediaBox").and_then(|m| m.as_array()) {
+                            if mb.len() >= 4 {
+                                let llx = mb[0].as_real().or_else(|| mb[0].as_integer().map(|i| i as f64)).unwrap_or(0.0) as f32;
+                                let lly = mb[1].as_real().or_else(|| mb[1].as_integer().map(|i| i as f64)).unwrap_or(0.0) as f32;
+                                let urx = mb[2].as_real().or_else(|| mb[2].as_integer().map(|i| i as f64)).unwrap_or(612.0) as f32;
+                                let ury = mb[3].as_real().or_else(|| mb[3].as_integer().map(|i| i as f64)).unwrap_or(792.0) as f32;
+                                result.push([llx, lly, urx, ury]);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            result.push([0.0, 0.0, 612.0, 792.0]);
+        }
+        result
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Set the MediaBox of a page.
     pub fn set_page_media_box(&mut self, index: usize, box_: [f32; 4]) -> Result<()> {

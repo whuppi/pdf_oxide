@@ -51,14 +51,26 @@ pub enum ReadingOrder {
 /// is kept (rather than using `BufReader<Cursor<Vec<u8>>>` directly) so a
 /// future file-backed variant can be re-introduced without touching call
 /// sites.
+// ── pdf_manipulator patch: External reader variant for O(1)-memory I/O ──
+// The External variant enables on-demand random-access reading via a
+// callback-backed Read+Seek (condvar on native, SAB/Asyncify on web).
+// The source file is never fully buffered in memory.
+
+/// Trait alias for Read + Seek + Send. Rust doesn't allow multiple
+/// non-auto traits in a trait object, so we combine them here.
+pub(crate) trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
 enum PdfReader {
     Memory(BufReader<Cursor<Vec<u8>>>),
+    External(BufReader<Box<dyn ReadSeek>>),
 }
 
 impl Read for PdfReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             PdfReader::Memory(r) => r.read(buf),
+            PdfReader::External(r) => r.read(buf),
         }
     }
 }
@@ -67,6 +79,7 @@ impl Seek for PdfReader {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match self {
             PdfReader::Memory(r) => r.seek(pos),
+            PdfReader::External(r) => r.seek(pos),
         }
     }
 }
@@ -75,15 +88,18 @@ impl BufRead for PdfReader {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         match self {
             PdfReader::Memory(r) => r.fill_buf(),
+            PdfReader::External(r) => r.fill_buf(),
         }
     }
 
     fn consume(&mut self, amt: usize) {
         match self {
             PdfReader::Memory(r) => r.consume(amt),
+            PdfReader::External(r) => r.consume(amt),
         }
     }
 }
+// ── end pdf_manipulator patch ──
 
 /// Maximum recursion depth for object resolution
 const MAX_RECURSION_DEPTH: u32 = 100;
@@ -877,6 +893,16 @@ impl PdfDocument {
         Self::from_bytes(data)
     }
 
+    // ── pdf_manipulator patch: O(1)-memory open from external reader ──
+    // Opens a PDF from any Read+Seek+Send without buffering the full source.
+    // The reader is called on demand throughout the document's lifetime.
+    // Used by the Flutter bridge with CallbackReader (condvar-backed).
+    pub(crate) fn from_external_reader(reader: Box<dyn ReadSeek>) -> Result<Self> {
+        let buf_reader = PdfReader::External(BufReader::new(reader));
+        Self::open_from_reader(buf_reader)
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Open a PDF document from a file path.
     ///
     /// Reads the entire file into memory, then parses the PDF structure.
@@ -1428,7 +1454,8 @@ impl PdfDocument {
         self.document_info_string("Creator")
     }
 
-    fn document_info_string(&self, key: &str) -> Option<String> {
+    // ── pdf_manipulator patch: info field + encryption + permissions accessors ──
+    pub(crate) fn document_info_string(&self, key: &str) -> Option<String> {
         let info_raw = self.trailer.as_dict()?.get("Info")?;
         let info = self.resolve_obj_ref(info_raw);
         let val_raw = info.as_dict()?.get(key)?.clone();
@@ -1437,6 +1464,34 @@ impl PdfDocument {
         let trimmed = s.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
+
+    // Reads from the /Encrypt dictionary already loaded by the parser.
+    // Returns coded algorithm: 0=none, 1=RC4_40, 2=RC4_128, 3=AES128, 4=AES256.
+    pub(crate) fn encryption_algorithm(&self) -> Option<u8> {
+        let encrypt = self.trailer.as_dict()?.get("Encrypt")?;
+        let encrypt = self.resolve_obj_ref(encrypt);
+        let dict = encrypt.as_dict()?;
+        let v = dict.get("V")?.as_integer()? as i32;
+        let r = dict.get("R").and_then(|r| r.as_integer()).unwrap_or(0) as i32;
+        let length = dict.get("Length").and_then(|l| l.as_integer()).unwrap_or(40) as i32;
+        let algo = match (v, r, length) {
+            (1, _, _) => 1,          // RC4 40-bit
+            (2, _, 128) => 2,        // RC4 128-bit
+            (4, 4, _) => 3,          // AES-128
+            (5, 5, _) | (5, 6, _) => 4, // AES-256
+            _ => 0,
+        };
+        Some(algo)
+    }
+
+    // Returns raw /P permission bits from the encrypt dictionary.
+    pub(crate) fn permission_bits(&self) -> Option<i32> {
+        let encrypt = self.trailer.as_dict()?.get("Encrypt")?;
+        let encrypt = self.resolve_obj_ref(encrypt);
+        let dict = encrypt.as_dict()?;
+        dict.get("P")?.as_integer().map(|v| v as i32)
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Axis-aligned intersection area of a [`Rect`](crate::geometry::Rect)
     /// with the page box `(x0, y0, x1, y1)`.
@@ -1841,6 +1896,40 @@ impl PdfDocument {
         ids.dedup();
         ids
     }
+
+    // ── pdf_manipulator patch: zero-clone ref extraction for GC ──
+    /// Extract all object IDs referenced by the given object without cloning.
+    /// Borrows the cache, avoiding the clone cost of load_object().
+    pub fn collect_refs_of(&self, id: u32, out: &mut Vec<u32>) {
+        fn push_refs(obj: &Object, out: &mut Vec<u32>) {
+            match obj {
+                Object::Reference(r) => out.push(r.id),
+                Object::Array(arr) => arr.iter().for_each(|o| push_refs(o, out)),
+                Object::Dictionary(d) => d.values().for_each(|o| push_refs(o, out)),
+                Object::Stream { dict, .. } => dict.values().for_each(|o| push_refs(o, out)),
+                _ => {}
+            }
+        }
+
+        let obj_ref = ObjectRef { id, gen: 0 };
+
+        // Try borrow from cache first — zero-clone hot path.
+        {
+            let cache = self.object_cache.lock_or_recover();
+            if let Some(obj) = cache.get(&obj_ref) {
+                push_refs(obj, out);
+                return;
+            }
+        }
+        // Cold path: load into cache, then borrow.
+        if self.load_object(obj_ref).is_ok() {
+            let cache = self.object_cache.lock_or_recover();
+            if let Some(obj) = cache.get(&obj_ref) {
+                push_refs(obj, out);
+            }
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Return references to every leaf page, in document order, with a single
     /// page-tree traversal.
@@ -20341,16 +20430,17 @@ impl PdfDocument {
     /// Use this when downstream callers will edit the DOCX in Word /
     /// LibreOffice; use the default for pixel-faithful round trips.
     pub fn to_docx_bytes_flow(&self) -> Result<Vec<u8>> {
-        let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Docx)?;
-        let mut writer = office_oxide::create::ir_to_docx(&ir);
-        self.embed_pdf_fonts_into(|name, data| {
-            writer.embed_font(name, data);
-        });
         let mut buf = std::io::Cursor::new(Vec::new());
-        writer
-            .write_to(&mut buf)
-            .map_err(|e| crate::error::Error::InvalidOperation(format!("DOCX export: {e}")))?;
+        self.to_docx_writer_flow(&mut buf)?;
         Ok(buf.into_inner())
+    }
+
+    // ── pdf_manipulator patch: streaming DOCX/PPTX/XLSX export ──
+    pub fn to_docx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+        let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Docx)?;
+        let mut w = office_oxide::create::ir_to_docx(&ir);
+        self.embed_pdf_fonts_into(|name, data| { w.embed_font(name, data); });
+        w.write_to(writer).map_err(|e| crate::error::Error::InvalidOperation(format!("DOCX export: {e}")))
     }
 
     /// Forward every embedded font program from the source PDF (if
@@ -20472,16 +20562,16 @@ impl PdfDocument {
     /// - Better for editing (real paragraph structure, fewer shapes).
     /// - Worse for visual fidelity (text reflows; positions drift).
     pub fn to_pptx_bytes_flow(&self) -> Result<Vec<u8>> {
-        let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Pptx)?;
-        let mut writer = office_oxide::create::ir_to_pptx(&ir);
-        self.embed_pdf_fonts_into(|name, data| {
-            writer.embed_font(name, data);
-        });
         let mut buf = std::io::Cursor::new(Vec::new());
-        writer
-            .write_to(&mut buf)
-            .map_err(|e| crate::error::Error::InvalidOperation(format!("PPTX export: {e}")))?;
+        self.to_pptx_writer_flow(&mut buf)?;
         Ok(buf.into_inner())
+    }
+
+    pub fn to_pptx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+        let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Pptx)?;
+        let mut w = office_oxide::create::ir_to_pptx(&ir);
+        self.embed_pdf_fonts_into(|name, data| { w.embed_font(name, data); });
+        w.write_to(writer).map_err(|e| crate::error::Error::InvalidOperation(format!("PPTX export: {e}")))
     }
 
     /// Convert the entire document to an XLSX file on disk.
@@ -20522,17 +20612,17 @@ impl PdfDocument {
     /// XLSX as a real spreadsheet (filters, formulas, sorts); use the
     /// default `to_xlsx_bytes` for pixel-faithful round trips.
     pub fn to_xlsx_bytes_flow(&self) -> Result<Vec<u8>> {
-        let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Xlsx)?;
-        let mut writer = office_oxide::create::ir_to_xlsx(&ir);
-        self.embed_pdf_fonts_into(|name, data| {
-            writer.embed_font(name, data);
-        });
         let mut buf = std::io::Cursor::new(Vec::new());
-        writer
-            .write_to(&mut buf)
-            .map_err(|e| crate::error::Error::InvalidOperation(format!("XLSX export: {e}")))?;
+        self.to_xlsx_writer_flow(&mut buf)?;
         Ok(buf.into_inner())
     }
+
+    pub fn to_xlsx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+        let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Xlsx)?;
+        let w = office_oxide::create::ir_to_xlsx(&ir);
+        w.write_to(writer).map_err(|e| crate::error::Error::InvalidOperation(format!("XLSX export: {e}")))
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Extract images from a page.
     ///
@@ -21251,10 +21341,7 @@ impl PdfDocument {
         // Parse content stream with image-only fast path (skips BT/ET text blocks)
         let operators = match parse_content_stream_images_only(&content_data) {
             Ok(ops) => ops,
-            Err(_) => {
-                // If content stream parsing fails, return empty
-                return Ok(Vec::new());
-            },
+            Err(_) => return Ok(Vec::new()),
         };
 
         let mut images = Vec::new();

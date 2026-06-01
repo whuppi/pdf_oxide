@@ -3032,6 +3032,22 @@ impl DocumentBuilder {
 
     /// Build the PDF document and return the bytes.
     pub fn build(self) -> Result<Vec<u8>> {
+        self.assemble_writer()?.finish()
+    }
+
+    // ── pdf_manipulator patch: streaming save to any Write+Seek ──
+    // Assembles the PdfWriter from pages, then writes directly to the
+    // output via finish_to_writer. Each PDF object is serialized and
+    // written individually — O(1) memory on the serialization side.
+    pub(crate) fn build_to_writer(self, output: &mut impl crate::host::positioned_write::PositionedWrite) -> Result<()> {
+        self.assemble_writer()?.finish_to_writer(output)
+    }
+    // ── end pdf_manipulator patch ──
+
+    // ── pdf_manipulator patch: separate page assembly from serialization ──
+    // Returns the fully-assembled PdfWriter ready for finish() or
+    // finish_to_writer(). build() and build_to_writer() both use this.
+    fn assemble_writer(self) -> Result<PdfWriter> {
         let mut config = PdfWriterConfig::default();
         if let Some(version) = self.metadata.version.clone() {
             config.version = version;
@@ -3491,8 +3507,9 @@ impl DocumentBuilder {
             page.finish();
         }
 
-        writer.finish()
+        Ok(writer)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Build and save the PDF to a file.
     pub fn save(self, path: impl AsRef<Path>) -> Result<()> {

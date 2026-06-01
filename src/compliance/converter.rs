@@ -269,7 +269,10 @@ impl PdfAConverter {
     }
 
     /// Core conversion logic operating on a [`DocumentEditor`].
-    fn convert_with_editor(&self, editor: &mut DocumentEditor) -> Result<ConversionResult> {
+    // ── pdf_manipulator patch: expose for PDF/A conversion via dispatch ──
+    // (visibility change only — pub(crate) instead of private)
+    // ── end pdf_manipulator patch ──
+    pub(crate) fn convert_with_editor(&self, editor: &mut DocumentEditor) -> Result<ConversionResult> {
         use std::collections::HashSet;
 
         let mut result = ConversionResult::new(self.level);
@@ -1461,7 +1464,34 @@ fn converter_fontdb() -> std::sync::Arc<fontdb::Database> {
     CONVERTER_FONTDB
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
+
+            // ── pdf_manipulator patch: bundled Liberation fonts ──
+            // WASM has no filesystem — load_system_fonts() returns nothing.
+            // Bundle Liberation fonts (SIL OFL) so PDF/A conversion has
+            // metric-compatible replacements for Helvetica/Times/Courier.
+            // On native, system fonts load first — these are fallback only.
+            static FONTS: &[&[u8]] = &[
+                include_bytes!("fonts/LiberationSans-Regular.ttf"),
+                include_bytes!("fonts/LiberationSans-Bold.ttf"),
+                include_bytes!("fonts/LiberationSans-Italic.ttf"),
+                include_bytes!("fonts/LiberationSans-BoldItalic.ttf"),
+                include_bytes!("fonts/LiberationSerif-Regular.ttf"),
+                include_bytes!("fonts/LiberationSerif-Bold.ttf"),
+                include_bytes!("fonts/LiberationSerif-Italic.ttf"),
+                include_bytes!("fonts/LiberationSerif-BoldItalic.ttf"),
+                include_bytes!("fonts/LiberationMono-Regular.ttf"),
+                include_bytes!("fonts/LiberationMono-Bold.ttf"),
+                include_bytes!("fonts/LiberationMono-Italic.ttf"),
+                include_bytes!("fonts/LiberationMono-BoldItalic.ttf"),
+            ];
+            for font_data in FONTS {
+                db.load_font_data(font_data.to_vec());
+            }
+            // ── end pdf_manipulator patch ──
+
+            #[cfg(not(target_arch = "wasm32"))]
             db.load_system_fonts();
+
             std::sync::Arc::new(db)
         })
         .clone()

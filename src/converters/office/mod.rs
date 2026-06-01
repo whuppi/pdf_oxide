@@ -163,22 +163,28 @@ impl OfficeConverter {
     /// Embedded font programs under `word/fonts/` are not yet plumbed
     /// into the IR renderer; that's tracked separately.
     pub fn convert_docx_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let cursor = std::io::Cursor::new(bytes.to_vec());
-        let doc = Document::from_reader(cursor, DocumentFormat::Docx)
+        let mut buf = std::io::Cursor::new(Vec::new());
+        self.convert_docx_reader_to_writer(std::io::Cursor::new(bytes.to_vec()), &mut buf)?;
+        Ok(buf.into_inner())
+    }
+
+    // ── pdf_manipulator patch: streaming DOCX→PDF (O(1) input via reader) ──
+    pub fn convert_docx_reader_to_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
+        &self, reader: R, output: &mut W,
+    ) -> Result<()> {
+        let doc = Document::from_reader(reader, DocumentFormat::Docx)
             .map_err(|e| Error::InvalidOperation(format!("DOCX parse: {e}")))?;
         let mut extra_fonts: Vec<(String, Vec<u8>)> = doc
-            .as_docx()
-            .map(|d| d.embedded_fonts.clone())
-            .unwrap_or_default();
-
+            .as_docx().map(|d| d.embedded_fonts.clone()).unwrap_or_default();
         let ir = doc.to_ir();
         let _ = maybe_load_unicode_fallback(&ir, &mut extra_fonts);
         let _ = maybe_load_cjk_fallback(&ir, &mut extra_fonts);
         if has_positional_layout(&ir) {
-            return render_positional_ir(&ir, &self.config, &extra_fonts);
+            return render_positional_ir_writer(&ir, &self.config, &extra_fonts, output);
         }
-        ir_to_pdf_bytes(&ir, &self.config, &extra_fonts)
+        ir_to_pdf_writer(&ir, &self.config, &extra_fonts, output)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Convert an XLSX file to PDF bytes.
     pub fn convert_xlsx(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -194,18 +200,25 @@ impl OfficeConverter {
     /// like body text and honour their per-cell font sizes; genuine
     /// grids stay as tables and go through `render_table`.
     pub fn convert_xlsx_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let cursor = std::io::Cursor::new(bytes.to_vec());
-        let doc = Document::from_reader(cursor, DocumentFormat::Xlsx)
+        let mut buf = std::io::Cursor::new(Vec::new());
+        self.convert_xlsx_reader_to_writer(std::io::Cursor::new(bytes.to_vec()), &mut buf)?;
+        Ok(buf.into_inner())
+    }
+
+    // ── pdf_manipulator patch: streaming XLSX→PDF (O(1) input via reader) ──
+    pub fn convert_xlsx_reader_to_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
+        &self, reader: R, output: &mut W,
+    ) -> Result<()> {
+        let doc = Document::from_reader(reader, DocumentFormat::Xlsx)
             .map_err(|e| Error::InvalidOperation(format!("XLSX parse: {e}")))?;
         let mut extra_fonts: Vec<(String, Vec<u8>)> = doc
-            .as_xlsx()
-            .map(|d| d.embedded_fonts.clone())
-            .unwrap_or_default();
+            .as_xlsx().map(|d| d.embedded_fonts.clone()).unwrap_or_default();
         let ir = doc.to_ir();
         let _ = maybe_load_unicode_fallback(&ir, &mut extra_fonts);
         let _ = maybe_load_cjk_fallback(&ir, &mut extra_fonts);
-        ir_to_pdf_bytes(&ir, &self.config, &extra_fonts)
+        ir_to_pdf_writer(&ir, &self.config, &extra_fonts, output)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Convert a PPTX file to PDF bytes.
     pub fn convert_pptx(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -222,27 +235,28 @@ impl OfficeConverter {
     /// by `PdfDocument::to_pptx_bytes`) are registered with the
     /// renderer so the original typeface is preserved.
     pub fn convert_pptx_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
-        let cursor = std::io::Cursor::new(bytes.to_vec());
-        let doc = Document::from_reader(cursor, DocumentFormat::Pptx)
+        let mut buf = std::io::Cursor::new(Vec::new());
+        self.convert_pptx_reader_to_writer(std::io::Cursor::new(bytes.to_vec()), &mut buf)?;
+        Ok(buf.into_inner())
+    }
+
+    // ── pdf_manipulator patch: streaming PPTX→PDF (O(1) input via reader) ──
+    pub fn convert_pptx_reader_to_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
+        &self, reader: R, output: &mut W,
+    ) -> Result<()> {
+        let doc = Document::from_reader(reader, DocumentFormat::Pptx)
             .map_err(|e| Error::InvalidOperation(format!("PPTX parse: {e}")))?;
         let mut extra_fonts: Vec<(String, Vec<u8>)> = doc
-            .as_pptx()
-            .map(|d| d.embedded_fonts.clone())
-            .unwrap_or_default();
+            .as_pptx().map(|d| d.embedded_fonts.clone()).unwrap_or_default();
         let ir = doc.to_ir();
         let _ = maybe_load_unicode_fallback(&ir, &mut extra_fonts);
         let _ = maybe_load_cjk_fallback(&ir, &mut extra_fonts);
-        // Slides are inherently positional. When the IR carries shape
-        // positions (every PPTX section now wraps shape content in
-        // `Element::TextBox` with EMU coordinates) render each slide
-        // as a single page with each shape painted at its absolute
-        // rectangle. Falls back to flow rendering only when no
-        // positional metadata survived parsing.
         if pptx_has_positional(&ir) {
-            return render_pptx_positional(&ir, &self.config, &extra_fonts);
+            return render_pptx_positional_writer(&ir, &self.config, &extra_fonts, output);
         }
-        ir_to_pdf_bytes(&ir, &self.config, &extra_fonts)
+        ir_to_pdf_writer(&ir, &self.config, &extra_fonts, output)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Auto-detect format and convert to PDF.
     pub fn convert(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -257,7 +271,7 @@ impl OfficeConverter {
             "doc" => {
                 let bytes =
                     std::fs::read(&path).map_err(|e| Error::InvalidOperation(e.to_string()))?;
-                let cursor = std::io::Cursor::new(bytes);
+                let cursor = std::io::Cursor::new(bytes.to_vec());
                 let doc = Document::from_reader(cursor, DocumentFormat::Doc)
                     .map_err(|e| Error::InvalidOperation(format!("DOC parse: {e}")))?;
                 ir_to_pdf_bytes(&doc.to_ir(), &self.config, &[])
@@ -322,6 +336,29 @@ fn render_positional_ir(
     config: &OfficeConfig,
     extra_fonts: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>> {
+    render_positional_ir_core(ir, config, extra_fonts, |builder| {
+        builder.build().map_err(|e| Error::InvalidOperation(format!("positional PDF build: {e}")))
+    })
+}
+
+// ── pdf_manipulator patch: streaming positional render + core refactor ──
+pub(crate) fn render_positional_ir_writer<W: std::io::Write>(
+    ir: &DocumentIR, config: &OfficeConfig, extra_fonts: &[(String, Vec<u8>)], output: &mut W,
+) -> Result<()> {
+    use crate::host::positioned_write::CountingWriter;
+    render_positional_ir_core(ir, config, extra_fonts, |builder| {
+        let mut writer = CountingWriter::new(output);
+        builder.build_to_writer(&mut writer)
+            .map_err(|e| Error::InvalidOperation(format!("positional PDF build: {e}")))
+    })
+}
+
+fn render_positional_ir_core<R>(
+    ir: &DocumentIR,
+    config: &OfficeConfig,
+    extra_fonts: &[(String, Vec<u8>)],
+    finalize: impl FnOnce(DocumentBuilder) -> Result<R>,
+) -> Result<R> {
     use crate::writer::{DocumentBuilder, EmbeddedFont, PageSize};
 
     let mut builder = DocumentBuilder::new().compress_streams(true);
@@ -478,10 +515,10 @@ fn render_positional_ir(
         Ok(())
     })?;
 
-    builder
-        .build()
-        .map_err(|e| Error::InvalidOperation(format!("positional PDF build: {e}")))
+    finalize(builder)
 }
+
+// ── end pdf_manipulator patch ──
 
 /// Render a vector shape (line / rectangle) onto the current page at
 /// its absolute coordinates. Coordinates arrive in DOCX/EMU with a
@@ -622,176 +659,115 @@ pub fn ir_to_pdf_bytes_pub(ir: &DocumentIR, config: &OfficeConfig) -> Result<Vec
     ir_to_pdf_bytes(ir, config, &[])
 }
 
-fn ir_to_pdf_bytes(
+// ── pdf_manipulator patch: shared IR→PDF core with pluggable finalize ──
+// Builds DocumentBuilder with all pages from IR, then calls `finalize`
+// to either build() → Vec<u8> or build_to_writer() → stream.
+fn ir_to_pdf_core<R>(
     ir: &DocumentIR,
     config: &OfficeConfig,
     extra_fonts: &[(String, Vec<u8>)],
-) -> Result<Vec<u8>> {
+    finalize: impl FnOnce(DocumentBuilder) -> Result<R>,
+) -> Result<R> {
     use crate::writer::EmbeddedFont;
     let mut doc = DocumentBuilder::new().compress_streams(true);
     let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Register embedded source-PDF fonts so flow-mode rendering can
-    // resolve face names back to the original typeface program.
-    // Same Unicode-cmap guard as `render_positional_ir` — registering
-    // a CID-only subset routes every glyph through GID 0 and makes
-    // text invisible.
     for (name, data) in extra_fonts {
         match EmbeddedFont::from_data(Some(name.clone()), data.clone()) {
             Ok(font) if font.has_usable_unicode_cmap() => {
                 doc = doc.register_embedded_font(name.clone(), font);
                 registered.insert(name.clone());
             },
-            Ok(_) => {
-                eprintln!(
-                    "  [font] skipped {} ({} bytes): no Unicode cmap (CID-only subset)",
-                    name,
-                    data.len()
-                );
-            },
-            Err(e) => {
-                eprintln!("  [font] register failed: {} ({} bytes): {}", name, data.len(), e);
-            },
+            _ => {},
         }
     }
 
-    if let Some(ref t) = ir.metadata.title {
-        doc = doc.title(t);
-    }
-    if let Some(ref a) = ir.metadata.author {
-        doc = doc.author(a);
-    }
-    if let Some(ref s) = ir.metadata.subject {
-        doc = doc.subject(s);
-    }
+    if let Some(ref t) = ir.metadata.title { doc = doc.title(t); }
+    if let Some(ref a) = ir.metadata.author { doc = doc.author(a); }
+    if let Some(ref s) = ir.metadata.subject { doc = doc.subject(s); }
 
     let unicode_fallback =
         if registered.contains(crate::fonts::unicode_fallback::UNICODE_FALLBACK_NAME) {
             Some(crate::fonts::unicode_fallback::UNICODE_FALLBACK_NAME.to_string())
-        } else {
-            None
-        };
+        } else { None };
     let cjk_fallback =
         if registered.contains(crate::fonts::unicode_fallback::UNICODE_FALLBACK_CJK_NAME) {
             Some(crate::fonts::unicode_fallback::UNICODE_FALLBACK_CJK_NAME.to_string())
-        } else {
-            None
-        };
-    let result = with_registered_fonts_full(
-        registered,
-        unicode_fallback,
-        cjk_fallback,
-        || -> Result<Vec<u8>> {
-            // Per-section page geometry: a section that carries its own
-            // `page_setup` (e.g. PDF→PPTX→PDF where every slide knows its
-            // source MediaBox) overrides the OfficeConfig default. This
-            // keeps a 660-page Letter PDF round-tripping back to 660
-            // Letter pages instead of overflowing onto the default size.
-            let section_page_size = |section: &Section| -> PageSize {
-                if let Some(ps) = section.page_setup.as_ref() {
-                    let w_pt = ps.width_twips as f32 / TWIPS_PER_PT;
-                    let h_pt = ps.height_twips as f32 / TWIPS_PER_PT;
-                    if w_pt > 0.0 && h_pt > 0.0 {
-                        return PageSize::Custom(w_pt, h_pt);
-                    }
-                }
-                if section_needs_landscape(section, config) {
-                    landscape(config.page_size)
-                } else {
-                    config.page_size
-                }
-            };
+        } else { None };
 
-            let first_size = ir
-                .sections
-                .first()
-                .map(section_page_size)
-                .unwrap_or(config.page_size);
-            let mut page = doc.page(first_size);
-            let mut cur_size = first_size;
-
-            for (si, section) in ir.sections.iter().enumerate() {
-                let want_size = section_page_size(section);
-
-                if si > 0 {
-                    let force_break = !matches!(section.break_type, SectionBreakType::Continuous);
-                    let size_changed = want_size.dimensions() != cur_size.dimensions();
-                    if force_break || size_changed {
-                        page = page.done().page(want_size);
-                        cur_size = want_size;
-                    }
-                }
-                // Multi-column sections (DOCX `<w:cols num="2">`,
-                // pdf_to_ir's `detect_columns`) reflow paragraphs into N
-                // bounded column rectangles and advance to the next
-                // column when one fills. Without this guard a 2-column
-                // arxiv-style paper rendered as a single narrow strip on
-                // the left half of every page. Falls back to the flat
-                // flow path for single-column sections.
-                let col_count = section.columns.as_ref().map(|c| c.count).unwrap_or(1);
-                if col_count >= 2 {
-                    let (page_w_pt, page_h_pt) = match cur_size {
-                        PageSize::Custom(w, h) => (w, h),
-                        other => other.dimensions(),
-                    };
-                    page = render_section_columned(
-                        page, section, col_count, page_w_pt, page_h_pt, config,
-                    )?;
-                } else {
-                    let (_, page_h_pt) = match cur_size {
-                        PageSize::Custom(w, h) => (w, h),
-                        other => other.dimensions(),
-                    };
-                    // Walk floating images first to find the lowest
-                    // bottom edge among any that anchor in the top half
-                    // of the page. Once we know that, we'll snap the
-                    // text cursor below it before emitting paragraphs.
-                    // Without this, flow-mode body text starts at the
-                    // page's top margin and lands on top of source
-                    // top-of-page logos (UNIVERSITY OF ICELAND header,
-                    // CFR shield, journal mastheads).
-                    let top_image_floor = top_floating_image_floor(&section.elements, page_h_pt);
-                    let mut text_cursor_pinned = false;
-                    for element in &section.elements {
-                        if let Some(floor_y) = top_image_floor {
-                            let is_text_like = matches!(
-                                element,
-                                Element::Paragraph(_)
-                                    | Element::Heading(_)
-                                    | Element::List(_)
-                                    | Element::Table(_)
-                                    | Element::CodeBlock(_)
-                            );
-                            if is_text_like && !text_cursor_pinned {
-                                // Push the cursor down to the bottom of
-                                // the lowest top-of-page floating image
-                                // (with a small visual gap) before flow
-                                // text begins. PDF y-coords increase
-                                // upward, so "lower on page" means
-                                // smaller y. Only adjust when the image
-                                // floor is actually below the current
-                                // cursor.
-                                let cur_y = page.cursor_y();
-                                let new_y = floor_y - 6.0;
-                                if new_y < cur_y && new_y > 0.0 {
-                                    let cur_x = page.cursor_x();
-                                    page = page.at(cur_x, new_y);
-                                }
-                                text_cursor_pinned = true;
-                            }
-                        }
-                        page = render_ir_element(page, element, config)?;
-                    }
+    with_registered_fonts_full(registered, unicode_fallback, cjk_fallback, || {
+        let section_page_size = |section: &Section| -> PageSize {
+            if let Some(ps) = section.page_setup.as_ref() {
+                let w_pt = ps.width_twips as f32 / TWIPS_PER_PT;
+                let h_pt = ps.height_twips as f32 / TWIPS_PER_PT;
+                if w_pt > 0.0 && h_pt > 0.0 {
+                    return PageSize::Custom(w_pt, h_pt);
                 }
             }
+            if section_needs_landscape(section, config) { landscape(config.page_size) }
+            else { config.page_size }
+        };
 
-            page.done();
-            doc.build()
-                .map_err(|e| Error::InvalidOperation(format!("PDF build: {e}")))
-        },
-    );
-    result
+        let first_size = ir.sections.first().map(section_page_size).unwrap_or(config.page_size);
+        let mut page = doc.page(first_size);
+        let mut cur_size = first_size;
+
+        for (si, section) in ir.sections.iter().enumerate() {
+            let want_size = section_page_size(section);
+            if si > 0 {
+                let force_break = !matches!(section.break_type, SectionBreakType::Continuous);
+                if force_break || want_size.dimensions() != cur_size.dimensions() {
+                    page = page.done().page(want_size);
+                    cur_size = want_size;
+                }
+            }
+            let col_count = section.columns.as_ref().map(|c| c.count).unwrap_or(1);
+            if col_count >= 2 {
+                let (pw, ph) = match cur_size { PageSize::Custom(w, h) => (w, h), o => o.dimensions() };
+                page = render_section_columned(page, section, col_count, pw, ph, config)?;
+            } else {
+                let (_, ph) = match cur_size { PageSize::Custom(w, h) => (w, h), o => o.dimensions() };
+                let top_floor = top_floating_image_floor(&section.elements, ph);
+                let mut pinned = false;
+                for element in &section.elements {
+                    if let Some(fy) = top_floor {
+                        if !pinned && matches!(element,
+                            Element::Paragraph(_) | Element::Heading(_) | Element::List(_)
+                            | Element::Table(_) | Element::CodeBlock(_)) {
+                            let cy = page.cursor_y();
+                            let ny = fy - 6.0;
+                            if ny < cy && ny > 0.0 { let cx = page.cursor_x(); page = page.at(cx, ny); }
+                            pinned = true;
+                        }
+                    }
+                    page = render_ir_element(page, element, config)?;
+                }
+            }
+        }
+        page.done();
+        finalize(doc)
+    })
 }
+
+fn ir_to_pdf_bytes(
+    ir: &DocumentIR, config: &OfficeConfig, extra_fonts: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>> {
+    ir_to_pdf_core(ir, config, extra_fonts, |doc| {
+        doc.build().map_err(|e| Error::InvalidOperation(format!("PDF build: {e}")))
+    })
+}
+
+pub(crate) fn ir_to_pdf_writer<W: std::io::Write>(
+    ir: &DocumentIR, config: &OfficeConfig, extra_fonts: &[(String, Vec<u8>)], output: &mut W,
+) -> Result<()> {
+    use crate::host::positioned_write::CountingWriter;
+    ir_to_pdf_core(ir, config, extra_fonts, |doc| {
+        let mut writer = CountingWriter::new(output);
+        doc.build_to_writer(&mut writer)
+            .map_err(|e| Error::InvalidOperation(format!("PDF build: {e}")))
+    })
+}
+// ── end pdf_manipulator patch ──
 
 /// Compute the lowest PDF-y bound (smallest y, since PDF y grows
 /// upward) reached by any floating image that anchors in the top
@@ -1435,7 +1411,7 @@ fn resolve_font_for_text(source_name: &str, text: &str) -> String {
 /// Returns the name to advertise to `resolve_font_for_text`
 /// (or `None` if no non-Latin text was found / no font could be
 /// loaded).
-fn maybe_load_unicode_fallback(
+pub(crate) fn maybe_load_unicode_fallback(
     ir: &DocumentIR,
     extra_fonts: &mut Vec<(String, Vec<u8>)>,
 ) -> Option<String> {
@@ -1456,7 +1432,7 @@ fn maybe_load_unicode_fallback(
 /// [`crate::fonts::unicode_fallback::UNICODE_FALLBACK_CJK_NAME`].
 /// Returns the name to advertise to `resolve_font_for_text` (or
 /// `None` if no CJK text was found / no CJK font is available).
-fn maybe_load_cjk_fallback(
+pub(crate) fn maybe_load_cjk_fallback(
     ir: &DocumentIR,
     extra_fonts: &mut Vec<(String, Vec<u8>)>,
 ) -> Option<String> {
@@ -2137,6 +2113,30 @@ fn render_pptx_positional(
     config: &OfficeConfig,
     extra_fonts: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>> {
+    render_pptx_positional_core(ir, config, extra_fonts, |builder| {
+        builder.build().map_err(|e| Error::InvalidOperation(format!("PPTX positional PDF build: {e}")))
+    })
+}
+
+// ── pdf_manipulator patch: streaming PPTX positional render ──
+pub(crate) fn render_pptx_positional_writer<W: std::io::Write>(
+    ir: &DocumentIR, config: &OfficeConfig, extra_fonts: &[(String, Vec<u8>)], output: &mut W,
+) -> Result<()> {
+    use crate::host::positioned_write::CountingWriter;
+    render_pptx_positional_core(ir, config, extra_fonts, |builder| {
+        let mut writer = CountingWriter::new(output);
+        builder.build_to_writer(&mut writer)
+            .map_err(|e| Error::InvalidOperation(format!("PPTX positional PDF build: {e}")))
+    })
+}
+// ── end pdf_manipulator patch ──
+
+fn render_pptx_positional_core<R>(
+    ir: &DocumentIR,
+    config: &OfficeConfig,
+    extra_fonts: &[(String, Vec<u8>)],
+    finalize: impl FnOnce(DocumentBuilder) -> Result<R>,
+) -> Result<R> {
     use crate::writer::EmbeddedFont;
 
     let mut builder = DocumentBuilder::new().compress_streams(true);
@@ -2185,7 +2185,7 @@ fn render_pptx_positional(
         registered,
         unicode_fallback,
         cjk_fallback,
-        || -> Result<Vec<u8>> {
+        || -> Result<R> {
             for section in &ir.sections {
                 let (page_w_pt, page_h_pt) = section
                     .page_setup
@@ -2265,9 +2265,7 @@ fn render_pptx_positional(
                 page.done();
             }
 
-            builder
-                .build()
-                .map_err(|e| Error::InvalidOperation(format!("PPTX positional PDF build: {e}")))
+            finalize(builder)
         },
     );
     result

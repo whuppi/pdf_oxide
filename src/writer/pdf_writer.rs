@@ -27,7 +27,7 @@ use crate::error::Result;
 use crate::geometry::Rect;
 use crate::object::{Object, ObjectRef};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Seek, Write};
 
 /// Configuration for PDF generation.
 #[derive(Debug, Clone)]
@@ -1237,15 +1237,26 @@ impl PdfWriter {
     }
 
     /// Build the complete PDF document.
-    pub fn finish(mut self) -> Result<Vec<u8>> {
+    pub fn finish(self) -> Result<Vec<u8>> {
+        use crate::host::positioned_write::SeekWriter;
+        let mut writer = SeekWriter::new(std::io::Cursor::new(Vec::new()));
+        self.finish_to_writer(&mut writer)?;
+        Ok(writer.into_inner().into_inner())
+    }
+
+    // ── pdf_manipulator patch: streaming save to any PositionedWrite ──
+    // Writes the PDF directly to a writer instead of buffering in memory.
+    // Each object is serialized and written individually — O(1) memory.
+    // Uses PositionedWrite (position tracking without Seek) so any
+    // Write-only sink works via CountingWriter.
+    pub(crate) fn finish_to_writer(mut self, output: &mut impl crate::host::positioned_write::PositionedWrite) -> Result<()> {
         let serializer = ObjectSerializer::compact();
-        let mut output = Vec::new();
         let mut xref_offsets: Vec<(u32, usize)> = Vec::new();
 
         // PDF Header
         writeln!(output, "%PDF-{}", self.config.version)?;
         // Binary marker (recommended for binary content)
-        output.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
+        output.write_all(b"%\xE2\xE3\xCF\xD3\n")?;
 
         // Register the full Latin Standard-14 set (all three families ×
         // regular / bold / oblique / bold-oblique). These are the exact
@@ -1947,18 +1958,18 @@ impl PdfWriter {
 
         // Write all objects
         // Catalog
-        xref_offsets.push((catalog_id, output.len()));
-        output.extend_from_slice(&serializer.serialize_indirect(catalog_id, 0, &catalog_obj));
+        xref_offsets.push((catalog_id, output.position() as usize));
+        output.write_all(&serializer.serialize_indirect(catalog_id, 0, &catalog_obj))?;
 
         // Pages
-        xref_offsets.push((pages_id, output.len()));
-        output.extend_from_slice(&serializer.serialize_indirect(pages_id, 0, &pages_obj));
+        xref_offsets.push((pages_id, output.position() as usize));
+        output.write_all(&serializer.serialize_indirect(pages_id, 0, &pages_obj))?;
 
         // Font objects (Base-14)
         for font_ref in self.fonts.values() {
             if let Some(font_obj) = self.objects.get(&font_ref.id) {
-                xref_offsets.push((font_ref.id, output.len()));
-                output.extend_from_slice(&serializer.serialize_indirect(font_ref.id, 0, font_obj));
+                xref_offsets.push((font_ref.id, output.position() as usize));
+                output.write_all(&serializer.serialize_indirect(font_ref.id, 0, font_obj))?;
             }
         }
 
@@ -1967,21 +1978,21 @@ impl PdfWriter {
         // ToUnicode stream).
         for &id in &embedded_object_ids {
             if let Some(obj) = self.objects.get(&id) {
-                xref_offsets.push((id, output.len()));
-                output.extend_from_slice(&serializer.serialize_indirect(id, 0, obj));
+                xref_offsets.push((id, output.position() as usize));
+                output.write_all(&serializer.serialize_indirect(id, 0, obj))?;
             }
         }
 
         // Page and content objects
         for (obj_id, obj, _) in &page_objects {
-            xref_offsets.push((*obj_id, output.len()));
-            output.extend_from_slice(&serializer.serialize_indirect(*obj_id, 0, obj));
+            xref_offsets.push((*obj_id, output.position() as usize));
+            output.write_all(&serializer.serialize_indirect(*obj_id, 0, obj))?;
         }
 
         // Image XObject streams (from HTML <img> / add_element Image).
         for (obj_id, obj, _) in &image_objects {
-            xref_offsets.push((*obj_id, output.len()));
-            output.extend_from_slice(&serializer.serialize_indirect(*obj_id, 0, obj));
+            xref_offsets.push((*obj_id, output.position() as usize));
+            output.write_all(&serializer.serialize_indirect(*obj_id, 0, obj))?;
         }
 
         // Hoist any inline appearance streams (e.g. a watermark's `/AP /N`)
@@ -1999,21 +2010,21 @@ impl PdfWriter {
 
         // Annotation objects
         for (annot_id, annot_obj) in &annotation_objects {
-            xref_offsets.push((*annot_id, output.len()));
-            output.extend_from_slice(&serializer.serialize_indirect(*annot_id, 0, annot_obj));
+            xref_offsets.push((*annot_id, output.position() as usize));
+            output.write_all(&serializer.serialize_indirect(*annot_id, 0, annot_obj))?;
         }
 
         // Form field objects
         for (field_id, field_obj) in &form_field_objects {
-            xref_offsets.push((*field_id, output.len()));
-            output.extend_from_slice(&serializer.serialize_indirect(*field_id, 0, field_obj));
+            xref_offsets.push((*field_id, output.position() as usize));
+            output.write_all(&serializer.serialize_indirect(*field_id, 0, field_obj))?;
         }
 
         // AcroForm object (if present)
         if let Some(acroform_id) = acroform_id {
             if let Some(acroform_obj) = self.objects.get(&acroform_id) {
-                xref_offsets.push((acroform_id, output.len()));
-                output.extend_from_slice(&serializer.serialize_indirect(
+                xref_offsets.push((acroform_id, output.position() as usize));
+                output.write_all(&serializer.serialize_indirect(
                     acroform_id,
                     0,
                     acroform_obj,
@@ -2024,16 +2035,16 @@ impl PdfWriter {
         // Outline objects (root + every item). #393 Bundle B-1.
         for &id in &outline_object_ids {
             if let Some(obj) = self.objects.get(&id) {
-                xref_offsets.push((id, output.len()));
-                output.extend_from_slice(&serializer.serialize_indirect(id, 0, obj));
+                xref_offsets.push((id, output.position() as usize));
+                output.write_all(&serializer.serialize_indirect(id, 0, obj))?;
             }
         }
 
         // PageLabels number tree (if set). #393 Bundle B-2.
         if let Some(id) = page_labels_id {
             if let Some(obj) = self.objects.get(&id) {
-                xref_offsets.push((id, output.len()));
-                output.extend_from_slice(&serializer.serialize_indirect(id, 0, obj));
+                xref_offsets.push((id, output.position() as usize));
+                output.write_all(&serializer.serialize_indirect(id, 0, obj))?;
             }
         }
 
@@ -2041,25 +2052,25 @@ impl PdfWriter {
         // Emit in insertion order (struct_tree_obj_ids preserves this).
         for &id in &struct_tree_obj_ids {
             if let Some(obj) = self.objects.get(&id) {
-                xref_offsets.push((id, output.len()));
-                output.extend_from_slice(&serializer.serialize_indirect(id, 0, obj));
+                xref_offsets.push((id, output.position() as usize));
+                output.write_all(&serializer.serialize_indirect(id, 0, obj))?;
             }
         }
 
         // ISO 14289-1 §6.7.11: XMP metadata stream (tagged PDF only).
         if let Some(xmp_id) = xmp_metadata_id {
             if let Some(obj) = self.objects.get(&xmp_id) {
-                xref_offsets.push((xmp_id, output.len()));
-                output.extend_from_slice(&serializer.serialize_indirect(xmp_id, 0, obj));
+                xref_offsets.push((xmp_id, output.position() as usize));
+                output.write_all(&serializer.serialize_indirect(xmp_id, 0, obj))?;
             }
         }
 
         // Info object
-        xref_offsets.push((info_id, output.len()));
-        output.extend_from_slice(&serializer.serialize_indirect(info_id, 0, &info_obj));
+        xref_offsets.push((info_id, output.position() as usize));
+        output.write_all(&serializer.serialize_indirect(info_id, 0, &info_obj))?;
 
         // Write xref table
-        let xref_start = output.len();
+        let xref_start = output.position() as usize;
         writeln!(output, "xref")?;
         writeln!(output, "0 {}", self.next_obj_id)?;
 
@@ -2081,14 +2092,15 @@ impl PdfWriter {
         ]);
 
         writeln!(output, "trailer")?;
-        output.extend_from_slice(&serializer.serialize(&trailer));
+        output.write_all(&serializer.serialize(&trailer))?;
         writeln!(output)?;
         writeln!(output, "startxref")?;
         writeln!(output, "{}", xref_start)?;
         write!(output, "%%EOF")?;
 
-        Ok(output)
+        Ok(())
     }
+    // ── end pdf_manipulator patch ──
 
     /// Save the PDF to a file.
     pub fn save(self, path: impl AsRef<std::path::Path>) -> Result<()> {
