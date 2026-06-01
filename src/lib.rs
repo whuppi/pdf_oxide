@@ -310,6 +310,13 @@ mod python;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+// ── pdf_manipulator patch: Flutter bridge host layer ──
+// Not part of upstream. Added for the pdf_manipulator Flutter package.
+// Contains: dispatch (shared ops), binary_codec (wire format),
+// bridge_api (single entry point for native FFI + WASM).
+pub mod host;
+// ── end pdf_manipulator patch ──
+
 // Re-exports
 pub use annotation_types::{
     AnnotationBorderStyle, AnnotationColor, AnnotationFlags, AnnotationSubtype, BorderEffectStyle,
