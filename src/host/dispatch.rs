@@ -21,93 +21,157 @@ use crate::error::{Error, Result};
 // bridge_api.rs encodes these to binary via ResponseWriter.
 // ═══════════════════════════════════════════════════════════════════
 
+/// Result of opening and inspecting a PDF document.
 pub struct OpenResult {
+    /// Total number of pages.
     pub page_count: usize,
+    /// PDF major version (e.g. 1 for PDF 1.7).
     pub version_major: u8,
+    /// PDF minor version (e.g. 7 for PDF 1.7).
     pub version_minor: u8,
+    /// Whether the document has an encryption dictionary.
     pub is_encrypted: bool,
+    /// Whether the document requires a password to read.
     pub requires_password: bool,
+    /// Whether the document has a structure tree (tagged PDF).
     pub is_tagged: bool,
+    /// Encryption algorithm identifier (0 if not encrypted).
     pub encryption_algorithm: u8,
+    /// Permission flags byte (0xFF if not encrypted).
     pub permission_bits: u8,
+    /// Per-page dimensions and rotation.
     pub pages: Vec<PageInfo>,
+    /// Document info Title field.
     pub title: String,
+    /// Document info Author field.
     pub author: String,
+    /// Document info Subject field.
     pub subject: String,
+    /// Document info Keywords field.
     pub keywords: String,
 }
 
+/// Dimensions and rotation of a single page.
 pub struct PageInfo {
+    /// Page width in points.
     pub width: f64,
+    /// Page height in points.
     pub height: f64,
+    /// Page rotation in degrees (0, 90, 180, 270).
     pub rotation: i32,
 }
 
+/// Result of text extraction from one or more pages.
 pub struct ExtractTextResult {
+    /// Extracted text content.
     pub text: String,
 }
 
+/// A single text search match with location.
 pub struct SearchHit {
+    /// Zero-based page index of the match.
     pub page: usize,
+    /// Matched text.
     pub text: String,
+    /// Bounding box X origin in points.
     pub x: f32,
+    /// Bounding box Y origin in points.
     pub y: f32,
+    /// Bounding box width in points.
     pub width: f32,
+    /// Bounding box height in points.
     pub height: f32,
 }
 
+/// Result of a text search across pages.
 pub struct SearchResult {
+    /// All matches found.
     pub hits: Vec<SearchHit>,
 }
 
+/// Metadata for one digital signature in the document.
 pub struct SignatureInfo {
+    /// Name of the signer.
     pub signer_name: String,
+    /// Stated reason for signing.
     pub reason: String,
+    /// Stated signing location.
     pub location: String,
 }
 
+/// Result of enumerating digital signatures.
 pub struct SignaturesResult {
+    /// All signatures found in the document.
     pub signatures: Vec<SignatureInfo>,
 }
 
+/// Result of PDF/A or PDF/UA compliance validation.
 pub struct ValidationResult {
+    /// Whether the document is compliant with the requested level.
     pub compliant: bool,
+    /// Number of validation errors (-1 if validation itself failed).
     pub errors: i32,
+    /// Number of validation warnings.
     pub warnings: i32,
 }
 
+/// Result of page or document classification.
 pub struct ClassificationResult {
+    /// Debug-formatted classification type name.
     pub type_name: String,
 }
 
+/// A bookmark-based split range for document splitting.
 pub struct BookmarkSplit {
+    /// Bookmark title.
     pub title: String,
+    /// First page index (inclusive).
     pub start_page: usize,
+    /// Last page index (inclusive).
     pub end_page: usize,
 }
 
+/// RGBA pixel data for a rendered page.
 pub struct RenderedPage {
+    /// Image width in pixels.
     pub width: u32,
+    /// Image height in pixels.
     pub height: u32,
+    /// Raw RGBA pixel bytes.
     pub data: Vec<u8>,
 }
 
+/// An image extracted from a PDF page.
 pub struct ExtractedImage {
+    /// Image width in pixels.
     pub width: u32,
+    /// Image height in pixels.
     pub height: u32,
+    /// Image format (e.g. "jpeg", "raw").
     pub format: String,
+    /// Color space (e.g. "DeviceRGB").
     pub color_space: String,
+    /// Bits per color component.
     pub bits_per_component: u32,
+    /// Raw image bytes.
     pub data: Vec<u8>,
 }
 
+/// Metadata snapshot from a DocumentEditor.
 pub struct EditorMetadataResult {
+    /// Current page count in the editor.
     pub page_count: usize,
+    /// PDF major version.
     pub version_major: u8,
+    /// PDF minor version.
     pub version_minor: u8,
+    /// Document title.
     pub title: String,
+    /// Document author.
     pub author: String,
+    /// Document subject.
     pub subject: String,
+    /// Document keywords.
     pub keywords: String,
 }
 
@@ -115,6 +179,7 @@ pub struct EditorMetadataResult {
 // Read operations — take &mut PdfDocument, return typed results.
 // ═══════════════════════════════════════════════════════════════════
 
+/// Open a document and return its metadata, page info, and document info strings.
 pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     let page_count = doc.page_count()?;
     let (major, minor) = doc.version();
@@ -151,6 +216,7 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     })
 }
 
+/// Extract text from one page or all pages in the given format.
 pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) -> Result<ExtractTextResult> {
     let text = match format {
         "markdown" => {
@@ -193,6 +259,7 @@ pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) ->
     Ok(ExtractTextResult { text })
 }
 
+/// Search for text across the document, optionally filtered to one page.
 pub fn search_text(doc: &mut PdfDocument, query: &str, page: Option<usize>) -> Result<SearchResult> {
     use crate::search::{SearchOptions, TextSearcher};
     let opts = SearchOptions::default();
@@ -212,10 +279,11 @@ pub fn search_text(doc: &mut PdfDocument, query: &str, page: Option<usize>) -> R
     Ok(SearchResult { hits })
 }
 
-pub fn get_signatures(doc: &mut PdfDocument) -> Result<SignaturesResult> {
+/// Enumerate digital signatures in the document.
+pub fn get_signatures(_doc: &mut PdfDocument) -> Result<SignaturesResult> {
     #[cfg(feature = "signatures")]
     {
-        let sigs = crate::signatures::enumerate_signatures(doc)?;
+        let sigs = crate::signatures::enumerate_signatures(_doc)?;
         let signatures = sigs.iter().map(|s| SignatureInfo {
             signer_name: s.signer_name.clone().unwrap_or_default(),
             reason: s.reason.clone().unwrap_or_default(),
@@ -227,10 +295,12 @@ pub fn get_signatures(doc: &mut PdfDocument) -> Result<SignaturesResult> {
     { Ok(SignaturesResult { signatures: vec![] }) }
 }
 
+/// Verify digital signatures (stub — always returns false).
 pub fn verify_signatures(_doc: &mut PdfDocument) -> Result<bool> {
     Ok(false)
 }
 
+/// Validate PDF/A compliance at the given level (1=A1b, 2=A2b, 3=A3b).
 pub fn validate_pdf_a(doc: &mut PdfDocument, level: i32) -> Result<ValidationResult> {
     use crate::compliance::{validate_pdf_a as do_validate, PdfALevel};
     let pdf_level = match level {
@@ -248,6 +318,7 @@ pub fn validate_pdf_a(doc: &mut PdfDocument, level: i32) -> Result<ValidationRes
     }
 }
 
+/// Validate PDF/UA compliance at the given level (1=UA1, 2=UA2).
 pub fn validate_pdf_ua(doc: &mut PdfDocument, level: i32) -> Result<bool> {
     use crate::compliance::pdf_ua::{validate_pdf_ua as do_validate, PdfUaLevel};
     let ua_level = match level {
@@ -257,16 +328,19 @@ pub fn validate_pdf_ua(doc: &mut PdfDocument, level: i32) -> Result<bool> {
     Ok(do_validate(doc, ua_level).map(|r| r.is_compliant).unwrap_or(false))
 }
 
+/// Classify a single page's content type.
 pub fn classify_page(doc: &mut PdfDocument, page: usize) -> Result<ClassificationResult> {
     let classification = doc.classify_page(page)?;
     Ok(ClassificationResult { type_name: format!("{:?}", classification) })
 }
 
+/// Classify the overall document type.
 pub fn classify_document(doc: &mut PdfDocument) -> Result<ClassificationResult> {
     let classification = doc.classify_document()?;
     Ok(ClassificationResult { type_name: format!("{:?}", classification) })
 }
 
+/// Plan bookmark-based page ranges for splitting the document.
 pub fn plan_split_by_bookmarks(doc: &mut PdfDocument) -> Result<Vec<BookmarkSplit>> {
     use crate::split_bookmarks::{plan_split_by_bookmarks as do_plan, SplitByBookmarksOptions};
     let opts = SplitByBookmarksOptions::default();
@@ -278,6 +352,7 @@ pub fn plan_split_by_bookmarks(doc: &mut PdfDocument) -> Result<Vec<BookmarkSpli
     }).collect())
 }
 
+/// Render a page to RGBA pixels, optionally constrained to max dimensions.
 pub fn render_page(doc: &mut PdfDocument, page: usize, max_width: u32, max_height: u32) -> Result<RenderedPage> {
     #[cfg(feature = "rendering")]
     {
@@ -301,6 +376,7 @@ pub fn render_page(doc: &mut PdfDocument, page: usize, max_width: u32, max_heigh
     }
 }
 
+/// Extract all images from a page as decoded pixel data.
 pub fn extract_images(doc: &mut PdfDocument, page: usize) -> Result<Vec<ExtractedImage>> {
     let images = doc.extract_images(page)?;
     Ok(images.into_iter().map(|img| {
@@ -397,6 +473,7 @@ pub fn render_pages_streamed<W: std::io::Write>(
 // Uses upstream DocumentEditor public + EditableDocument trait methods.
 // ═══════════════════════════════════════════════════════════════════
 
+/// Read current metadata from the editor.
 pub fn edit_get_metadata(editor: &mut DocumentEditor) -> EditorMetadataResult {
     let version = editor.version();
     EditorMetadataResult {
@@ -410,10 +487,12 @@ pub fn edit_get_metadata(editor: &mut DocumentEditor) -> EditorMetadataResult {
     }
 }
 
+/// Check whether the editor has unsaved modifications.
 pub fn edit_is_modified(editor: &DocumentEditor) -> bool {
     editor.is_modified()
 }
 
+/// Get the media box (x, y, width, height) for a page.
 pub fn edit_page_media_box(editor: &mut DocumentEditor, page: usize) -> Result<(f32, f32, f32, f32)> {
     let mb = editor.get_page_media_box(page)?;
     Ok((mb[0], mb[1], mb[2], mb[3]))
@@ -421,24 +500,29 @@ pub fn edit_page_media_box(editor: &mut DocumentEditor, page: usize) -> Result<(
 
 // ── Metadata setters ──
 
+/// Set the document title.
 pub fn edit_set_title(editor: &mut DocumentEditor, value: &str) {
     editor.set_title(value);
 }
 
+/// Set the document author.
 pub fn edit_set_author(editor: &mut DocumentEditor, value: &str) {
     editor.set_author(value);
 }
 
+/// Set the document subject.
 pub fn edit_set_subject(editor: &mut DocumentEditor, value: &str) {
     editor.set_subject(value);
 }
 
+/// Set the document keywords.
 pub fn edit_set_keywords(editor: &mut DocumentEditor, value: &str) {
     editor.set_keywords(value);
 }
 
 // ── Page manipulation ──
 
+/// Keep only the specified pages (by index), removing all others.
 pub fn edit_select_pages(editor: &mut DocumentEditor, pages: &[usize]) -> Result<()> {
     editor.select_pages(pages)
 }
@@ -451,6 +535,7 @@ pub fn edit_delete_pages(editor: &mut DocumentEditor, pages: &[usize]) -> Result
     editor.select_pages(&keep)
 }
 
+/// Rotate specific pages by the given degrees.
 pub fn edit_rotate_pages(editor: &mut DocumentEditor, rotations: &[(usize, i32)]) -> Result<()> {
     for &(page, degrees) in rotations {
         editor.rotate_page_by(page, degrees)?;
@@ -458,15 +543,18 @@ pub fn edit_rotate_pages(editor: &mut DocumentEditor, rotations: &[(usize, i32)]
     Ok(())
 }
 
+/// Rotate all pages by the given degrees.
 pub fn edit_rotate_all(editor: &mut DocumentEditor, degrees: i32) -> Result<()> {
     editor.rotate_all_pages(degrees)
 }
 
+/// Move a page from one index to another.
 pub fn edit_move_page(editor: &mut DocumentEditor, from: usize, to: usize) -> Result<()> {
     use crate::editor::EditableDocument;
     editor.move_page(from, to)
 }
 
+/// Merge pages from one or more secondary PDFs into this document.
 pub fn edit_merge(editor: &mut DocumentEditor, secondary_bytes: &[Vec<u8>]) -> Result<()> {
     for secondary in secondary_bytes {
         editor.merge_from_bytes(secondary)?;
@@ -476,14 +564,17 @@ pub fn edit_merge(editor: &mut DocumentEditor, secondary_bytes: &[Vec<u8>]) -> R
 
 // ── Content operations ──
 
+/// Flatten interactive form fields into page content.
 pub fn edit_flatten_forms(editor: &mut DocumentEditor) -> Result<()> {
     editor.flatten_forms()
 }
 
+/// Flatten all annotations into page content.
 pub fn edit_flatten_all_annotations(editor: &mut DocumentEditor) -> Result<()> {
     editor.flatten_all_annotations()
 }
 
+/// Compress the document (currently a no-op without image recompress).
 pub fn edit_compress(editor: &mut DocumentEditor, _quality: u8) -> Result<()> {
     // Image optimization requires the image_optimizer patch.
     // Compression without image recompress is a no-op for now.
@@ -491,23 +582,29 @@ pub fn edit_compress(editor: &mut DocumentEditor, _quality: u8) -> Result<()> {
     Ok(())
 }
 
+/// Recompress images above `min_size` bytes at the given quality. Returns count optimized.
 pub fn edit_optimize_images(editor: &mut DocumentEditor, quality: u8, min_size: u32) -> Result<usize> {
     // Image optimizer runs on the source document's object graph.
     // Modified objects are staged via insert_modified for the next save.
-    let mut mods = std::collections::HashMap::new();
     #[cfg(feature = "rendering")]
-    let count = crate::host::image_optimizer::optimize_images(
-        editor.source(), &mut mods, quality, min_size,
-    )?;
-    #[cfg(not(feature = "rendering"))]
-    let count = { let _ = (quality, min_size); 0usize };
-
-    for (id, obj) in mods {
-        editor.insert_modified(id, obj);
+    {
+        let mut mods = std::collections::HashMap::new();
+        let count = crate::host::image_optimizer::optimize_images(
+            editor.source(), &mut mods, quality, min_size,
+        )?;
+        for (id, obj) in mods {
+            editor.insert_modified(id, obj);
+        }
+        Ok(count)
     }
-    Ok(count)
+    #[cfg(not(feature = "rendering"))]
+    {
+        let _ = (editor, quality, min_size);
+        Ok(0)
+    }
 }
 
+/// Remove embedded copies of the 14 standard PDF fonts. Returns count unembedded.
 pub fn edit_unembed_standard_fonts(editor: &mut DocumentEditor) -> Result<usize> {
     let mut mods = std::collections::HashMap::new();
     let count = crate::host::font_optimizer::unembed_standard_fonts(
@@ -519,27 +616,33 @@ pub fn edit_unembed_standard_fonts(editor: &mut DocumentEditor) -> Result<usize>
     Ok(count)
 }
 
+/// Embed a file attachment into the document.
 pub fn edit_embed_file(editor: &mut DocumentEditor, name: &str, data: Vec<u8>) -> Result<()> {
     editor.embed_file(name, data)
 }
 
+/// Erase rectangular regions from a page's content.
 pub fn edit_erase_regions(editor: &mut DocumentEditor, page: usize, rects: &[[f32; 4]]) -> Result<()> {
     editor.erase_regions(page, rects)
 }
 
+/// Crop all pages by the given margin insets (in points).
 pub fn edit_crop_margins(editor: &mut DocumentEditor, left: f32, right: f32, top: f32, bottom: f32) -> Result<()> {
     editor.crop_margins(left, right, top, bottom)
 }
 
+/// Set a form field's value by field name.
 pub fn edit_set_form_field_value(editor: &mut DocumentEditor, name: &str, value: &str) -> Result<()> {
     use crate::editor::form_fields::FormFieldValue;
     editor.set_form_field_value(name, FormFieldValue::Text(value.to_string()))
 }
 
+/// Resize a named image XObject on a page.
 pub fn edit_resize_image(editor: &mut DocumentEditor, page: usize, name: &str, width: f32, height: f32) -> Result<()> {
     editor.resize_image(page, name, width, height)
 }
 
+/// Convert the document to PDF/A at the given level (1=A1b, 2=A2b, 3=A3b).
 pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<()> {
     use crate::compliance::PdfALevel;
     let pdf_level = match level {
@@ -554,19 +657,23 @@ pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<
 
 // ── Redaction ──
 
+/// Mark a rectangular region on a page for redaction.
 pub fn edit_add_redaction(editor: &mut DocumentEditor, page: usize, rect: [f32; 4]) -> Result<()> {
     editor.add_redaction(page, rect, None)
 }
 
+/// Count pending redaction annotations on a page.
 pub fn edit_redaction_count(editor: &mut DocumentEditor, page: usize) -> Result<usize> {
     editor.redaction_count(page)
 }
 
+/// Apply all pending redactions, permanently removing redacted content.
 pub fn edit_apply_redactions_destructive(editor: &mut DocumentEditor) -> Result<()> {
     editor.apply_redactions_destructive(crate::redaction::RedactionOptions::default())?;
     Ok(())
 }
 
+/// Remove document metadata (info dict, XMP, etc.).
 pub fn edit_scrub_metadata(editor: &mut DocumentEditor) -> Result<()> {
     let opts = crate::redaction::RedactionOptions {
         scrub_metadata: true,
@@ -580,6 +687,7 @@ pub fn edit_scrub_metadata(editor: &mut DocumentEditor) -> Result<()> {
 
 // ── Save ──
 
+/// Save the editor's document to a positioned writer with the given options.
 pub fn edit_save_with_options(
     editor: &mut DocumentEditor,
     writer: &mut impl crate::host::positioned_write::PositionedWrite,
@@ -588,6 +696,7 @@ pub fn edit_save_with_options(
     editor.write_full_to_writer(writer, options)
 }
 
+/// Save the editor's document with compression, GC, and save-mode flags.
 pub fn edit_save(
     editor: &mut DocumentEditor,
     writer: &mut impl crate::host::positioned_write::PositionedWrite,
@@ -605,6 +714,7 @@ pub fn edit_save(
     editor.write_full_to_writer(writer, &options)
 }
 
+/// Save with AES-256 encryption, returning the encrypted bytes.
 pub fn edit_save_encrypted(
     editor: &mut DocumentEditor,
     user_password: &str,
@@ -622,6 +732,7 @@ pub fn edit_save_encrypted(
 // Document conversion — convert between PDF and office formats.
 // ═══════════════════════════════════════════════════════════════════
 
+/// Convert a PDF to an office format, streaming output to a writer.
 pub fn convert_to_format_writer<W: std::io::Write>(doc: &PdfDocument, format: &str, writer: &mut W) -> Result<()> {
     match format {
         "docx" => doc.to_docx_writer_flow(writer),
@@ -631,6 +742,7 @@ pub fn convert_to_format_writer<W: std::io::Write>(doc: &PdfDocument, format: &s
     }
 }
 
+/// Convert a PDF to an office format, returning the bytes.
 pub fn convert_to_format(doc: &PdfDocument, format: &str) -> Result<Vec<u8>> {
     match format {
         "docx" => doc.to_docx_bytes(),
@@ -640,6 +752,7 @@ pub fn convert_to_format(doc: &PdfDocument, format: &str) -> Result<Vec<u8>> {
     }
 }
 
+/// Convert an office document to PDF, streaming output to a writer.
 pub fn convert_from_format_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
     reader: R, format: &str, writer: &mut W,
 ) -> Result<()> {
@@ -652,6 +765,7 @@ pub fn convert_from_format_writer<R: std::io::Read + std::io::Seek + Send + 'sta
     }
 }
 
+/// Convert an office document (in memory) to PDF bytes.
 pub fn convert_from_format_to_bytes(data: &[u8], format: &str) -> Result<Vec<u8>> {
     let mut buf = std::io::Cursor::new(Vec::new());
     convert_from_format_writer(std::io::Cursor::new(data.to_vec()), format, &mut buf)?;
@@ -664,6 +778,7 @@ pub fn convert_from_format_to_bytes(data: &[u8], format: &str) -> Result<Vec<u8>
 // No upstream patch. Uses only public APIs.
 // ═══════════════════════════════════════════════════════════════════
 
+/// Add a text watermark to one page (page >= 0) or all pages (page < 0).
 pub fn edit_watermark(
     editor: &mut DocumentEditor, page: i32, text: &str,
     font_size: f32, rotation: f32, opacity: f32,
@@ -898,6 +1013,7 @@ fn prepend_to_page_content(
     Ok(())
 }
 
+/// Add a standard stamp annotation to a page.
 pub fn edit_add_stamp(
     editor: &mut DocumentEditor, page: usize, stamp_type: i32,
     x: f32, y: f32, w: f32, h: f32, opacity: f32,
@@ -1052,36 +1168,175 @@ fn stamp_type_from_int(i: i32) -> crate::writer::StampType {
 
 use crate::writer::{DocumentBuilder, FluentPageBuilder, PageSize};
 
+/// A buffered page-building operation replayed by [`replay_page_ops`].
 pub enum PageOp {
+    /// Set the current font by name and size.
     Font(String, f32),
+    /// Move the cursor to absolute (x, y) coordinates.
     At(f32, f32),
+    /// Draw inline text at the current cursor position.
     Text(String),
+    /// Draw a heading at the given level (1-6).
     Heading(u8, String),
+    /// Draw a paragraph of body text.
     Paragraph(String),
+    /// Insert vertical space (points).
     Space(f32),
+    /// Draw a horizontal rule across the page width.
     HorizontalRule,
-    Image { data: Vec<u8>, x: f32, y: f32, w: f32, h: f32, alt: String },
+    /// Place an image at the given rect with alt text.
+    Image {
+        /// Raw image bytes (JPEG or PNG).
+        data: Vec<u8>,
+        /// X origin in points.
+        x: f32,
+        /// Y origin in points.
+        y: f32,
+        /// Width in points.
+        w: f32,
+        /// Height in points.
+        h: f32,
+        /// Alt text for accessibility.
+        alt: String,
+    },
+    /// Add a diagonal text watermark.
     Watermark(String),
-    TextField { name: String, x: f32, y: f32, w: f32, h: f32, default_value: Option<String> },
-    Checkbox { name: String, x: f32, y: f32, w: f32, h: f32, checked: bool },
-    ComboBox { name: String, x: f32, y: f32, w: f32, h: f32, options: Vec<String>, selected: Option<String> },
-    PushButton { name: String, x: f32, y: f32, w: f32, h: f32, caption: String },
-    SignatureField { name: String, x: f32, y: f32, w: f32, h: f32 },
-    RadioGroup { name: String, values: Vec<String>, xs: Vec<f32>, ys: Vec<f32>, ws: Vec<f32>, hs: Vec<f32>, selected: Option<String> },
+    /// Add a text input field.
+    TextField {
+        /// Field name.
+        name: String,
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Optional default value.
+        default_value: Option<String>,
+    },
+    /// Add a checkbox field.
+    Checkbox {
+        /// Field name.
+        name: String,
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Initial checked state.
+        checked: bool,
+    },
+    /// Add a combo box (dropdown) field.
+    ComboBox {
+        /// Field name.
+        name: String,
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Selectable options.
+        options: Vec<String>,
+        /// Initially selected option.
+        selected: Option<String>,
+    },
+    /// Add a push button field.
+    PushButton {
+        /// Field name.
+        name: String,
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Button label text.
+        caption: String,
+    },
+    /// Add an empty digital signature field.
+    SignatureField {
+        /// Field name.
+        name: String,
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+    },
+    /// Add a radio button group.
+    RadioGroup {
+        /// Group name.
+        name: String,
+        /// Value labels for each button.
+        values: Vec<String>,
+        /// X origins (one per button).
+        xs: Vec<f32>,
+        /// Y origins (one per button).
+        ys: Vec<f32>,
+        /// Widths (one per button).
+        ws: Vec<f32>,
+        /// Heights (one per button).
+        hs: Vec<f32>,
+        /// Initially selected value.
+        selected: Option<String>,
+    },
+    /// Attach a JavaScript keystroke action to the most recent field.
     FieldKeystroke(String),
+    /// Attach a JavaScript format action to the most recent field.
     FieldFormat(String),
+    /// Attach a JavaScript validate action to the most recent field.
     FieldValidate(String),
+    /// Attach a JavaScript calculate action to the most recent field.
     FieldCalculate(String),
+    /// Attach a URL hyperlink annotation.
     LinkUrl(String),
+    /// Attach a same-document page link annotation.
     LinkPage(usize),
-    Footnote { ref_mark: String, note_text: String },
-    Columns { column_count: u32, gap_pt: f32, text: String },
+    /// Insert a footnote with reference mark and note text.
+    Footnote {
+        /// Reference mark placed inline.
+        ref_mark: String,
+        /// Note text placed at page bottom.
+        note_text: String,
+    },
+    /// Lay out text in multiple columns.
+    Columns {
+        /// Number of columns.
+        column_count: u32,
+        /// Gap between columns in points.
+        gap_pt: f32,
+        /// Text to flow across columns.
+        text: String,
+    },
+    /// Insert a line break.
     Newline,
+    /// Start a new page with the same dimensions as the current one.
     NewPageSameSize,
-    NewPage { width: f32, height: f32 },
+    /// Start a new page with custom dimensions.
+    NewPage {
+        /// Page width in points.
+        width: f32,
+        /// Page height in points.
+        height: f32,
+    },
+    /// Finalize the current page.
     Done,
 }
 
+/// Replay a sequence of buffered page operations onto a builder.
 pub fn replay_page_ops(builder: &mut DocumentBuilder, default_size: PageSize, ops: Vec<PageOp>) {
     let mut current_page: Option<FluentPageBuilder<'_>> = None;
 
@@ -1144,15 +1399,25 @@ pub fn replay_page_ops(builder: &mut DocumentBuilder, default_size: PageSize, op
     if let Some(p) = current_page { p.done(); }
 }
 
+/// Create a new empty DocumentBuilder.
 pub fn builder_new() -> DocumentBuilder { DocumentBuilder::new() }
+/// Set the builder's document title.
 pub fn builder_set_title(b: DocumentBuilder, title: &str) -> DocumentBuilder { b.title(title) }
+/// Set the builder's document author.
 pub fn builder_set_author(b: DocumentBuilder, author: &str) -> DocumentBuilder { b.author(author) }
+/// Set the builder's document subject.
 pub fn builder_set_subject(b: DocumentBuilder, subject: &str) -> DocumentBuilder { b.subject(subject) }
+/// Set the builder's document keywords.
 pub fn builder_set_keywords(b: DocumentBuilder, keywords: &str) -> DocumentBuilder { b.keywords(keywords) }
+/// Add a custom-sized page and return a fluent page builder.
 pub fn builder_add_page(b: &mut DocumentBuilder, width: f32, height: f32) -> FluentPageBuilder<'_> { b.page(PageSize::Custom(width, height)) }
+/// Add an A4-sized page and return a fluent page builder.
 pub fn builder_add_a4_page(b: &mut DocumentBuilder) -> FluentPageBuilder<'_> { b.page(PageSize::A4) }
+/// Add a Letter-sized page and return a fluent page builder.
 pub fn builder_add_letter_page(b: &mut DocumentBuilder) -> FluentPageBuilder<'_> { b.page(PageSize::Letter) }
+/// Build the document and return the PDF bytes.
 pub fn builder_save(b: DocumentBuilder) -> Result<Vec<u8>> { b.build() }
+/// Build the document and write the PDF to a positioned writer.
 pub fn builder_save_to_writer(b: DocumentBuilder, writer: &mut impl crate::host::positioned_write::PositionedWrite) -> Result<()> {
     b.build_to_writer(writer)
 }

@@ -141,7 +141,7 @@ fn read_all_from_reader(reader: &mut BoxedReader) -> std::io::Result<Vec<u8>> {
 ///
 /// O(1)-memory I/O: when reader/writer are Some, PDF bytes flow
 /// through them on demand — never fully buffered.
-pub fn handle_request(
+pub(crate) fn handle_request(
     state: &InstanceState,
     bytes: &[u8],
     source_bytes: Option<&[u8]>,
@@ -1488,46 +1488,41 @@ mod ffi_entry {
         drop(inst);
     }
 
-    // ── Condvar buffer lifecycle (called by Dart coordinator) ──
+    // ── Sync buffer lifecycle (called by Dart coordinator) ──
+    //
+    // Cross-platform: std::sync::Mutex + Condvar stored as heap-allocated
+    // SyncPair, pointer written into the buffer's sync_ptr slot.
 
     use crate::host::native::shared_buffer as sb;
 
     #[no_mangle]
     pub unsafe extern "C" fn bridge_init_read_buffer(buf: *mut u8) {
-        sb::init_sync(buf, sb::read_channel::OFFSET_MUTEX, sb::read_channel::OFFSET_CONDVAR);
+        sb::init_sync(buf, sb::read_channel::OFFSET_SYNC_PTR);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn bridge_destroy_read_buffer(buf: *mut u8) {
-        sb::destroy_sync(buf, sb::read_channel::OFFSET_MUTEX, sb::read_channel::OFFSET_CONDVAR);
+        sb::destroy_sync(buf, sb::read_channel::OFFSET_SYNC_PTR);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn bridge_signal_read(buf: *mut u8) {
-        let condvar = sb::condvar_ptr(buf, sb::read_channel::OFFSET_CONDVAR);
-        let mutex = sb::mutex_ptr(buf, sb::read_channel::OFFSET_MUTEX);
-        libc::pthread_mutex_lock(mutex);
-        libc::pthread_cond_signal(condvar);
-        libc::pthread_mutex_unlock(mutex);
+        sb::notify(buf, sb::read_channel::OFFSET_SYNC_PTR);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn bridge_init_write_buffer(buf: *mut u8) {
-        sb::init_sync(buf, sb::write_channel::OFFSET_MUTEX, sb::write_channel::OFFSET_CONDVAR);
+        sb::init_sync(buf, sb::write_channel::OFFSET_SYNC_PTR);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn bridge_destroy_write_buffer(buf: *mut u8) {
-        sb::destroy_sync(buf, sb::write_channel::OFFSET_MUTEX, sb::write_channel::OFFSET_CONDVAR);
+        sb::destroy_sync(buf, sb::write_channel::OFFSET_SYNC_PTR);
     }
 
     #[no_mangle]
     pub unsafe extern "C" fn bridge_signal_write(buf: *mut u8) {
-        let condvar = sb::condvar_ptr(buf, sb::write_channel::OFFSET_CONDVAR);
-        let mutex = sb::mutex_ptr(buf, sb::write_channel::OFFSET_MUTEX);
-        libc::pthread_mutex_lock(mutex);
-        libc::pthread_cond_signal(condvar);
-        libc::pthread_mutex_unlock(mutex);
+        sb::notify(buf, sb::write_channel::OFFSET_SYNC_PTR);
     }
 
     #[no_mangle]

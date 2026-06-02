@@ -20,18 +20,13 @@ use std::sync::Arc;
 
 const WRITE_TIMEOUT_SECS: u64 = 30;
 
-/// Output writer backed by condvar-shared memory.
-///
-/// Small writes accumulate in the shared buffer (256KB). A round-trip
-/// to Dart only happens when the buffer is full or on flush/drop.
-/// This reduces thousands of per-object round-trips to ~tens of
-/// full-buffer flushes. O(1) memory — the shared buffer is fixed-size.
+/// Write+Seek implementation backed by shared-memory I/O with the host.
 pub struct CallbackWriter {
     buf: *mut u8,
     notify_fn: unsafe extern "C" fn(),
     cancel: Option<Arc<AtomicBool>>,
     position: u64,
-    pending: usize, // bytes accumulated in shared buffer, not yet flushed
+    pending: usize,
 }
 
 unsafe impl Send for CallbackWriter {}
@@ -41,7 +36,7 @@ impl CallbackWriter {
     /// # Safety
     ///
     /// - `buf` must point to a write-channel buffer (`wc::TOTAL_SIZE` bytes)
-    ///   with mutex+condvar initialized via `sb::init_sync`.
+    ///   with sync initialized via `sb::init_sync`.
     /// - `notify_fn` must be safe to call from any thread.
     /// - The buffer must outlive this writer.
     pub unsafe fn new(
@@ -52,8 +47,6 @@ impl CallbackWriter {
         Self { buf, notify_fn, cancel, position: 0, pending: 0 }
     }
 
-    /// Flush accumulated bytes to the host via condvar round-trip.
-    /// Only called when the buffer is full or on explicit flush/drop.
     fn flush_pending(&mut self) -> io::Result<()> {
         if self.pending == 0 {
             return Ok(());
@@ -62,49 +55,37 @@ impl CallbackWriter {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
 
+        let pair = unsafe { sb::get_sync(self.buf, wc::OFFSET_SYNC_PTR) };
+        let guard = pair.mutex.lock().unwrap();
+
         unsafe {
-            let mutex = sb::mutex_ptr(self.buf, wc::OFFSET_MUTEX);
-            let condvar = sb::condvar_ptr(self.buf, wc::OFFSET_CONDVAR);
-
-            libc::pthread_mutex_lock(mutex);
-
             sb::write_i64(self.buf, wc::OFFSET_CHUNK_LENGTH, self.pending as i64);
             sb::clear_flags(self.buf, wc::OFFSET_FLAGS);
             sb::set_flag_bits(self.buf, wc::OFFSET_FLAGS, sb::FLAG_READY);
-
-            (self.notify_fn)();
-
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
-            ts.tv_sec += WRITE_TIMEOUT_SECS as i64;
-
-            loop {
-                let flags = sb::load_flags(self.buf, wc::OFFSET_FLAGS);
-
-                if flags & sb::FLAG_ACK != 0 {
-                    self.pending = 0;
-                    libc::pthread_mutex_unlock(mutex);
-                    return Ok(());
-                }
-
-                if flags & sb::FLAG_ERROR != 0 {
-                    self.pending = 0;
-                    libc::pthread_mutex_unlock(mutex);
-                    return Err(io::Error::new(io::ErrorKind::Other, "host write failed"));
-                }
-
-                if flags & sb::FLAG_CANCELLED != 0 {
-                    libc::pthread_mutex_unlock(mutex);
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-                }
-
-                let rc = libc::pthread_cond_timedwait(condvar, mutex, &ts);
-                if rc == libc::ETIMEDOUT {
-                    libc::pthread_mutex_unlock(mutex);
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out"));
-                }
-            }
         }
+
+        unsafe { (self.notify_fn)(); }
+
+        let flags = sb::wait_for_flags(
+            pair,
+            guard,
+            self.buf,
+            wc::OFFSET_FLAGS,
+            sb::FLAG_ACK | sb::FLAG_ERROR | sb::FLAG_CANCELLED,
+            std::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+        )?;
+
+        self.pending = 0;
+
+        if flags & sb::FLAG_ACK != 0 {
+            return Ok(());
+        }
+
+        if flags & sb::FLAG_ERROR != 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, "host write failed"));
+        }
+
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
     }
 
     fn is_cancelled(&self) -> bool {
@@ -156,9 +137,6 @@ impl Drop for CallbackWriter {
 }
 
 impl Seek for CallbackWriter {
-    /// Only `stream_position()` is supported (SeekFrom::Current(0)).
-    /// The engine uses this to track byte offsets for xref tables.
-    /// Backward seeking is not supported and returns an error.
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match pos {
             SeekFrom::Current(0) => Ok(self.position),
@@ -203,7 +181,7 @@ mod tests {
     #[test]
     fn cancelled_write_returns_interrupted() {
         let mut buf = vec![0u8; wc::TOTAL_SIZE];
-        unsafe { sb::init_sync(buf.as_mut_ptr(), wc::OFFSET_MUTEX, wc::OFFSET_CONDVAR); }
+        unsafe { sb::init_sync(buf.as_mut_ptr(), wc::OFFSET_SYNC_PTR); }
 
         let cancel = Arc::new(AtomicBool::new(true));
         let mut writer = unsafe {
@@ -212,7 +190,7 @@ mod tests {
         let err = writer.write(&[1, 2, 3]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
 
-        unsafe { sb::destroy_sync(buf.as_mut_ptr(), wc::OFFSET_MUTEX, wc::OFFSET_CONDVAR); }
+        unsafe { sb::destroy_sync(buf.as_mut_ptr(), wc::OFFSET_SYNC_PTR); }
     }
 
     #[test]

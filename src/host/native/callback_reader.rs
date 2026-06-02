@@ -4,32 +4,30 @@
 //!
 //! Implements `Read + Seek` for the PDF engine. The reader runs on a
 //! Rust pool thread. The host (Dart isolate) fills read requests via
-//! shared memory. Communication: pthread condvar. The pool thread
-//! sleeps (zero CPU) while waiting for bytes.
+//! shared memory. Communication: std::sync Mutex+Condvar (cross-platform).
+//! The pool thread sleeps (zero CPU) while waiting for bytes.
 //!
 //! O(1)-memory guarantee: at most one shared-buffer chunk (64KB) is
 //! in flight at any time. The source file is never buffered in memory.
 //!
 //! Lifecycle:
-//!   1. Pool thread writes (offset, count) to shared buffer
-//!   2. Pool thread calls notify_fn (wakes Dart isolate listener)
-//!   3. Pool thread blocks on condvar
-//!   4. Dart reads from DataSource, writes bytes to shared buffer
-//!   5. Dart sets FLAG_READY, signals condvar
-//!   6. Pool thread wakes, copies bytes, continues
+//!   1. Pool thread locks the mutex
+//!   2. Pool thread writes (offset, count) to shared buffer, clears flags
+//!   3. Pool thread calls notify_fn (wakes Dart isolate listener)
+//!   4. Pool thread blocks on condvar (atomically unlocks mutex + parks)
+//!   5. Dart reads from DataSource, writes bytes to shared buffer
+//!   6. Dart sets FLAG_READY, locks mutex, signals condvar, unlocks mutex
+//!   7. Pool thread wakes (mutex re-locked), copies bytes, unlocks, returns
 
 use crate::host::native::shared_buffer::{self as sb, read_channel as rc};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 const READ_TIMEOUT_SECS: u64 = 30;
 
-/// Source reader backed by condvar-shared memory.
-///
-/// Created per-operation. The shared buffer is allocated by Dart.
-/// `notify_fn` is a `NativeCallable.listener` — callable from any
-/// thread, fires asynchronously on the Dart isolate's event loop.
+/// Read+Seek implementation backed by shared-memory I/O with the host.
 pub struct CallbackReader {
     buf: *mut u8,
     notify_fn: unsafe extern "C" fn(),
@@ -45,7 +43,7 @@ impl CallbackReader {
     /// # Safety
     ///
     /// - `buf` must point to a read-channel buffer (`rc::TOTAL_SIZE` bytes)
-    ///   with mutex+condvar initialized via `sb::init_sync`.
+    ///   with sync initialized via `sb::init_sync`.
     /// - `notify_fn` must be safe to call from any thread.
     /// - The buffer must outlive this reader.
     pub unsafe fn new(
@@ -79,51 +77,41 @@ impl Read for CallbackReader {
             .min(remaining as usize)
             .min(rc::DATA_CAPACITY);
 
+        let pair = unsafe { sb::get_sync(self.buf, rc::OFFSET_SYNC_PTR) };
+        let guard = pair.mutex.lock().unwrap();
+
         unsafe {
-            let mutex = sb::mutex_ptr(self.buf, rc::OFFSET_MUTEX);
-            let condvar = sb::condvar_ptr(self.buf, rc::OFFSET_CONDVAR);
-
-            libc::pthread_mutex_lock(mutex);
-
             sb::write_i64(self.buf, rc::OFFSET_REQUEST_OFFSET, self.position as i64);
             sb::write_i64(self.buf, rc::OFFSET_REQUEST_COUNT, to_read as i64);
             sb::clear_flags(self.buf, rc::OFFSET_FLAGS);
-
-            (self.notify_fn)();
-
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
-            ts.tv_sec += READ_TIMEOUT_SECS as i64;
-
-            loop {
-                let flags = sb::load_flags(self.buf, rc::OFFSET_FLAGS);
-
-                if flags & sb::FLAG_READY != 0 {
-                    let n = sb::read_i64(self.buf, rc::OFFSET_RESPONSE_LENGTH) as usize;
-                    let src = sb::data_ptr(self.buf, rc::OFFSET_DATA);
-                    std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
-                    self.position += n as u64;
-                    libc::pthread_mutex_unlock(mutex);
-                    return Ok(n);
-                }
-
-                if flags & sb::FLAG_ERROR != 0 {
-                    libc::pthread_mutex_unlock(mutex);
-                    return Err(io::Error::new(io::ErrorKind::Other, "host read failed"));
-                }
-
-                if flags & sb::FLAG_CANCELLED != 0 {
-                    libc::pthread_mutex_unlock(mutex);
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-                }
-
-                let rc = libc::pthread_cond_timedwait(condvar, mutex, &ts);
-                if rc == libc::ETIMEDOUT {
-                    libc::pthread_mutex_unlock(mutex);
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "read timed out"));
-                }
-            }
         }
+
+        unsafe { (self.notify_fn)(); }
+
+        let flags = sb::wait_for_flags(
+            pair,
+            guard,
+            self.buf,
+            rc::OFFSET_FLAGS,
+            sb::FLAG_READY | sb::FLAG_ERROR | sb::FLAG_CANCELLED,
+            Duration::from_secs(READ_TIMEOUT_SECS),
+        )?;
+
+        if flags & sb::FLAG_READY != 0 {
+            let n = unsafe { sb::read_i64(self.buf, rc::OFFSET_RESPONSE_LENGTH) as usize };
+            unsafe {
+                let src = sb::data_ptr(self.buf, rc::OFFSET_DATA);
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+            }
+            self.position += n as u64;
+            return Ok(n);
+        }
+
+        if flags & sb::FLAG_ERROR != 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, "host read failed"));
+        }
+
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
     }
 }
 
@@ -154,7 +142,7 @@ mod tests {
     #[test]
     fn seek_positions() {
         let mut buf = vec![0u8; rc::TOTAL_SIZE];
-        unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_MUTEX, rc::OFFSET_CONDVAR); }
+        unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
 
         let mut reader = unsafe {
             CallbackReader::new(buf.as_mut_ptr(), noop_notify, 1000, None)
@@ -165,13 +153,13 @@ mod tests {
         assert_eq!(reader.seek(SeekFrom::End(-100)).unwrap(), 900);
         assert_eq!(reader.seek(SeekFrom::Start(0)).unwrap(), 0);
 
-        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_MUTEX, rc::OFFSET_CONDVAR); }
+        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
     }
 
     #[test]
     fn read_at_eof() {
         let mut buf = vec![0u8; rc::TOTAL_SIZE];
-        unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_MUTEX, rc::OFFSET_CONDVAR); }
+        unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
 
         let mut reader = unsafe {
             CallbackReader::new(buf.as_mut_ptr(), noop_notify, 0, None)
@@ -179,13 +167,13 @@ mod tests {
         let mut out = [0u8; 16];
         assert_eq!(reader.read(&mut out).unwrap(), 0);
 
-        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_MUTEX, rc::OFFSET_CONDVAR); }
+        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
     }
 
     #[test]
     fn read_cancelled() {
         let mut buf = vec![0u8; rc::TOTAL_SIZE];
-        unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_MUTEX, rc::OFFSET_CONDVAR); }
+        unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
 
         let cancel = Arc::new(AtomicBool::new(true));
         let mut reader = unsafe {
@@ -194,6 +182,6 @@ mod tests {
         let mut out = [0u8; 16];
         assert_eq!(reader.read(&mut out).unwrap_err().kind(), io::ErrorKind::Interrupted);
 
-        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_MUTEX, rc::OFFSET_CONDVAR); }
+        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
     }
 }

@@ -10,17 +10,25 @@
 //! - Read channel: engine requests source bytes from the host.
 //! - Write channel: engine sends output chunks to the host.
 //!
-//! Communication: pthread mutex + condvar. The pool thread sleeps
-//! (zero CPU) while waiting. The Dart isolate signals the condvar
-//! after fulfilling a request.
+//! Synchronization: a heap-allocated Mutex+Condvar pair, raw pointer
+//! stored in the buffer's sync_ptr slot (Dart never reads it).
+//! Cross-platform: Linux, macOS, Windows, Android, iOS.
+//! The pool thread sleeps (zero CPU) while waiting. The Dart isolate
+//! signals via an FFI call that locks the mutex before notify_one().
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 // ── Flag bits (same values on both Rust and Dart sides) ────────────
 
+/// Flag bit: host has filled the response data.
 pub const FLAG_READY: u32 = 1 << 0;
+/// Flag bit: host encountered an error.
 pub const FLAG_ERROR: u32 = 1 << 1;
+/// Flag bit: operation has been cancelled.
 pub const FLAG_CANCELLED: u32 = 1 << 2;
+/// Flag bit: host acknowledged the written chunk.
 pub const FLAG_ACK: u32 = 1 << 3;
 
 // ── Read channel byte layout ───────────────────────────────────────
@@ -31,21 +39,29 @@ pub const FLAG_ACK: u32 = 1 << 3;
 // 16      response_length    8      bytes actually returned by host
 // 24      flags              4      atomic flag bits
 // 28      (padding)          4
-// 32      mutex              64     pthread_mutex_t
-// 96      condvar            64     pthread_cond_t
+// 32      sync_ptr           8      *mut SyncPair (Rust-side only, Dart never reads)
+// 40      (reserved)         120
 // 160     data               64KB   response byte payload
 
+/// Byte layout constants for the read (source) channel.
 pub mod read_channel {
+    /// Maximum payload bytes per read request.
     pub const DATA_CAPACITY: usize = crate::host::constants::READ_BUF_CAPACITY;
 
+    /// Offset of the requested byte position (i64).
     pub const OFFSET_REQUEST_OFFSET: usize = 0;
+    /// Offset of the requested byte count (i64).
     pub const OFFSET_REQUEST_COUNT: usize = 8;
+    /// Offset of the actual response length (i64).
     pub const OFFSET_RESPONSE_LENGTH: usize = 16;
+    /// Offset of the atomic flags word (u32).
     pub const OFFSET_FLAGS: usize = 24;
-    pub const OFFSET_MUTEX: usize = 32;
-    pub const OFFSET_CONDVAR: usize = 96;
+    /// Offset of the SyncPair raw pointer (usize).
+    pub const OFFSET_SYNC_PTR: usize = 32;
+    /// Offset where the payload data begins.
     pub const OFFSET_DATA: usize = 160;
 
+    /// Total buffer size in bytes.
     pub const TOTAL_SIZE: usize = OFFSET_DATA + DATA_CAPACITY;
 }
 
@@ -55,20 +71,25 @@ pub mod read_channel {
 // 0       chunk_length       8      bytes in this output chunk
 // 8       flags              4      atomic flag bits
 // 12      (padding)          4
-// 16      mutex              64     pthread_mutex_t
-// 80      condvar            64     pthread_cond_t
+// 16      sync_ptr           8      *mut SyncPair (Rust-side only, Dart never reads)
+// 24      (reserved)         120
 // 144     data               256KB  output byte payload
 
+/// Byte layout constants for the write (output) channel.
 pub mod write_channel {
+    /// Maximum payload bytes per write chunk.
     pub const DATA_CAPACITY: usize = crate::host::constants::WRITE_BUF_CAPACITY;
 
-
+    /// Offset of the chunk length (i64).
     pub const OFFSET_CHUNK_LENGTH: usize = 0;
+    /// Offset of the atomic flags word (u32).
     pub const OFFSET_FLAGS: usize = 8;
-    pub const OFFSET_MUTEX: usize = 16;
-    pub const OFFSET_CONDVAR: usize = 80;
+    /// Offset of the SyncPair raw pointer (usize).
+    pub const OFFSET_SYNC_PTR: usize = 16;
+    /// Offset where the payload data begins.
     pub const OFFSET_DATA: usize = 144;
 
+    /// Total buffer size in bytes.
     pub const TOTAL_SIZE: usize = OFFSET_DATA + DATA_CAPACITY;
 }
 
@@ -96,20 +117,6 @@ pub unsafe fn flags_ref(base: *const u8, offset: usize) -> &'static AtomicU32 {
 }
 
 /// # Safety
-/// `base` must have a valid pthread_mutex_t at `offset`.
-#[inline]
-pub unsafe fn mutex_ptr(base: *mut u8, offset: usize) -> *mut libc::pthread_mutex_t {
-    base.add(offset) as *mut libc::pthread_mutex_t
-}
-
-/// # Safety
-/// `base` must have a valid pthread_cond_t at `offset`.
-#[inline]
-pub unsafe fn condvar_ptr(base: *mut u8, offset: usize) -> *mut libc::pthread_cond_t {
-    base.add(offset) as *mut libc::pthread_cond_t
-}
-
-/// # Safety
 /// `base` must have data starting at `offset`.
 #[inline]
 pub unsafe fn data_ptr(base: *mut u8, offset: usize) -> *mut u8 {
@@ -117,46 +124,139 @@ pub unsafe fn data_ptr(base: *mut u8, offset: usize) -> *mut u8 {
 }
 
 #[inline]
+/// Atomically load the flags word from the buffer.
 pub fn load_flags(base: *const u8, flags_offset: usize) -> u32 {
     unsafe { flags_ref(base, flags_offset).load(Ordering::Acquire) }
 }
 
 #[inline]
+/// Atomically store the flags word into the buffer.
 pub fn store_flags(base: *mut u8, flags_offset: usize, value: u32) {
     unsafe { flags_ref(base, flags_offset).store(value, Ordering::Release) }
 }
 
 #[inline]
+/// Atomically OR the given bits into the flags word.
 pub fn set_flag_bits(base: *mut u8, flags_offset: usize, bits: u32) {
     unsafe { flags_ref(base, flags_offset).fetch_or(bits, Ordering::Release) };
 }
 
 #[inline]
+/// Clear all flags to zero.
 pub fn clear_flags(base: *mut u8, flags_offset: usize) {
     store_flags(base, flags_offset, 0);
 }
 
 #[inline]
+/// Check whether a specific flag bit is set.
 pub fn has_flag(base: *const u8, flags_offset: usize, bit: u32) -> bool {
     load_flags(base, flags_offset) & bit != 0
 }
 
-/// Initialize pthread mutex + condvar in the buffer.
-///
-/// # Safety
-/// Must be called exactly once per buffer before any use.
-pub unsafe fn init_sync(base: *mut u8, mutex_offset: usize, condvar_offset: usize) {
-    libc::pthread_mutex_init(mutex_ptr(base, mutex_offset), std::ptr::null());
-    libc::pthread_cond_init(condvar_ptr(base, condvar_offset), std::ptr::null());
+// ── SyncPair — heap-allocated, pointer stored in buffer ────────────
+
+/// Mutex+Condvar pair for cross-thread signaling.
+pub struct SyncPair {
+    /// Mutex protecting the condvar wait.
+    pub mutex: Mutex<()>,
+    /// Condvar signaled when flags change.
+    pub condvar: Condvar,
 }
 
-/// Destroy pthread mutex + condvar.
+/// Write the SyncPair raw pointer into the buffer at `ptr_offset`.
+#[inline]
+unsafe fn write_sync_ptr(base: *mut u8, ptr_offset: usize, ptr: *mut SyncPair) {
+    (base.add(ptr_offset) as *mut usize).write(ptr as usize);
+}
+
+/// Read the SyncPair raw pointer from the buffer at `ptr_offset`.
+#[inline]
+unsafe fn read_sync_ptr(base: *const u8, ptr_offset: usize) -> *mut SyncPair {
+    (base.add(ptr_offset) as *const usize).read() as *mut SyncPair
+}
+
+/// Get a reference to the SyncPair stored in the buffer.
 ///
 /// # Safety
-/// Must be called exactly once per buffer after all use is done.
-pub unsafe fn destroy_sync(base: *mut u8, mutex_offset: usize, condvar_offset: usize) {
-    libc::pthread_mutex_destroy(mutex_ptr(base, mutex_offset));
-    libc::pthread_cond_destroy(condvar_ptr(base, condvar_offset));
+/// Buffer must have been initialized via `init_sync`.
+#[inline]
+pub unsafe fn get_sync(base: *const u8, ptr_offset: usize) -> &'static SyncPair {
+    &*read_sync_ptr(base, ptr_offset)
+}
+
+/// Initialize sync pair for a buffer. Call once before any use.
+///
+/// # Safety
+/// `base` must point to a valid buffer with space at `ptr_offset`.
+pub unsafe fn init_sync(base: *mut u8, ptr_offset: usize) {
+    let pair = Box::new(SyncPair {
+        mutex: Mutex::new(()),
+        condvar: Condvar::new(),
+    });
+    write_sync_ptr(base, ptr_offset, Box::into_raw(pair));
+}
+
+/// Destroy sync pair. Call once after all use is done.
+///
+/// # Safety
+/// `base` must have been initialized via `init_sync`.
+pub unsafe fn destroy_sync(base: *mut u8, ptr_offset: usize) {
+    let ptr = read_sync_ptr(base, ptr_offset);
+    if !ptr.is_null() {
+        let _ = Box::from_raw(ptr);
+        write_sync_ptr(base, ptr_offset, std::ptr::null_mut());
+    }
+}
+
+/// Signal the condvar. Called from Dart via FFI after fulfilling a request.
+///
+/// MUST lock the mutex before signaling — this prevents lost wakeups
+/// when the signal fires between the waiter's flag-check and park.
+///
+/// # Safety
+/// `base` must have been initialized via `init_sync`.
+pub unsafe fn notify(base: *mut u8, ptr_offset: usize) {
+    let pair = &*read_sync_ptr(base, ptr_offset);
+    let _guard = pair.mutex.lock().unwrap();
+    pair.condvar.notify_one();
+}
+
+/// Wait for any of the specified flag bits, with timeout.
+/// Caller MUST hold the mutex (via `get_sync().mutex.lock()`) before
+/// calling this — the mutex must be held across the entire
+/// setup → wait → response cycle to prevent lost wakeups.
+pub fn wait_for_flags(
+    pair: &SyncPair,
+    mut guard: MutexGuard<'_, ()>,
+    buf: *const u8,
+    flags_offset: usize,
+    target_bits: u32,
+    timeout: Duration,
+) -> Result<u32, std::io::Error> {
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let flags = load_flags(buf, flags_offset);
+        if flags & target_bits != 0 {
+            return Ok(flags);
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
+        }
+
+        let (new_guard, timeout_result) = pair.condvar.wait_timeout(guard, remaining).unwrap();
+        guard = new_guard;
+
+        if timeout_result.timed_out() {
+            let flags = load_flags(buf, flags_offset);
+            if flags & target_bits != 0 {
+                return Ok(flags);
+            }
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +304,57 @@ mod tests {
             assert_eq!(read_i64(base, 0), 42);
             assert_eq!(read_i64(base, 8), -1);
             assert_eq!(read_i64(base, 16), i64::MAX);
+        }
+    }
+
+    #[test]
+    fn sync_lifecycle() {
+        let mut buf = vec![0u8; 256];
+        let ptr_offset = 32;
+        unsafe {
+            init_sync(buf.as_mut_ptr(), ptr_offset);
+            // notify should not panic
+            notify(buf.as_mut_ptr(), ptr_offset);
+            destroy_sync(buf.as_mut_ptr(), ptr_offset);
+        }
+    }
+
+    #[test]
+    fn wait_immediate_flag() {
+        let mut buf = vec![0u8; 256];
+        let ptr_offset = 32;
+        let flags_offset = 24;
+        unsafe {
+            init_sync(buf.as_mut_ptr(), ptr_offset);
+            set_flag_bits(buf.as_mut_ptr(), flags_offset, FLAG_READY);
+            let pair = get_sync(buf.as_ptr(), ptr_offset);
+            let guard = pair.mutex.lock().unwrap();
+            let result = wait_for_flags(
+                pair, guard, buf.as_ptr(), flags_offset,
+                FLAG_READY | FLAG_ERROR, Duration::from_secs(1),
+            );
+            assert!(result.is_ok());
+            assert!(result.unwrap() & FLAG_READY != 0);
+            destroy_sync(buf.as_mut_ptr(), ptr_offset);
+        }
+    }
+
+    #[test]
+    fn wait_timeout() {
+        let mut buf = vec![0u8; 256];
+        let ptr_offset = 32;
+        let flags_offset = 24;
+        unsafe {
+            init_sync(buf.as_mut_ptr(), ptr_offset);
+            let pair = get_sync(buf.as_ptr(), ptr_offset);
+            let guard = pair.mutex.lock().unwrap();
+            let result = wait_for_flags(
+                pair, guard, buf.as_ptr(), flags_offset,
+                FLAG_READY, Duration::from_millis(10),
+            );
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            destroy_sync(buf.as_mut_ptr(), ptr_offset);
         }
     }
 }
