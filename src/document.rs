@@ -23319,6 +23319,8 @@ impl PdfDocument {
     }
 
     // ── pdf_manipulator patch: streaming DOCX/PPTX/XLSX export ──
+
+    /// Convert document to DOCX, streaming output to `writer`.
     pub fn to_docx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
         let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Docx)?;
         let mut w = office_oxide::create::ir_to_docx(&ir);
@@ -23450,6 +23452,7 @@ impl PdfDocument {
         Ok(buf.into_inner())
     }
 
+    /// Convert document to PPTX, streaming output to `writer`.
     pub fn to_pptx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
         let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Pptx)?;
         let mut w = office_oxide::create::ir_to_pptx(&ir);
@@ -23500,6 +23503,7 @@ impl PdfDocument {
         Ok(buf.into_inner())
     }
 
+    /// Convert document to XLSX, streaming output to `writer`.
     pub fn to_xlsx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
         let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Xlsx)?;
         let w = office_oxide::create::ir_to_xlsx(&ir);

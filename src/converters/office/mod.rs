@@ -169,6 +169,8 @@ impl OfficeConverter {
     }
 
     // ── pdf_manipulator patch: streaming DOCX→PDF (O(1) input via reader) ──
+
+    /// Convert DOCX from a reader to PDF, streaming output to `writer`.
     pub fn convert_docx_reader_to_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
         &self, reader: R, output: &mut W,
     ) -> Result<()> {
@@ -206,6 +208,8 @@ impl OfficeConverter {
     }
 
     // ── pdf_manipulator patch: streaming XLSX→PDF (O(1) input via reader) ──
+
+    /// Convert XLSX from a reader to PDF, streaming output to `writer`.
     pub fn convert_xlsx_reader_to_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
         &self, reader: R, output: &mut W,
     ) -> Result<()> {
@@ -241,6 +245,8 @@ impl OfficeConverter {
     }
 
     // ── pdf_manipulator patch: streaming PPTX→PDF (O(1) input via reader) ──
+
+    /// Convert PPTX from a reader to PDF, streaming output to `writer`.
     pub fn convert_pptx_reader_to_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
         &self, reader: R, output: &mut W,
     ) -> Result<()> {
@@ -331,7 +337,7 @@ fn has_positional_layout(ir: &DocumentIR) -> bool {
 /// the section's geometry, so an 8-page layout-preserving PDF→DOCX
 /// round-trips back to 8 PDF pages with each page's positioned
 /// paragraphs landing on the correct page.
-fn render_positional_ir(
+fn _render_positional_ir(
     ir: &DocumentIR,
     config: &OfficeConfig,
     extra_fonts: &[(String, Vec<u8>)],
@@ -2108,7 +2114,7 @@ fn pptx_has_positional(ir: &DocumentIR) -> bool {
 /// page sized to the slide geometry, the section background (if any)
 /// fills the page, and each positioned `TextBox` lands at its EMU
 /// rectangle.
-fn render_pptx_positional(
+fn _render_pptx_positional(
     ir: &DocumentIR,
     config: &OfficeConfig,
     extra_fonts: &[(String, Vec<u8>)],
