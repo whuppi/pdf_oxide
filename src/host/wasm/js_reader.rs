@@ -37,6 +37,7 @@ pub struct JsCallbackReader {
 }
 
 impl JsCallbackReader {
+    /// Create a reader for the source at `source_index`.
     pub fn new(source_index: u32, length: u64) -> Self {
         Self { source_index, length, position: 0 }
     }
@@ -51,14 +52,12 @@ impl Read for JsCallbackReader {
         let remaining = self.length - self.position;
         let to_read = buf.len().min(remaining as usize).min(crate::host::constants::READ_BUF_CAPACITY);
 
-        let n = unsafe {
-            host_read_at(
-                self.source_index,
-                self.position as u32,
-                to_read as u32,
-                buf.as_mut_ptr() as u32,
-            )
-        };
+        let n = host_read_at(
+            self.source_index,
+            self.position as u32,
+            to_read as u32,
+            buf.as_mut_ptr() as u32,
+        );
 
         if n < 0 {
             return Err(io::Error::new(io::ErrorKind::Other, "host_read_at failed"));

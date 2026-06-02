@@ -34,6 +34,7 @@ pub struct JsCallbackWriter {
 }
 
 impl JsCallbackWriter {
+    /// Create a writer for the sink at `sink_index`.
     pub fn new(sink_index: u32) -> Self {
         Self {
             sink_index,
