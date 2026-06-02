@@ -16,6 +16,7 @@ use std::thread::{self, JoinHandle};
 /// A task submitted to the pool.
 pub struct Task {
     work: Box<dyn FnOnce(&Bump) + Send>,
+    /// Shared cancellation flag checked before execution.
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -28,6 +29,7 @@ impl std::fmt::Debug for Task {
 }
 
 impl Task {
+    /// Create a new task with the given work closure and cancellation flag.
     pub fn new(
         work: impl FnOnce(&Bump) + Send + 'static,
         cancel: Arc<AtomicBool>,
@@ -35,6 +37,7 @@ impl Task {
         Self { work: Box::new(work), cancel }
     }
 
+    /// Check whether this task has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
@@ -52,6 +55,7 @@ impl ThreadPool {
         Self::with_capacity(Self::default_size(), 64)
     }
 
+    /// Create a pool with a specific thread count and bounded queue depth.
     pub fn with_capacity(size: usize, queue_depth: usize) -> Self {
         let (sender, receiver) = bounded::<Task>(queue_depth);
         let mut workers = Vec::with_capacity(size);
@@ -76,16 +80,19 @@ impl ThreadPool {
         }
     }
 
+    /// Drop the sender so worker threads will exit after draining.
     pub fn shutdown(&mut self) {
         self.sender = None;
     }
 
+    /// Join all worker threads, blocking until they finish.
     pub fn join(&mut self) {
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
     }
 
+    /// Return the number of worker threads.
     pub fn size(&self) -> usize {
         self.workers.len()
     }

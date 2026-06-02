@@ -21,26 +21,40 @@
 // Request parser
 // ═══════════════════════════════════════════════════════════════════
 
+/// A parsed binary request with an operation name and typed fields.
 pub struct Request<'a> {
     op: &'a str,
     fields: Vec<(&'a str, FieldValue<'a>)>,
 }
 
+/// A typed field value decoded from a binary request.
 pub enum FieldValue<'a> {
+    /// Null / absent value (type code 0).
     Null,
+    /// 32-bit signed integer (type code 1).
     I32(i32),
+    /// 64-bit signed integer (type code 2).
     I64(i64),
+    /// 64-bit floating point (type code 3).
     F64(f64),
+    /// Boolean (type code 4).
     Bool(bool),
+    /// UTF-8 string slice (type code 5).
     Str(&'a str),
+    /// Raw byte slice (type code 6).
     Bytes(&'a [u8]),
+    /// List of i32 values (type code 7).
     IntList(Vec<i32>),
+    /// List of f64 values (type code 8).
     F64List(Vec<f64>),
+    /// List of string slices (type code 9).
     StringList(Vec<&'a str>),
+    /// List of key-value maps (type code 10).
     MapList(Vec<Vec<(&'a str, FieldValue<'a>)>>),
 }
 
 impl<'a> Request<'a> {
+    /// Parse a binary request from raw bytes.
     pub fn parse(data: &'a [u8]) -> Result<Self, &'static str> {
         let mut r = Reader::new(data);
         let op_len = r.u8()? as usize;
@@ -56,16 +70,19 @@ impl<'a> Request<'a> {
         Ok(Request { op, fields })
     }
 
+    /// Return the operation name.
     pub fn op(&self) -> &str {
         self.op
     }
 
+    /// Get a string field by key.
     pub fn get_str(&self, key: &str) -> Option<&'a str> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key { if let FieldValue::Str(s) = v { Some(*s) } else { None } } else { None }
         })
     }
 
+    /// Get an i32 field by key (also accepts i64, truncated).
     pub fn get_i32(&self, key: &str) -> Option<i32> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key {
@@ -78,6 +95,7 @@ impl<'a> Request<'a> {
         })
     }
 
+    /// Get an i64 field by key (also accepts i32, widened).
     pub fn get_i64(&self, key: &str) -> Option<i64> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key {
@@ -90,6 +108,7 @@ impl<'a> Request<'a> {
         })
     }
 
+    /// Get an f64 field by key (also accepts i32/i64, widened).
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key {
@@ -104,30 +123,35 @@ impl<'a> Request<'a> {
         })
     }
 
+    /// Get a bool field by key.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key { if let FieldValue::Bool(b) = v { Some(*b) } else { None } } else { None }
         })
     }
 
+    /// Get a byte-slice field by key.
     pub fn get_bytes(&self, key: &str) -> Option<&'a [u8]> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key { if let FieldValue::Bytes(b) = v { Some(*b) } else { None } } else { None }
         })
     }
 
+    /// Get an i32 list field by key.
     pub fn get_int_list(&self, key: &str) -> Option<&[i32]> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key { if let FieldValue::IntList(l) = v { Some(l.as_slice()) } else { None } } else { None }
         })
     }
 
+    /// Get an f64 list field by key.
     pub fn get_f64_list(&self, key: &str) -> Option<&[f64]> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key { if let FieldValue::F64List(l) = v { Some(l.as_slice()) } else { None } } else { None }
         })
     }
 
+    /// Get a string list field by key.
     pub fn get_string_list(&self, key: &str) -> Option<Vec<&'a str>> {
         self.fields.iter().find_map(|(k, v)| {
             if *k == key { if let FieldValue::StringList(l) = v { Some(l.clone()) } else { None } } else { None }
@@ -199,11 +223,13 @@ fn read_value<'a>(r: &mut Reader<'a>) -> Result<FieldValue<'a>, &'static str> {
 // Response writer
 // ═══════════════════════════════════════════════════════════════════
 
+/// Builds a binary response with typed key-value fields.
 pub struct ResponseWriter {
     buf: Vec<u8>,
 }
 
 impl ResponseWriter {
+    /// Create a new success response writer.
     pub fn ok() -> Self {
         let mut buf = Vec::with_capacity(256);
         buf.push(1); // status = ok
@@ -211,6 +237,7 @@ impl ResponseWriter {
         ResponseWriter { buf }
     }
 
+    /// Encode a complete error response with the given message.
     pub fn error(msg: &str) -> Vec<u8> {
         let msg_bytes = msg.as_bytes();
         let mut buf = Vec::with_capacity(5 + msg_bytes.len());
@@ -220,6 +247,7 @@ impl ResponseWriter {
         buf
     }
 
+    /// Write an i32 field.
     pub fn put_i32(&mut self, key: &str, val: i32) {
         self.write_key(key);
         self.buf.push(1);
@@ -227,6 +255,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write an i64 field.
     pub fn put_i64(&mut self, key: &str, val: i64) {
         self.write_key(key);
         self.buf.push(2);
@@ -234,6 +263,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write an f64 field.
     pub fn put_f64(&mut self, key: &str, val: f64) {
         self.write_key(key);
         self.buf.push(3);
@@ -241,6 +271,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write a bool field.
     pub fn put_bool(&mut self, key: &str, val: bool) {
         self.write_key(key);
         self.buf.push(4);
@@ -248,6 +279,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write a string field.
     pub fn put_str(&mut self, key: &str, val: &str) {
         self.write_key(key);
         self.buf.push(5);
@@ -257,6 +289,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write a byte-slice field.
     pub fn put_bytes(&mut self, key: &str, val: &[u8]) {
         self.write_key(key);
         self.buf.push(6);
@@ -265,6 +298,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write an i32 list field.
     pub fn put_int_list(&mut self, key: &str, val: &[i32]) {
         self.write_key(key);
         self.buf.push(7);
@@ -275,6 +309,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write a list of map (key-value) entries.
     pub fn put_map_list<F>(&mut self, key: &str, count: usize, mut write_item: F)
     where F: FnMut(usize, &mut ResponseWriter)
     {
@@ -291,6 +326,7 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Consume the writer and return the encoded response bytes.
     pub fn finish(self) -> Vec<u8> {
         self.buf
     }

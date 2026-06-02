@@ -14,6 +14,7 @@ use std::io::{self, Seek, Write};
 
 /// A writer that knows its current byte position.
 pub trait PositionedWrite: Write {
+    /// Return the current byte offset in the output stream.
     fn position(&mut self) -> u64;
 }
 
@@ -24,10 +25,12 @@ pub struct CountingWriter<W: Write> {
 }
 
 impl<W: Write> CountingWriter<W> {
+    /// Create a new counting writer starting at position 0.
     pub fn new(inner: W) -> Self {
         Self { inner, pos: 0 }
     }
 
+    /// Consume the wrapper and return the inner writer.
     pub fn into_inner(self) -> W {
         self.inner
     }
@@ -57,10 +60,12 @@ pub struct SeekWriter<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> SeekWriter<W> {
+    /// Create a new seek-based writer.
     pub fn new(inner: W) -> Self {
         Self { inner }
     }
 
+    /// Consume the wrapper and return the inner writer.
     pub fn into_inner(self) -> W {
         self.inner
     }
