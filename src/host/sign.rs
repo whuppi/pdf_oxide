@@ -24,7 +24,7 @@ use crate::signatures::{DigestAlgorithm, SignOptions, SigningCredentials};
 /// same wrapper pattern used for editor save. No generics, no `Sized`
 /// issues with trait objects.
 #[cfg(feature = "signatures")]
-pub fn sign_pdf(
+pub(crate) fn sign_pdf(
     reader: &mut super::bridge_api::BoxedReader,
     source_length: u64,
     writer: &mut super::bridge_api::BoxedWriter,
@@ -178,11 +178,11 @@ pub fn sign_pdf(
 fn build_cms_from_digest(
     credentials: &SigningCredentials,
     message_digest: &[u8],
-    digest_algorithm: DigestAlgorithm,
+    _digest_algorithm: DigestAlgorithm,
 ) -> Result<Vec<u8>> {
     use crate::signatures::der_util::*;
     use cms::cert::x509::Certificate as X509Certificate;
-    use der::oid::db::rfc5912::{ID_SHA_1, ID_SHA_256, ID_SHA_384, ID_SHA_512};
+    use der::oid::db::rfc5912::ID_SHA_256;
     use der::{Decode, Encode};
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::{Pkcs1v15Sign, RsaPrivateKey};
@@ -317,7 +317,7 @@ fn scan_root_ref(tail: &[u8]) -> Option<String> {
 
 #[cfg(feature = "signatures")]
 fn scan_pages_ref(reader: &mut (impl std::io::Read + std::io::Seek), catalog_id: u64, xref_offset: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::SeekFrom;
     // Read the xref table to find catalog object offset, then read
     // the catalog object to extract /Pages reference.
     // Fall back: scan the full file for the catalog object header.
