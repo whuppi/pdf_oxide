@@ -1354,7 +1354,7 @@ impl DocumentEditor {
     }
 
     // ── pdf_manipulator patch: O(1)-memory merge via reader ──
-    pub fn merge_from_reader(&mut self, reader: Box<dyn crate::document::ReadSeek>) -> Result<usize> {
+    pub(crate) fn merge_from_reader(&mut self, reader: Box<dyn crate::document::ReadSeek>) -> Result<usize> {
         let mut source_doc = PdfDocument::from_external_reader(reader)?;
         self.merge_from_document(&mut source_doc)
     }

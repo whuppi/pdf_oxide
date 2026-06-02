@@ -27,7 +27,7 @@ use crate::error::Result;
 use crate::geometry::Rect;
 use crate::object::{Object, ObjectRef};
 use std::collections::HashMap;
-use std::io::{Seek, Write};
+use std::io::Write;
 
 /// Configuration for PDF generation.
 #[derive(Debug, Clone)]
@@ -2028,7 +2028,7 @@ impl PdfWriter {
                     acroform_id,
                     0,
                     acroform_obj,
-                ));
+                ))?;
             }
         }
 
