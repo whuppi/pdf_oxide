@@ -1371,9 +1371,14 @@ mod ffi_entry {
     /// Combined instance: InstanceState + ThreadPool.
     /// The pool is separate because InstanceState is shared (&ref)
     /// while the pool owns the threads.
+    ///
+    /// Field order is load-bearing: Rust drops fields in declaration
+    /// order. `pool` must drop first — ThreadPool::drop joins all
+    /// threads, ensuring no thread is still accessing `state`. If
+    /// `state` dropped first, a pool thread could read freed memory.
     struct NativeInstance {
-        state: InstanceState,
         pool: ThreadPool,
+        state: InstanceState,
     }
 
     /// Create a new engine instance. Returns an opaque pointer.
@@ -1384,8 +1389,8 @@ mod ffi_entry {
     #[no_mangle]
     pub unsafe extern "C" fn bridge_init() -> *mut std::ffi::c_void {
         let instance = Box::new(NativeInstance {
-            state: InstanceState::new(),
             pool: ThreadPool::new(),
+            state: InstanceState::new(),
         });
         Box::into_raw(instance) as *mut std::ffi::c_void
     }
