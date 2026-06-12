@@ -5,7 +5,7 @@
 //! Implements `Write + Seek` (stream_position only) by calling
 //! `host_write_chunk` imported from the JS global scope via wasm_bindgen.
 //!
-//! worker.js sets `self.host_write_chunk = hostWriteChunk` before loading WASM.
+//! lane_worker.js sets `self.host_write_chunk = hostWriteChunk` before loading WASM.
 //!
 //! Small writes accumulate in a fixed internal buffer (256KB, matching
 //! the native condvar write channel). A round-trip to JS only happens
@@ -16,7 +16,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use wasm_bindgen::prelude::*;
 use crate::host::constants::WRITE_BUF_CAPACITY;
 
-// Imported from the JS global scope (self.host_write_chunk in worker.js).
+// Imported from the JS global scope (self.host_write_chunk in lane_worker.js).
 // Uses u32 for buf_ptr because wasm_bindgen doesn't support raw pointers.
 #[wasm_bindgen]
 extern "C" {
@@ -48,6 +48,12 @@ impl JsCallbackWriter {
             return Ok(());
         }
         let result = host_write_chunk(self.sink_index, self.buffer.as_ptr() as u32, self.buffer.len() as u32);
+        if result == crate::host::constants::HOST_IO_CANCELLED {
+            // Deliberately NOT ErrorKind::Interrupted — std combinators
+            // retry that kind, which would spin forever on a cancel.
+            self.buffer.clear();
+            return Err(io::Error::other("operation cancelled"));
+        }
         if result < 0 {
             return Err(io::Error::new(io::ErrorKind::Other, "host_write_chunk failed"));
         }

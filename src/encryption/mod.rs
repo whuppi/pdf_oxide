@@ -580,6 +580,13 @@ impl EncryptDictBuilder {
                 &user_hash,
                 revision,
             )?;
+            // ── pdf_manipulator patch: /Perms is mandatory for R6 ──
+            let perms = algorithms::compute_perms(
+                self.permissions,
+                self.encrypt_metadata,
+                &file_key,
+            )?;
+            // ── end pdf_manipulator patch ──
             return Ok((
                 EncryptDict {
                     filter: "Standard".to_string(),
@@ -593,7 +600,7 @@ impl EncryptDictBuilder {
                     encrypt_metadata: self.encrypt_metadata,
                     owner_encryption: Some(owner_encryption),
                     user_encryption: Some(user_encryption),
-                    perms: None,
+                    perms: Some(perms), // pdf_manipulator patch: R6 requires /Perms
                     stream_crypt_method: None,
                 },
                 // The key /UE and /OE wrap. Streams must use this one.

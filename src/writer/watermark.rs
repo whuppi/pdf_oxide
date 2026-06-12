@@ -103,6 +103,7 @@ impl Default for WatermarkAnnotation {
 }
 
 impl WatermarkAnnotation {
+
     /// Create a new watermark annotation with the given text.
     pub fn new(text: impl Into<String>) -> Self {
         Self {

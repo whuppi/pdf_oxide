@@ -13,3 +13,14 @@ pub const READ_BUF_CAPACITY: usize = 64 * 1024;
 
 /// BufWriter capacity (256KB) — one shared-buffer write trip.
 pub const WRITE_BUF_CAPACITY: usize = 256 * 1024;
+
+// ── Host I/O status codes (web lane bodies return these from
+//    host_read_at / host_write_chunk; Dart mirrors them in
+//    lane_protocol.dart) ─────────────────────────────────────────
+
+/// Host-side I/O failure (read error, missing source, dead sink).
+pub const HOST_IO_ERROR: i32 = -1;
+
+/// Host-side cancellation (job cancel or instance dispose). Mapped
+/// to the non-retryable cancelled error — never to a plain failure.
+pub const HOST_IO_CANCELLED: i32 = -2;

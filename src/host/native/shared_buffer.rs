@@ -16,6 +16,7 @@
 //! The pool thread sleeps (zero CPU) while waiting. The Dart isolate
 //! signals via an FFI call that locks the mutex before notify_one().
 
+use crate::host::native::cancel::CancelToken;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -147,6 +148,20 @@ pub fn clear_flags(base: *mut u8, flags_offset: usize) {
     store_flags(base, flags_offset, 0);
 }
 
+/// The response bits the host sets to answer one request.
+pub const RESPONSE_FLAGS: u32 = FLAG_READY | FLAG_ERROR | FLAG_ACK;
+
+#[inline]
+/// Clear only the response bits, preserving FLAG_CANCELLED.
+///
+/// Cancellation is STICKY on a channel: once set it survives every
+/// request cycle, so a cancel can never be erased by a racing
+/// `clear`. A held channel that was collaterally flagged is revived
+/// explicitly by the host between jobs — never implicitly here.
+pub fn clear_response_flags(base: *mut u8, flags_offset: usize) {
+    unsafe { flags_ref(base, flags_offset).fetch_and(!RESPONSE_FLAGS, Ordering::AcqRel) };
+}
+
 #[inline]
 /// Check whether a specific flag bit is set.
 pub fn has_flag(base: *const u8, flags_offset: usize, bit: u32) -> bool {
@@ -221,41 +236,52 @@ pub unsafe fn notify(base: *mut u8, ptr_offset: usize) {
     pair.condvar.notify_one();
 }
 
-/// Wait for any of the specified flag bits, with timeout.
+/// Wait for any of the specified flag bits, or cancellation.
+///
 /// Caller MUST hold the mutex (via `get_sync().mutex.lock()`) before
 /// calling this — the mutex must be held across the entire
 /// setup → wait → response cycle to prevent lost wakeups.
+///
+/// There is deliberately NO timeout. The only exits are the flags
+/// arriving or the token being cancelled — behavior never depends on
+/// how slow the device or the host is. The periodic wake below is a
+/// belt-and-suspenders token re-check plus a debug-build diagnostic
+/// for long parks; it decides nothing. Every canceller also signals
+/// the condvar (after setting its flag, under this mutex), so
+/// cancellation latency does not depend on the heartbeat either.
 pub fn wait_for_flags(
     pair: &SyncPair,
     mut guard: MutexGuard<'_, ()>,
     buf: *const u8,
     flags_offset: usize,
     target_bits: u32,
-    timeout: Duration,
+    token: &CancelToken,
 ) -> Result<u32, std::io::Error> {
-    let deadline = std::time::Instant::now() + timeout;
+    const HEARTBEAT: Duration = Duration::from_secs(30);
 
     loop {
+        if token.is_cancelled() {
+            return Err(crate::host::native::cancel::cancelled());
+        }
+
         let flags = load_flags(buf, flags_offset);
         if flags & target_bits != 0 {
             return Ok(flags);
         }
 
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
-        }
-
-        let (new_guard, timeout_result) = pair.condvar.wait_timeout(guard, remaining).unwrap();
+        let (new_guard, timeout_result) = pair.condvar.wait_timeout(guard, HEARTBEAT).unwrap();
         guard = new_guard;
 
+        #[cfg(debug_assertions)]
         if timeout_result.timed_out() {
-            let flags = load_flags(buf, flags_offset);
-            if flags & target_bits != 0 {
-                return Ok(flags);
-            }
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
+            eprintln!(
+                "[pdf_oxide] I/O wait parked > {}s (flags_offset={flags_offset}) — \
+                 host slow or stalled; still waiting",
+                HEARTBEAT.as_secs()
+            );
         }
+        #[cfg(not(debug_assertions))]
+        let _ = timeout_result;
     }
 }
 
@@ -273,6 +299,20 @@ mod tests {
     fn write_channel_layout() {
         assert_eq!(write_channel::OFFSET_DATA, 144);
         assert_eq!(write_channel::TOTAL_SIZE, 144 + write_channel::DATA_CAPACITY);
+    }
+
+    #[test]
+    fn cancelled_flag_is_sticky_across_response_clears() {
+        let mut buf = vec![0u8; 64];
+        let base = buf.as_mut_ptr();
+
+        set_flag_bits(base, 0, FLAG_READY | FLAG_ERROR | FLAG_ACK | FLAG_CANCELLED);
+        clear_response_flags(base, 0);
+
+        assert!(has_flag(base, 0, FLAG_CANCELLED));
+        assert!(!has_flag(base, 0, FLAG_READY));
+        assert!(!has_flag(base, 0, FLAG_ERROR));
+        assert!(!has_flag(base, 0, FLAG_ACK));
     }
 
     #[test]
@@ -329,9 +369,10 @@ mod tests {
             set_flag_bits(buf.as_mut_ptr(), flags_offset, FLAG_READY);
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
+            let token = CancelToken::unconnected();
             let result = wait_for_flags(
                 pair, guard, buf.as_ptr(), flags_offset,
-                FLAG_READY | FLAG_ERROR, Duration::from_secs(1),
+                FLAG_READY | FLAG_ERROR, &token,
             );
             assert!(result.is_ok());
             assert!(result.unwrap() & FLAG_READY != 0);
@@ -340,7 +381,10 @@ mod tests {
     }
 
     #[test]
-    fn wait_timeout() {
+    fn wait_pre_cancelled_token_returns_interrupted() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
         let mut buf = vec![0u8; 256];
         let ptr_offset = 32;
         let flags_offset = 24;
@@ -348,12 +392,52 @@ mod tests {
             init_sync(buf.as_mut_ptr(), ptr_offset);
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
+            let lane = Arc::new(AtomicBool::new(true));
+            let token = CancelToken::new(lane, Arc::new(AtomicBool::new(false)));
             let result = wait_for_flags(
                 pair, guard, buf.as_ptr(), flags_offset,
-                FLAG_READY, Duration::from_millis(10),
+                FLAG_READY, &token,
             );
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            let err = result.unwrap_err();
+            // Must NOT be Interrupted — std combinators retry that kind.
+            assert_ne!(err.kind(), std::io::ErrorKind::Interrupted);
+            assert!(err.to_string().contains("cancelled"));
+            destroy_sync(buf.as_mut_ptr(), ptr_offset);
+        }
+    }
+
+    #[test]
+    fn wait_woken_by_cancel_flag_and_signal() {
+        // The canceller protocol: set FLAG_CANCELLED under the pair
+        // mutex, then notify. A parked waiter must wake and return
+        // the flags (the caller maps FLAG_CANCELLED to the
+        // non-retryable cancelled error).
+        let mut buf = vec![0u8; 256];
+        let ptr_offset = 32;
+        let flags_offset = 24;
+        unsafe {
+            init_sync(buf.as_mut_ptr(), ptr_offset);
+
+            let base = buf.as_mut_ptr() as usize;
+            let canceller = std::thread::spawn(move || {
+                let base = base as *mut u8;
+                std::thread::sleep(Duration::from_millis(50));
+                let pair = get_sync(base, 32);
+                let _guard = pair.mutex.lock().unwrap();
+                set_flag_bits(base, 24, FLAG_CANCELLED);
+                pair.condvar.notify_all();
+            });
+
+            let pair = get_sync(buf.as_ptr(), ptr_offset);
+            let guard = pair.mutex.lock().unwrap();
+            let token = CancelToken::unconnected();
+            let result = wait_for_flags(
+                pair, guard, buf.as_ptr(), flags_offset,
+                FLAG_READY | FLAG_ERROR | FLAG_CANCELLED, &token,
+            );
+            assert!(result.unwrap() & FLAG_CANCELLED != 0);
+
+            canceller.join().unwrap();
             destroy_sync(buf.as_mut_ptr(), ptr_offset);
         }
     }

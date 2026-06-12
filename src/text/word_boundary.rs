@@ -257,9 +257,20 @@ impl WordBoundaryDetector {
     pub fn new() -> Self {
         Self {
             tj_offset_threshold: -100,
-            // Geometric gap threshold: 80% of font size
-            // This is conservative enough to avoid false positives from normal character spacing
-            // but sensitive enough to detect actual word breaks
+            // ── pdf_manipulator patch: document the division of labor ──
+            // Geometric gap threshold: 80% of font size.
+            //
+            // This detector clusters characters WITHIN one TJ array,
+            // where intra-word fragments dominate — a conservative
+            // ratio avoids tearing words apart. Word gaps BETWEEN
+            // show-strings (the dart-pdf / word-processor shape, one
+            // word per string at one-space-width gaps) are NOT this
+            // detector's job: they are resolved by the span-merge
+            // space decision, whose intra-word kerning guard is
+            // calibrated at 0.9× of the space-glyph advance. The
+            // corpus tests in this module pin this value — change it
+            // only with corpus evidence.
+            // ── end pdf_manipulator patch ──
             geometric_gap_ratio: 0.8,
             cjk_enabled: true,
             detect_script_transitions: true,
@@ -281,7 +292,8 @@ impl WordBoundaryDetector {
     /// Set the geometric gap ratio as a fraction of font size.
     ///
     /// Gaps between characters larger than (font_size * ratio) are considered
-    /// word boundaries. Default: 0.3
+    /// word boundaries. Default: 0.8
+    // ── pdf_manipulator patch: doc said 0.3; the actual default is 0.8 ──
     pub fn with_geometric_gap_ratio(mut self, ratio: f32) -> Self {
         self.geometric_gap_ratio = ratio;
         self

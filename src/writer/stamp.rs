@@ -114,6 +114,37 @@ pub struct StampAnnotation {
 }
 
 impl StampAnnotation {
+    // ── pdf_manipulator patch: stamp normal appearance ──
+    /// Build this stamp's normal appearance as a Form XObject
+    /// (dict, content bytes): the classic rubber-stamp look — rounded
+    /// red border + uppercased label, font inlined in the XObject.
+    pub(crate) fn appearance(
+        &self,
+    ) -> (std::collections::HashMap<String, crate::object::Object>, Vec<u8>) {
+        crate::writer::appearance_stream::AppearanceStreamBuilder::for_stamp(
+            self.rect,
+            &self.display_label(),
+            crate::annotation_types::AnnotationColor::red(),
+        )
+        .build()
+    }
+
+    /// Display label: camel-case PDF name split into words + uppercased
+    /// ("NotApproved" → "NOT APPROVED"), matching the convention of
+    /// viewer-synthesized standard stamps.
+    fn display_label(&self) -> String {
+        let name = self.stamp_type.pdf_name();
+        let mut out = String::with_capacity(name.len() + 4);
+        for (i, ch) in name.chars().enumerate() {
+            if i > 0 && ch.is_uppercase() {
+                out.push(' ');
+            }
+            out.push(ch.to_ascii_uppercase());
+        }
+        out
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Create a new stamp annotation with the given rect and stamp type.
     pub fn new(rect: Rect, stamp_type: StampType) -> Self {
         Self {

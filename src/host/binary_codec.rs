@@ -237,6 +237,13 @@ impl ResponseWriter {
         ResponseWriter { buf }
     }
 
+    /// Encode a complete cancelled response (status 2). Posted for
+    /// every job killed by dispose or PdfTask.cancel — hosts map it
+    /// to their typed cancellation error, never by message matching.
+    pub fn cancelled() -> Vec<u8> {
+        vec![2]
+    }
+
     /// Encode a complete error response with the given message.
     pub fn error(msg: &str) -> Vec<u8> {
         let msg_bytes = msg.as_bytes();
