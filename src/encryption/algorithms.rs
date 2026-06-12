@@ -612,6 +612,33 @@ pub fn compute_u_and_ue(
     Ok((u, ue, file_key))
 }
 
+// ── pdf_manipulator patch: Algorithm 10 — /Perms for R6 dictionaries ──
+/// PDF 2.0 Algorithm 10: compute the /Perms value for R6.
+///
+/// A 16-byte block — /P as little-endian 32-bit, four 0xFF bytes,
+/// 'T'/'F' mirroring /EncryptMetadata, the literal "adb", four random
+/// bytes — encrypted with the FILE key using AES-256 in ECB mode.
+/// One block under CBC with a zero IV is bit-identical to ECB, which
+/// is how the provider exposes it. Required for V=5/R=6 dictionaries:
+/// validators (qpdf, Acrobat preflight) reject the file without it.
+pub fn compute_perms(
+    permissions: i32,
+    encrypt_metadata: bool,
+    file_key: &[u8],
+) -> crate::Result<Vec<u8>> {
+    let mut block = [0u8; 16];
+    block[..4].copy_from_slice(&(permissions as u32).to_le_bytes());
+    block[4..8].copy_from_slice(&[0xFF; 4]);
+    block[8] = if encrypt_metadata { b'T' } else { b'F' };
+    block[9..12].copy_from_slice(b"adb");
+    let rnd = generate_random_bytes(4)?;
+    block[12..16].copy_from_slice(&rnd);
+    let iv = [0u8; 16];
+    super::aes::aes256_encrypt_no_padding(&file_key[..32], &iv, &block)
+        .map_err(|e| crate::Error::InvalidPdf(format!("Perms encryption failed: {e}")))
+}
+// ── end pdf_manipulator patch ──
+
 /// PDF 2.0 Algorithm 9: compute O and OE for R>=5.
 ///
 /// Returns `(O, OE)` where:

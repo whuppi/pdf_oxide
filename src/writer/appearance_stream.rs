@@ -29,7 +29,7 @@
 //! ```
 
 use crate::annotation_types::{
-    AnnotationColor, CaretSymbol, LineEndingStyle, StampType, TextAnnotationIcon,
+    AnnotationColor, CaretSymbol, LineEndingStyle, TextAnnotationIcon,
 };
 use crate::geometry::Rect;
 use crate::object::Object;
@@ -62,6 +62,44 @@ impl AppearanceStreamBuilder {
             matrix: None,
         }
     }
+
+    // ── pdf_manipulator patch: inline-font resources + text escaping ──
+    /// Register a standard-14 font as an INLINE resource under `res_name`.
+    ///
+    /// Form XObjects resolve `Tf` through their own `/Resources/Font`;
+    /// an inline font dict keeps the appearance fully self-contained —
+    /// no extra objects, valid wherever the XObject travels.
+    pub fn with_inline_font(mut self, res_name: &str, base_font: &str) -> Self {
+        let mut font = HashMap::new();
+        font.insert("Type".to_string(), Object::Name("Font".to_string()));
+        font.insert("Subtype".to_string(), Object::Name("Type1".to_string()));
+        font.insert("BaseFont".to_string(), Object::Name(base_font.to_string()));
+        font.insert(
+            "Encoding".to_string(),
+            Object::Name("WinAnsiEncoding".to_string()),
+        );
+        let fonts = match self.resources.get_mut("Font") {
+            Some(Object::Dictionary(d)) => d,
+            _ => {
+                self.resources
+                    .insert("Font".to_string(), Object::Dictionary(HashMap::new()));
+                match self.resources.get_mut("Font") {
+                    Some(Object::Dictionary(d)) => d,
+                    _ => unreachable!("Font entry was just inserted as a dict"),
+                }
+            }
+        };
+        fonts.insert(res_name.to_string(), Object::Dictionary(font));
+        self
+    }
+
+    /// Escape text for a PDF literal string `( ... )`.
+    fn escape_text(text: &str) -> String {
+        text.replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)")
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Create an appearance stream for a highlight annotation.
     ///
@@ -225,7 +263,7 @@ impl AppearanceStreamBuilder {
     }
 
     /// Create an appearance stream for a stamp annotation.
-    pub fn for_stamp(rect: Rect, _stamp_type: StampType, color: AnnotationColor) -> Self {
+    pub fn for_stamp(rect: Rect, label: &str, color: AnnotationColor) -> Self {
         let mut builder = Self::new(Rect::new(0.0, 0.0, rect.width, rect.height));
 
         let mut content = String::new();
@@ -263,12 +301,31 @@ impl AppearanceStreamBuilder {
         content.push_str(&format!("{} {} {} {} {} {} c\n", 0.0, r, 0.0, 0.0, r, 0.0));
         content.push_str("S\n");
 
-        // Add stamp text (would need font resources for actual text)
-        // For now, just the border
+        // ── pdf_manipulator patch: render the stamp label (was border-only) ──
+        if !label.is_empty() {
+            // Fit the label inside the border: cap height at 60% of the
+            // box, width at ~90% using the 0.6-em average glyph width
+            // of Helvetica-Bold uppercase.
+            let size = (h * 0.6).min(w * 0.9 / (label.len() as f32 * 0.6));
+            let text_w = label.len() as f32 * size * 0.6;
+            let tx = (w - text_w) / 2.0;
+            let ty = (h - size) / 2.0 + size * 0.18; // optical centering
+            if let Some(fill_ops) = Self::color_to_fill_ops(&color) {
+                content.push_str(&fill_ops);
+            }
+            content.push_str(&format!(
+                "BT\n/F0 {:.1} Tf\n{:.2} {:.2} Td\n({}) Tj\nET\n",
+                size,
+                tx,
+                ty,
+                Self::escape_text(label),
+            ));
+        }
 
         builder.content = content.into_bytes();
-        builder
+        builder.with_inline_font("F0", "Helvetica-Bold")
     }
+    // ── end pdf_manipulator patch ──
 
     /// Create an appearance stream for a line annotation.
     pub fn for_line(
@@ -1103,13 +1160,18 @@ mod tests {
     fn test_stamp_appearance() {
         let rect = Rect::new(0.0, 0.0, 150.0, 50.0);
         let ap =
-            AppearanceStreamBuilder::for_stamp(rect, StampType::Approved, AnnotationColor::red());
+            AppearanceStreamBuilder::for_stamp(rect, "APPROVED", AnnotationColor::red());
 
-        let (_, content) = ap.build();
+        let (dict, content) = ap.build();
         let content_str = String::from_utf8_lossy(&content);
 
         assert!(content_str.contains("1 0 0 RG")); // Red stroke
         assert!(content_str.contains("c")); // Curved corners
+        // The label renders as real text through an inline font resource.
+        assert!(content_str.contains("(APPROVED) Tj"));
+        assert!(content_str.contains("/F0"));
+        let res = dict.get("Resources").and_then(|r| r.as_dict()).unwrap();
+        assert!(res.get("Font").and_then(|f| f.as_dict()).unwrap().contains_key("F0"));
     }
 
     #[test]
@@ -1571,7 +1633,7 @@ mod tests {
         let rect = Rect::new(0.0, 0.0, 120.0, 40.0);
         let ap = AppearanceStreamBuilder::for_stamp(
             rect,
-            StampType::Confidential,
+            "CONFIDENTIAL",
             AnnotationColor::Rgb(0.8, 0.0, 0.0),
         );
         let (_, content) = ap.build();
@@ -1588,7 +1650,7 @@ mod tests {
         // Small rect should limit corner radius
         let rect = Rect::new(0.0, 0.0, 12.0, 6.0);
         let ap =
-            AppearanceStreamBuilder::for_stamp(rect, StampType::Approved, AnnotationColor::green());
+            AppearanceStreamBuilder::for_stamp(rect, "APPROVED", AnnotationColor::green());
         let (_, content) = ap.build();
         assert!(!content.is_empty());
     }

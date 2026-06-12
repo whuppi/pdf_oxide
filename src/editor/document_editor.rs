@@ -1960,23 +1960,27 @@ impl DocumentEditor {
                     EncryptionAlgorithm::Aes256 => Algorithm::Aes256,
                 };
 
-                // Build encryption dictionary
-                let encrypt_dict = EncryptDictBuilder::new(algorithm)
-                    .user_password(config.user_password.as_bytes())
-                    .owner_password(config.owner_password.as_bytes())
-                    .permissions(config.permissions.to_bits())
-                    .encrypt_metadata(true)
-                    .build(&id1)?;
+                // ── pdf_manipulator patch: encrypt with the dict's own key ──
+                // Build encryption dictionary AND capture its file key.
+                // For R6 the file key is random and is what encrypts the
+                // streams — the handler MUST reuse it, not re-derive a
+                // second random key, or every stream is garbage under a
+                // key the dict cannot unwrap.
+                let (encrypt_dict, file_key) =
+                    EncryptDictBuilder::new(algorithm)
+                        .user_password(config.user_password.as_bytes())
+                        .owner_password(config.owner_password.as_bytes())
+                        .permissions(config.permissions.to_bits())
+                        .encrypt_metadata(true)
+                        .build_with_key(&id1)?;
 
-                // Create encryption handler
-                let handler = EncryptionWriteHandler::new(
-                    config.user_password.as_bytes(),
-                    &encrypt_dict.owner_password,
-                    encrypt_dict.permissions,
-                    &id1,
+                // The handler encrypts streams with the dict's own key.
+                let handler = EncryptionWriteHandler::from_key(
+                    file_key,
                     algorithm,
                     true,
-                )?;
+                );
+                // ── end pdf_manipulator patch ──
 
                 (Some((id1, id2)), Some(encrypt_dict), Some(handler))
             } else {
@@ -2373,7 +2377,21 @@ impl DocumentEditor {
                         let cached_page_refs = self.get_page_refs().unwrap_or_default();
                         for kid in kids {
                             if let Some(page_ref) = kid.as_reference() {
-                                let page_obj = self.source.load_object(page_ref)?;
+                                // ── pdf_manipulator patch: staged page dict wins over source ──
+                                // Edits that rewrite the page dictionary
+                                // (under-content watermark, content replacement)
+                                // stage it in modified_objects. Rebuilding from
+                                // source here drops the staged /Contents pointer:
+                                // the new content stream becomes an orphan and
+                                // the edit vanishes from the saved document.
+                                let page_obj = if let Some(staged) =
+                                    self.modified_objects.get(&page_ref.id)
+                                {
+                                    staged.clone()
+                                } else {
+                                    self.source.load_object(page_ref)?
+                                };
+                                // ── end pdf_manipulator patch ──
 
                                 // Resolve the original source page index for all HashMap lookups.
                                 // Merged pages (appended after source pages) use the loop counter.
@@ -2557,6 +2575,16 @@ impl DocumentEditor {
                                             _ => Object::Array(vec![contents, overlay_ref]),
                                         };
                                         new_dict.insert("Contents".to_string(), contents_array);
+                                    } else {
+                                        // ── pdf_manipulator patch ──
+                                        // A page with no /Contents (legal —
+                                        // blank page) still gets the overlay:
+                                        // it becomes the page's content.
+                                        new_dict.insert(
+                                            "Contents".to_string(),
+                                            Object::Reference(ObjectRef::new(overlay_obj_id, 0)),
+                                        );
+                                        // ── end pdf_manipulator patch ──
                                     }
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
@@ -2581,6 +2609,16 @@ impl DocumentEditor {
                                             _ => Object::Array(vec![contents, additions_ref]),
                                         };
                                         new_dict.insert("Contents".to_string(), contents_array);
+                                    } else {
+                                        // ── pdf_manipulator patch ──
+                                        // A page with no /Contents (legal —
+                                        // blank page) still gets the overlay:
+                                        // it becomes the page's content.
+                                        new_dict.insert(
+                                            "Contents".to_string(),
+                                            Object::Reference(ObjectRef::new(additions_id, 0)),
+                                        );
+                                        // ── end pdf_manipulator patch ──
                                     }
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
@@ -2610,6 +2648,16 @@ impl DocumentEditor {
                                             _ => Object::Array(vec![contents, overlay_ref]),
                                         };
                                         new_dict.insert("Contents".to_string(), contents_array);
+                                    } else {
+                                        // ── pdf_manipulator patch ──
+                                        // A page with no /Contents (legal —
+                                        // blank page) still gets the overlay:
+                                        // it becomes the page's content.
+                                        new_dict.insert(
+                                            "Contents".to_string(),
+                                            Object::Reference(ObjectRef::new(*flatten_overlay_id, 0)),
+                                        );
+                                        // ── end pdf_manipulator patch ──
                                     }
 
                                     // Add XObjects to Resources
@@ -2685,6 +2733,16 @@ impl DocumentEditor {
                                             _ => Object::Array(vec![contents, overlay_ref]),
                                         };
                                         new_dict.insert("Contents".to_string(), contents_array);
+                                    } else {
+                                        // ── pdf_manipulator patch ──
+                                        // A page with no /Contents (legal —
+                                        // blank page) still gets the overlay:
+                                        // it becomes the page's content.
+                                        new_dict.insert(
+                                            "Contents".to_string(),
+                                            Object::Reference(ObjectRef::new(*redact_overlay_id, 0)),
+                                        );
+                                        // ── end pdf_manipulator patch ──
                                     }
 
                                     // Remove Redact annotations from /Annots array
@@ -2742,6 +2800,16 @@ impl DocumentEditor {
                                             _ => Object::Array(vec![contents, overlay_ref]),
                                         };
                                         new_dict.insert("Contents".to_string(), contents_array);
+                                    } else {
+                                        // ── pdf_manipulator patch ──
+                                        // A page with no /Contents (legal —
+                                        // blank page) still gets the overlay:
+                                        // it becomes the page's content.
+                                        new_dict.insert(
+                                            "Contents".to_string(),
+                                            Object::Reference(ObjectRef::new(*form_overlay_id, 0)),
+                                        );
+                                        // ── end pdf_manipulator patch ──
                                     }
 
                                     // Add XObjects to Resources
@@ -3109,8 +3177,23 @@ impl DocumentEditor {
                                                 .get("Contents")
                                                 .and_then(|c| c.as_reference())
                                             {
-                                                let contents_obj =
-                                                    self.source.load_object(contents_ref)?;
+                                                // ── pdf_manipulator patch: staged stream wins over source ──
+                                                // Prefer a staged stream: an
+                                                // under-content edit re-points
+                                                // /Contents at a NEW object that
+                                                // exists only in modified_objects.
+                                                // Loading it from source yields
+                                                // null, poisons the xref, and the
+                                                // real stream is then skipped as
+                                                // "already written".
+                                                let contents_obj = if let Some(staged) =
+                                                    self.modified_objects.get(&contents_ref.id)
+                                                {
+                                                    staged.clone()
+                                                } else {
+                                                    self.source.load_object(contents_ref)?
+                                                };
+                                                // ── end pdf_manipulator patch ──
                                                 let offset = writer.position();
                                                 let bytes = serialize_obj(
                                                     &serializer,
@@ -3453,9 +3536,34 @@ impl DocumentEditor {
                                                 .iter()
                                                 .zip(annotations.iter().filter(|a| a.is_new()))
                                                 .filter_map(|(annot_id, annot_wrapper)| {
-                                                    annot_wrapper
-                                                        .writer_annotation()
-                                                        .map(|wa| (*annot_id, wa.build(&page_refs)))
+                                                    annot_wrapper.writer_annotation().map(|wa| {
+                                                        let mut dict = wa.build(&page_refs);
+                                                        // ── pdf_manipulator patch: appearance for AP-less types ──
+                                                        // Types whose build() emits no /AP (stamp) get one
+                                                        // from the appearance generator, as an INLINE
+                                                        // stream — the hoist below lifts it to an indirect
+                                                        // object like any builder-inlined appearance.
+                                                        // Without /AP the annotation is viewer-synthesized
+                                                        // at best and flattening finds nothing to inline.
+                                                        if !dict.contains_key("AP") {
+                                                            if let Some((ap_dict, ap_data)) = wa.appearance() {
+                                                                let mut ap = HashMap::new();
+                                                                ap.insert(
+                                                                    "N".to_string(),
+                                                                    Object::Stream {
+                                                                        dict: ap_dict,
+                                                                        data: bytes::Bytes::from(ap_data),
+                                                                    },
+                                                                );
+                                                                dict.insert(
+                                                                    "AP".to_string(),
+                                                                    Object::Dictionary(ap),
+                                                                );
+                                                            }
+                                                        }
+                                                        // ── end pdf_manipulator patch ──
+                                                        (*annot_id, dict)
+                                                    })
                                                 })
                                                 .collect()
                                         } else {
@@ -3499,6 +3607,7 @@ impl DocumentEditor {
                                         writer.write_all(&bytes)?;
                                         xref_entries.push((annot_id, offset, 0, true));
                                     }
+                                    // ── end pdf_manipulator patch ──
                                 }
 
                                 // Write new form field objects
@@ -3932,7 +4041,6 @@ impl DocumentEditor {
         } else {
             None
         };
-
         // Restore original /Pages so the page-loop rebuild is unaffected.
         if let Some((pages_id, prior)) = staged_pages_prior {
             match prior {
@@ -4202,12 +4310,27 @@ impl DocumentEditor {
             }
         };
 
-        // Load annotations from source document
-        let read_annotations = self.source.get_annotations(page_index).unwrap_or_default();
-        let annotations: Vec<crate::editor::dom::AnnotationWrapper> = read_annotations
-            .into_iter()
-            .map(crate::editor::dom::AnnotationWrapper::from_read)
-            .collect();
+        // ── pdf_manipulator patch: pending annotations are the truth ──
+        // Load annotations: pending edits first. Once any annotation
+        // edit has touched this page, `modified_annotations` IS the
+        // page's current truth (it was seeded from source at that
+        // moment) — re-seeding from source here would hand the caller
+        // a stale set, and the eventual save_page would REPLACE the
+        // pending entry with it, silently erasing earlier edits
+        // (e.g. a stamp wiping out a watermark added before it).
+        let source_page = self.output_to_source_index(page_index);
+        let annotations: Vec<crate::editor::dom::AnnotationWrapper> =
+            if let Some(pending) = self.modified_annotations.get(&source_page) {
+                pending.clone()
+            } else {
+                self.source
+                    .get_annotations(page_index)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(crate::editor::dom::AnnotationWrapper::from_read)
+                    .collect()
+            };
+        // ── end pdf_manipulator patch ──
 
         Ok(crate::editor::dom::PdfPage::from_structure_with_annotations(
             page_index,

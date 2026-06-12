@@ -450,6 +450,20 @@ pub enum Annotation {
 }
 
 impl Annotation {
+    // ── pdf_manipulator patch: appearance generation dispatch ──
+    /// Normal appearance (`/AP /N`) for annotation types whose `build()`
+    /// emits no inline appearance: Form XObject dict + content bytes.
+    /// `None` means the type either inlines its own /AP in `build()`
+    /// (watermark) or has no generator yet — in the latter case viewers
+    /// synthesize a look and flattening has nothing to inline.
+    pub fn appearance(&self) -> Option<(HashMap<String, Object>, Vec<u8>)> {
+        match self {
+            Annotation::Stamp(s) => Some(s.appearance()),
+            _ => None,
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Build the annotation dictionary.
     pub fn build(&self, page_refs: &[ObjectRef]) -> HashMap<String, Object> {
         match self {

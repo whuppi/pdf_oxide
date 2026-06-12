@@ -3,7 +3,7 @@
 //! Implements `Read + Seek` by calling `host_read_at` imported from
 //! the JS global scope via wasm_bindgen.
 //!
-//! worker.js sets `self.host_read_at = hostReadAt` before loading WASM.
+//! lane_worker.js sets `self.host_read_at = hostReadAt` before loading WASM.
 //! wasm_bindgen resolves the import via global lookup — no bare "env"
 //! import specifier that would break in ES module Workers.
 //!
@@ -11,14 +11,14 @@
 //! The source file is never fully buffered.
 //!
 //! Three JS-side implementations (transparent to this reader):
-//!   Atomics:  host_read_at blocks via Atomics.wait, coordinator fills SAB
+//!   Atomics:  host_read_at blocks via Atomics.wait, main thread fills SAB
 //!   JSPI:     V8 suspends WASM stack natively when import returns Promise
 //!   OPFS:     host_read_at calls SyncAccessHandle.read (data on disk)
 
 use std::io::{self, Read, Seek, SeekFrom};
 use wasm_bindgen::prelude::*;
 
-// Imported from the JS global scope (self.host_read_at in worker.js).
+// Imported from the JS global scope (self.host_read_at in lane_worker.js).
 // Uses u32 for buf_ptr because wasm_bindgen doesn't support raw pointers.
 // WASM pointers are u32. Cast at the call site.
 #[wasm_bindgen]
@@ -59,6 +59,11 @@ impl Read for JsCallbackReader {
             buf.as_mut_ptr() as u32,
         );
 
+        if n == crate::host::constants::HOST_IO_CANCELLED {
+            // Deliberately NOT ErrorKind::Interrupted — std combinators
+            // retry that kind, which would spin forever on a cancel.
+            return Err(io::Error::other("operation cancelled"));
+        }
         if n < 0 {
             return Err(io::Error::new(io::ErrorKind::Other, "host_read_at failed"));
         }

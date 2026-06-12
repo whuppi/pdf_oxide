@@ -167,6 +167,14 @@ pub struct EncryptDict {
     /// Stream crypt filter method (CFM from /CF dictionary, for V=4).
     /// "V2" = RC4-128, "AESV2" = AES-128. None means not specified (defaults to AES-128).
     pub stream_crypt_method: Option<String>,
+    // ── pdf_manipulator patch: expose the raw file key to the writer ──
+    /// The raw file encryption key, populated by `build_with_key`.
+    /// NOT a dictionary entry — never serialized; it exists so the
+    /// writer can encrypt streams with the SAME key the dict
+    /// advertises (R6 wraps it in /UE and /OE; R<=4 derives it from
+    /// the password). None on parse.
+    pub file_key: Option<Vec<u8>>,
+    // ── end pdf_manipulator patch ──
 }
 
 impl EncryptDict {
@@ -289,6 +297,7 @@ impl EncryptDict {
             user_encryption,
             perms,
             stream_crypt_method,
+            file_key: None, // parse side never holds the raw key
         })
     }
 
@@ -489,6 +498,30 @@ impl EncryptDictBuilder {
     /// # Arguments
     /// * `file_id` - The first element of the PDF file identifier array
     pub fn build(self, file_id: &[u8]) -> Result<EncryptDict> {
+        self.build_inner(file_id)
+    }
+
+    // ── pdf_manipulator patch: build_with_key — dict + raw file key ──
+    /// Build the dictionary AND return the file encryption key.
+    ///
+    /// For V=5/R=6 the file key is random and is what actually
+    /// encrypts the document's streams. The dict only stores it WRAPPED
+    /// (in /UE and /OE), so a writer cannot recover it from the dict —
+    /// it must receive it here and feed it to
+    /// `EncryptionWriteHandler::from_key`, or streams get encrypted
+    /// under a key the dict cannot unwrap (the file opens, every stream
+    /// is garbage). For R<=4 the password-derived key is returned the
+    /// same way.
+    pub fn build_with_key(self, file_id: &[u8]) -> Result<(EncryptDict, Vec<u8>)> {
+        let dict = self.build_inner(file_id)?;
+        let key = dict.file_key.clone().ok_or_else(|| {
+            crate::Error::InvalidPdf("encryption build produced no file key".to_string())
+        })?;
+        Ok((dict, key))
+    }
+    // ── end pdf_manipulator patch ──
+
+    fn build_inner(self, file_id: &[u8]) -> Result<EncryptDict> {
         let (version, revision) = match self.algorithm {
             Algorithm::None => (0, 0),
             Algorithm::RC4_40 => (1, 2),
@@ -555,6 +588,13 @@ impl EncryptDictBuilder {
                 &user_hash,
                 revision,
             )?;
+            // ── pdf_manipulator patch: /Perms is mandatory for R6 ──
+            let perms = algorithms::compute_perms(
+                self.permissions,
+                self.encrypt_metadata,
+                &file_key,
+            )?;
+            // ── end pdf_manipulator patch ──
             return Ok(EncryptDict {
                 filter: "Standard".to_string(),
                 sub_filter: None,
@@ -567,8 +607,9 @@ impl EncryptDictBuilder {
                 encrypt_metadata: self.encrypt_metadata,
                 owner_encryption: Some(owner_encryption),
                 user_encryption: Some(user_encryption),
-                perms: None,
+                perms: Some(perms),
                 stream_crypt_method: None,
+                file_key: Some(file_key),
             });
         }
 
@@ -608,6 +649,10 @@ impl EncryptDictBuilder {
             user_encryption: None,
             perms: None,
             stream_crypt_method: None,
+            // For R<=4 the file key IS the password-derived key — expose
+            // it so the writer encrypts with the same key the dict
+            // advertises (R6 exposes its random key the same way).
+            file_key: Some(encryption_key),
         })
     }
 }
@@ -1130,6 +1175,7 @@ mod tests {
             user_encryption: None,
             perms: None,
             stream_crypt_method: None,
+            file_key: None,
         };
         let obj = ed.to_object();
         let dict = obj.as_dict().unwrap();
@@ -1159,6 +1205,7 @@ mod tests {
             user_encryption: None,
             perms: None,
             stream_crypt_method: None,
+            file_key: None,
         };
         let obj = ed.to_object();
         let dict = obj.as_dict().unwrap();
@@ -1183,6 +1230,7 @@ mod tests {
             user_encryption: None,
             perms: None,
             stream_crypt_method: None,
+            file_key: None,
         };
         let obj = ed.to_object();
         let dict = obj.as_dict().unwrap();
@@ -1207,6 +1255,7 @@ mod tests {
             user_encryption: Some(vec![0u8; 32]),
             perms: Some(vec![0u8; 16]),
             stream_crypt_method: None,
+            file_key: None,
         };
         let obj = ed.to_object();
         let dict = obj.as_dict().unwrap();
@@ -1454,6 +1503,7 @@ mod tests {
             user_encryption: None,
             perms: None,
             stream_crypt_method: None,
+            file_key: None,
         };
         let obj = original.to_object();
         let parsed = EncryptDict::from_object(&obj).unwrap();
@@ -1481,6 +1531,7 @@ mod tests {
             user_encryption: None,
             perms: None,
             stream_crypt_method: None,
+            file_key: None,
         };
         let obj = original.to_object();
         let parsed = EncryptDict::from_object(&obj).unwrap();
@@ -1508,6 +1559,7 @@ mod tests {
             user_encryption: None,
             perms: None,
             stream_crypt_method: Some("V2".to_string()),
+            file_key: None,
         };
         assert_eq!(ed.algorithm().unwrap(), Algorithm::Rc4_128);
     }
@@ -1529,6 +1581,7 @@ mod tests {
             user_encryption: None,
             perms: None,
             stream_crypt_method: Some("V2".to_string()),
+            file_key: None,
         };
         let obj = original.to_object();
         let parsed = EncryptDict::from_object(&obj).unwrap();

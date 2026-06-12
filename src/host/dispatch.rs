@@ -836,9 +836,11 @@ pub fn edit_watermark(
         if layer == 1 {
             // Under-content: prepend watermark to page content stream.
             // Renders BEHIND existing page content.
+            let font_res = ensure_page_font(ed, p, "Helvetica")?;
             for rect in &rects {
                 let stream = generate_watermark_stream(
                     text, *rect, font_size, rotation, opacity, r, g, b,
+                    &font_res,
                 );
                 prepend_to_page_content(ed, p, &stream)?;
             }
@@ -902,9 +904,11 @@ pub fn edit_watermark(
                 _ => vec![Rect::new(pw * 0.1, ph * 0.3, pw * 0.8, ph * 0.4)],
             };
             if layer == 1 {
+                let font_res = ensure_page_font(editor, i, "Helvetica")?;
                 for rect in &rects {
                     let stream = generate_watermark_stream(
                         text, *rect, font_size, rotation, opacity, r, g, b,
+                        &font_res,
                     );
                     prepend_to_page_content(editor, i, &stream)?;
                 }
@@ -934,6 +938,7 @@ fn generate_watermark_stream(
     rotation: f32,
     opacity: f32,
     r: f32, g: f32, b: f32,
+    font_res: &str,
 ) -> Vec<u8> {
     let cx = rect.x + rect.width / 2.0;
     let cy = rect.y + rect.height / 2.0;
@@ -950,13 +955,129 @@ fn generate_watermark_stream(
 
     format!(
         "q\n{:.2} {:.2} {:.2} rg\n{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} cm\n\
-         BT\n/Helvetica {:.1} Tf\n{:.2} {:.2} Td\n({}) Tj\nET\nQ\n",
+         BT\n/{} {:.1} Tf\n{:.2} {:.2} Td\n({}) Tj\nET\nQ\n",
         ar, ag, ab,
         cos_r, sin_r, -sin_r, cos_r, cx, cy,
+        font_res,
         font_size,
         -approx_width / 2.0, -font_size / 3.0,
         escaped,
     ).into_bytes()
+}
+
+/// Ensure the page's `/Resources/Font` maps a resource name to
+/// `base_font` (a standard Type1 font), staging the updated page dict.
+/// Returns the resource name the content stream must use in `Tf`.
+///
+/// A `Tf` operand is a RESOURCE name resolved through the page's
+/// `/Resources/Font` — not a typeface name. Emitting a stream without
+/// registering its font produces spec-invalid output that extractors
+/// and strict viewers cannot decode.
+fn ensure_page_font(
+    editor: &mut DocumentEditor,
+    page: usize,
+    base_font: &str,
+) -> Result<String> {
+    use crate::object::{Object, ObjectRef};
+
+    let page_ref = editor.source_mut().get_page_ref(page)?;
+    // Staged-preferred: an earlier edit on this editor may already have
+    // replaced the page dict; loading from source would drop that work.
+    let page_obj = if let Some(staged) =
+        editor.modified_objects_mut().get(&page_ref.id)
+    {
+        staged.clone()
+    } else {
+        editor.source_mut().load_object(page_ref)?
+    };
+    let page_dict = match page_obj.as_dict() {
+        Some(d) => d.clone(),
+        None => return Err(Error::InvalidPdf("page not a dict".into())),
+    };
+
+    // Resolve a possibly-referenced dict value to an owned dict,
+    // preferring staged objects over source (same staleness rule).
+    fn deref_dict(
+        editor: &mut DocumentEditor,
+        value: Option<&Object>,
+    ) -> Result<std::collections::HashMap<String, Object>> {
+        match value {
+            Some(Object::Dictionary(d)) => Ok(d.clone()),
+            Some(Object::Reference(r)) => {
+                let r = *r;
+                let obj = if let Some(staged) =
+                    editor.modified_objects_mut().get(&r.id)
+                {
+                    staged.clone()
+                } else {
+                    editor.source_mut().load_object(r)?
+                };
+                Ok(match obj {
+                    Object::Dictionary(d) => d,
+                    _ => std::collections::HashMap::new(),
+                })
+            }
+            _ => Ok(std::collections::HashMap::new()),
+        }
+    }
+
+    let mut resources = deref_dict(editor, page_dict.get("Resources"))?;
+    let mut fonts = deref_dict(editor, resources.get("Font"))?;
+
+    // Reuse an existing registration of the same standard font.
+    for (name, value) in fonts.clone() {
+        let font_obj = match value {
+            Object::Dictionary(d) => Object::Dictionary(d),
+            Object::Reference(r) => {
+                if let Some(staged) = editor.modified_objects_mut().get(&r.id)
+                {
+                    staged.clone()
+                } else {
+                    match editor.source_mut().load_object(r) {
+                        Ok(o) => o,
+                        Err(_) => continue, // unreadable entry: skip, register fresh
+                    }
+                }
+            }
+            _ => continue,
+        };
+        if let Some(d) = font_obj.as_dict() {
+            if d.get("BaseFont").and_then(|o| o.as_name()) == Some(base_font)
+                && d.get("Subtype").and_then(|o| o.as_name()) == Some("Type1")
+            {
+                return Ok(name);
+            }
+        }
+    }
+
+    // Register fresh under a collision-free name.
+    let mut n = 0usize;
+    let name = loop {
+        let candidate = format!("WMF{n}");
+        if !fonts.contains_key(&candidate) {
+            break candidate;
+        }
+        n += 1;
+    };
+
+    let mut font = std::collections::HashMap::new();
+    font.insert("Type".into(), Object::Name("Font".into()));
+    font.insert("Subtype".into(), Object::Name("Type1".into()));
+    font.insert("BaseFont".into(), Object::Name(base_font.into()));
+    font.insert("Encoding".into(), Object::Name("WinAnsiEncoding".into()));
+    let font_id = editor.alloc_id();
+    editor.insert_modified(font_id, Object::Dictionary(font));
+
+    fonts.insert(name.clone(), Object::Reference(ObjectRef::new(font_id, 0)));
+    // Inline the merged dicts directly on the page. If Resources was a
+    // reference it may be SHARED across pages — staging the referenced
+    // object would leak this font into every sharing page; an inline
+    // copy scopes the change to this page only.
+    resources.insert("Font".into(), Object::Dictionary(fonts));
+    let mut new_page = page_dict;
+    new_page.insert("Resources".into(), Object::Dictionary(resources));
+    editor.insert_modified(page_ref.id, Object::Dictionary(new_page));
+    Ok(name)
 }
 
 /// Prepend content stream bytes to a page's existing content.
@@ -969,14 +1090,31 @@ fn prepend_to_page_content(
     use crate::object::{Object, ObjectRef};
 
     let page_ref = editor.source_mut().get_page_ref(page)?;
-    let page_obj = editor.source_mut().load_object(page_ref)?;
+    // Staged-preferred: ensure_page_font (and any earlier prepend) stages
+    // an updated page dict; loading from source would drop that work and
+    // re-resolve a stale Contents reference.
+    let page_obj = if let Some(staged) =
+        editor.modified_objects_mut().get(&page_ref.id)
+    {
+        staged.clone()
+    } else {
+        editor.source_mut().load_object(page_ref)?
+    };
     let page_dict = page_obj.as_dict()
         .ok_or_else(|| Error::InvalidPdf("page not a dict".into()))?;
 
-    // Get existing content stream data
+    // Get existing content stream data. The Contents reference may point
+    // at a STAGED stream (a prior prepend on this editor) whose id does
+    // not exist in source — staged objects must win here too.
     let existing_data = if let Some(contents_ref) = page_dict.get("Contents") {
         if let Some(r) = contents_ref.as_reference() {
-            let obj = editor.source_mut().load_object(r)?;
+            let obj = if let Some(staged) =
+                editor.modified_objects_mut().get(&r.id)
+            {
+                staged.clone()
+            } else {
+                editor.source_mut().load_object(r)?
+            };
             match obj {
                 Object::Stream { data, .. } => data.to_vec(),
                 _ => Vec::new(),

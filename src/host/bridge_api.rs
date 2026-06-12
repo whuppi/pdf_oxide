@@ -1,85 +1,32 @@
-//! Bridge API — the ONE entry point for both native FFI and WASM.
+//! Bridge API — the shared request brain for both native and WASM lanes.
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
-//! ## Instance model
+//! ## Lane model
 //!
-//! Each `Pdf()` in Dart/JS creates one `InstanceState` via `bridge_init`.
-//! The instance owns all handles (documents, editors, builders) and the
-//! thread pool (native). Destroying the instance via `bridge_shutdown`
-//! drops everything — all handles freed, all threads stopped.
+//! Engine state lives per LANE (`LaneState`) — one isolated execution
+//! unit per native thread / per Web Worker. This file never spawns,
+//! routes, or kills lanes; it is the decision-free request brain that
+//! every lane body calls:
 //!
-//! Multiple instances are fully isolated. Different pools, different
-//! handle maps, different memory. Killing one doesn't touch the others.
-//!
-//! ## Entry points (cfg-gated, same logic)
-//!
-//!   Native: `bridge_init` → `*mut InstanceState`
-//!           `bridge_execute(instance, request, ...)` → posts result via allo-isolate
-//!           `bridge_shutdown(instance)` → drops everything
-//!
-//!   WASM:   `bridge_init` → `u32` (WASM pointer)
-//!           `bridge_execute(instance, request, ...)` → returns `Vec<u8>`
-//!           `bridge_shutdown(instance)` → drops everything
+//!   Native lane body: `host/native/lane.rs` (mailbox thread)
+//!   Web lane body:    `web_assets/lane_worker.js` (Worker + wasm_entry)
 //!
 //! ## Request routing
 //!
 //! `handle_request` parses binary request bytes, calls the matching
-//! dispatch function, encodes the result as binary response bytes.
-//! Same source code for both targets. 100% platform-agnostic.
+//! dispatch function against the lane's own state, and encodes the
+//! result as binary response bytes. Same source code for both
+//! targets. 100% platform-agnostic. No locks — a lane's state has
+//! exactly one owner thread, so handlers take `&mut LaneState`.
 
 use crate::host::binary_codec::{Request, ResponseWriter};
 use crate::host::dispatch;
+use crate::host::lane_state::LaneState;
 
 use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;
-use crate::writer::{DocumentBuilder, PageSize};
-
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
-
-// ═══════════════════════════════════════════════════════════════════
-// InstanceState — all per-instance state in one struct.
-// Created by bridge_init. Destroyed by bridge_shutdown.
-// Passed as opaque pointer to every bridge_execute call.
-// ═══════════════════════════════════════════════════════════════════
-
-/// All state for one Pdf engine instance.
-///
-/// Each `Pdf()` on the Dart/JS side creates exactly one of these.
-/// The instance is fully isolated — different instances can't see
-/// each other's documents, editors, or builders.
-///
-/// `dispose()` on the Dart side calls `bridge_shutdown`, which drops
-/// this struct. All handles, all memory, all threads — gone.
-pub struct InstanceState {
-    documents: Mutex<HashMap<u32, PdfDocument>>,
-    editors: Mutex<HashMap<u32, DocumentEditor>>,
-    builders: Mutex<HashMap<u32, DocumentBuilder>>,
-    page_ops: Mutex<HashMap<u32, Vec<dispatch::PageOp>>>,
-    next_handle: AtomicU32,
-    /// Instance-wide cancellation flag. Set by bridge_shutdown.
-    /// Readers/writers check this to bail early during teardown.
-    pub cancel: AtomicBool,
-}
-
-impl InstanceState {
-    fn new() -> Self {
-        Self {
-            documents: Mutex::new(HashMap::new()),
-            editors: Mutex::new(HashMap::new()),
-            builders: Mutex::new(HashMap::new()),
-            page_ops: Mutex::new(HashMap::new()),
-            next_handle: AtomicU32::new(1),
-            cancel: AtomicBool::new(false),
-        }
-    }
-
-    fn next_handle_id(&self) -> u32 {
-        self.next_handle.fetch_add(1, Ordering::Relaxed)
-    }
-}
+use crate::writer::PageSize;
 
 // ═══════════════════════════════════════════════════════════════════
 // BoxedReader / BoxedWriter — concrete wrappers for trait objects
@@ -142,7 +89,7 @@ fn read_all_from_reader(reader: &mut BoxedReader) -> std::io::Result<Vec<u8>> {
 /// O(1)-memory I/O: when reader/writer are Some, PDF bytes flow
 /// through them on demand — never fully buffered.
 pub(crate) fn handle_request(
-    state: &InstanceState,
+    state: &mut LaneState,
     bytes: &[u8],
     source_bytes: Option<&[u8]>,
     mut sources: Vec<BoxedReader>,
@@ -179,7 +126,7 @@ pub(crate) fn handle_request(
         "open" => handle_open(state, &req, source_bytes, take_source(&mut sources, 0)),
         "docDispose" => {
             let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            state.documents.lock().unwrap().remove(&hid);
+            state.documents.remove(&hid);
             let mut w = ResponseWriter::ok();
             w.put_bool("disposed", true);
             w.finish()
@@ -275,7 +222,7 @@ pub(crate) fn handle_request(
         "editorOpen" => handle_editor_open(state, &req, source_bytes, take_source(&mut sources, 0)),
         "editorDispose" => {
             let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            state.editors.lock().unwrap().remove(&hid);
+            state.editors.remove(&hid);
             let mut w = ResponseWriter::ok();
             w.put_bool("disposed", true);
             w.finish()
@@ -329,7 +276,7 @@ pub(crate) fn handle_request(
         }
         "editorMergeFrom" => {
             let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            let mut editors = state.editors.lock().unwrap();
+            let editors = &mut state.editors;
             let editor = match editors.get_mut(&hid) {
                 Some(e) => e,
                 None => return ResponseWriter::error("editor not found"),
@@ -363,22 +310,22 @@ pub(crate) fn handle_request(
         "builderCreate" => {
             let builder = dispatch::builder_new();
             let hid = state.next_handle_id();
-            state.builders.lock().unwrap().insert(hid, builder);
+            state.builders.insert(hid, builder);
             let mut w = ResponseWriter::ok();
             w.put_i32("handleId", hid as i32);
             w.finish()
         }
         "builderDispose" => {
             let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            state.builders.lock().unwrap().remove(&hid);
-            state.page_ops.lock().unwrap().remove(&hid);
+            state.builders.remove(&hid);
+            state.page_ops.remove(&hid);
             let mut w = ResponseWriter::ok();
             w.put_bool("disposed", true);
             w.finish()
         }
         "builderSetMetadata" => {
             let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            let mut builders = state.builders.lock().unwrap();
+            let builders = &mut state.builders;
             if let Some(b) = builders.remove(&hid) {
                 let mut b = b;
                 if let Some(v) = req.get_str("title") { b = dispatch::builder_set_title(b, v); }
@@ -407,7 +354,7 @@ pub(crate) fn handle_request(
                 ),
             };
             let (pw, ph) = size.dimensions();
-            state.page_ops.lock().unwrap()
+            state.page_ops
                 .entry(hid)
                 .or_default()
                 .push(dispatch::PageOp::NewPage { width: pw, height: ph });
@@ -418,7 +365,7 @@ pub(crate) fn handle_request(
         "builderPageOp" => handle_builder_page_op(state, &req, take_source(&mut sources, 0)),
         "builderPageDone" => {
             let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            state.page_ops.lock().unwrap()
+            state.page_ops
                 .entry(hid)
                 .or_default()
                 .push(dispatch::PageOp::Done);
@@ -432,11 +379,32 @@ pub(crate) fn handle_request(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Op handlers — each takes &InstanceState instead of accessing globals
+// Op handlers — each takes &mut LaneState; no handler touches globals
 // ═══════════════════════════════════════════════════════════════════
 
+/// Authenticates `doc` against the request's optional password, or
+/// returns the error response that refuses the operation.
+///
+/// Always runs — with the empty password when none was supplied —
+/// because the PDF spec's empty-user-password convention is what lets
+/// owner-only documents open for everyone, while a real user password
+/// makes both the no-password and wrong-password attempts fail.
+/// Discarding the result here is the bug class this helper replaces:
+/// an unauthenticated encrypted document must refuse, never open.
+fn authenticate_or_refuse(doc: &PdfDocument, password: Option<&str>) -> Option<Vec<u8>> {
+    match doc.authenticate(password.unwrap_or("").as_bytes()) {
+        Ok(true) => None,
+        Ok(false) => Some(ResponseWriter::error(if password.is_some() {
+            "wrong password"
+        } else {
+            "password required: document is encrypted with a user password"
+        })),
+        Err(e) => Some(ResponseWriter::error(&e.to_string())),
+    }
+}
+
 fn handle_open(
-    state: &InstanceState,
+    state: &mut LaneState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
@@ -455,13 +423,13 @@ fn handle_open(
     } else {
         return ResponseWriter::error("no source for open");
     };
-    if let Some(pw) = password {
-        let _ = doc.authenticate(pw.as_bytes());
+    if let Some(resp) = authenticate_or_refuse(&doc, password) {
+        return resp;
     }
     match dispatch::open_document(&mut doc) {
         Ok(result) => {
             let hid = state.next_handle_id();
-            state.documents.lock().unwrap().insert(hid, doc);
+            state.documents.insert(hid, doc);
             let mut w = ResponseWriter::ok();
             w.put_i32("handleId", hid as i32);
             w.put_i32("pageCount", result.page_count as i32);
@@ -489,7 +457,7 @@ fn handle_open(
 }
 
 fn handle_editor_open(
-    state: &InstanceState,
+    state: &mut LaneState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
@@ -508,25 +476,25 @@ fn handle_editor_open(
     } else {
         return ResponseWriter::error("no source for editorOpen");
     };
-    if let Some(pw) = password {
-        let _ = doc.authenticate(pw.as_bytes());
+    if let Some(resp) = authenticate_or_refuse(&doc, password) {
+        return resp;
     }
     let editor = match DocumentEditor::from_document(doc) {
         Ok(e) => e,
         Err(e) => return ResponseWriter::error(&e.to_string()),
     };
     let hid = state.next_handle_id();
-    state.editors.lock().unwrap().insert(hid, editor);
+    state.editors.insert(hid, editor);
     let mut w = ResponseWriter::ok();
     w.put_i32("handleId", hid as i32);
     w.finish()
 }
 
-fn handle_with_doc<F>(state: &InstanceState, req: &Request<'_>, f: F) -> Vec<u8>
+fn handle_with_doc<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut docs = state.documents.lock().unwrap();
+    let docs = &mut state.documents;
     match docs.get_mut(&hid) {
         Some(doc) => match f(doc, req) {
             Ok(bytes) => bytes,
@@ -536,11 +504,11 @@ where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
     }
 }
 
-fn handle_with_editor<F>(state: &InstanceState, req: &Request<'_>, f: F) -> Vec<u8>
+fn handle_with_editor<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut DocumentEditor, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut editors = state.editors.lock().unwrap();
+    let editors = &mut state.editors;
     match editors.get_mut(&hid) {
         Some(editor) => match f(editor, req) {
             Ok(bytes) => bytes,
@@ -551,7 +519,7 @@ where F: FnOnce(&mut DocumentEditor, &Request<'_>) -> crate::error::Result<Vec<u
 }
 
 fn handle_editor_mutate(
-    state: &InstanceState,
+    state: &mut LaneState,
     req: &Request<'_>,
     data_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
@@ -560,7 +528,7 @@ fn handle_editor_mutate(
         None => return ResponseWriter::error("missing editOp"),
     };
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut editors = state.editors.lock().unwrap();
+    let editors = &mut state.editors;
     let editor = match editors.get_mut(&hid) {
         Some(e) => e,
         None => return ResponseWriter::error("editor not found"),
@@ -782,7 +750,7 @@ fn do_editor_mutate(
 }
 
 fn handle_builder_page_op(
-    state: &InstanceState,
+    state: &mut LaneState,
     req: &Request<'_>,
     mut data_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
@@ -887,7 +855,7 @@ fn handle_builder_page_op(
         }
     };
 
-    state.page_ops.lock().unwrap()
+    state.page_ops
         .entry(hid)
         .or_default()
         .push(op);
@@ -898,7 +866,7 @@ fn handle_builder_page_op(
 }
 
 fn handle_convert_to(
-    state: &InstanceState,
+    state: &mut LaneState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
@@ -909,7 +877,7 @@ fn handle_convert_to(
     // Try handle-based path first (if caller opened the doc already).
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
     if hid > 0 {
-        let mut docs = state.documents.lock().unwrap();
+        let docs = &mut state.documents;
         if let Some(doc) = docs.get_mut(&hid) {
             return convert_to_with_doc(doc, format, sink_writer);
         }
@@ -931,8 +899,8 @@ fn handle_convert_to(
         return ResponseWriter::error("no source for convertTo");
     };
 
-    if let Some(pw) = req.get_str("password") {
-        let _ = doc.authenticate(pw.as_bytes());
+    if let Some(resp) = authenticate_or_refuse(&doc, req.get_str("password")) {
+        return resp;
     }
 
     convert_to_with_doc(&mut doc, format, sink_writer)
@@ -1018,15 +986,15 @@ fn handle_convert_to_pdf(
     }
 }
 
-fn handle_builder_save(state: &InstanceState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut builders_map = state.builders.lock().unwrap();
+    let builders_map = &mut state.builders;
     let builder = match builders_map.remove(&hid) {
         Some(b) => b,
         None => return ResponseWriter::error("builder not found"),
     };
 
-    let ops = state.page_ops.lock().unwrap().remove(&hid).unwrap_or_default();
+    let ops = state.page_ops.remove(&hid).unwrap_or_default();
     let mut builder = builder;
     if !ops.is_empty() {
         dispatch::replay_page_ops(&mut builder, PageSize::A4, ops);
@@ -1053,9 +1021,9 @@ fn handle_builder_save(state: &InstanceState, req: &Request<'_>, sink_writer: Op
     }
 }
 
-fn handle_render_streamed(state: &InstanceState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut docs = state.documents.lock().unwrap();
+    let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
         Some(d) => d,
         None => return ResponseWriter::error("document not found"),
@@ -1096,9 +1064,9 @@ fn handle_render_streamed(state: &InstanceState, req: &Request<'_>, sink_writer:
     }
 }
 
-fn handle_extract_images_streamed(state: &InstanceState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+fn handle_extract_images_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut docs = state.documents.lock().unwrap();
+    let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
         Some(d) => d,
         None => return ResponseWriter::error("document not found"),
@@ -1201,12 +1169,12 @@ fn handle_sign(
 }
 
 fn handle_editor_save(
-    state: &InstanceState,
+    state: &mut LaneState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
 ) -> Vec<u8> {
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut editors = state.editors.lock().unwrap();
+    let editors = &mut state.editors;
     let editor = match editors.get_mut(&hid) {
         Some(e) => e,
         None => return ResponseWriter::error("editor not found"),
@@ -1270,12 +1238,12 @@ fn handle_editor_save(
 /// Editor extract pages — select → save(sink) → restore page_order.
 /// Editor state is unchanged after the call. O(1) streaming via sink.
 fn handle_editor_extract_pages(
-    state: &InstanceState,
+    state: &mut LaneState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
 ) -> Vec<u8> {
     let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-    let mut editors = state.editors.lock().unwrap();
+    let editors = &mut state.editors;
     let editor = match editors.get_mut(&hid) {
         Some(e) => e,
         None => return ResponseWriter::error("editor not found"),
@@ -1357,193 +1325,18 @@ fn permissions_from_bits(bits: i32) -> crate::editor::Permissions {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Native FFI entry point — per-instance pool + allo-isolate
+// WASM lane body — one Worker = one lane = one LaneState
 // ═══════════════════════════════════════════════════════════════════
-
-#[cfg(not(target_arch = "wasm32"))]
-mod ffi_entry {
-    use super::*;
-    use crate::host::native::callback_reader::CallbackReader;
-    use crate::host::native::callback_writer::CallbackWriter;
-    use crate::host::native::thread_pool::{Task, ThreadPool};
-    use std::sync::Arc;
-
-    /// Combined instance: InstanceState + ThreadPool.
-    /// The pool is separate because InstanceState is shared (&ref)
-    /// while the pool owns the threads.
-    ///
-    /// Field order is load-bearing: Rust drops fields in declaration
-    /// order. `pool` must drop first — ThreadPool::drop joins all
-    /// threads, ensuring no thread is still accessing `state`. If
-    /// `state` dropped first, a pool thread could read freed memory.
-    struct NativeInstance {
-        pool: ThreadPool,
-        state: InstanceState,
-    }
-
-    /// Create a new engine instance. Returns an opaque pointer.
-    ///
-    /// The instance owns its own thread pool and handle maps.
-    /// Multiple instances are fully isolated.
-    /// Call `bridge_shutdown` to destroy.
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_init() -> *mut std::ffi::c_void {
-        let instance = Box::new(NativeInstance {
-            pool: ThreadPool::new(),
-            state: InstanceState::new(),
-        });
-        Box::into_raw(instance) as *mut std::ffi::c_void
-    }
-
-    /// Execute an operation on an instance's thread pool.
-    ///
-    /// Submits work to the pool and returns immediately.
-    /// The pool thread runs handle_request, then posts the
-    /// result back to Dart via allo-isolate.
-    /// source_count: how many sources. Each source has a (buf, notify, length) triple.
-    /// source_bufs, source_notifys, source_lengths: parallel arrays of size source_count.
-    /// sink_count, sink_bufs, sink_notifys: parallel arrays for output sinks.
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_execute(
-        instance: *mut std::ffi::c_void,
-        request_ptr: *const u8,
-        request_len: i32,
-        source_count: i32,
-        source_bufs: *const *mut u8,
-        source_notifys: *const Option<unsafe extern "C" fn()>,
-        source_lengths: *const i64,
-        sink_count: i32,
-        sink_bufs: *const *mut u8,
-        sink_notifys: *const Option<unsafe extern "C" fn()>,
-        result_port: i64,
-    ) {
-        let inst = &*(instance as *const NativeInstance);
-        let request_owned = std::slice::from_raw_parts(request_ptr, request_len as usize).to_vec();
-
-        let sc = source_count as usize;
-        let skc = sink_count as usize;
-
-        // Copy array data to owned vecs (Send-safe usize + fn ptrs)
-        let src_bufs: Vec<usize> = (0..sc).map(|i| *source_bufs.add(i) as usize).collect();
-        let src_notifys: Vec<Option<unsafe extern "C" fn()>> = (0..sc).map(|i| *source_notifys.add(i)).collect();
-        let src_lengths: Vec<i64> = (0..sc).map(|i| *source_lengths.add(i)).collect();
-        let snk_bufs: Vec<usize> = (0..skc).map(|i| *sink_bufs.add(i) as usize).collect();
-        let snk_notifys: Vec<Option<unsafe extern "C" fn()>> = (0..skc).map(|i| *sink_notifys.add(i)).collect();
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        let task_cancel = cancel.clone();
-        let state_addr = &inst.state as *const InstanceState as usize;
-
-        let task = Task::new(
-            move |_arena| {
-                let state = unsafe { &*(state_addr as *const InstanceState) };
-
-                let mut sources = Vec::with_capacity(src_bufs.len());
-                for i in 0..src_bufs.len() {
-                    if src_bufs[i] != 0 && src_notifys[i].is_some() && src_lengths[i] > 0 {
-                        let cb = unsafe {
-                            CallbackReader::new(
-                                src_bufs[i] as *mut u8,
-                                src_notifys[i].unwrap(),
-                                src_lengths[i] as u64,
-                                Some(cancel.clone()),
-                            )
-                        };
-                        sources.push(BoxedReader(Box::new(cb)));
-                    }
-                }
-
-                let mut sink_vec = Vec::with_capacity(snk_bufs.len());
-                for i in 0..snk_bufs.len() {
-                    if snk_bufs[i] != 0 && snk_notifys[i].is_some() {
-                        let cb = unsafe {
-                            CallbackWriter::new(
-                                snk_bufs[i] as *mut u8,
-                                snk_notifys[i].unwrap(),
-                                Some(cancel.clone()),
-                            )
-                        };
-                        sink_vec.push(BoxedWriter(Box::new(cb)));
-                    }
-                }
-
-                let result = handle_request(state, &request_owned, None, sources, sink_vec);
-
-                let isolate = allo_isolate::Isolate::new(result_port);
-                isolate.post(allo_isolate::ZeroCopyBuffer(result));
-            },
-            task_cancel,
-        );
-
-        let _ = inst.pool.submit(task);
-    }
-
-    /// Destroy an instance. Drops all handles, drains the pool.
-    ///
-    /// After this call, the instance pointer is invalid.
-    /// All documents, editors, builders — gone.
-    /// All pool threads — stopped and joined.
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_shutdown(instance: *mut std::ffi::c_void) {
-        if instance.is_null() { return; }
-        let inst = Box::from_raw(instance as *mut NativeInstance);
-        // Set cancel flag so in-flight readers/writers bail early.
-        inst.state.cancel.store(true, Ordering::Relaxed);
-        // Drop inst — ThreadPool::drop drains threads, HashMap::drop frees handles.
-        drop(inst);
-    }
-
-    // ── Sync buffer lifecycle (called by Dart coordinator) ──
-    //
-    // Cross-platform: std::sync::Mutex + Condvar stored as heap-allocated
-    // SyncPair, pointer written into the buffer's sync_ptr slot.
-
-    use crate::host::native::shared_buffer as sb;
-
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_init_read_buffer(buf: *mut u8) {
-        sb::init_sync(buf, sb::read_channel::OFFSET_SYNC_PTR);
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_destroy_read_buffer(buf: *mut u8) {
-        sb::destroy_sync(buf, sb::read_channel::OFFSET_SYNC_PTR);
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_signal_read(buf: *mut u8) {
-        sb::notify(buf, sb::read_channel::OFFSET_SYNC_PTR);
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_init_write_buffer(buf: *mut u8) {
-        sb::init_sync(buf, sb::write_channel::OFFSET_SYNC_PTR);
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_destroy_write_buffer(buf: *mut u8) {
-        sb::destroy_sync(buf, sb::write_channel::OFFSET_SYNC_PTR);
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn bridge_signal_write(buf: *mut u8) {
-        sb::notify(buf, sb::write_channel::OFFSET_SYNC_PTR);
-    }
-
-    #[no_mangle]
-    pub extern "C" fn bridge_read_buffer_size() -> i32 {
-        sb::read_channel::TOTAL_SIZE as i32
-    }
-
-    #[no_mangle]
-    pub extern "C" fn bridge_write_buffer_size() -> i32 {
-        sb::write_channel::TOTAL_SIZE as i32
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// WASM entry point — per-instance state in WASM linear memory
-// ═══════════════════════════════════════════════════════════════════
+//
+// The web twin of `host/native/lane.rs`. A Web Worker IS a lane: the
+// browser provides the isolated thread; this module provides the
+// lane's owned state and the call into the shared request brain.
+// Decision-free by design — routing, pinning, queuing, and cancel
+// bookkeeping all live in the shared Dart Router.
+//
+// Hard kill on web is `worker.terminate()` — the browser frees the
+// whole WASM heap with the worker, so `lane_destroy` exists only for
+// the graceful path (lane reuse without worker restart).
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_entry {
@@ -1552,27 +1345,33 @@ mod wasm_entry {
     use crate::host::wasm::js_writer::JsCallbackWriter;
     use wasm_bindgen::prelude::*;
 
-    /// Create a new engine instance. Returns a WASM pointer.
+    /// Create this worker's lane state. Returns a WASM pointer.
+    /// Called exactly once per worker, from lane_worker.js bootstrap.
     #[wasm_bindgen]
-    pub fn bridge_init() -> u32 {
-        let instance = Box::new(InstanceState::new());
-        Box::into_raw(instance) as u32
+    pub fn lane_init() -> u32 {
+        let lane = Box::new(LaneState::new());
+        Box::into_raw(lane) as u32
     }
 
-    /// Execute an operation within an instance.
+    /// Execute one job against this lane's state.
     ///
-    /// source_lengths: packed f64 array — each 8 bytes is one source length.
+    /// source_lengths: packed f64 array — each 8 bytes is one source
+    /// length (f64 because JS numbers cross the boundary as doubles).
     /// Sources get indexed readers (0, 1, 2, ...).
     /// sink_count: how many output sinks exist.
     /// Sinks get indexed writers (0, 1, 2, ...).
+    ///
+    /// The worker is single-threaded, so the &mut reconstruction from
+    /// the raw pointer is sound: no other code can hold a reference
+    /// while this runs.
     #[wasm_bindgen]
-    pub fn bridge_execute(
-        instance_ptr: u32,
+    pub fn lane_execute(
+        lane_ptr: u32,
         request_bytes: &[u8],
         source_lengths: &[u8],
         sink_count: u32,
     ) -> Vec<u8> {
-        let state = unsafe { &*(instance_ptr as *const InstanceState) };
+        let state = unsafe { &mut *(lane_ptr as *mut LaneState) };
 
         let mut sources = Vec::new();
         let num_sources = source_lengths.len() / 8;
@@ -1597,12 +1396,13 @@ mod wasm_entry {
         handle_request(state, request_bytes, None, sources, sinks)
     }
 
-    /// Destroy an instance. Drops all handles, frees all WASM heap memory.
+    /// Drop this lane's state, freeing every handle it owns.
+    /// Graceful-path only — `worker.terminate()` makes this moot.
     #[wasm_bindgen]
-    pub fn bridge_shutdown(instance_ptr: u32) {
-        if instance_ptr == 0 { return; }
+    pub fn lane_destroy(lane_ptr: u32) {
+        if lane_ptr == 0 { return; }
         unsafe {
-            let _ = Box::from_raw(instance_ptr as *mut InstanceState);
+            let _ = Box::from_raw(lane_ptr as *mut LaneState);
         }
     }
 }

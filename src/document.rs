@@ -2631,24 +2631,35 @@ impl PdfDocument {
         };
         let data = &buf[..n];
 
-        // Search for /Subtype in the buffer
-        // Look for "/Subtype" followed by a name like "/Form" or "/Image"
-        if let Some(pos) = data.windows(8).position(|w| w == b"/Subtype") {
-            let after = &data[pos + 8..];
-            // Skip whitespace
+        // ── pdf_manipulator patch: scan ALL /Subtype hits, not the first ──
+        // Search for /Subtype in the buffer. Scan EVERY occurrence, not
+        // just the first: a Form XObject with an inline font resource
+        // serializes the font's "/Subtype /Type1" BEFORE the outer
+        // "/Subtype /Form", and judging by the first hit misclassifies
+        // the Form as an image — silently dropping its text from
+        // extraction. Any /Form hit wins; misreporting toward "Form"
+        // only costs a full load, misreporting toward "image" loses text.
+        let mut saw_subtype = false;
+        let mut search = data;
+        while let Some(pos) = search.windows(8).position(|w| w == b"/Subtype") {
+            let after = &search[pos + 8..];
             let trimmed = after
                 .iter()
                 .position(|&b| b != b' ' && b != b'\t' && b != b'\r' && b != b'\n');
             if let Some(start) = trimmed {
-                let name_data = &after[start..];
-                if name_data.starts_with(b"/Form") {
+                saw_subtype = true;
+                if after[start..].starts_with(b"/Form") {
                     return true;
                 }
-                // Image, PS, or anything else — not a Form
-                self.image_xobject_cache.lock_or_recover().insert(obj_ref);
-                return false;
             }
+            search = &search[pos + 8..];
         }
+        if saw_subtype {
+            // At least one /Subtype seen, none of them /Form — not a Form.
+            self.image_xobject_cache.lock_or_recover().insert(obj_ref);
+            return false;
+        }
+        // ── end pdf_manipulator patch ──
 
         // /Subtype not found in first 1KB — conservative fallback
         true
