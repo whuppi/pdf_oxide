@@ -148,8 +148,8 @@ fn encode_jpeg(data: &[u8], width: u32, height: u32, components: u8, quality: u8
         1 => (data.to_vec(), ExtendedColorType::L8),
         3 => (data.to_vec(), ExtendedColorType::Rgb8),
         4 => {
-            // CMYK → RGB (Rust image crate cannot encode CMYK JPEG).
-            // QPDF uses libjpeg's JCS_CMYK — we don't have that in Rust.
+            // CMYK → RGB before encoding — the image crate cannot
+            // encode CMYK JPEG (libjpeg's JCS_CMYK has no Rust port).
             let mut rgb = Vec::with_capacity((width * height * 3) as usize);
             for chunk in data.chunks_exact(4) {
                 let c = chunk[0] as f32 / 255.0;

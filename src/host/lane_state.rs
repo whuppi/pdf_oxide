@@ -9,8 +9,8 @@
 //! checker enforces single ownership at compile time.
 //!
 //! Do NOT add Mutex/RwLock/Atomic fields here. If a field seems to
-//! need one, state is escaping its lane — that's an architecture
-//! violation (shared-brain/dumb-edges law), not a locking problem.
+//! need one, state is escaping its lane — fix the escape, don't add
+//! the lock.
 
 use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;

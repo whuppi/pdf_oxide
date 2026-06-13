@@ -1,5 +1,7 @@
 //! Write trait with position tracking — no Seek required.
 //!
+//! This file is part of the pdf_manipulator host layer (NOT upstream).
+//!
 //! PDF serialization needs to know byte offsets for the xref table
 //! but never seeks backwards. PositionedWrite captures exactly that:
 //! sequential Write + "where am I?" position query.

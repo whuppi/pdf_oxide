@@ -580,7 +580,7 @@ impl EncryptDictBuilder {
                 &user_hash,
                 revision,
             )?;
-            // ── pdf_manipulator patch: /Perms is mandatory for R6 ──
+            // ── pdf_manipulator patch: /Perms + raw file key for R6 ──
             let perms = algorithms::compute_perms(
                 self.permissions,
                 self.encrypt_metadata,
