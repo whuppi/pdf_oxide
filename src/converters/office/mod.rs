@@ -163,9 +163,11 @@ impl OfficeConverter {
     /// Embedded font programs under `word/fonts/` are not yet plumbed
     /// into the IR renderer; that's tracked separately.
     pub fn convert_docx_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        // ── pdf_manipulator patch: delegate to the streaming converter ──
         let mut buf = std::io::Cursor::new(Vec::new());
         self.convert_docx_reader_to_writer(std::io::Cursor::new(bytes.to_vec()), &mut buf)?;
         Ok(buf.into_inner())
+        // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: streaming DOCX→PDF (O(1) input via reader) ──
@@ -202,9 +204,11 @@ impl OfficeConverter {
     /// like body text and honour their per-cell font sizes; genuine
     /// grids stay as tables and go through `render_table`.
     pub fn convert_xlsx_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        // ── pdf_manipulator patch: delegate to the streaming converter ──
         let mut buf = std::io::Cursor::new(Vec::new());
         self.convert_xlsx_reader_to_writer(std::io::Cursor::new(bytes.to_vec()), &mut buf)?;
         Ok(buf.into_inner())
+        // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: streaming XLSX→PDF (O(1) input via reader) ──
@@ -239,9 +243,11 @@ impl OfficeConverter {
     /// by `PdfDocument::to_pptx_bytes`) are registered with the
     /// renderer so the original typeface is preserved.
     pub fn convert_pptx_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        // ── pdf_manipulator patch: delegate to the streaming converter ──
         let mut buf = std::io::Cursor::new(Vec::new());
         self.convert_pptx_reader_to_writer(std::io::Cursor::new(bytes.to_vec()), &mut buf)?;
         Ok(buf.into_inner())
+        // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: streaming PPTX→PDF (O(1) input via reader) ──
@@ -277,7 +283,7 @@ impl OfficeConverter {
             "doc" => {
                 let bytes =
                     std::fs::read(&path).map_err(|e| Error::InvalidOperation(e.to_string()))?;
-                let cursor = std::io::Cursor::new(bytes.to_vec());
+                let cursor = std::io::Cursor::new(bytes);
                 let doc = Document::from_reader(cursor, DocumentFormat::Doc)
                     .map_err(|e| Error::InvalidOperation(format!("DOC parse: {e}")))?;
                 ir_to_pdf_bytes(&doc.to_ir(), &self.config, &[])
@@ -327,26 +333,6 @@ fn has_positional_layout(ir: &DocumentIR) -> bool {
     false
 }
 
-/// Render an IR with frame positions to PDF bytes. Each positioned
-/// paragraph lands at its absolute coordinates on the page; text uses
-/// the run properties (font, size, bold/italic) from the IR.
-///
-/// Pages are derived from the IR section list; per-section page
-/// breaks (the IR carries the source's hard `<w:br w:type="page"/>`
-/// breaks as `Element::ThematicBreak`) advance to a new page sharing
-/// the section's geometry, so an 8-page layout-preserving PDF→DOCX
-/// round-trips back to 8 PDF pages with each page's positioned
-/// paragraphs landing on the correct page.
-fn _render_positional_ir(
-    ir: &DocumentIR,
-    config: &OfficeConfig,
-    extra_fonts: &[(String, Vec<u8>)],
-) -> Result<Vec<u8>> {
-    render_positional_ir_core(ir, config, extra_fonts, |builder| {
-        builder.build().map_err(|e| Error::InvalidOperation(format!("positional PDF build: {e}")))
-    })
-}
-
 // ── pdf_manipulator patch: streaming positional render + core refactor ──
 pub(crate) fn render_positional_ir_writer<W: std::io::Write>(
     ir: &DocumentIR, config: &OfficeConfig, extra_fonts: &[(String, Vec<u8>)], output: &mut W,
@@ -359,6 +345,16 @@ pub(crate) fn render_positional_ir_writer<W: std::io::Write>(
     })
 }
 
+/// Render an IR with frame positions to PDF bytes. Each positioned
+/// paragraph lands at its absolute coordinates on the page; text uses
+/// the run properties (font, size, bold/italic) from the IR.
+///
+/// Pages are derived from the IR section list; per-section page
+/// breaks (the IR carries the source's hard `<w:br w:type="page"/>`
+/// breaks as `Element::ThematicBreak`) advance to a new page sharing
+/// the section's geometry, so an 8-page layout-preserving PDF→DOCX
+/// round-trips back to 8 PDF pages with each page's positioned
+/// paragraphs landing on the correct page.
 fn render_positional_ir_core<R>(
     ir: &DocumentIR,
     config: &OfficeConfig,
@@ -1417,6 +1413,8 @@ fn resolve_font_for_text(source_name: &str, text: &str) -> String {
 /// Returns the name to advertise to `resolve_font_for_text`
 /// (or `None` if no non-Latin text was found / no font could be
 /// loaded).
+// ── pdf_manipulator patch: pub(crate) for the streaming converters ──
+// ── end pdf_manipulator patch ──
 pub(crate) fn maybe_load_unicode_fallback(
     ir: &DocumentIR,
     extra_fonts: &mut Vec<(String, Vec<u8>)>,
@@ -1438,6 +1436,8 @@ pub(crate) fn maybe_load_unicode_fallback(
 /// [`crate::fonts::unicode_fallback::UNICODE_FALLBACK_CJK_NAME`].
 /// Returns the name to advertise to `resolve_font_for_text` (or
 /// `None` if no CJK text was found / no CJK font is available).
+// ── pdf_manipulator patch: pub(crate) for the streaming converters ──
+// ── end pdf_manipulator patch ──
 pub(crate) fn maybe_load_cjk_fallback(
     ir: &DocumentIR,
     extra_fonts: &mut Vec<(String, Vec<u8>)>,
@@ -2110,20 +2110,6 @@ fn pptx_has_positional(ir: &DocumentIR) -> bool {
     false
 }
 
-/// Render a PPTX `DocumentIR` to PDF where each section becomes one
-/// page sized to the slide geometry, the section background (if any)
-/// fills the page, and each positioned `TextBox` lands at its EMU
-/// rectangle.
-fn _render_pptx_positional(
-    ir: &DocumentIR,
-    config: &OfficeConfig,
-    extra_fonts: &[(String, Vec<u8>)],
-) -> Result<Vec<u8>> {
-    render_pptx_positional_core(ir, config, extra_fonts, |builder| {
-        builder.build().map_err(|e| Error::InvalidOperation(format!("PPTX positional PDF build: {e}")))
-    })
-}
-
 // ── pdf_manipulator patch: streaming PPTX positional render ──
 pub(crate) fn render_pptx_positional_writer<W: std::io::Write>(
     ir: &DocumentIR, config: &OfficeConfig, extra_fonts: &[(String, Vec<u8>)], output: &mut W,
@@ -2135,8 +2121,11 @@ pub(crate) fn render_pptx_positional_writer<W: std::io::Write>(
             .map_err(|e| Error::InvalidOperation(format!("PPTX positional PDF build: {e}")))
     })
 }
-// ── end pdf_manipulator patch ──
 
+/// Render a PPTX `DocumentIR` to PDF where each section becomes one
+/// page sized to the slide geometry, the section background (if any)
+/// fills the page, and each positioned `TextBox` lands at its EMU
+/// rectangle.
 fn render_pptx_positional_core<R>(
     ir: &DocumentIR,
     config: &OfficeConfig,
@@ -2276,6 +2265,7 @@ fn render_pptx_positional_core<R>(
     );
     result
 }
+// ── end pdf_manipulator patch ──
 
 /// Render a single section-level IR element on a positioned slide
 /// page. Handles `TextBox` (positioned shape), `Heading` (title at top

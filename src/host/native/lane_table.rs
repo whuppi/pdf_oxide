@@ -482,7 +482,6 @@ mod tests {
         wait_until(Duration::from_secs(20), || controller.channels.live_count() > 0)
     }
 
-
     #[test]
     fn spawn_and_kill_lane_with_no_jobs() {
         let key = spawn();
@@ -666,8 +665,8 @@ mod tests {
         }
 
         // No thread may remain for the skipped waiters (or anything
-        // else from this batch). Other tests run in parallel, so we
-        // only require convergence to a small steady level.
+        // else from this batch). Other tests run in parallel, so the
+        // assertion only requires convergence, not an exact count.
         assert!(
             wait_until(Duration::from_secs(10), || {
                 keys.iter().all(|k| controller_for(*k).is_none())

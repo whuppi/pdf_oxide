@@ -28,6 +28,8 @@
 //! let (dict, stream_bytes) = ap.build();
 //! ```
 
+// ── pdf_manipulator patch: StampType unused — for_stamp takes a label ──
+// ── end pdf_manipulator patch ──
 use crate::annotation_types::{
     AnnotationColor, CaretSymbol, LineEndingStyle, TextAnnotationIcon,
 };
@@ -263,6 +265,8 @@ impl AppearanceStreamBuilder {
     }
 
     /// Create an appearance stream for a stamp annotation.
+    // ── pdf_manipulator patch: for_stamp takes label + color ──
+    // ── end pdf_manipulator patch ──
     pub fn for_stamp(rect: Rect, label: &str, color: AnnotationColor) -> Self {
         let mut builder = Self::new(Rect::new(0.0, 0.0, rect.width, rect.height));
 
@@ -301,7 +305,7 @@ impl AppearanceStreamBuilder {
         content.push_str(&format!("{} {} {} {} {} {} c\n", 0.0, r, 0.0, 0.0, r, 0.0));
         content.push_str("S\n");
 
-        // ── pdf_manipulator patch: render the stamp label (was border-only) ──
+        // ── pdf_manipulator patch: stamp label rendering ──
         if !label.is_empty() {
             // Fit the label inside the border: cap height at 60% of the
             // box, width at ~90% using the 0.6-em average glyph width
@@ -1156,6 +1160,7 @@ mod tests {
         assert!(content_str.contains("h f")); // Closed arrow fill
     }
 
+    // ── pdf_manipulator patch: stamp tests track the label signature ──
     #[test]
     fn test_stamp_appearance() {
         let rect = Rect::new(0.0, 0.0, 150.0, 50.0);
@@ -1173,6 +1178,7 @@ mod tests {
         let res = dict.get("Resources").and_then(|r| r.as_dict()).unwrap();
         assert!(res.get("Font").and_then(|f| f.as_dict()).unwrap().contains_key("F0"));
     }
+    // ── end pdf_manipulator patch ──
 
     #[test]
     fn test_caret_appearance() {
@@ -1628,6 +1634,7 @@ mod tests {
     // Stamp appearance tests
     // ==========================================
 
+    // ── pdf_manipulator patch: stamp tests track the label signature ──
     #[test]
     fn test_stamp_rounded_corners() {
         let rect = Rect::new(0.0, 0.0, 120.0, 40.0);
@@ -1654,6 +1661,7 @@ mod tests {
         let (_, content) = ap.build();
         assert!(!content.is_empty());
     }
+    // ── end pdf_manipulator patch ──
 
     // ==========================================
     // Line appearance tests

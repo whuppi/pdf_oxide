@@ -168,6 +168,8 @@ pub struct EncryptDict {
     /// "V2" = RC4-128, "AESV2" = AES-128. None means not specified (defaults to AES-128).
     pub stream_crypt_method: Option<String>,
     // ── pdf_manipulator patch: expose the raw file key to the writer ──
+    // Every `file_key:` line in this file's struct literals (parse
+    // paths, tests) and in handler.rs is fallout of this field.
     /// The raw file encryption key, populated by `build_with_key`.
     /// NOT a dictionary entry — never serialized; it exists so the
     /// writer can encrypt streams with the SAME key the dict
@@ -588,13 +590,12 @@ impl EncryptDictBuilder {
                 &user_hash,
                 revision,
             )?;
-            // ── pdf_manipulator patch: /Perms is mandatory for R6 ──
+            // ── pdf_manipulator patch: /Perms + raw file key for R6 ──
             let perms = algorithms::compute_perms(
                 self.permissions,
                 self.encrypt_metadata,
                 &file_key,
             )?;
-            // ── end pdf_manipulator patch ──
             return Ok(EncryptDict {
                 filter: "Standard".to_string(),
                 sub_filter: None,
@@ -611,6 +612,7 @@ impl EncryptDictBuilder {
                 stream_crypt_method: None,
                 file_key: Some(file_key),
             });
+            // ── end pdf_manipulator patch ──
         }
 
         // Compute owner password hash (O value)
@@ -649,10 +651,12 @@ impl EncryptDictBuilder {
             user_encryption: None,
             perms: None,
             stream_crypt_method: None,
+            // ── pdf_manipulator patch: R<=4 raw file key ──
             // For R<=4 the file key IS the password-derived key — expose
             // it so the writer encrypts with the same key the dict
             // advertises (R6 exposes its random key the same way).
             file_key: Some(encryption_key),
+            // ── end pdf_manipulator patch ──
         })
     }
 }

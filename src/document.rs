@@ -56,8 +56,8 @@ pub enum ReadingOrder {
 // callback-backed Read+Seek (condvar on native, SAB/Asyncify on web).
 // The source file is never fully buffered in memory.
 
-/// Trait alias for Read + Seek + Send. Rust doesn't allow multiple
-/// non-auto traits in a trait object, so we combine them here.
+/// Trait alias for Read + Seek + Send — trait objects allow only one
+/// non-auto trait, so the bound needs a single name.
 pub(crate) trait ReadSeek: Read + Seek + Send {}
 impl<T: Read + Seek + Send> ReadSeek for T {}
 
@@ -20441,9 +20441,11 @@ impl PdfDocument {
     /// Use this when downstream callers will edit the DOCX in Word /
     /// LibreOffice; use the default for pixel-faithful round trips.
     pub fn to_docx_bytes_flow(&self) -> Result<Vec<u8>> {
+        // ── pdf_manipulator patch: delegate to the streaming exporter ──
         let mut buf = std::io::Cursor::new(Vec::new());
         self.to_docx_writer_flow(&mut buf)?;
         Ok(buf.into_inner())
+        // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: streaming DOCX/PPTX/XLSX export ──
@@ -21356,7 +21358,10 @@ impl PdfDocument {
         // Parse content stream with image-only fast path (skips BT/ET text blocks)
         let operators = match parse_content_stream_images_only(&content_data) {
             Ok(ops) => ops,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => {
+                // If content stream parsing fails, return empty
+                return Ok(Vec::new());
+            },
         };
 
         let mut images = Vec::new();

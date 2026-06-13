@@ -107,6 +107,19 @@ pub(crate) fn handle_request(
     fn take_sink(sinks: &mut Vec<BoxedWriter>, idx: usize) -> Option<BoxedWriter> {
         if idx < sinks.len() { Some(sinks.remove(idx)) } else { None }
     }
+    // Helper: take the op's DATA source (image bytes, embedded file,
+    // merge document). Pinned ops re-create the document reader at
+    // sources[0], so their data rides at sources[1]; non-pinned ops
+    // carry data at sources[0].
+    fn take_data_reader(sources: &mut Vec<BoxedReader>) -> Option<BoxedReader> {
+        if sources.len() > 1 {
+            Some(sources.remove(1))
+        } else if !sources.is_empty() {
+            Some(sources.remove(0))
+        } else {
+            None
+        }
+    }
 
     // Ops that produce output via sinks[0].
     match req.op() {
@@ -125,11 +138,8 @@ pub(crate) fn handle_request(
         // ── Document handle lifecycle ──
         "open" => handle_open(state, &req, source_bytes, take_source(&mut sources, 0)),
         "docDispose" => {
-            let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            state.documents.remove(&hid);
-            let mut w = ResponseWriter::ok();
-            w.put_bool("disposed", true);
-            w.finish()
+            state.documents.remove(&req_handle(&req));
+            ok_flag("disposed")
         }
 
         // ── Document read ops (reuse already-parsed doc via handleId) ──
@@ -215,17 +225,11 @@ pub(crate) fn handle_request(
             Ok(w.finish())
         }),
 
-        // ── One-shot write ops ──
-        "sign" => ResponseWriter::error("sign: use early-return path"),
-
         // ── Editor lifecycle ──
         "editorOpen" => handle_editor_open(state, &req, source_bytes, take_source(&mut sources, 0)),
         "editorDispose" => {
-            let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            state.editors.remove(&hid);
-            let mut w = ResponseWriter::ok();
-            w.put_bool("disposed", true);
-            w.finish()
+            state.editors.remove(&req_handle(&req));
+            ok_flag("disposed")
         }
         "editorGetMetadata" => handle_with_editor(state, &req, |editor, _| {
             let m = dispatch::edit_get_metadata(editor);
@@ -261,117 +265,32 @@ pub(crate) fn handle_request(
             w.put_i32("count", count as i32);
             Ok(w.finish())
         }),
-        // For pinned ops, sources[0] is the re-created PDF reader (unused by
-        // the editor — it has its own internal reader). sources[1] is the
-        // actual data (image, file). For non-pinned ops, sources is empty.
         "editorMutate" => {
-            let data = if sources.len() > 1 {
-                Some(sources.remove(1))
-            } else if !sources.is_empty() {
-                Some(sources.remove(0))
-            } else {
-                None
-            };
+            let data = take_data_reader(&mut sources);
             handle_editor_mutate(state, &req, data)
         }
         "editorMergeFrom" => {
-            let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            let editors = &mut state.editors;
-            let editor = match editors.get_mut(&hid) {
-                Some(e) => e,
-                None => return ResponseWriter::error("editor not found"),
-            };
-            // sources[1] = merge data (pinned ops), sources[0] = merge data (non-pinned)
-            let merge_reader = if sources.len() > 1 {
-                Some(sources.remove(1))
-            } else if !sources.is_empty() {
-                Some(sources.remove(0))
-            } else {
-                None
-            };
-            let result = if let Some(reader) = merge_reader {
-                editor.merge_from_reader(reader.0)
-            } else if let Some(other) = req.get_bytes("otherBytes") {
-                editor.merge_from_bytes(other)
-            } else {
-                return ResponseWriter::error("editorMergeFrom: no source");
-            };
-            match result {
-                Ok(_) => {
-                    let mut w = ResponseWriter::ok();
-                    w.put_bool("merged", true);
-                    w.finish()
-                }
-                Err(e) => ResponseWriter::error(&e.to_string()),
-            }
+            let data = take_data_reader(&mut sources);
+            handle_editor_merge_from(state, &req, data)
         }
 
         // ── Builder lifecycle ──
-        "builderCreate" => {
-            let builder = dispatch::builder_new();
-            let hid = state.next_handle_id();
-            state.builders.insert(hid, builder);
-            let mut w = ResponseWriter::ok();
-            w.put_i32("handleId", hid as i32);
-            w.finish()
-        }
+        "builderCreate" => handle_builder_create(state),
         "builderDispose" => {
-            let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+            let hid = req_handle(&req);
             state.builders.remove(&hid);
             state.page_ops.remove(&hid);
-            let mut w = ResponseWriter::ok();
-            w.put_bool("disposed", true);
-            w.finish()
+            ok_flag("disposed")
         }
-        "builderSetMetadata" => {
-            let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            let builders = &mut state.builders;
-            if let Some(b) = builders.remove(&hid) {
-                let mut b = b;
-                if let Some(v) = req.get_str("title") { b = dispatch::builder_set_title(b, v); }
-                if let Some(v) = req.get_str("author") { b = dispatch::builder_set_author(b, v); }
-                if let Some(v) = req.get_str("subject") { b = dispatch::builder_set_subject(b, v); }
-                if let Some(v) = req.get_str("keywords") { b = dispatch::builder_set_keywords(b, v); }
-                builders.insert(hid, b);
-                let mut w = ResponseWriter::ok();
-                w.put_bool("set", true);
-                w.finish()
-            } else {
-                ResponseWriter::error("builder not found")
-            }
-        }
-        "builderAddPage" => {
-            let hid = req.get_i32("handleId").unwrap_or(0) as u32;
-            let page_type = req.get_str("pageType");
-            let width = req.get_f64("width");
-            let height = req.get_f64("height");
-            let size = match page_type {
-                Some("a4") => PageSize::A4,
-                Some("letter") => PageSize::Letter,
-                _ => PageSize::Custom(
-                    width.unwrap_or(595.0) as f32,
-                    height.unwrap_or(842.0) as f32,
-                ),
-            };
-            let (pw, ph) = size.dimensions();
-            state.page_ops
-                .entry(hid)
-                .or_default()
-                .push(dispatch::PageOp::NewPage { width: pw, height: ph });
-            let mut w = ResponseWriter::ok();
-            w.put_bool("added", true);
-            w.finish()
-        }
+        "builderSetMetadata" => handle_builder_set_metadata(state, &req),
+        "builderAddPage" => handle_builder_add_page(state, &req),
         "builderPageOp" => handle_builder_page_op(state, &req, take_source(&mut sources, 0)),
         "builderPageDone" => {
-            let hid = req.get_i32("handleId").unwrap_or(0) as u32;
             state.page_ops
-                .entry(hid)
+                .entry(req_handle(&req))
                 .or_default()
                 .push(dispatch::PageOp::Done);
-            let mut w = ResponseWriter::ok();
-            w.put_bool("done", true);
-            w.finish()
+            ok_flag("done")
         }
 
         _ => ResponseWriter::error(&format!("unknown op: {}", req.op())),
@@ -381,6 +300,106 @@ pub(crate) fn handle_request(
 // ═══════════════════════════════════════════════════════════════════
 // Op handlers — each takes &mut LaneState; no handler touches globals
 // ═══════════════════════════════════════════════════════════════════
+
+/// The request's handle id (0 when absent — never a valid handle).
+fn req_handle(req: &Request<'_>) -> u32 {
+    req.get_i32("handleId").unwrap_or(0) as u32
+}
+
+/// A success response carrying a single `true` flag.
+fn ok_flag(key: &str) -> Vec<u8> {
+    let mut w = ResponseWriter::ok();
+    w.put_bool(key, true);
+    w.finish()
+}
+
+/// Open a document from the op's source: the streaming reader when the
+/// transport provided one, else inline bytes. `Err` carries the
+/// encoded error response, ready to return.
+fn open_source(
+    source_bytes: Option<&[u8]>,
+    source_reader: Option<BoxedReader>,
+    op: &str,
+) -> Result<PdfDocument, Vec<u8>> {
+    if let Some(reader) = source_reader {
+        PdfDocument::from_external_reader(reader.0)
+            .map_err(|e| ResponseWriter::error(&e.to_string()))
+    } else if let Some(bytes) = source_bytes {
+        PdfDocument::from_bytes(bytes.to_vec())
+            .map_err(|e| ResponseWriter::error(&e.to_string()))
+    } else {
+        Err(ResponseWriter::error(&format!("no source for {op}")))
+    }
+}
+
+fn handle_builder_create(state: &mut LaneState) -> Vec<u8> {
+    let builder = dispatch::builder_new();
+    let hid = state.next_handle_id();
+    state.builders.insert(hid, builder);
+    let mut w = ResponseWriter::ok();
+    w.put_i32("handleId", hid as i32);
+    w.finish()
+}
+
+fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+    let hid = req_handle(req);
+    let Some(mut b) = state.builders.remove(&hid) else {
+        return ResponseWriter::error("builder not found");
+    };
+    if let Some(v) = req.get_str("title") {
+        b = dispatch::builder_set_title(b, v);
+    }
+    if let Some(v) = req.get_str("author") {
+        b = dispatch::builder_set_author(b, v);
+    }
+    if let Some(v) = req.get_str("subject") {
+        b = dispatch::builder_set_subject(b, v);
+    }
+    if let Some(v) = req.get_str("keywords") {
+        b = dispatch::builder_set_keywords(b, v);
+    }
+    state.builders.insert(hid, b);
+    ok_flag("set")
+}
+
+fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+    let size = match req.get_str("pageType") {
+        Some("a4") => PageSize::A4,
+        Some("letter") => PageSize::Letter,
+        _ => PageSize::Custom(
+            req.get_f64("width").unwrap_or(595.0) as f32,
+            req.get_f64("height").unwrap_or(842.0) as f32,
+        ),
+    };
+    let (pw, ph) = size.dimensions();
+    state
+        .page_ops
+        .entry(req_handle(req))
+        .or_default()
+        .push(dispatch::PageOp::NewPage { width: pw, height: ph });
+    ok_flag("added")
+}
+
+fn handle_editor_merge_from(
+    state: &mut LaneState,
+    req: &Request<'_>,
+    merge_reader: Option<BoxedReader>,
+) -> Vec<u8> {
+    let Some(editor) = state.editors.get_mut(&req_handle(req)) else {
+        return ResponseWriter::error("editor not found");
+    };
+    let result = if let Some(reader) = merge_reader {
+        editor.merge_from_reader(reader.0)
+    } else if let Some(other) = req.get_bytes("otherBytes") {
+        editor.merge_from_bytes(other)
+    } else {
+        return ResponseWriter::error("editorMergeFrom: no source");
+    };
+    match result {
+        Ok(_) => ok_flag("merged"),
+        Err(e) => ResponseWriter::error(&e.to_string()),
+    }
+}
 
 /// Authenticates `doc` against the request's optional password, or
 /// returns the error response that refuses the operation.
@@ -410,18 +429,9 @@ fn handle_open(
     source_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
     let password = req.get_str("password");
-    let mut doc = if let Some(reader) = source_reader {
-        match PdfDocument::from_external_reader(reader.0) {
-            Ok(d) => d,
-            Err(e) => return ResponseWriter::error(&e.to_string()),
-        }
-    } else if let Some(bytes) = source_bytes {
-        match PdfDocument::from_bytes(bytes.to_vec()) {
-            Ok(d) => d,
-            Err(e) => return ResponseWriter::error(&e.to_string()),
-        }
-    } else {
-        return ResponseWriter::error("no source for open");
+    let mut doc = match open_source(source_bytes, source_reader, "open") {
+        Ok(d) => d,
+        Err(resp) => return resp,
     };
     if let Some(resp) = authenticate_or_refuse(&doc, password) {
         return resp;
@@ -463,18 +473,9 @@ fn handle_editor_open(
     source_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
     let password = req.get_str("password");
-    let doc = if let Some(reader) = source_reader {
-        match PdfDocument::from_external_reader(reader.0) {
-            Ok(d) => d,
-            Err(e) => return ResponseWriter::error(&e.to_string()),
-        }
-    } else if let Some(bytes) = source_bytes {
-        match PdfDocument::from_bytes(bytes.to_vec()) {
-            Ok(d) => d,
-            Err(e) => return ResponseWriter::error(&e.to_string()),
-        }
-    } else {
-        return ResponseWriter::error("no source for editorOpen");
+    let doc = match open_source(source_bytes, source_reader, "editorOpen") {
+        Ok(d) => d,
+        Err(resp) => return resp,
     };
     if let Some(resp) = authenticate_or_refuse(&doc, password) {
         return resp;
@@ -493,7 +494,7 @@ fn handle_editor_open(
 fn handle_with_doc<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let docs = &mut state.documents;
     match docs.get_mut(&hid) {
         Some(doc) => match f(doc, req) {
@@ -507,7 +508,7 @@ where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
 fn handle_with_editor<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut DocumentEditor, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let editors = &mut state.editors;
     match editors.get_mut(&hid) {
         Some(editor) => match f(editor, req) {
@@ -527,7 +528,7 @@ fn handle_editor_mutate(
         Some(op) => op,
         None => return ResponseWriter::error("missing editOp"),
     };
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let editors = &mut state.editors;
     let editor = match editors.get_mut(&hid) {
         Some(e) => e,
@@ -754,7 +755,7 @@ fn handle_builder_page_op(
     req: &Request<'_>,
     mut data_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let page_op = match req.get_str("pageOp") {
         Some(op) => op,
         None => return ResponseWriter::error("missing pageOp"),
@@ -860,9 +861,7 @@ fn handle_builder_page_op(
         .or_default()
         .push(op);
 
-    let mut w = ResponseWriter::ok();
-    w.put_bool("buffered", true);
-    w.finish()
+    ok_flag("buffered")
 }
 
 fn handle_convert_to(
@@ -875,7 +874,7 @@ fn handle_convert_to(
     let format = req.get_str("format").unwrap_or("docx");
 
     // Try handle-based path first (if caller opened the doc already).
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     if hid > 0 {
         let docs = &mut state.documents;
         if let Some(doc) = docs.get_mut(&hid) {
@@ -885,18 +884,9 @@ fn handle_convert_to(
 
     // One-shot path: open from source, convert, no handle needed.
     // O(1)-memory via BoxedReader when available.
-    let mut doc = if let Some(reader) = source_reader {
-        match PdfDocument::from_external_reader(reader.0) {
-            Ok(d) => d,
-            Err(e) => return ResponseWriter::error(&e.to_string()),
-        }
-    } else if let Some(bytes) = source_bytes {
-        match PdfDocument::from_bytes(bytes.to_vec()) {
-            Ok(d) => d,
-            Err(e) => return ResponseWriter::error(&e.to_string()),
-        }
-    } else {
-        return ResponseWriter::error("no source for convertTo");
+    let mut doc = match open_source(source_bytes, source_reader, "convertTo") {
+        Ok(d) => d,
+        Err(resp) => return resp,
     };
 
     if let Some(resp) = authenticate_or_refuse(&doc, req.get_str("password")) {
@@ -914,9 +904,7 @@ fn convert_to_with_doc(
     if let Some(mut writer) = sink_writer {
         match dispatch::convert_to_format_writer(doc, format, &mut writer) {
             Ok(()) => {
-                let mut w = ResponseWriter::ok();
-                w.put_bool("streamed", true);
-                w.finish()
+                ok_flag("streamed")
             }
             Err(e) => ResponseWriter::error(&e.to_string()),
         }
@@ -945,18 +933,14 @@ fn handle_convert_to_pdf(
         if let Some(reader) = source_reader {
             match dispatch::convert_from_format_writer(reader, format, &mut writer) {
                 Ok(()) => {
-                    let mut w = ResponseWriter::ok();
-                    w.put_bool("streamed", true);
-                    w.finish()
+                    ok_flag("streamed")
                 }
                 Err(e) => ResponseWriter::error(&e.to_string()),
             }
         } else if let Some(bytes) = source_bytes {
             match dispatch::convert_from_format_writer(std::io::Cursor::new(bytes.to_vec()), format, &mut writer) {
                 Ok(()) => {
-                    let mut w = ResponseWriter::ok();
-                    w.put_bool("streamed", true);
-                    w.finish()
+                    ok_flag("streamed")
                 }
                 Err(e) => ResponseWriter::error(&e.to_string()),
             }
@@ -987,7 +971,7 @@ fn handle_convert_to_pdf(
 }
 
 fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let builders_map = &mut state.builders;
     let builder = match builders_map.remove(&hid) {
         Some(b) => b,
@@ -1003,9 +987,7 @@ fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Op
     if let Some(mut writer) = sink_writer {
         match dispatch::builder_save_to_writer(builder, &mut writer) {
             Ok(()) => {
-                let mut w = ResponseWriter::ok();
-                w.put_bool("streamed", true);
-                w.finish()
+                ok_flag("streamed")
             }
             Err(e) => ResponseWriter::error(&e.to_string()),
         }
@@ -1022,7 +1004,7 @@ fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Op
 }
 
 fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
         Some(d) => d,
@@ -1065,7 +1047,7 @@ fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer:
 }
 
 fn handle_extract_images_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
         Some(d) => d,
@@ -1138,9 +1120,7 @@ fn handle_sign(
             &mut reader, length, &mut writer, &credentials, opts,
         ) {
             Ok(()) => {
-                let mut w = ResponseWriter::ok();
-                w.put_bool("signed", true);
-                w.finish()
+                ok_flag("signed")
             }
             Err(e) => ResponseWriter::error(&e.to_string()),
         }
@@ -1173,7 +1153,7 @@ fn handle_editor_save(
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
 ) -> Vec<u8> {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let editors = &mut state.editors;
     let editor = match editors.get_mut(&hid) {
         Some(e) => e,
@@ -1217,9 +1197,7 @@ fn handle_editor_save(
     if let Some(mut writer) = sink_writer {
         match dispatch::edit_save_with_options(editor, &mut writer, &options) {
             Ok(()) => {
-                let mut w = ResponseWriter::ok();
-                w.put_bool("streamed", true);
-                w.finish()
+                ok_flag("streamed")
             }
             Err(e) => ResponseWriter::error(&e.to_string()),
         }
@@ -1242,7 +1220,7 @@ fn handle_editor_extract_pages(
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
 ) -> Vec<u8> {
-    let hid = req.get_i32("handleId").unwrap_or(0) as u32;
+    let hid = req_handle(req);
     let editors = &mut state.editors;
     let editor = match editors.get_mut(&hid) {
         Some(e) => e,
@@ -1296,9 +1274,7 @@ fn handle_editor_extract_pages(
 
     match result {
         Ok(()) => {
-            let mut w = ResponseWriter::ok();
-            w.put_bool("streamed", true);
-            w.finish()
+            ok_flag("streamed")
         }
         Err(e) => ResponseWriter::error(&e.to_string()),
     }

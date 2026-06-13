@@ -187,8 +187,8 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     let requires_password = is_encrypted && !doc.is_authenticated();
     let is_tagged = doc.structure_tree().ok().flatten().is_some();
 
-    // Encryption info — reads from the encrypt dict via pub(crate) accessors
-    // added by our patch on document.rs. Returns 0 if not encrypted.
+    // Encrypt-dict accessors return None on unencrypted documents —
+    // 0 / 0xFF are the wire's "not encrypted / all permitted" values.
     let enc_algo: u8 = doc.encryption_algorithm().unwrap_or(0);
     let perms: u8 = doc.permission_bits().map(|p| p as u8).unwrap_or(0xFF);
 
@@ -429,7 +429,7 @@ pub fn extract_images_streamed<W: std::io::Write>(
         writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         // image data dropped here — only one image in memory at a time
     }
-    // End marker
+    // A zero-length frame terminates the stream.
     writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
     Ok(count)
 }
@@ -463,7 +463,7 @@ pub fn render_pages_streamed<W: std::io::Write>(
         writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         // RGBA data dropped here — only one page in memory at a time
     }
-    // End marker
+    // A zero-length frame terminates the stream.
     writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
     Ok(count)
 }
@@ -574,10 +574,10 @@ pub fn edit_flatten_all_annotations(editor: &mut DocumentEditor) -> Result<()> {
     editor.flatten_all_annotations()
 }
 
-/// Compress the document (currently a no-op without image recompress).
+/// Compress the document. A no-op: stream deflation is a save-time
+/// option (SaveOptions.compress) and image recompression is the
+/// separate `optimizeImages` op — nothing is left for this call.
 pub fn edit_compress(editor: &mut DocumentEditor, _quality: u8) -> Result<()> {
-    // Image optimization requires the image_optimizer patch.
-    // Compression without image recompress is a no-op for now.
     let _ = editor;
     Ok(())
 }
@@ -623,7 +623,10 @@ pub fn edit_embed_file(editor: &mut DocumentEditor, name: &str, data: Vec<u8>) -
 
 /// Erase rectangular regions from a page's content.
 pub fn edit_erase_regions(editor: &mut DocumentEditor, page: usize, rects: &[[f32; 4]]) -> Result<()> {
-    editor.erase_regions(page, rects)
+    // Destructive by contract: the public op promises the covered
+    // content is GONE from the file, not painted over. The cosmetic
+    // overlay (`erase_regions`) leaves every glyph extractable.
+    editor.erase_regions_destructive(page, rects)
 }
 
 /// Crop all pages by the given margin insets (in points).
@@ -1080,8 +1083,17 @@ fn ensure_page_font(
     Ok(name)
 }
 
-/// Prepend content stream bytes to a page's existing content.
-/// The prepended bytes render BEHIND existing content (under-content).
+/// Prepend a content stream to a page so it renders BEHIND the
+/// existing content (under-content).
+///
+/// The new stream is staged as its OWN object and /Contents becomes an
+/// array `[new, ...existing]` — never a byte-concatenation. The
+/// existing stream is routinely compressed (its dict carries /Filter);
+/// splicing plaintext operators onto raw compressed bytes produces a
+/// stream that decodes to garbage past the prepended part, silently
+/// destroying the page's original content. The array form is the
+/// spec's mechanism for exactly this: elements render as one stream
+/// with whitespace between, and the original bytes are never touched.
 fn prepend_to_page_content(
     editor: &mut DocumentEditor,
     page: usize,
@@ -1092,7 +1104,7 @@ fn prepend_to_page_content(
     let page_ref = editor.source_mut().get_page_ref(page)?;
     // Staged-preferred: ensure_page_font (and any earlier prepend) stages
     // an updated page dict; loading from source would drop that work and
-    // re-resolve a stale Contents reference.
+    // re-resolve a stale Contents value.
     let page_obj = if let Some(staged) =
         editor.modified_objects_mut().get(&page_ref.id)
     {
@@ -1103,49 +1115,43 @@ fn prepend_to_page_content(
     let page_dict = page_obj.as_dict()
         .ok_or_else(|| Error::InvalidPdf("page not a dict".into()))?;
 
-    // Get existing content stream data. The Contents reference may point
-    // at a STAGED stream (a prior prepend on this editor) whose id does
-    // not exist in source — staged objects must win here too.
-    let existing_data = if let Some(contents_ref) = page_dict.get("Contents") {
-        if let Some(r) = contents_ref.as_reference() {
-            let obj = if let Some(staged) =
-                editor.modified_objects_mut().get(&r.id)
-            {
-                staged.clone()
-            } else {
-                editor.source_mut().load_object(r)?
-            };
-            match obj {
-                Object::Stream { data, .. } => data.to_vec(),
-                _ => Vec::new(),
-            }
-        } else if let Object::Stream { data, .. } = contents_ref {
-            data.to_vec()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
-
-    // Prepend watermark stream + existing content
-    let mut new_data = Vec::with_capacity(stream_bytes.len() + existing_data.len());
-    new_data.extend_from_slice(stream_bytes);
-    new_data.extend_from_slice(&existing_data);
-
-    // Build new content stream object
+    // Stage the new under-content stream as its own object.
     let mut content_dict = std::collections::HashMap::new();
-    content_dict.insert("Length".into(), Object::Integer(new_data.len() as i64));
-
+    content_dict.insert("Length".into(), Object::Integer(stream_bytes.len() as i64));
     let content_id = editor.alloc_id();
     editor.insert_modified(content_id, Object::Stream {
         dict: content_dict,
-        data: bytes::Bytes::from(new_data),
+        data: bytes::Bytes::from(stream_bytes.to_vec()),
     });
+    let new_ref = Object::Reference(ObjectRef::new(content_id, 0));
 
-    // Update page to point to new content stream
+    // /Contents = [new, ...existing]. A direct (non-reference) existing
+    // stream is hoisted into its own object first — array elements must
+    // be references.
+    let contents = match page_dict.get("Contents") {
+        None => new_ref,
+        Some(Object::Array(existing)) => {
+            let mut arr = Vec::with_capacity(existing.len() + 1);
+            arr.push(new_ref);
+            arr.extend(existing.iter().cloned());
+            Object::Array(arr)
+        }
+        Some(r @ Object::Reference(_)) => {
+            Object::Array(vec![new_ref, r.clone()])
+        }
+        Some(direct @ Object::Stream { .. }) => {
+            let hoisted_id = editor.alloc_id();
+            editor.insert_modified(hoisted_id, direct.clone());
+            Object::Array(vec![
+                new_ref,
+                Object::Reference(ObjectRef::new(hoisted_id, 0)),
+            ])
+        }
+        Some(_) => new_ref, // malformed /Contents: the overlay becomes the content
+    };
+
     let mut new_page = page_dict.clone();
-    new_page.insert("Contents".into(), Object::Reference(ObjectRef::new(content_id, 0)));
+    new_page.insert("Contents".into(), contents);
     editor.insert_modified(page_ref.id, Object::Dictionary(new_page));
 
     Ok(())

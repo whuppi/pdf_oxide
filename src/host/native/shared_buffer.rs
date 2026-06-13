@@ -1,9 +1,9 @@
-//! Shared memory layout between Rust pool threads and the Dart isolate.
+//! Shared memory layout between Rust lane threads and the Dart isolate.
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
 //! Both sides (Rust + Dart) agree on exact byte offsets. Rust defines
-//! the layout here. Dart mirrors it in `shared_buffer.dart`. The buffer
+//! the layout here; the Dart side mirrors it byte for byte. The buffer
 //! is allocated by Dart via `calloc` and passed to Rust as a raw pointer.
 //!
 //! Two channel types:
@@ -13,7 +13,7 @@
 //! Synchronization: a heap-allocated Mutex+Condvar pair, raw pointer
 //! stored in the buffer's sync_ptr slot (Dart never reads it).
 //! Cross-platform: Linux, macOS, Windows, Android, iOS.
-//! The pool thread sleeps (zero CPU) while waiting. The Dart isolate
+//! The lane thread sleeps (zero CPU) while waiting. The Dart isolate
 //! signals via an FFI call that locks the mutex before notify_one().
 
 use crate::host::native::cancel::CancelToken;
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_pre_cancelled_token_returns_interrupted() {
+    fn wait_pre_cancelled_token_returns_cancelled_error() {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 

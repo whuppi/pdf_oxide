@@ -1,5 +1,7 @@
 //! JsCallbackReader — O(1)-memory source I/O for WASM.
 //!
+//! This file is part of the pdf_manipulator host layer (NOT upstream).
+//!
 //! Implements `Read + Seek` by calling `host_read_at` imported from
 //! the JS global scope via wasm_bindgen.
 //!

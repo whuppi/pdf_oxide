@@ -257,7 +257,7 @@ impl WordBoundaryDetector {
     pub fn new() -> Self {
         Self {
             tj_offset_threshold: -100,
-            // ── pdf_manipulator patch: document the division of labor ──
+            // ── pdf_manipulator patch: geometric-gap threshold contract ──
             // Geometric gap threshold: 80% of font size.
             //
             // This detector clusters characters WITHIN one TJ array,
@@ -292,8 +292,9 @@ impl WordBoundaryDetector {
     /// Set the geometric gap ratio as a fraction of font size.
     ///
     /// Gaps between characters larger than (font_size * ratio) are considered
+    // ── pdf_manipulator patch: doc-comment default matches code (0.8) ──
     /// word boundaries. Default: 0.8
-    // ── pdf_manipulator patch: doc said 0.3; the actual default is 0.8 ──
+    // ── end pdf_manipulator patch ──
     pub fn with_geometric_gap_ratio(mut self, ratio: f32) -> Self {
         self.geometric_gap_ratio = ratio;
         self

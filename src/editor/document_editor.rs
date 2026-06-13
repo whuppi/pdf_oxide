@@ -739,6 +739,7 @@ impl DocumentEditor {
 
     /// Save the document to an in-memory byte vector with specific options.
     pub fn save_to_bytes_with_options(&mut self, options: SaveOptions) -> Result<Vec<u8>> {
+        // ── pdf_manipulator patch: route through the streaming writer ──
         use crate::host::positioned_write::SeekWriter;
         if options.incremental {
             return Err(Error::InvalidPdf(
@@ -748,6 +749,7 @@ impl DocumentEditor {
         let mut writer = SeekWriter::new(std::io::Cursor::new(Vec::new()));
         self.write_full_to_writer(&mut writer, &options)?;
         Ok(writer.into_inner().into_inner())
+        // ── end pdf_manipulator patch ──
     }
 
     /// Find the maximum object ID in the document.
@@ -1349,8 +1351,10 @@ impl DocumentEditor {
     ///
     /// Number of pages merged from the source PDF.
     pub fn merge_from_bytes(&mut self, data: &[u8]) -> Result<usize> {
+        // ── pdf_manipulator patch: shared core with merge_from_reader ──
         let mut source_doc = PdfDocument::from_bytes(data.to_vec())?;
         self.merge_from_document(&mut source_doc)
+        // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: O(1)-memory merge via reader ──
@@ -1779,10 +1783,12 @@ impl DocumentEditor {
     /// Write a full rewrite of the PDF.
     #[cfg(not(target_arch = "wasm32"))]
     fn write_full(&mut self, path: impl AsRef<Path>, options: &SaveOptions) -> Result<()> {
+        // ── pdf_manipulator patch: route through the streaming writer ──
         use crate::host::positioned_write::SeekWriter;
         let file = File::create(path.as_ref())?;
         let mut writer = SeekWriter::new(BufWriter::new(file));
         self.write_full_to_writer(&mut writer, options)
+        // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: zero-clone BFS for GC + trimmed pages staging ──
@@ -1893,8 +1899,11 @@ impl DocumentEditor {
     // ── end pdf_manipulator patch ──
 
     /// Write a full rewrite of the PDF to a generic writer.
-    // ── pdf_manipulator patch: expose write_full_to_writer for dispatch ──
-    // (visibility change only — pub(crate) instead of private)
+    // ── pdf_manipulator patch: pub(crate) + PositionedWrite output ──
+    // Visibility (pub(crate) for dispatch) AND the output type: the
+    // writer is any PositionedWrite, and every byte offset below comes
+    // from writer.position() — all such calls in this function are
+    // part of this patch.
     // ── end pdf_manipulator patch ──
     pub(crate) fn write_full_to_writer(
         &mut self,
@@ -2374,7 +2383,9 @@ impl DocumentEditor {
                         let source_page_count = source_indices.len();
 
                         let mut page_index = 0;
+                        // ── pdf_manipulator patch: page refs fetched once per save ──
                         let cached_page_refs = self.get_page_refs().unwrap_or_default();
+                        // ── end pdf_manipulator patch ──
                         for kid in kids {
                             if let Some(page_ref) = kid.as_reference() {
                                 // ── pdf_manipulator patch: staged page dict wins over source ──
@@ -3523,7 +3534,9 @@ impl DocumentEditor {
 
                                 // Write new annotation objects
                                 if !new_annotation_ids.is_empty() {
+                                    // ── pdf_manipulator patch: reuse the per-save page refs ──
                                     let page_refs = &cached_page_refs;
+                                    // ── end pdf_manipulator patch ──
 
                                     // Build the annotation dictionaries first, in
                                     // a scope that releases the `modified_annotations`
@@ -3579,9 +3592,7 @@ impl DocumentEditor {
                                             &mut self.next_object_id,
                                         );
                                         for (stream_id, stream_obj) in hoisted {
-                                            // ── pdf_manipulator patch: PositionedWrite, not Seek ──
                                             let offset = writer.position();
-                                            // ── end pdf_manipulator patch ──
                                             let bytes = serialize_obj(
                                                 &serializer,
                                                 stream_id,
@@ -3594,9 +3605,7 @@ impl DocumentEditor {
                                         }
 
                                         // Write the annotation object
-                                        // ── pdf_manipulator patch: PositionedWrite, not Seek ──
                                         let offset = writer.position();
-                                        // ── end pdf_manipulator patch ──
                                         let bytes = serialize_obj(
                                             &serializer,
                                             annot_id,
@@ -3707,9 +3716,7 @@ impl DocumentEditor {
                                         // Write any indirect objects this appearance depends
                                         // on (e.g. an embedded fallback-font graph).
                                         for (extra_id, extra_obj) in &appearance.extra_objects {
-                                            // ── pdf_manipulator patch: PositionedWrite, not Seek ──
                                             let off = writer.position();
-                                            // ── end pdf_manipulator patch ──
                                             let b = serialize_obj(
                                                 &serializer,
                                                 *extra_id,
@@ -3863,9 +3870,7 @@ impl DocumentEditor {
                                         // Write any indirect objects this appearance depends
                                         // on (e.g. an embedded fallback-font graph).
                                         for (extra_id, extra_obj) in &appearance.extra_objects {
-                                            // ── pdf_manipulator patch: PositionedWrite, not Seek ──
                                             let off = writer.position();
-                                            // ── end pdf_manipulator patch ──
                                             let b = serialize_obj(
                                                 &serializer,
                                                 *extra_id,
@@ -3906,12 +3911,6 @@ impl DocumentEditor {
                                 page_index += 1;
                             }
                         }
-                        if page_index > 10 {
-
-
-                        }
-
-
                     }
                 }
             }
@@ -4026,6 +4025,7 @@ impl DocumentEditor {
         written_ids.clear();
         written_ids.extend(xref_entries.iter().map(|(id, _, _, _)| *id));
 
+        // ── pdf_manipulator patch: GC sees the trimmed page tree ──
         // Stage a trimmed /Pages dict so GC sees only kept pages.
         // Without this, GC walks the original page tree and marks every
         // object reachable — dropping almost nothing.
@@ -4048,6 +4048,7 @@ impl DocumentEditor {
                 None => { self.modified_objects.remove(&pages_id); }
             }
         }
+        // ── end pdf_manipulator patch ──
 
         let all_source_ids = self.source.all_object_ids();
         for obj_id in all_source_ids {
@@ -6863,49 +6864,60 @@ impl DocumentEditor {
             // Save graphics state
             content.extend_from_slice(b"q\n");
 
-            // Calculate transformation to position the XObject
-            // The appearance is defined in BBox coordinates and needs to be
-            // positioned at annot_rect on the page.
+            // ── pdf_manipulator patch: §12.5.5 appearance placement ──
+            // Position the appearance per ISO 32000-1 §12.5.5: the
+            // form's /Matrix is applied by the XObject itself (it is
+            // written into the FlatForm dict), so the placement matrix
+            // A here must map the MATRIX-TRANSFORMED BBox onto the
+            // annotation Rect. Mapping the raw BBox — or re-applying
+            // /Matrix in this overlay — double-shifts any appearance
+            // whose Matrix carries a translation (producers commonly
+            // bake the widget's absolute page Y into it), landing the
+            // content off-page.
             let bbox = appearance.bbox;
             let rect = appearance.annot_rect;
+            let m = appearance
+                .matrix
+                .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
 
-            // Calculate scale and translation
-            let bbox_width = bbox[2] - bbox[0];
-            let bbox_height = bbox[3] - bbox[1];
+            // Transform the four BBox corners through /Matrix and take
+            // the bounding box of the result.
+            let corners = [
+                (bbox[0], bbox[1]),
+                (bbox[2], bbox[1]),
+                (bbox[0], bbox[3]),
+                (bbox[2], bbox[3]),
+            ];
+            let (mut tb_x0, mut tb_y0) = (f32::INFINITY, f32::INFINITY);
+            let (mut tb_x1, mut tb_y1) =
+                (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for (x, y) in corners {
+                let cx = m[0] * x + m[2] * y + m[4];
+                let cy = m[1] * x + m[3] * y + m[5];
+                tb_x0 = tb_x0.min(cx);
+                tb_y0 = tb_y0.min(cy);
+                tb_x1 = tb_x1.max(cx);
+                tb_y1 = tb_y1.max(cy);
+            }
+
+            let tb_width = tb_x1 - tb_x0;
+            let tb_height = tb_y1 - tb_y0;
             let rect_width = rect[2] - rect[0];
             let rect_height = rect[3] - rect[1];
 
-            // Avoid division by zero
-            let sx = if bbox_width != 0.0 {
-                rect_width / bbox_width
+            let sx = if tb_width != 0.0 { rect_width / tb_width } else { 1.0 };
+            let sy = if tb_height != 0.0 {
+                rect_height / tb_height
             } else {
                 1.0
             };
-            let sy = if bbox_height != 0.0 {
-                rect_height / bbox_height
-            } else {
-                1.0
-            };
+            let tx = rect[0] - tb_x0 * sx;
+            let ty = rect[1] - tb_y0 * sy;
 
-            // Translation to position the XObject
-            let tx = rect[0] - bbox[0] * sx;
-            let ty = rect[1] - bbox[1] * sy;
-
-            // Apply transformation matrix: [sx 0 0 sy tx ty]
             content.extend_from_slice(
                 format!("{:.6} 0 0 {:.6} {:.6} {:.6} cm\n", sx, sy, tx, ty).as_bytes(),
             );
-
-            // If the appearance has its own matrix, apply it
-            if let Some(m) = appearance.matrix {
-                content.extend_from_slice(
-                    format!(
-                        "{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm\n",
-                        m[0], m[1], m[2], m[3], m[4], m[5]
-                    )
-                    .as_bytes(),
-                );
-            }
+            // ── end pdf_manipulator patch ──
 
             // Invoke the XObject
             content.extend_from_slice(format!("/{} Do\n", xobj_name).as_bytes());
@@ -7108,7 +7120,9 @@ impl DocumentEditor {
         &mut self,
         opts: crate::redaction::RedactionOptions,
     ) -> Result<crate::redaction::RedactionReport> {
-        use crate::redaction::{redact_content_stream, RedactionRegion, RegionSet};
+        // ── pdf_manipulator patch: per-page work shared with eraseRegions ──
+        use crate::redaction::{RedactionRegion, RegionSet};
+        // ── end pdf_manipulator patch ──
         let mut pages: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         pages.extend(self.apply_redactions_pages.iter().copied());
         pages.extend(self.redaction_regions.keys().copied());
@@ -7130,39 +7144,9 @@ impl DocumentEditor {
                     rs.push(*r);
                 }
             }
-            if rs.is_empty() {
-                continue;
-            }
-            let content = self.get_page_content_bytes(src)?;
-            if content.is_empty() {
-                continue;
-            }
-            let fonts = self.build_page_font_metrics(src)?;
-            let (bytes, rep) = redact_content_stream(&content, &rs, &opts, &fonts)?;
-            // Record the original /Contents object ids so the save path
-            // hard-drops them (G6) — the secret must not survive even as
-            // an orphaned, GC-missed object.
-            if let Ok(page_ref) = self.source.get_page_ref(src) {
-                if let Ok(page_obj) = self.source.load_object(page_ref) {
-                    if let Some(d) = page_obj.as_dict() {
-                        match d.get("Contents") {
-                            Some(Object::Reference(r)) => {
-                                self.redacted_orphan_ids.insert(r.id);
-                            },
-                            Some(Object::Array(arr)) => {
-                                for it in arr {
-                                    if let Object::Reference(r) = it {
-                                        self.redacted_orphan_ids.insert(r.id);
-                                    }
-                                }
-                            },
-                            _ => {},
-                        }
-                    }
-                }
-            }
-            self.redacted_content.insert(src, bytes);
-            self.apply_redactions_pages.insert(src);
+            // ── pdf_manipulator patch: delegate to the shared per-page core ──
+            let rep = self.destroy_regions_on_page(src, &rs, &opts)?;
+            // ── end pdf_manipulator patch ──
             total.regions += rep.regions;
             total.glyphs_removed += rep.glyphs_removed;
             total.bytes_removed += rep.bytes_removed;
@@ -7170,6 +7154,97 @@ impl DocumentEditor {
         self.is_modified = true;
         Ok(total)
     }
+
+    // ── pdf_manipulator patch: scoped destructive removal ──
+
+    /// Destroy the given regions on one page: rewrite its content
+    /// stream without the covered glyphs and queue the original
+    /// /Contents objects for hard-dropping at save. The per-page core
+    /// of [`Self::apply_redactions_destructive`], callable with an
+    /// explicit region set so an operation can destroy ONLY its own
+    /// regions without firing the document's pending redaction marks.
+    fn destroy_regions_on_page(
+        &mut self,
+        src: usize,
+        rs: &crate::redaction::RegionSet,
+        opts: &crate::redaction::RedactionOptions,
+    ) -> Result<crate::redaction::RedactionReport> {
+        use crate::redaction::redact_content_stream;
+
+        if rs.is_empty() {
+            return Ok(crate::redaction::RedactionReport::default());
+        }
+        let content = self.get_page_content_bytes(src)?;
+        if content.is_empty() {
+            return Ok(crate::redaction::RedactionReport::default());
+        }
+        let fonts = self.build_page_font_metrics(src)?;
+        let (bytes, rep) = redact_content_stream(&content, rs, opts, &fonts)?;
+        // Record the original /Contents object ids so the save path
+        // hard-drops them — the removed content must not survive even
+        // as an orphaned, GC-missed object.
+        if let Ok(page_ref) = self.source.get_page_ref(src) {
+            if let Ok(page_obj) = self.source.load_object(page_ref) {
+                if let Some(d) = page_obj.as_dict() {
+                    match d.get("Contents") {
+                        Some(Object::Reference(r)) => {
+                            self.redacted_orphan_ids.insert(r.id);
+                        },
+                        Some(Object::Array(arr)) => {
+                            for it in arr {
+                                if let Object::Reference(r) = it {
+                                    self.redacted_orphan_ids.insert(r.id);
+                                }
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+            }
+        }
+        self.redacted_content.insert(src, bytes);
+        self.apply_redactions_pages.insert(src);
+        Ok(rep)
+    }
+
+    /// Destructively erase rectangular regions on a page.
+    ///
+    /// The contract is removal, not concealment: covered glyphs are
+    /// rewritten out of the content stream and the original stream
+    /// objects are hard-dropped at save. Unlike
+    /// [`Self::apply_redactions_destructive`] this fires ONLY the
+    /// given regions — the document's pending redaction marks (queued
+    /// via [`Self::add_redaction`] or present as /Redact annotations)
+    /// stay pending — and none of redaction's document-wide side
+    /// effects run: no metadata scrub, no JavaScript removal, no
+    /// opaque overlay drawn over the region.
+    pub fn erase_regions_destructive(
+        &mut self,
+        page: usize,
+        rects: &[[f32; 4]],
+    ) -> Result<()> {
+        use crate::redaction::{RedactionOptions, RedactionRegion, RegionSet};
+
+        if page >= self.current_page_count() {
+            return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
+        }
+        let src = self.output_to_source_index(page);
+        let mut rs = RegionSet::new(src);
+        for r in rects {
+            rs.push(RedactionRegion::from_rect(r[0], r[1], r[2], r[3], None));
+        }
+        let opts = RedactionOptions {
+            scrub_metadata: false,
+            remove_javascript: false,
+            remove_embedded_files: false,
+            draw_overlay_when_no_ic: false,
+            ..Default::default()
+        };
+        self.destroy_regions_on_page(src, &rs, &opts)?;
+        self.is_modified = true;
+        Ok(())
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Standalone document sanitization without geometric redaction
     /// (#231 T10, feature plan §4.6 / §5.1).
@@ -8681,8 +8756,18 @@ mod tests {
         let content = editor.generate_flatten_overlay(&[appearance], &names);
         let content_str = String::from_utf8(content).unwrap();
 
-        // Should have two cm operators: one for positioning, one for the appearance matrix
-        assert_eq!(content_str.matches("cm\n").count(), 2);
+        // ── pdf_manipulator patch: §12.5.5 placement expectations ──
+        // Exactly ONE cm: the placement matrix A. The form's /Matrix
+        // is applied by the XObject itself — emitting it here too
+        // double-shifts translated appearances off the page.
+        assert_eq!(content_str.matches("cm\n").count(), 1);
+        // BBox [0,0,100,100] through translate(5,5) → [5,5,105,105];
+        // mapping that onto Rect [0,0,100,100] compensates with -5.
+        assert!(
+            content_str.contains("1.000000 0 0 1.000000 -5.000000 -5.000000 cm"),
+            "placement must map the MATRIX-TRANSFORMED BBox to Rect: {content_str}"
+        );
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]

@@ -1238,10 +1238,12 @@ impl PdfWriter {
 
     /// Build the complete PDF document.
     pub fn finish(self) -> Result<Vec<u8>> {
+        // ── pdf_manipulator patch: delegate to the streaming writer ──
         use crate::host::positioned_write::SeekWriter;
         let mut writer = SeekWriter::new(std::io::Cursor::new(Vec::new()));
         self.finish_to_writer(&mut writer)?;
         Ok(writer.into_inner().into_inner())
+        // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: streaming save to any PositionedWrite ──
