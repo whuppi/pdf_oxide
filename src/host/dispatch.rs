@@ -1187,27 +1187,27 @@ pub fn edit_add_image_stamp(
     let img = ImageData::from_bytes(&image_bytes)
         .map_err(|e| Error::InvalidPdf(format!("invalid image: {e}")))?;
 
-    // Image XObject
-    let mut img_dict = std::collections::HashMap::new();
-    img_dict.insert("Type".into(), Object::Name("XObject".into()));
-    img_dict.insert("Subtype".into(), Object::Name("Image".into()));
-    img_dict.insert("Width".into(), Object::Integer(img.width as i64));
-    img_dict.insert("Height".into(), Object::Integer(img.height as i64));
-    img_dict.insert("BitsPerComponent".into(), Object::Integer(img.bits_per_component as i64));
-    let cs = match img.color_space {
-        crate::writer::ColorSpace::DeviceGray => "DeviceGray",
-        crate::writer::ColorSpace::DeviceRGB => "DeviceRGB",
-        crate::writer::ColorSpace::DeviceCMYK => "DeviceCMYK",
-    };
-    img_dict.insert("ColorSpace".into(), Object::Name(cs.into()));
-    match img.format {
-        crate::writer::ImageFormat::Jpeg =>
-            { img_dict.insert("Filter".into(), Object::Name("DCTDecode".into())); }
-        crate::writer::ImageFormat::Png =>
-            { img_dict.insert("Filter".into(), Object::Name("FlateDecode".into())); }
-        _ => {}
+    // build_xobject_dict() carries the PNG DecodeParms/Predictor=15 that
+    // from_png()'s per-row filter bytes require; a hand-rolled FlateDecode
+    // dict without it misreads every scanline.
+    let mut img_dict = img.build_xobject_dict();
+
+    // A PNG alpha channel must travel as a separate grayscale /SMask, or
+    // transparent pixels paint solid black over the page. from_png() has
+    // already split the alpha into img.soft_mask.
+    if let (Some(smask_dict), Some(smask_data)) =
+        (img.build_soft_mask_dict(), img.soft_mask.clone())
+    {
+        let smask_id = editor.alloc_id();
+        editor.insert_modified(smask_id, Object::Stream {
+            dict: smask_dict,
+            data: bytes::Bytes::from(smask_data),
+        });
+        img_dict.insert(
+            "SMask".into(),
+            Object::Reference(crate::object::ObjectRef::new(smask_id, 0)),
+        );
     }
-    img_dict.insert("Length".into(), Object::Integer(img.data.len() as i64));
 
     let img_id = editor.alloc_id();
     editor.insert_modified(img_id, Object::Stream {
