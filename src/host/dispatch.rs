@@ -131,13 +131,14 @@ pub struct BookmarkSplit {
     pub end_page: usize,
 }
 
-/// RGBA pixel data for a rendered page.
+/// A rendered page: pixel dimensions plus the encoded image bytes.
 pub struct RenderedPage {
     /// Image width in pixels.
     pub width: u32,
     /// Image height in pixels.
     pub height: u32,
-    /// Raw RGBA pixel bytes.
+    /// PNG-encoded image bytes. `render_page` renders with the default
+    /// options (PNG); the raster is never handed out as raw RGBA here.
     pub data: Vec<u8>,
 }
 
@@ -352,7 +353,8 @@ pub fn plan_split_by_bookmarks(doc: &mut PdfDocument) -> Result<Vec<BookmarkSpli
     }).collect())
 }
 
-/// Render a page to RGBA pixels, optionally constrained to max dimensions.
+/// Render a page to a PNG-encoded image, optionally constrained to max
+/// dimensions. Uses the default render options (PNG output).
 pub fn render_page(doc: &mut PdfDocument, page: usize, max_width: u32, max_height: u32) -> Result<RenderedPage> {
     #[cfg(feature = "rendering")]
     {
@@ -437,7 +439,7 @@ pub fn extract_images_streamed<W: std::io::Write>(
 /// O(1)-memory streaming page render.
 ///
 /// Renders pages one at a time and writes each as a length-prefixed
-/// binary frame to the writer. Each RGBA buffer is dropped after writing.
+/// binary frame to the writer. Each encoded page is dropped after writing.
 /// At most one rendered page in memory at any time.
 ///
 /// Frame format: [len: u32 LE] [binary-encoded rendered page response]
@@ -461,7 +463,7 @@ pub fn render_pages_streamed<W: std::io::Write>(
         let len_bytes = (frame.len() as u32).to_le_bytes();
         writer.write_all(&len_bytes).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-        // RGBA data dropped here — only one page in memory at a time
+        // encoded page dropped here — only one page in memory at a time
     }
     // A zero-length frame terminates the stream.
     writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
