@@ -49,6 +49,12 @@ pub struct OpenResult {
     pub subject: String,
     /// Document info Keywords field.
     pub keywords: String,
+    /// Document info Producer field.
+    pub producer: String,
+    /// Document info Creator field.
+    pub creator: String,
+    /// Document info CreationDate field (raw PDF date string).
+    pub creation_date: String,
 }
 
 /// Dimensions and rotation of a single page.
@@ -174,6 +180,10 @@ pub struct EditorMetadataResult {
     pub subject: String,
     /// Document keywords.
     pub keywords: String,
+    /// Document producer.
+    pub producer: String,
+    /// Document creation date (raw PDF date string).
+    pub creation_date: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -208,12 +218,16 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     let author = doc.document_info_string("Author").unwrap_or_default();
     let subject = doc.document_info_string("Subject").unwrap_or_default();
     let keywords = doc.document_info_string("Keywords").unwrap_or_default();
+    let producer = doc.document_info_string("Producer").unwrap_or_default();
+    let creator = doc.document_info_string("Creator").unwrap_or_default();
+    let creation_date = doc.document_info_string("CreationDate").unwrap_or_default();
 
     Ok(OpenResult {
         page_count, version_major: major, version_minor: minor,
         is_encrypted, requires_password, is_tagged,
         encryption_algorithm: enc_algo, permission_bits: perms,
         pages, title, author, subject, keywords,
+        producer, creator, creation_date,
     })
 }
 
@@ -486,6 +500,8 @@ pub fn edit_get_metadata(editor: &mut DocumentEditor) -> EditorMetadataResult {
         author: editor.author().ok().flatten().unwrap_or_default(),
         subject: editor.subject().ok().flatten().unwrap_or_default(),
         keywords: editor.keywords().ok().flatten().unwrap_or_default(),
+        producer: editor.producer().ok().flatten().unwrap_or_default(),
+        creation_date: editor.creation_date().ok().flatten().unwrap_or_default(),
     }
 }
 
@@ -520,6 +536,16 @@ pub fn edit_set_subject(editor: &mut DocumentEditor, value: &str) {
 /// Set the document keywords.
 pub fn edit_set_keywords(editor: &mut DocumentEditor, value: &str) {
     editor.set_keywords(value);
+}
+
+/// Set the document producer.
+pub fn edit_set_producer(editor: &mut DocumentEditor, value: &str) {
+    editor.set_producer(value);
+}
+
+/// Set the document creation date (raw PDF date string, e.g. "D:20240101120000Z").
+pub fn edit_set_creation_date(editor: &mut DocumentEditor, value: &str) {
+    editor.set_creation_date(value);
 }
 
 // ── Page manipulation ──
