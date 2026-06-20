@@ -240,6 +240,8 @@ pub(crate) fn handle_request(
             w.put_str("author", &m.author);
             w.put_str("subject", &m.subject);
             w.put_str("keywords", &m.keywords);
+            w.put_str("producer", &m.producer);
+            w.put_str("creationDate", &m.creation_date);
             Ok(w.finish())
         }),
         "editorIsModified" => handle_with_editor(state, &req, |editor, _| {
@@ -453,6 +455,9 @@ fn handle_open(
             w.put_str("author", &result.author);
             w.put_str("subject", &result.subject);
             w.put_str("keywords", &result.keywords);
+            w.put_str("producer", &result.producer);
+            w.put_str("creator", &result.creator);
+            w.put_str("creationDate", &result.creation_date);
             w.put_map_list("pages", result.pages.len(), |i, item| {
                 let p = &result.pages[i];
                 item.put_i32("index", i as i32);
@@ -689,6 +694,14 @@ fn do_editor_mutate(
         }
         "setKeywords" => {
             dispatch::edit_set_keywords(editor, req.get_str("keywords").unwrap_or(""));
+            ok_response()
+        }
+        "setProducer" => {
+            dispatch::edit_set_producer(editor, req.get_str("producer").unwrap_or(""));
+            ok_response()
+        }
+        "setCreationDate" => {
+            dispatch::edit_set_creation_date(editor, req.get_str("creationDate").unwrap_or(""));
             ok_response()
         }
         "unembedStandardFonts" => {
