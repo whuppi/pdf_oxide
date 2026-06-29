@@ -16,7 +16,7 @@ pub const WRITE_BUF_CAPACITY: usize = 256 * 1024;
 
 // ── Host I/O status codes (web lane bodies return these from
 //    host_read_at / host_write_chunk; Dart mirrors them in
-//    lane_protocol.dart) ─────────────────────────────────────────
+//    web/protocol.dart) ──────────────────────────────────────────
 
 /// Host-side I/O failure (read error, missing source, dead sink).
 pub const HOST_IO_ERROR: i32 = -1;
