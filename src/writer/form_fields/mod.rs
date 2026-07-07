@@ -43,6 +43,9 @@ pub use field_flags::{
     ButtonFieldFlags, ChoiceFieldFlags, FieldFlags, TextAlignment, TextFieldFlags,
 };
 pub use form_appearance::FormAppearanceGenerator;
+// ── pdf_manipulator patch: shared WinAnsi literal encoder ──
+pub(crate) use form_appearance::escape_pdf_string as encode_win_ansi_literal;
+// ── end pdf_manipulator patch ──
 pub use push_button::{FormAction, PushButtonWidget, SubmitFormFlags};
 pub use radio_button::{RadioButtonGroup, RadioButtonWidget};
 pub use signature::SignatureWidget;

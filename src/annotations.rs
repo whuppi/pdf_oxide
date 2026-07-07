@@ -476,10 +476,12 @@ impl PdfDocument {
         }
 
         // Get field name (T entry)
+        // ── pdf_manipulator patch: /T is a text string, not UTF-8 ──
         let field_name = dict.get("T").and_then(|t| match t {
-            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
+            Object::String(s) => Some(crate::object::decode_pdf_text_string(s)),
             _ => None,
         });
+        // ── end pdf_manipulator patch ──
 
         // Get appearance state (AS entry) for checkboxes/radios
         let appearance_state = dict
@@ -540,7 +542,9 @@ impl PdfDocument {
     /// Parse a string value from various PDF object types.
     fn parse_string_value(obj: Option<&Object>) -> Option<String> {
         match obj {
-            Some(Object::String(s)) => Some(String::from_utf8_lossy(s).to_string()),
+            // ── pdf_manipulator patch: /V and /DV are text strings, not UTF-8 ──
+            Some(Object::String(s)) => Some(crate::object::decode_pdf_text_string(s)),
+            // ── end pdf_manipulator patch ──
             Some(Object::Name(n)) => Some(n.clone()),
             Some(Object::Integer(i)) => Some(i.to_string()),
             Some(Object::Real(f)) => Some(f.to_string()),
@@ -555,15 +559,19 @@ impl PdfDocument {
                 let opts: Vec<String> = arr
                     .iter()
                     .filter_map(|o| match o {
-                        Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
+                        // ── pdf_manipulator patch: /Opt entries are text strings ──
+                        Object::String(s) => Some(crate::object::decode_pdf_text_string(s)),
                         Object::Name(n) => Some(n.clone()),
                         Object::Array(inner) if !inner.is_empty() => {
                             // Option can be [export_value, display_value]
                             inner.first().and_then(|first| match first {
-                                Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
+                                Object::String(s) => {
+                                    Some(crate::object::decode_pdf_text_string(s))
+                                },
                                 _ => None,
                             })
                         },
+                        // ── end pdf_manipulator patch ──
                         _ => None,
                     })
                     .collect();

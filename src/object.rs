@@ -76,6 +76,56 @@ pub fn encode_pdf_text_string(s: &str) -> Vec<u8> {
     }
 }
 
+// ── pdf_manipulator patch: shared PDF text-string decoder ──
+/// Decode a PDF text string byte sequence (ISO 32000-1 §7.9.2.2) to text.
+///
+/// The inverse of [`encode_pdf_text_string`], plus the tolerances every
+/// major reader applies to real-world files:
+/// - `FE FF` BOM → UTF-16BE (the spec's Unicode branch)
+/// - `FF FE` BOM → UTF-16LE (not in the spec, but produced in the wild)
+/// - `EF BB BF` BOM → UTF-8 (legal since ISO 32000-2, PDF 2.0)
+/// - no BOM, valid UTF-8 with non-ASCII bytes → UTF-8. The spec says
+///   PDFDocEncoding here, but LibreOffice-class producers write raw
+///   UTF-8 field names and values; decoding them as PDFDocEncoding
+///   yields mojibake that breaks fill-by-name. Pure ASCII is identical
+///   under both readings, and PDFDocEncoding high-byte sequences are
+///   almost never coincidentally valid UTF-8.
+/// - anything else → PDFDocEncoding (Appendix D.2 table).
+///
+/// Every read of a /T, /V, /Title-class string must go through this one
+/// function — a second ad-hoc decode (e.g. `from_utf8_lossy`) is how the
+/// fill path and the flatten path end up disagreeing about a field name.
+pub fn decode_pdf_text_string(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        // UTF-8 with BOM — a legal third encoding since ISO 32000-2 §7.9.2.2.
+        return String::from_utf8_lossy(&bytes[3..]).into_owned();
+    }
+    if bytes.iter().any(|&b| b > 0x7F) {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            return s.to_string();
+        }
+    }
+    bytes
+        .iter()
+        .filter_map(|&b| crate::fonts::font_dict::pdfdoc_encoding_lookup(b))
+        .collect()
+}
+// ── end pdf_manipulator patch ──
+
 impl Object {
     /// Create a PDF text string object from a Rust string.
     ///
