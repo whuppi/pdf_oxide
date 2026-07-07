@@ -216,27 +216,12 @@ impl FormExtractor {
     /// - If bytes start with 0xFE 0xFF, the string is UTF-16BE with BOM
     /// - Otherwise, it's PDFDocEncoding (superset of ISO Latin-1)
     fn decode_text_string(bytes: &[u8]) -> Option<String> {
-        if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-            // UTF-16BE with BOM
-            let utf16_bytes = &bytes[2..]; // Skip BOM
-
-            // Convert bytes to u16 pairs (big-endian)
-            let utf16_pairs: Vec<u16> = utf16_bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                .collect();
-
-            String::from_utf16(&utf16_pairs).ok()
-        } else {
-            // PDFDocEncoding - use proper character mapping
-            // ISO 32000-1:2008, Appendix D.2, Table D.2
-            Some(
-                bytes
-                    .iter()
-                    .filter_map(|&b| crate::fonts::font_dict::pdfdoc_encoding_lookup(b))
-                    .collect(),
-            )
-        }
+        // ── pdf_manipulator patch: one decoder for every text-string read —
+        // adds the UTF-16LE and real-world raw-UTF-8 tolerances, and keeps
+        // this stack byte-for-byte consistent with the annotation parser the
+        // flattener uses to match fields back to modified values. ──
+        Some(crate::object::decode_pdf_text_string(bytes))
+        // ── end pdf_manipulator patch ──
     }
 
     /// Extract all form fields from a PDF document.

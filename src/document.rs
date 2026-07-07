@@ -9322,31 +9322,10 @@ impl PdfDocument {
 
     /// Decode a PDF text string that may be UTF-16BE/LE (with BOM) or PDFDocEncoding.
     fn decode_pdf_text_string(bytes: &[u8]) -> String {
-        if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-            // UTF-16BE with BOM
-            let utf16_bytes = &bytes[2..];
-            let utf16_pairs: Vec<u16> = utf16_bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                .collect();
-            String::from_utf16(&utf16_pairs)
-                .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string())
-        } else if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-            // UTF-16LE with BOM
-            let utf16_bytes = &bytes[2..];
-            let utf16_pairs: Vec<u16> = utf16_bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect();
-            String::from_utf16(&utf16_pairs)
-                .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string())
-        } else {
-            // PDFDocEncoding — superset of ISO Latin-1
-            bytes
-                .iter()
-                .filter_map(|&b| crate::fonts::font_dict::pdfdoc_encoding_lookup(b))
-                .collect()
-        }
+        // ── pdf_manipulator patch: delegate to the shared decoder in
+        // `object.rs` — one implementation for every text-string read. ──
+        crate::object::decode_pdf_text_string(bytes)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Strip XHTML tags from rich content (/RC) to extract plain text.
@@ -27011,15 +26990,16 @@ mod tests {
     // NEW COVERAGE TESTS — Batch 3: decode_pdf_text_string
     // ========================================================================
 
+    // ── pdf_manipulator patch: UTF-8 BOM is a legal text-string
+    // encoding since ISO 32000-2 §7.9.2.2 — decode it, don't read the
+    // BOM bytes as PDFDocEncoding ï»¿ mojibake. ──
     #[test]
-    fn test_decode_pdf_text_string_utf8_bom_treated_as_pdfdoc() {
-        // UTF-8 BOM (EF BB BF) is NOT recognized by this function;
-        // it only handles UTF-16 BOMs. Bytes fall through to PDFDocEncoding.
+    fn test_decode_pdf_text_string_utf8_bom() {
         let bytes = vec![0xEF, 0xBB, 0xBF, b'H', b'e', b'l', b'l', b'o'];
         let result = PdfDocument::decode_pdf_text_string(&bytes);
-        // 0xEF -> ï, 0xBB -> », 0xBF -> ¿ in PDFDocEncoding (Latin-1 range)
-        assert_eq!(result, "\u{00EF}\u{00BB}\u{00BF}Hello");
+        assert_eq!(result, "Hello");
     }
+    // ── end pdf_manipulator patch ──
 
     #[test]
     fn test_decode_pdf_text_string_plain_ascii() {

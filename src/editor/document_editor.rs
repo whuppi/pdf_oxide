@@ -85,24 +85,26 @@ impl DocumentInfo {
     pub fn to_object(&self) -> Object {
         let mut dict = HashMap::new();
 
+        // ── pdf_manipulator patch: Info values are text strings, not UTF-8 ──
         if let Some(ref title) = self.title {
-            dict.insert("Title".to_string(), Object::String(title.as_bytes().to_vec()));
+            dict.insert("Title".to_string(), Object::text_string(title));
         }
         if let Some(ref author) = self.author {
-            dict.insert("Author".to_string(), Object::String(author.as_bytes().to_vec()));
+            dict.insert("Author".to_string(), Object::text_string(author));
         }
         if let Some(ref subject) = self.subject {
-            dict.insert("Subject".to_string(), Object::String(subject.as_bytes().to_vec()));
+            dict.insert("Subject".to_string(), Object::text_string(subject));
         }
         if let Some(ref keywords) = self.keywords {
-            dict.insert("Keywords".to_string(), Object::String(keywords.as_bytes().to_vec()));
+            dict.insert("Keywords".to_string(), Object::text_string(keywords));
         }
         if let Some(ref creator) = self.creator {
-            dict.insert("Creator".to_string(), Object::String(creator.as_bytes().to_vec()));
+            dict.insert("Creator".to_string(), Object::text_string(creator));
         }
         if let Some(ref producer) = self.producer {
-            dict.insert("Producer".to_string(), Object::String(producer.as_bytes().to_vec()));
+            dict.insert("Producer".to_string(), Object::text_string(producer));
         }
+        // ── end pdf_manipulator patch ──
         if let Some(ref creation_date) = self.creation_date {
             dict.insert(
                 "CreationDate".to_string(),
@@ -117,33 +119,36 @@ impl DocumentInfo {
     }
 
     /// Parse from a PDF Info dictionary object.
+    // ── pdf_manipulator patch: Info values decode as text strings (see
+    // `decode_pdf_text_string`) — `from_utf8_lossy` turned PDFDocEncoding
+    // and UTF-16BE metadata into U+FFFD mojibake. ──
     pub fn from_object(obj: &Object) -> Self {
         let mut info = Self::default();
 
         if let Some(dict) = obj.as_dict() {
             if let Some(Object::String(s)) = dict.get("Title") {
-                info.title = String::from_utf8_lossy(s).to_string().into();
+                info.title = crate::object::decode_pdf_text_string(s).into();
             }
             if let Some(Object::String(s)) = dict.get("Author") {
-                info.author = String::from_utf8_lossy(s).to_string().into();
+                info.author = crate::object::decode_pdf_text_string(s).into();
             }
             if let Some(Object::String(s)) = dict.get("Subject") {
-                info.subject = String::from_utf8_lossy(s).to_string().into();
+                info.subject = crate::object::decode_pdf_text_string(s).into();
             }
             if let Some(Object::String(s)) = dict.get("Keywords") {
-                info.keywords = String::from_utf8_lossy(s).to_string().into();
+                info.keywords = crate::object::decode_pdf_text_string(s).into();
             }
             if let Some(Object::String(s)) = dict.get("Creator") {
-                info.creator = String::from_utf8_lossy(s).to_string().into();
+                info.creator = crate::object::decode_pdf_text_string(s).into();
             }
             if let Some(Object::String(s)) = dict.get("Producer") {
-                info.producer = String::from_utf8_lossy(s).to_string().into();
+                info.producer = crate::object::decode_pdf_text_string(s).into();
             }
             if let Some(Object::String(s)) = dict.get("CreationDate") {
-                info.creation_date = String::from_utf8_lossy(s).to_string().into();
+                info.creation_date = crate::object::decode_pdf_text_string(s).into();
             }
             if let Some(Object::String(s)) = dict.get("ModDate") {
-                info.mod_date = String::from_utf8_lossy(s).to_string().into();
+                info.mod_date = crate::object::decode_pdf_text_string(s).into();
             }
         }
 
@@ -6117,7 +6122,11 @@ impl DocumentEditor {
                             .as_ref()
                             .and_then(|d| d.get("T"))
                             .and_then(|t| match t {
-                                Object::String(s) => String::from_utf8(s.clone()).ok(),
+                                // ── pdf_manipulator patch: /T is a text string ──
+                                Object::String(s) => {
+                                    Some(crate::object::decode_pdf_text_string(s))
+                                },
+                                // ── end pdf_manipulator patch ──
                                 _ => None,
                             })
                             .unwrap_or_else(|| format!("widget@page{}", page));
@@ -6420,18 +6429,10 @@ impl DocumentEditor {
 
     /// Escape a string for a PDF literal `(...)` text operand.
     fn escape_pdf_literal(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '(' => out.push_str("\\("),
-                ')' => out.push_str("\\)"),
-                '\r' => out.push_str("\\r"),
-                '\n' => out.push_str("\\n"),
-                _ => out.push(c),
-            }
-        }
-        out
+        // ── pdf_manipulator patch: single-byte encode, not UTF-8 passthrough —
+        // these literals draw under single-byte /DA fonts. ──
+        crate::writer::form_fields::encode_win_ansi_literal(s)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Regenerate a *text* widget appearance whose value contains non-Latin or

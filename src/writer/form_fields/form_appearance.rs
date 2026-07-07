@@ -365,8 +365,18 @@ fn circle_path(cx: f32, cy: f32, r: f32) -> String {
     )
 }
 
-/// Escape special characters in PDF strings.
-fn escape_pdf_string(s: &str) -> String {
+// ── pdf_manipulator patch: encode to WinAnsi bytes, not UTF-8 ──
+/// Escape and encode text for a `(…) Tj` literal under a single-byte
+/// WinAnsiEncoding font (the /DA fonts these appearances reference).
+///
+/// The content stream is a byte stream: pushing a `char` above U+007F
+/// into a Rust `String` emits its multi-byte UTF-8 form, which a
+/// single-byte font decodes as several wrong glyphs (ß → "ÃŸ" — the
+/// classic Latin-1-range mojibake). Every char is therefore written as
+/// exactly one WinAnsi byte, octal-escaped outside printable ASCII.
+/// Chars with no WinAnsi byte become '?' — the fallback-font path owns
+/// them, and a wrong single byte would render a random glyph.
+pub(crate) fn escape_pdf_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -375,11 +385,58 @@ fn escape_pdf_string(s: &str) -> String {
             ')' => result.push_str("\\)"),
             '\r' => result.push_str("\\r"),
             '\n' => result.push_str("\\n"),
-            _ => result.push(c),
+            _ => match win_ansi_byte(c) {
+                Some(b) if (0x20..0x7F).contains(&b) => result.push(b as char),
+                Some(b) => {
+                    result.push_str(&format!("\\{:03o}", b));
+                },
+                None => result.push('?'),
+            },
         }
     }
     result
 }
+
+/// The WinAnsiEncoding byte for a char, if it has one: ASCII and
+/// U+00A0–U+00FF map to themselves; the 0x80–0x9F slots hold the
+/// Windows-1252 specials (€, curly quotes, dashes, ™, …).
+fn win_ansi_byte(c: char) -> Option<u8> {
+    let cp = c as u32;
+    if cp < 0x80 || (0xA0..=0xFF).contains(&cp) {
+        return Some(cp as u8);
+    }
+    Some(match c {
+        '\u{20AC}' => 0x80, // €
+        '\u{201A}' => 0x82, // ‚
+        '\u{0192}' => 0x83, // ƒ
+        '\u{201E}' => 0x84, // „
+        '\u{2026}' => 0x85, // …
+        '\u{2020}' => 0x86, // †
+        '\u{2021}' => 0x87, // ‡
+        '\u{02C6}' => 0x88, // ˆ
+        '\u{2030}' => 0x89, // ‰
+        '\u{0160}' => 0x8A, // Š
+        '\u{2039}' => 0x8B, // ‹
+        '\u{0152}' => 0x8C, // Œ
+        '\u{017D}' => 0x8E, // Ž
+        '\u{2018}' => 0x91, // '
+        '\u{2019}' => 0x92, // '
+        '\u{201C}' => 0x93, // "
+        '\u{201D}' => 0x94, // "
+        '\u{2022}' => 0x95, // •
+        '\u{2013}' => 0x96, // –
+        '\u{2014}' => 0x97, // —
+        '\u{02DC}' => 0x98, // ˜
+        '\u{2122}' => 0x99, // ™
+        '\u{0161}' => 0x9A, // š
+        '\u{203A}' => 0x9B, // ›
+        '\u{0153}' => 0x9C, // œ
+        '\u{017E}' => 0x9E, // ž
+        '\u{0178}' => 0x9F, // Ÿ
+        _ => return None,
+    })
+}
+// ── end pdf_manipulator patch ──
 
 #[cfg(test)]
 mod tests {
