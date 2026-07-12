@@ -206,6 +206,10 @@ pub mod text;
 /// Core annotation types and enums per PDF spec
 pub mod annotation_types;
 pub mod annotations;
+// ── pdf_manipulator patch: widget-appearance regeneration shared by the
+// flattener and the renderer (moved off DocumentEditor; see form_regen.rs) ──
+mod form_regen;
+// ── end pdf_manipulator patch ──
 /// Content elements for PDF generation
 pub mod elements;
 /// Cross-platform-safe filename slug helpers (shared, pure).
