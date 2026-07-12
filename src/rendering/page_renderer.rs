@@ -7483,6 +7483,11 @@ impl PageRenderer {
         let annotations = doc.get_annotations(page_num)?;
         // Reuse the per-render snapshot so we don't deep-clone the HashSet here.
         let excluded_snapshot: Option<Arc<HashSet<String>>> = self.excluded_layers_snapshot.clone();
+        // ── pdf_manipulator patch: when the AcroForm has /NeedAppearances true,
+        // a reopened filled form's /AP is a stale placeholder — regenerate each
+        // widget's appearance from /V rather than rasterizing the blank. ──
+        let needs_appearances = doc.acroform_needs_appearances();
+        // ── end pdf_manipulator patch ──
         for annot in annotations {
             // Per ISO 32000-1 §12.5.2, an annotation dict may carry an /OC
             // entry referencing the OCG/OCMD the annotation belongs to. Skip
@@ -7495,6 +7500,53 @@ impl PageRenderer {
                     }
                 }
             }
+            // ── pdf_manipulator patch: draw the regenerated widget appearance ──
+            // Shares the flattener's generator (form_regen.rs). When the form
+            // asked for regeneration, draw the value from /V and skip the stale
+            // /AP /N below. Non-widgets and value-less fields fall through.
+            if needs_appearances
+                && annot.subtype_enum == crate::annotation_types::AnnotationSubtype::Widget
+            {
+                if let Some(generated) = doc.regenerate_widget_appearance(&annot)? {
+                    if let Some(rect) = annot.rect {
+                        let annot_transform =
+                            base_transform.pre_translate(rect[0] as f32, rect[1] as f32);
+                        let mut form_dict = std::collections::HashMap::new();
+                        form_dict.insert(
+                            "BBox".to_string(),
+                            Object::Array(vec![
+                                Object::Real(generated.bbox[0] as f64),
+                                Object::Real(generated.bbox[1] as f64),
+                                Object::Real(generated.bbox[2] as f64),
+                                Object::Real(generated.bbox[3] as f64),
+                            ]),
+                        );
+                        if let Some(res) = generated.resources.clone() {
+                            form_dict.insert("Resources".to_string(), res);
+                        }
+                        let old_fonts = self.fonts.clone();
+                        let old_cs = self.color_spaces.clone();
+                        if let Some(res) = form_dict.get("Resources") {
+                            if let Ok(res_obj) = doc.resolve_object(res) {
+                                self.load_resources(doc, &res_obj)?;
+                            }
+                        }
+                        self.render_form_xobject(
+                            pixmap,
+                            &form_dict,
+                            &generated.content,
+                            annot_transform,
+                            doc,
+                            page_num,
+                            &Object::Dictionary(std::collections::HashMap::new()),
+                        )?;
+                        self.fonts = old_fonts;
+                        self.color_spaces = old_cs;
+                    }
+                    continue;
+                }
+            }
+            // ── end pdf_manipulator patch ──
             // Check if annotation has an appearance stream (/AP)
             if let Some(ap_obj) = annot.raw_dict.as_ref().and_then(|d| d.get("AP")) {
                 let ap_stream_obj = doc.resolve_object(ap_obj)?;

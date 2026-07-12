@@ -2201,10 +2201,16 @@ impl DocumentEditor {
                         .and_then(|o| o.as_reference())
                     {
                         if let Ok(af) = self.source.load_object(af_ref) {
-                            if let Some(orig_fields) = af
+                            // ── pdf_manipulator patch: /Fields may be an indirect reference ──
+                            // (ISO 32000-1 §12.7.3). as_array() alone returns None for
+                            // the reference form, dropping every pre-existing field from
+                            // the rebuilt /Fields. Resolve one level before reading it.
+                            let orig_fields_obj = af
                                 .as_dict()
                                 .and_then(|d| d.get("Fields"))
-                                .and_then(|o| o.as_array())
+                                .and_then(|o| self.source.resolve_object(o).ok());
+                            if let Some(orig_fields) =
+                                orig_fields_obj.as_ref().and_then(|o| o.as_array())
                             {
                                 for r in orig_fields {
                                     if let Some(rf) = r.as_reference() {
@@ -2212,6 +2218,7 @@ impl DocumentEditor {
                                     }
                                 }
                             }
+                            // ── end pdf_manipulator patch ──
                         }
                     }
                 }
@@ -4991,6 +4998,16 @@ impl DocumentEditor {
 
         let fields_array = match acroform_dict.get("Fields") {
             Some(Object::Array(arr)) => arr.clone(),
+            // ── pdf_manipulator patch: /Fields may be an indirect reference ──
+            // ISO 32000-1 §12.7.3 — the AcroForm field array can be reached
+            // through an indirect reference. The array-only match treated that
+            // as "no fields" and skipped the rebuild, dropping every field after
+            // a partial flatten. Resolve the reference form too.
+            Some(Object::Reference(r)) => match self.source.load_object(*r) {
+                Ok(Object::Array(arr)) => arr,
+                _ => return Ok(None),
+            },
+            // ── end pdf_manipulator patch ──
             _ => return Ok(None),
         };
 
@@ -6075,7 +6092,23 @@ impl DocumentEditor {
             // value or the empty placeholder the form writer never refreshed.
             // Regenerate the appearance from the new value so the flattened page
             // shows what was set, instead of baking the blank placeholder.
-            if let Some(text) = self.modified_widget_text(&annotation) {
+            // ── pdf_manipulator patch: also regenerate from persisted /V on reopen ──
+            // modified_widget_text() is the in-session value and is empty after a
+            // save+reopen (it lives in the session-local modified_form_fields map).
+            // A field filled in an earlier session therefore falls through to the
+            // stale /AP below and flattens blank. When the AcroForm carries
+            // /NeedAppearances true — which our save path sets whenever a value is
+            // written, deliberately leaving the /AP a placeholder — take the parsed
+            // /V instead and regenerate. Same regeneration block, two text sources.
+            let regen_text = self.modified_widget_text(&annotation).or_else(|| {
+                if self.source.acroform_needs_appearances() {
+                    annotation.field_value.clone().filter(|s| !s.is_empty())
+                } else {
+                    None
+                }
+            });
+            if let Some(text) = regen_text {
+                // ── end pdf_manipulator patch ──
                 // Values with CJK/emoji glyphs the /DA font cannot render are
                 // regenerated with an embedded fallback font; pure-Latin values
                 // return None here and fall through to the plain /DA path.
@@ -6163,122 +6196,14 @@ impl DocumentEditor {
         }
     }
 
-    /// Resolve an object one level of indirection deep against the source.
-    fn resolve_obj(&self, o: &Object) -> Object {
-        match o {
-            Object::Reference(r) => self.source.load_object(*r).unwrap_or(Object::Null),
-            other => other.clone(),
-        }
-    }
-
-    /// The interactive form's default resource dictionary (`/DR`), resolved.
-    fn acroform_default_resources(&self) -> Option<Object> {
-        let cat = self.source.catalog().ok()?;
-        let af = self.resolve_obj(cat.as_dict()?.get("AcroForm")?);
-        let dr = af.as_dict()?.get("DR")?.clone();
-        Some(self.resolve_obj(&dr))
-    }
-
-    /// The field's effective default-appearance string: the widget's own `/DA`,
-    /// else the document-wide AcroForm `/DA` (ISO 32000-1 §12.7.3.3, inheritable).
-    fn effective_da(&self, annotation: &crate::annotations::Annotation) -> Option<String> {
-        if let Some(Object::String(s)) = annotation.raw_dict.as_ref().and_then(|d| d.get("DA")) {
-            return Some(String::from_utf8_lossy(s).into_owned());
-        }
-        let cat = self.source.catalog().ok()?;
-        let af = self.resolve_obj(cat.as_dict()?.get("AcroForm")?);
-        match af.as_dict()?.get("DA") {
-            Some(Object::String(s)) => Some(String::from_utf8_lossy(s).into_owned()),
-            _ => None,
-        }
-    }
-
-    /// Parse a `/DA` string into `(font resource name incl. '/', size, rgb)`.
-    /// A size of 0 means auto-size; colour defaults to black.
-    fn parse_da(da: &str) -> (String, f32, (f32, f32, f32)) {
-        let toks: Vec<&str> = da.split_whitespace().collect();
-        let mut font = "/Helv".to_string();
-        let mut size = 0.0f32;
-        let mut color = (0.0, 0.0, 0.0);
-        for i in 0..toks.len() {
-            match toks[i] {
-                "Tf" if i >= 2 => {
-                    if toks[i - 2].starts_with('/') {
-                        font = toks[i - 2].to_string();
-                    }
-                    if let Ok(s) = toks[i - 1].parse::<f32>() {
-                        size = s;
-                    }
-                },
-                "g" if i >= 1 => {
-                    if let Ok(v) = toks[i - 1].parse::<f32>() {
-                        color = (v, v, v);
-                    }
-                },
-                "rg" if i >= 3 => {
-                    if let (Ok(r), Ok(g), Ok(b)) = (
-                        toks[i - 3].parse::<f32>(),
-                        toks[i - 2].parse::<f32>(),
-                        toks[i - 1].parse::<f32>(),
-                    ) {
-                        color = (r, g, b);
-                    }
-                },
-                _ => {},
-            }
-        }
-        (font, size, color)
-    }
-
-    /// A self-contained standard-14 Helvetica font dictionary (no external
-    /// dependencies, so it survives the garbage-collected full rewrite).
-    fn helvetica_font_dict() -> Object {
-        let mut d = HashMap::new();
-        d.insert("Type".to_string(), Object::Name("Font".to_string()));
-        d.insert("Subtype".to_string(), Object::Name("Type1".to_string()));
-        d.insert("BaseFont".to_string(), Object::Name("Helvetica".to_string()));
-        d.insert("Encoding".to_string(), Object::Name("WinAnsiEncoding".to_string()));
-        Object::Dictionary(d)
-    }
-
-    /// Build the `/Resources` dict for a regenerated text appearance so the
-    /// `/DA` font name resolves inside the flattened form XObject.
-    ///
-    /// The form's `/DR` fonts are referenced from the AcroForm, which is dropped
-    /// when flattening (so its font objects are garbage-collected). We therefore
-    /// *inline* a self-contained font dict under the `/DA` name: the document's
-    /// own font when it is a standard-14 Type1 (no embedded program), otherwise
-    /// a Helvetica stand-in. Non-Latin fonts that need an embedded program are
-    /// handled by the fallback-embedding path.
-    fn build_text_appearance_resources(&self, da_font_name: &str) -> Object {
-        let name = da_font_name.trim_start_matches('/').to_string();
-
-        let font_dict = self
-            .acroform_default_resources()
-            .and_then(|dr| dr.as_dict()?.get("Font").map(|f| self.resolve_obj(f)))
-            .and_then(|fonts| fonts.as_dict()?.get(&name).map(|f| self.resolve_obj(f)))
-            .filter(Self::is_self_contained_simple_font)
-            .unwrap_or_else(Self::helvetica_font_dict);
-
-        let mut fonts = HashMap::new();
-        fonts.insert(name, font_dict);
-        let mut res = HashMap::new();
-        res.insert("Font".to_string(), Object::Dictionary(fonts));
-        Object::Dictionary(res)
-    }
-
-    /// True for a standard-14 Type1 font dict with no embedded font program,
-    /// i.e. one that can be inlined verbatim and stay self-contained.
-    fn is_self_contained_simple_font(font: &Object) -> bool {
-        let Some(d) = font.as_dict() else {
-            return false;
-        };
-        if d.get("Subtype").and_then(|s| s.as_name()) != Some("Type1") {
-            return false;
-        }
-        // A FontDescriptor implies an embedded program / extra object graph.
-        !d.contains_key("FontDescriptor")
-    }
+    // ── pdf_manipulator patch: widget-appearance generation moved to
+    // form_regen.rs (`impl PdfDocument`) so the page renderer can share it —
+    // resolve_obj, acroform_needs_appearances, acroform_default_resources,
+    // effective_da, parse_da, helvetica_font_dict, build_text_appearance_resources,
+    // and is_self_contained_simple_font now live there. This editor reaches them
+    // via `self.source.*` (resolve_obj was reinventing PdfDocument::resolve_object
+    // and is gone). The flatten path keeps the CJK/emoji embedded-font fallback
+    // below; the shared Latin/`/DA` path is `self.source.regenerate_widget_appearance`. ──
 
     /// Extract appearance stream from a widget annotation.
     fn extract_widget_appearance(
@@ -6494,8 +6419,10 @@ impl DocumentEditor {
         let width = (rect[2] - rect[0]) as f32;
         let height = (rect[3] - rect[1]) as f32;
 
+        // ── pdf_manipulator patch: parse_da/effective_da moved to form_regen.rs ──
         let (da_font, da_size, da_color) =
-            Self::parse_da(&self.effective_da(annotation).unwrap_or_default());
+            PdfDocument::parse_da(&self.source.effective_da(annotation).unwrap_or_default());
+        // ── end pdf_manipulator patch ──
         let font_size = if da_size > 0.0 {
             da_size
         } else {
@@ -6504,7 +6431,9 @@ impl DocumentEditor {
 
         // Resource dict seeded with the /DA font (used for any Latin runs).
         let mut font_res: HashMap<String, Object> = HashMap::new();
-        if let Object::Dictionary(res) = self.build_text_appearance_resources(&da_font) {
+        // ── pdf_manipulator patch: build_text_appearance_resources moved to form_regen.rs ──
+        if let Object::Dictionary(res) = self.source.build_text_appearance_resources(&da_font) {
+            // ── end pdf_manipulator patch ──
             if let Some(Object::Dictionary(f)) = res.get("Font") {
                 font_res = f.clone();
             }
@@ -6605,97 +6534,33 @@ impl DocumentEditor {
     }
 
     /// Generate appearance stream for a widget without one.
+    // ── pdf_manipulator patch: delegate to the shared generator ──
+    /// Regenerate a widget's appearance for the flatten overlay by delegating to
+    /// the shared `PdfDocument::regenerate_widget_appearance` (form_regen.rs,
+    /// also used by the page renderer) and wrapping the result into an
+    /// `AnnotationAppearance`.
     fn generate_widget_appearance(
         &self,
         annotation: &crate::annotations::Annotation,
     ) -> Result<Option<AnnotationAppearance>> {
-        use crate::annotation_types::WidgetFieldType;
-        use crate::geometry::Rect;
-        use crate::writer::FormAppearanceGenerator;
-
-        let rect = match annotation.rect {
-            Some(r) => r,
+        let generated = match self.source.regenerate_widget_appearance(annotation)? {
+            Some(g) => g,
             None => return Ok(None),
         };
-
-        let annot_rect = [
-            rect[0] as f32,
-            rect[1] as f32,
-            rect[2] as f32,
-            rect[3] as f32,
-        ];
-        let width = annot_rect[2] - annot_rect[0];
-        let height = annot_rect[3] - annot_rect[1];
-        let geom_rect = Rect::new(0.0, 0.0, width, height);
-
-        // Text-bearing fields regenerate per ISO 32000-1 §12.7.3.3: the font
-        // name, size, and colour come from the field's /DA, and the appearance
-        // /Resources are built from the form's /DR. A text-only generator (no
-        // opaque background or border) avoids painting over page content the
-        // field rect may overlap.
-        let field_type = annotation.field_type.as_ref();
-        let shape_generator = FormAppearanceGenerator::new()
-            .with_background(1.0, 1.0, 1.0)
-            .with_border(1.0, 0.0, 0.0, 0.0);
-        let text_generator = FormAppearanceGenerator::new();
-
-        let (da_font, da_size, da_color) =
-            Self::parse_da(&self.effective_da(annotation).unwrap_or_default());
-        // Auto-size (/DA size 0) → fit the annotation height with padding.
-        let font_size = if da_size > 0.0 {
-            da_size
-        } else {
-            (height * 0.7).clamp(6.0, 12.0)
-        };
-
-        let mut text_resources: Option<Object> = None;
-        let content_str = match field_type {
-            Some(WidgetFieldType::Text) => {
-                let text = annotation.field_value.as_deref().unwrap_or("");
-                text_resources = Some(self.build_text_appearance_resources(&da_font));
-                text_generator.text_field_appearance(geom_rect, text, &da_font, font_size, da_color)
-            },
-            Some(WidgetFieldType::Checkbox { checked }) => {
-                if *checked {
-                    shape_generator.checkbox_on_appearance(geom_rect, (0.0, 0.0, 0.0))
-                } else {
-                    shape_generator.checkbox_off_appearance(geom_rect)
-                }
-            },
-            Some(WidgetFieldType::Radio { selected }) => {
-                if selected.is_some() {
-                    shape_generator.radio_on_appearance(geom_rect, (0.0, 0.0, 0.0))
-                } else {
-                    shape_generator.radio_off_appearance(geom_rect)
-                }
-            },
-            Some(WidgetFieldType::Button) => {
-                let caption = annotation.field_value.as_deref().unwrap_or("");
-                text_resources = Some(self.build_text_appearance_resources(&da_font));
-                text_generator.button_appearance(geom_rect, caption, &da_font, font_size, da_color)
-            },
-            Some(WidgetFieldType::Choice { selected, .. }) => {
-                let text = selected.as_deref().unwrap_or("");
-                text_resources = Some(self.build_text_appearance_resources(&da_font));
-                text_generator.text_field_appearance(geom_rect, text, &da_font, font_size, da_color)
-            },
-            Some(WidgetFieldType::Signature) | Some(WidgetFieldType::Unknown) | None => {
-                return Ok(None);
-            },
-        };
-
-        let content_bytes = content_str.into_bytes();
-        let bbox = [0.0, 0.0, width, height];
-
+        let annot_rect = annotation
+            .rect
+            .map(|r| [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32])
+            .unwrap_or([0.0, 0.0, 0.0, 0.0]);
         Ok(Some(AnnotationAppearance {
-            content: content_bytes,
-            bbox,
+            content: generated.content,
+            bbox: generated.bbox,
             annot_rect,
             matrix: None,
-            resources: text_resources,
+            resources: generated.resources,
             extra_objects: Vec::new(),
         }))
     }
+    // ── end pdf_manipulator patch ──
 
     /// Get annotation appearance stream data for flattening.
     ///

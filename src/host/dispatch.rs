@@ -1308,11 +1308,26 @@ pub fn edit_add_image_stamp(
     let mut page_dict = page_obj.as_dict()
         .ok_or_else(|| Error::InvalidPdf("page not a dict".into()))?
         .clone();
-    let mut annots = page_dict.get("Annots")
-        .and_then(|a| a.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // /Annots may be a direct array OR an indirect reference to one (ISO
+    // 32000-1 §7.3.10 — any object may be indirect). Resolve both: `as_array`
+    // alone returns None for the indirect form, so a naive read drops every
+    // existing widget/link on the page and leaves only the new stamp.
+    // Detach the object from page_dict first so load_object's &mut borrow of
+    // the editor doesn't overlap the page_dict borrow.
+    let annots_obj = page_dict.get("Annots").cloned();
+    let mut annots = match annots_obj {
+        Some(Object::Array(items)) => items,
+        Some(Object::Reference(reference)) => editor
+            .source_mut()
+            .load_object(reference)
+            .ok()
+            .and_then(|o| o.as_array().cloned())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     annots.push(Object::Reference(crate::object::ObjectRef::new(annot_id, 0)));
+    // Write the resolved list back inline; the old indirect array object is
+    // orphaned harmlessly (the page no longer references it).
     page_dict.insert("Annots".into(), Object::Array(annots));
     editor.insert_modified(page_ref.id, Object::Dictionary(page_dict));
 
