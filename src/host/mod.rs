@@ -13,6 +13,8 @@ pub mod constants;
 pub mod dispatch;
 pub mod fallback_fonts;
 pub mod lane_state;
+/// Per-op dispatch units (entry + handler + linker anchor).
+pub mod ops;
 pub mod positioned_write;
 pub mod font_optimizer;
 #[cfg(feature = "rendering")]

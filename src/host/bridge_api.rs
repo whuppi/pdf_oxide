@@ -100,203 +100,16 @@ pub(crate) fn handle_request(
         Err(e) => return ResponseWriter::error(&format!("parse error: {e}")),
     };
 
-    // Helper: take a source/sink by index (removes from vec, takes ownership).
-    fn take_source(sources: &mut Vec<BoxedReader>, idx: usize) -> Option<BoxedReader> {
-        if idx < sources.len() { Some(sources.remove(idx)) } else { None }
-    }
-    fn take_sink(sinks: &mut Vec<BoxedWriter>, idx: usize) -> Option<BoxedWriter> {
-        if idx < sinks.len() { Some(sinks.remove(idx)) } else { None }
-    }
-    // Helper: take the op's DATA source (image bytes, embedded file,
-    // merge document). Pinned ops re-create the document reader at
-    // sources[0], so their data rides at sources[1]; non-pinned ops
-    // carry data at sources[0].
-    fn take_data_reader(sources: &mut Vec<BoxedReader>) -> Option<BoxedReader> {
-        if sources.len() > 1 {
-            Some(sources.remove(1))
-        } else if !sources.is_empty() {
-            Some(sources.remove(0))
-        } else {
-            None
-        }
-    }
-
-    // Ops that produce output via sinks[0].
-    match req.op() {
-        "editorSave" => return handle_editor_save(state, &req, take_sink(&mut sinks, 0)),
-        "editorExtractPages" => return handle_editor_extract_pages(state, &req, take_sink(&mut sinks, 0)),
-        "registerFallbackFont" => return handle_register_fallback_font(&req, source_bytes, take_source(&mut sources, 0)),
-        "convertTo" => return handle_convert_to(state, &req, source_bytes, take_source(&mut sources, 0), take_sink(&mut sinks, 0)),
-        "convertToPdf" => return handle_convert_to_pdf(&req, source_bytes, take_source(&mut sources, 0), take_sink(&mut sinks, 0)),
-        "builderSave" => return handle_builder_save(state, &req, take_sink(&mut sinks, 0)),
-        "render" => return handle_render_streamed(state, &req, take_sink(&mut sinks, 0)),
-        "extractImages" => return handle_extract_images_streamed(state, &req, take_sink(&mut sinks, 0)),
-        "sign" => return handle_sign(&req, take_source(&mut sources, 0), source_bytes, take_sink(&mut sinks, 0)),
-        _ => {}
-    }
-
-    match req.op() {
-        // ── Document handle lifecycle ──
-        "open" => handle_open(state, &req, source_bytes, take_source(&mut sources, 0)),
-        "docDispose" => {
-            state.documents.remove(&req_handle(&req));
-            ok_flag("disposed")
-        }
-
-        // ── Document read ops (reuse already-parsed doc via handleId) ──
-        "extract" => handle_with_doc(state, &req, |doc, req| {
-            let page = req.get_i32("page").map(|p| p as usize);
-            let format = req.get_str("format").unwrap_or("plainText");
-            let result = dispatch::extract_text(doc, page, format)?;
-            let mut w = ResponseWriter::ok();
-            w.put_str("text", &result.text);
-            Ok(w.finish())
-        }),
-        "search" => handle_with_doc(state, &req, |doc, req| {
-            let query = req.get_str("query").unwrap_or("");
-            let page = req.get_i32("page").map(|p| p as usize);
-            let result = dispatch::search_text(doc, query, page)?;
-            let mut w = ResponseWriter::ok();
-            w.put_map_list("hits", result.hits.len(), |i, item| {
-                let h = &result.hits[i];
-                item.put_i32("page", h.page as i32);
-                item.put_str("text", &h.text);
-                item.put_f64("x", h.x as f64);
-                item.put_f64("y", h.y as f64);
-                item.put_f64("width", h.width as f64);
-                item.put_f64("height", h.height as f64);
-            });
-            Ok(w.finish())
-        }),
-        "getSignatures" => handle_with_doc(state, &req, |doc, _| {
-            let result = dispatch::get_signatures(doc)?;
-            let mut w = ResponseWriter::ok();
-            w.put_map_list("signatures", result.signatures.len(), |i, item| {
-                let s = &result.signatures[i];
-                item.put_str("signerName", &s.signer_name);
-                item.put_str("reason", &s.reason);
-                item.put_str("location", &s.location);
-            });
-            Ok(w.finish())
-        }),
-        "verifySignatures" => handle_with_doc(state, &req, |doc, _| {
-            let result = dispatch::verify_signatures(doc)?;
-            let mut w = ResponseWriter::ok();
-            w.put_bool("valid", result);
-            Ok(w.finish())
-        }),
-        "validatePdfA" => handle_with_doc(state, &req, |doc, req| {
-            let level = req.get_i32("level").unwrap_or(2);
-            let result = dispatch::validate_pdf_a(doc, level)?;
-            let mut w = ResponseWriter::ok();
-            w.put_bool("compliant", result.compliant);
-            w.put_i32("errors", result.errors);
-            w.put_i32("warnings", result.warnings);
-            Ok(w.finish())
-        }),
-        "validatePdfUa" => handle_with_doc(state, &req, |doc, req| {
-            let level = req.get_i32("level").unwrap_or(1);
-            let result = dispatch::validate_pdf_ua(doc, level)?;
-            let mut w = ResponseWriter::ok();
-            w.put_bool("valid", result);
-            Ok(w.finish())
-        }),
-        "planSplitByBookmarks" => handle_with_doc(state, &req, |doc, _| {
-            let result = dispatch::plan_split_by_bookmarks(doc)?;
-            let mut w = ResponseWriter::ok();
-            w.put_map_list("splits", result.len(), |i, item| {
-                let s = &result[i];
-                item.put_str("title", &s.title);
-                item.put_i32("startPage", s.start_page as i32);
-                item.put_i32("endPage", s.end_page as i32);
-            });
-            Ok(w.finish())
-        }),
-        "classifyPage" => handle_with_doc(state, &req, |doc, req| {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
-            let result = dispatch::classify_page(doc, page)?;
-            let mut w = ResponseWriter::ok();
-            w.put_str("type", &result.type_name);
-            Ok(w.finish())
-        }),
-        "classifyDocument" => handle_with_doc(state, &req, |doc, _| {
-            let result = dispatch::classify_document(doc)?;
-            let mut w = ResponseWriter::ok();
-            w.put_str("type", &result.type_name);
-            Ok(w.finish())
-        }),
-
-        // ── Editor lifecycle ──
-        "editorOpen" => handle_editor_open(state, &req, source_bytes, take_source(&mut sources, 0)),
-        "editorDispose" => {
-            state.editors.remove(&req_handle(&req));
-            ok_flag("disposed")
-        }
-        "editorGetMetadata" => handle_with_editor(state, &req, |editor, _| {
-            let m = dispatch::edit_get_metadata(editor);
-            let mut w = ResponseWriter::ok();
-            w.put_i32("pageCount", m.page_count as i32);
-            w.put_str("version", &format!("{}.{}", m.version_major, m.version_minor));
-            w.put_str("title", &m.title);
-            w.put_str("author", &m.author);
-            w.put_str("subject", &m.subject);
-            w.put_str("keywords", &m.keywords);
-            w.put_str("producer", &m.producer);
-            w.put_str("creationDate", &m.creation_date);
-            Ok(w.finish())
-        }),
-        "editorIsModified" => handle_with_editor(state, &req, |editor, _| {
-            let modified = dispatch::edit_is_modified(editor);
-            let mut w = ResponseWriter::ok();
-            w.put_bool("modified", modified);
-            Ok(w.finish())
-        }),
-        "editorPageMediaBox" => handle_with_editor(state, &req, |editor, req| {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
-            let (x, y, w2, h) = dispatch::edit_page_media_box(editor, page)?;
-            let mut w = ResponseWriter::ok();
-            w.put_f64("x", x as f64);
-            w.put_f64("y", y as f64);
-            w.put_f64("width", w2 as f64);
-            w.put_f64("height", h as f64);
-            Ok(w.finish())
-        }),
-        "editorRedactionCount" => handle_with_editor(state, &req, |editor, req| {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
-            let count = dispatch::edit_redaction_count(editor, page)?;
-            let mut w = ResponseWriter::ok();
-            w.put_i32("count", count as i32);
-            Ok(w.finish())
-        }),
-        "editorMutate" => {
-            let data = take_data_reader(&mut sources);
-            handle_editor_mutate(state, &req, data)
-        }
-        "editorMergeFrom" => {
-            let data = take_data_reader(&mut sources);
-            handle_editor_merge_from(state, &req, data)
-        }
-
-        // ── Builder lifecycle ──
-        "builderCreate" => handle_builder_create(state),
-        "builderDispose" => {
-            let hid = req_handle(&req);
-            state.builders.remove(&hid);
-            state.page_ops.remove(&hid);
-            ok_flag("disposed")
-        }
-        "builderSetMetadata" => handle_builder_set_metadata(state, &req),
-        "builderAddPage" => handle_builder_add_page(state, &req),
-        "builderPageOp" => handle_builder_page_op(state, &req, take_source(&mut sources, 0)),
-        "builderPageDone" => {
-            state.page_ops
-                .entry(req_handle(&req))
-                .or_default()
-                .push(dispatch::PageOp::Done);
-            ok_flag("done")
-        }
-
-        _ => ResponseWriter::error(&format!("unknown op: {}", req.op())),
+    let mut ctx = crate::host::ops::OpCtx {
+        state,
+        req: &req,
+        source_bytes,
+        sources: &mut sources,
+        sinks: &mut sinks,
+    };
+    match crate::host::ops::registry::find(req.op()) {
+        Some(entry) => (entry.handle)(&mut ctx),
+        None => ResponseWriter::error(&format!("unknown op: {}", req.op())),
     }
 }
 
@@ -305,12 +118,12 @@ pub(crate) fn handle_request(
 // ═══════════════════════════════════════════════════════════════════
 
 /// The request's handle id (0 when absent — never a valid handle).
-fn req_handle(req: &Request<'_>) -> u32 {
+pub(crate) fn req_handle(req: &Request<'_>) -> u32 {
     req.get_i32("handleId").unwrap_or(0) as u32
 }
 
 /// A success response carrying a single `true` flag.
-fn ok_flag(key: &str) -> Vec<u8> {
+pub(crate) fn ok_flag(key: &str) -> Vec<u8> {
     let mut w = ResponseWriter::ok();
     w.put_bool(key, true);
     w.finish()
@@ -335,7 +148,7 @@ fn open_source(
     }
 }
 
-fn handle_builder_create(state: &mut LaneState) -> Vec<u8> {
+pub(crate) fn handle_builder_create(state: &mut LaneState) -> Vec<u8> {
     let builder = dispatch::builder_new();
     let hid = state.next_handle_id();
     state.builders.insert(hid, builder);
@@ -344,7 +157,7 @@ fn handle_builder_create(state: &mut LaneState) -> Vec<u8> {
     w.finish()
 }
 
-fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+pub(crate) fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
     let hid = req_handle(req);
     let Some(mut b) = state.builders.remove(&hid) else {
         return ResponseWriter::error("builder not found");
@@ -365,7 +178,7 @@ fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<
     ok_flag("set")
 }
 
-fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+pub(crate) fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
     let size = match req.get_str("pageType") {
         Some("a4") => PageSize::A4,
         Some("letter") => PageSize::Letter,
@@ -383,7 +196,7 @@ fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> 
     ok_flag("added")
 }
 
-fn handle_editor_merge_from(
+pub(crate) fn handle_editor_merge_from(
     state: &mut LaneState,
     req: &Request<'_>,
     merge_reader: Option<BoxedReader>,
@@ -425,7 +238,7 @@ fn authenticate_or_refuse(doc: &PdfDocument, password: Option<&str>) -> Option<V
     }
 }
 
-fn handle_open(
+pub(crate) fn handle_open(
     state: &mut LaneState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
@@ -472,7 +285,7 @@ fn handle_open(
     }
 }
 
-fn handle_editor_open(
+pub(crate) fn handle_editor_open(
     state: &mut LaneState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
@@ -497,7 +310,7 @@ fn handle_editor_open(
     w.finish()
 }
 
-fn handle_with_doc<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
+pub(crate) fn handle_with_doc<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
     let hid = req_handle(req);
@@ -511,7 +324,7 @@ where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
     }
 }
 
-fn handle_with_editor<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
+pub(crate) fn handle_with_editor<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut DocumentEditor, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
     let hid = req_handle(req);
@@ -525,7 +338,7 @@ where F: FnOnce(&mut DocumentEditor, &Request<'_>) -> crate::error::Result<Vec<u
     }
 }
 
-fn handle_editor_mutate(
+pub(crate) fn handle_editor_mutate(
     state: &mut LaneState,
     req: &Request<'_>,
     data_reader: Option<BoxedReader>,
@@ -764,7 +577,7 @@ fn do_editor_mutate(
     }
 }
 
-fn handle_builder_page_op(
+pub(crate) fn handle_builder_page_op(
     state: &mut LaneState,
     req: &Request<'_>,
     mut data_reader: Option<BoxedReader>,
@@ -878,7 +691,7 @@ fn handle_builder_page_op(
     ok_flag("buffered")
 }
 
-fn handle_register_fallback_font(
+pub(crate) fn handle_register_fallback_font(
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
@@ -902,7 +715,7 @@ fn handle_register_fallback_font(
     }
 }
 
-fn handle_convert_to(
+pub(crate) fn handle_convert_to(
     state: &mut LaneState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
@@ -958,7 +771,7 @@ fn convert_to_with_doc(
     }
 }
 
-fn handle_convert_to_pdf(
+pub(crate) fn handle_convert_to_pdf(
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
@@ -1008,7 +821,7 @@ fn handle_convert_to_pdf(
     }
 }
 
-fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+pub(crate) fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
     let hid = req_handle(req);
     let builders_map = &mut state.builders;
     let builder = match builders_map.remove(&hid) {
@@ -1041,7 +854,7 @@ fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Op
     }
 }
 
-fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
     let hid = req_handle(req);
     let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
@@ -1084,7 +897,7 @@ fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer:
     }
 }
 
-fn handle_extract_images_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+pub(crate) fn handle_extract_images_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
     let hid = req_handle(req);
     let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
@@ -1125,7 +938,7 @@ fn handle_extract_images_streamed(state: &mut LaneState, req: &Request<'_>, sink
 }
 
 #[cfg(feature = "signatures")]
-fn handle_sign(
+pub(crate) fn handle_sign(
     req: &Request<'_>,
     source_reader: Option<BoxedReader>,
     source_bytes: Option<&[u8]>,
@@ -1177,7 +990,7 @@ fn handle_sign(
 }
 
 #[cfg(not(feature = "signatures"))]
-fn handle_sign(
+pub(crate) fn handle_sign(
     _req: &Request<'_>,
     _source_reader: Option<BoxedReader>,
     _source_bytes: Option<&[u8]>,
@@ -1186,7 +999,7 @@ fn handle_sign(
     ResponseWriter::error("signatures feature not enabled")
 }
 
-fn handle_editor_save(
+pub(crate) fn handle_editor_save(
     state: &mut LaneState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
@@ -1253,7 +1066,7 @@ fn handle_editor_save(
 
 /// Editor extract pages — select → save(sink) → restore page_order.
 /// Editor state is unchanged after the call. O(1) streaming via sink.
-fn handle_editor_extract_pages(
+pub(crate) fn handle_editor_extract_pages(
     state: &mut LaneState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,

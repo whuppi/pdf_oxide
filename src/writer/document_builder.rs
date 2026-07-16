@@ -565,6 +565,9 @@ impl<'a> FluentPageBuilder<'a> {
     }
     /// Width of the current page in points. Useful for callers
     /// computing alignment rectangles relative to the page edge.
+    // ── pdf_manipulator patch ── only the office converter calls this.
+    #[cfg(feature = "office")]
+    // ── end pdf_manipulator patch ──
     pub(crate) fn page_width(&self) -> f32 {
         self.builder.pages[self.page_index].width
     }
