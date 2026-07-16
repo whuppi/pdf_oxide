@@ -26,10 +26,18 @@
 //! same pattern as `adobe_glyph_list.rs`.
 
 mod adobe_arabic;
+// ── pdf_manipulator patch ── the four CJK tables are ~0.9 MB of const
+// data only text extraction consumes; the extract feature gates them.
+// adobe_arabic stays (a 4 KB identity-range stub, not a table).
+#[cfg(feature = "extract")]
 mod adobe_cns1;
+#[cfg(feature = "extract")]
 mod adobe_gb1;
+#[cfg(feature = "extract")]
 mod adobe_japan1;
+#[cfg(feature = "extract")]
 mod adobe_korea1;
+// ── end pdf_manipulator patch ──
 
 /// Look up Unicode code point for a CID in Adobe-GB1 (Simplified Chinese).
 ///
@@ -44,7 +52,16 @@ mod adobe_korea1;
 /// The corresponding Unicode code point, or None if not mapped.
 #[inline]
 pub fn lookup_adobe_gb1(cid: u16) -> Option<u32> {
-    adobe_gb1::lookup(cid)
+    // ── pdf_manipulator patch ── table gated by the extract feature;
+    // None routes callers to their existing fallback chains.
+    #[cfg(feature = "extract")]
+    return adobe_gb1::lookup(cid);
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = cid;
+        None
+    }
+    // ── end pdf_manipulator patch ──
 }
 
 /// Look up Unicode code point for a CID in Adobe-Japan1 (Japanese).
@@ -60,7 +77,16 @@ pub fn lookup_adobe_gb1(cid: u16) -> Option<u32> {
 /// The corresponding Unicode code point, or None if not mapped.
 #[inline]
 pub fn lookup_adobe_japan1(cid: u16) -> Option<u32> {
-    adobe_japan1::lookup(cid)
+    // ── pdf_manipulator patch ── table gated by the extract feature;
+    // None routes callers to their existing fallback chains.
+    #[cfg(feature = "extract")]
+    return adobe_japan1::lookup(cid);
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = cid;
+        None
+    }
+    // ── end pdf_manipulator patch ──
 }
 
 /// Look up Unicode code point for a CID in Adobe-CNS1 (Traditional Chinese).
@@ -76,7 +102,16 @@ pub fn lookup_adobe_japan1(cid: u16) -> Option<u32> {
 /// The corresponding Unicode code point, or None if not mapped.
 #[inline]
 pub fn lookup_adobe_cns1(cid: u16) -> Option<u32> {
-    adobe_cns1::lookup(cid)
+    // ── pdf_manipulator patch ── table gated by the extract feature;
+    // None routes callers to their existing fallback chains.
+    #[cfg(feature = "extract")]
+    return adobe_cns1::lookup(cid);
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = cid;
+        None
+    }
+    // ── end pdf_manipulator patch ──
 }
 
 /// Look up Unicode code point for a CID in Adobe-Korea1 (Korean).
@@ -92,7 +127,16 @@ pub fn lookup_adobe_cns1(cid: u16) -> Option<u32> {
 /// The corresponding Unicode code point, or None if not mapped.
 #[inline]
 pub fn lookup_adobe_korea1(cid: u16) -> Option<u32> {
-    adobe_korea1::lookup(cid)
+    // ── pdf_manipulator patch ── table gated by the extract feature;
+    // None routes callers to their existing fallback chains.
+    #[cfg(feature = "extract")]
+    return adobe_korea1::lookup(cid);
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = cid;
+        None
+    }
+    // ── end pdf_manipulator patch ──
 }
 
 /// look up Unicode code point for a CID in
@@ -115,7 +159,9 @@ pub fn lookup_adobe_arabic(cid: u16) -> Option<u32> {
     adobe_arabic::lookup(cid)
 }
 
-#[cfg(test)]
+// ── pdf_manipulator patch ── the CJK lookups need their tables.
+#[cfg(all(test, feature = "extract"))]
+// ── end pdf_manipulator patch ──
 mod tests {
     use super::*;
 
