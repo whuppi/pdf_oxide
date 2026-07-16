@@ -6365,8 +6365,8 @@ impl DocumentEditor {
     /// CID-keyed text (ISO 32000-1 §12.7.3.3 + §9.7 composite fonts).
     ///
     /// Returns `Ok(None)` when no fallback is needed (pure Latin-1) or available
-    /// (the `cjk-form-fonts` feature is off, or a font fails to parse/embed), so
-    /// the caller falls back to the plain `/DA` appearance path.
+    /// (no fallback font is registered or compiled in, or a font fails to
+    /// parse/embed), so the caller falls back to the plain `/DA` appearance path.
     fn regenerate_text_appearance_embedded(
         &mut self,
         annotation: &crate::annotations::Annotation,
@@ -6385,24 +6385,15 @@ impl DocumentEditor {
             return Ok(None);
         }
 
-        #[cfg(not(feature = "cjk-form-fonts"))]
-        {
-            self.flatten_warnings.push(
-                "field value contains non-Latin/emoji characters the /DA font cannot render; \
-                 rebuild with the `cjk-form-fonts` feature to embed a fallback font when flattening"
-                    .to_string(),
-            );
-            Ok(None)
-        }
-
-        #[cfg(feature = "cjk-form-fonts")]
-        {
-            self.embed_fallback_text_appearance(annotation, text)
-        }
+        // ── pdf_manipulator patch: fallback availability is a runtime question
+        // (registered font first, compiled-in asset second), not a compile-time
+        // cfg — the missing-font warning moved into
+        // embed_fallback_text_appearance where the per-kind lookup happens. ──
+        self.embed_fallback_text_appearance(annotation, text)
+        // ── end pdf_manipulator patch ──
     }
 
-    /// The `cjk-form-fonts`-gated body of [`Self::regenerate_text_appearance_embedded`].
-    #[cfg(feature = "cjk-form-fonts")]
+    /// The fallback-embedding body of [`Self::regenerate_text_appearance_embedded`].
     fn embed_fallback_text_appearance(
         &mut self,
         annotation: &crate::annotations::Annotation,
@@ -6446,7 +6437,24 @@ impl DocumentEditor {
         for run in &runs {
             if let Some(kind) = run.fallback {
                 if !fonts.contains_key(&kind) {
-                    match EmbeddedFont::from_data(None, form_fallback::font_bytes(kind).to_vec()) {
+                    // ── pdf_manipulator patch: registered-or-embedded lookup;
+                    // a missing font degrades to the /DA path with a warning
+                    // (the pre-registry builds said "rebuild with the
+                    // `cjk-form-fonts` feature" here). ──
+                    let bytes = match form_fallback::resolve_font_bytes(kind) {
+                        Some(b) => b,
+                        None => {
+                            self.flatten_warnings.push(format!(
+                                "field value contains {:?} characters the /DA font cannot \
+                                 render; register a fallback font (registerFallbackFont) or \
+                                 build with the `cjk-form-fonts` feature",
+                                kind
+                            ));
+                            return Ok(None);
+                        },
+                    };
+                    match EmbeddedFont::from_data(None, bytes.to_vec()) {
+                        // ── end pdf_manipulator patch ──
                         Ok(f) => {
                             fonts.insert(kind, f);
                         },

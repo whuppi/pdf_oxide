@@ -11,6 +11,7 @@ pub mod binary_codec;
 pub mod bridge_api;
 pub mod constants;
 pub mod dispatch;
+pub mod fallback_fonts;
 pub mod lane_state;
 pub mod positioned_write;
 pub mod font_optimizer;
