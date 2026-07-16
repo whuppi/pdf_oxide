@@ -302,17 +302,21 @@ pub mod hybrid;
 pub mod ocr;
 
 // C FFI for Go, Node.js, C# bindings (not available on wasm32)
-#[cfg(not(target_arch = "wasm32"))]
+// ── pdf_manipulator patch ── (public-api gate; see feature doc in Cargo.toml)
+#[cfg(all(not(target_arch = "wasm32"), feature = "public-api"))]
 pub mod ffi;
+// ── end pdf_manipulator patch ──
 
 // Python bindings (optional)
 #[cfg(feature = "python")]
 mod python;
 
 // WASM bindings (optional)
+// ── pdf_manipulator patch ── (public-api gate; see feature doc in Cargo.toml)
 #[cfg(any(target_arch = "wasm32", test))]
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "public-api"))]
 pub mod wasm;
+// ── end pdf_manipulator patch ──
 
 // ── pdf_manipulator patch: Flutter bridge host layer ──
 // Not part of upstream. Added for the pdf_manipulator Flutter package.

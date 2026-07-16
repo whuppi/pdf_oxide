@@ -455,6 +455,16 @@ native-bridge = ["dep:bumpalo", "dep:crossbeam-channel", "dep:allo-isolate"]
 # Debug feature for span merging analysis
 debug-span-merging = []
 
+# ── pdf_manipulator patch ──
+# The crate's own public API surfaces (the wasm-bindgen JS API in
+# src/wasm.rs and the C FFI in src/ffi.rs) are dead weight for the
+# lane-bridge consumer: every export is a linker root that pins its whole
+# reachable graph into the binary, defeating LTO dead-code elimination.
+# Default OFF here; enable for upstream-style standalone use and for
+# `cargo test` (the test suites cover these surfaces).
+public-api = []
+# ── end pdf_manipulator patch ──
+
 # Test-support hooks for integration tests. Currently exposes
 # `PageRenderer::icc_transform_cache_build_count()`, backed by an
 # instance-local `Cell<usize>` on the `IccTransformCache`, so the
