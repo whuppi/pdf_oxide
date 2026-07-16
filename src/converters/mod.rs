@@ -42,9 +42,15 @@ pub mod docx_layout;
 pub mod form_xobject_finder;
 pub mod formula_renderer;
 pub mod html;
+// ── pdf_manipulator patch ── only the office layout modules consume this.
+#[cfg(feature = "office")]
 pub(crate) mod layout_lines;
+// ── end pdf_manipulator patch ──
 pub mod markdown;
+// ── pdf_manipulator patch ── only the office layout modules consume this.
+#[cfg(feature = "office")]
 pub mod music_region_finder;
+// ── end pdf_manipulator patch ──
 // ── pdf_manipulator patch ──
 #[cfg(feature = "office")]
 pub mod office;
