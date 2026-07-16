@@ -674,6 +674,29 @@ pub fn edit_resize_image(editor: &mut DocumentEditor, page: usize, name: &str, w
 }
 
 /// Convert the document to PDF/A at the given level (1=A1b, 2=A2b, 3=A3b).
+/// Register a runtime fallback font for form-value baking.
+///
+/// `kind` is `"cjk"` or `"emoji"`. Idempotent per lane instance: the first
+/// registration wins (the router replays the same bytes to every lane).
+pub fn register_fallback_font(kind: &str, bytes: Vec<u8>) -> Result<()> {
+    use crate::fonts::form_fallback::Fallback;
+    let k = match kind {
+        "cjk" => Fallback::Cjk,
+        "emoji" => Fallback::Emoji,
+        other => {
+            return Err(Error::InvalidPdf(format!(
+                "unknown fallback font kind '{other}' (expected 'cjk' or 'emoji')"
+            )))
+        },
+    };
+    if bytes.is_empty() {
+        return Err(Error::InvalidPdf("fallback font bytes are empty".into()));
+    }
+    crate::host::fallback_fonts::register(k, bytes);
+    Ok(())
+}
+
+/// Convert the editor's document to PDF/A at the given conformance level.
 pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<()> {
     use crate::compliance::PdfALevel;
     let pdf_level = match level {

@@ -71,6 +71,23 @@ pub fn split_runs(text: &str) -> Vec<Run> {
     runs
 }
 
+// ── pdf_manipulator patch ──
+/// Fallback bytes for the form-flatten path: a runtime-registered font
+/// (see `crate::host::fallback_fonts`) wins over the compiled-in asset, so
+/// builds without `cjk-form-fonts` keep full CJK/emoji form fill when the
+/// app supplies the font. `None` = no fallback available; the caller keeps
+/// its no-font behavior.
+pub fn resolve_font_bytes(kind: Fallback) -> Option<&'static [u8]> {
+    if let Some(bytes) = crate::host::fallback_fonts::registered(kind) {
+        return Some(bytes);
+    }
+    #[cfg(any(feature = "cjk-form-fonts", feature = "cjk-render-fallback"))]
+    return Some(font_bytes(kind));
+    #[cfg(not(any(feature = "cjk-form-fonts", feature = "cjk-render-fallback")))]
+    None
+}
+// ── end pdf_manipulator patch ──
+
 /// Raw TrueType bytes for a bundled fallback font.
 ///
 /// Available to the form-flatten path (`cjk-form-fonts`) and to the page
