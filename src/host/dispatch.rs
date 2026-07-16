@@ -233,45 +233,53 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
 
 /// Extract text from one page or all pages in the given format.
 pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) -> Result<ExtractTextResult> {
-    let text = match format {
-        "markdown" => {
-            let opts = crate::converters::ConversionOptions::default();
-            match page {
-                None => doc.to_markdown_all(&opts)?,
-                Some(i) => doc.to_markdown(i, &opts)?,
-            }
-        }
-        "html" => {
-            let opts = crate::converters::ConversionOptions::default();
-            match page {
-                None => {
-                    let count = doc.page_count()?;
-                    let mut all = String::new();
-                    for i in 0..count {
-                        if i > 0 { all.push('\n'); }
-                        all.push_str(&doc.to_html(i, &opts)?);
-                    }
-                    all
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = (doc, page, format);
+        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+    }
+    #[cfg(feature = "extract")]
+    {
+        let text = match format {
+            "markdown" => {
+                let opts = crate::converters::ConversionOptions::default();
+                match page {
+                    None => doc.to_markdown_all(&opts)?,
+                    Some(i) => doc.to_markdown(i, &opts)?,
                 }
-                Some(i) => doc.to_html(i, &opts)?,
             }
-        }
-        _ => {
-            match page {
-                None => {
-                    let count = doc.page_count()?;
-                    let mut all = String::new();
-                    for i in 0..count {
-                        if i > 0 { all.push('\n'); }
-                        all.push_str(&doc.extract_text(i)?);
+            "html" => {
+                let opts = crate::converters::ConversionOptions::default();
+                match page {
+                    None => {
+                        let count = doc.page_count()?;
+                        let mut all = String::new();
+                        for i in 0..count {
+                            if i > 0 { all.push('\n'); }
+                            all.push_str(&doc.to_html(i, &opts)?);
+                        }
+                        all
                     }
-                    all
+                    Some(i) => doc.to_html(i, &opts)?,
                 }
-                Some(i) => doc.extract_text(i)?,
             }
-        }
-    };
-    Ok(ExtractTextResult { text })
+            _ => {
+                match page {
+                    None => {
+                        let count = doc.page_count()?;
+                        let mut all = String::new();
+                        for i in 0..count {
+                            if i > 0 { all.push('\n'); }
+                            all.push_str(&doc.extract_text(i)?);
+                        }
+                        all
+                    }
+                    Some(i) => doc.extract_text(i)?,
+                }
+            }
+        };
+        Ok(ExtractTextResult { text })
+    }
 }
 
 /// Search for text across the document, optionally filtered to one page.
@@ -369,14 +377,30 @@ pub fn validate_pdf_ua(doc: &mut PdfDocument, level: i32) -> Result<bool> {
 
 /// Classify a single page's content type.
 pub fn classify_page(doc: &mut PdfDocument, page: usize) -> Result<ClassificationResult> {
-    let classification = doc.classify_page(page)?;
-    Ok(ClassificationResult { type_name: format!("{:?}", classification) })
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = (doc, page);
+        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+    }
+    #[cfg(feature = "extract")]
+    {
+        let classification = doc.classify_page(page)?;
+        Ok(ClassificationResult { type_name: format!("{:?}", classification) })
+    }
 }
 
 /// Classify the overall document type.
 pub fn classify_document(doc: &mut PdfDocument) -> Result<ClassificationResult> {
-    let classification = doc.classify_document()?;
-    Ok(ClassificationResult { type_name: format!("{:?}", classification) })
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = doc;
+        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+    }
+    #[cfg(feature = "extract")]
+    {
+        let classification = doc.classify_document()?;
+        Ok(ClassificationResult { type_name: format!("{:?}", classification) })
+    }
 }
 
 /// Plan bookmark-based page ranges for splitting the document.
