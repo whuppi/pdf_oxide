@@ -27269,6 +27269,10 @@ mod tests {
     ///
     /// This exercises the post-processing pass in extract_words_inner that merges
     /// spans whose bboxes abut (gap ≤ 0.15 × font_size) on the same line.
+    // ── pdf_manipulator patch ── this test drives the C FFI builder, which is
+    // gated behind the public-api feature.
+    #[cfg(feature = "public-api")]
+    // ── end pdf_manipulator patch ──
     #[test]
     fn test_extract_words_adjacent_spans_merged() {
         // Build a minimal one-page PDF whose content stream places "Q" then "（"

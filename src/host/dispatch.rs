@@ -1655,3 +1655,47 @@ pub fn builder_save(b: DocumentBuilder) -> Result<Vec<u8>> { b.build() }
 pub fn builder_save_to_writer(b: DocumentBuilder, writer: &mut impl crate::host::positioned_write::PositionedWrite) -> Result<()> {
     b.build_to_writer(writer)
 }
+
+#[cfg(all(test, not(feature = "pdfa")))]
+mod trim_probe_tests {
+    use super::*;
+
+    fn minimal_pdf() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (id, body) in [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ] {
+            offsets.push(buf.len());
+            buf.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_off = buf.len();
+        buf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+        buf
+    }
+
+    // The shake-audit runtime probe: a trimmed build must answer an excluded
+    // op with the typed not-enabled error, never a crash.
+    #[test]
+    fn pdfa_ops_report_not_enabled_when_trimmed() {
+        let mut doc = match PdfDocument::from_bytes(minimal_pdf()) {
+            Ok(doc) => doc,
+            Err(e) => panic!("minimal doc must parse: {e}"),
+        };
+        let err = match validate_pdf_a(&mut doc, 2) {
+            Ok(_) => panic!("expected not-enabled error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not enabled in this build"));
+    }
+}
