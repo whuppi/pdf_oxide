@@ -114,7 +114,10 @@ pub use crate::extractors::xmp::{XmpExtractor, XmpMetadata};
 pub use crate::writer::{iso_timestamp, XmpWriter};
 
 // Re-export search types
+// ── pdf_manipulator patch ──
+#[cfg(feature = "extract")]
 pub use crate::search::{SearchOptions, SearchResult, TextSearcher};
+// ── end pdf_manipulator patch ──
 
 // Re-export embedded files types
 pub use crate::writer::{AFRelationship, EmbeddedFile, EmbeddedFilesBuilder};

@@ -619,6 +619,9 @@ harness = false
 [[bin]]
 name = "rust_bench"
 path = "bench/rust_bench.rs"
+# ── pdf_manipulator patch ── benches search, which the extract feature gates.
+required-features = ["extract"]
+# ── end pdf_manipulator patch ──
 
 # ── v0.3.39 per-feature examples (examples/rust/09-new-features/) ─────────────
 [[example]]

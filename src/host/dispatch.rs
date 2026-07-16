@@ -276,22 +276,30 @@ pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) ->
 
 /// Search for text across the document, optionally filtered to one page.
 pub fn search_text(doc: &mut PdfDocument, query: &str, page: Option<usize>) -> Result<SearchResult> {
-    use crate::search::{SearchOptions, TextSearcher};
-    let opts = SearchOptions::default();
-    let all_hits = TextSearcher::search(doc, query, &opts)?;
-    let hits: Vec<SearchHit> = all_hits
-        .into_iter()
-        .filter(|h| page.map_or(true, |p| h.page == p))
-        .map(|h| SearchHit {
-            page: h.page,
-            text: h.text,
-            x: h.bbox.x,
-            y: h.bbox.y,
-            width: h.bbox.width,
-            height: h.bbox.height,
-        })
-        .collect();
-    Ok(SearchResult { hits })
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = (doc, query, page);
+        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+    }
+    #[cfg(feature = "extract")]
+    {
+        use crate::search::{SearchOptions, TextSearcher};
+        let opts = SearchOptions::default();
+        let all_hits = TextSearcher::search(doc, query, &opts)?;
+        let hits: Vec<SearchHit> = all_hits
+            .into_iter()
+            .filter(|h| page.map_or(true, |p| h.page == p))
+            .map(|h| SearchHit {
+                page: h.page,
+                text: h.text,
+                x: h.bbox.x,
+                y: h.bbox.y,
+                width: h.bbox.width,
+                height: h.bbox.height,
+            })
+            .collect();
+        Ok(SearchResult { hits })
+    }
 }
 
 /// Enumerate digital signatures in the document.
@@ -1680,6 +1688,28 @@ pub fn builder_save_to_writer(b: DocumentBuilder, writer: &mut impl crate::host:
     b.build_to_writer(writer)
 }
 
+#[cfg(all(test, not(feature = "extract")))]
+mod extract_trim_probe_tests {
+    use super::*;
+
+    // A trimmed build must answer an excluded extract-family op with the
+    // typed not-enabled error, never a crash.
+    #[test]
+    fn search_reports_not_enabled_when_trimmed() {
+        let mut doc = match PdfDocument::from_bytes(
+            crate::host::dispatch::trim_probe_tests_support::minimal_pdf(),
+        ) {
+            Ok(doc) => doc,
+            Err(e) => panic!("minimal doc must parse: {e}"),
+        };
+        let err = match search_text(&mut doc, "x", None) {
+            Ok(_) => panic!("expected not-enabled error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not enabled in this build"));
+    }
+}
+
 #[cfg(all(test, not(feature = "office")))]
 mod office_trim_probe_tests {
     use super::*;
@@ -1696,11 +1726,10 @@ mod office_trim_probe_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "pdfa")))]
-mod trim_probe_tests {
-    use super::*;
-
-    fn minimal_pdf() -> Vec<u8> {
+#[cfg(test)]
+pub(crate) mod trim_probe_tests_support {
+    /// The smallest parseable PDF (catalog + one empty page + xref).
+    pub(crate) fn minimal_pdf() -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"%PDF-1.4\n");
         let mut offsets = Vec::new();
@@ -1723,12 +1752,19 @@ mod trim_probe_tests {
         );
         buf
     }
+}
+
+#[cfg(all(test, not(feature = "pdfa")))]
+mod trim_probe_tests {
+    use super::*;
 
     // The shake-audit runtime probe: a trimmed build must answer an excluded
     // op with the typed not-enabled error, never a crash.
     #[test]
     fn pdfa_ops_report_not_enabled_when_trimmed() {
-        let mut doc = match PdfDocument::from_bytes(minimal_pdf()) {
+        let mut doc = match PdfDocument::from_bytes(
+            trim_probe_tests_support::minimal_pdf(),
+        ) {
             Ok(doc) => doc,
             Err(e) => panic!("minimal doc must parse: {e}"),
         };
