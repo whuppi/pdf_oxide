@@ -401,8 +401,10 @@ legacy-crypto = ["dep:md-5"]
 
 # Python bindings (v0.1.0)
 python = [
-    # ── pdf_manipulator patch ── python API exposes office conversion ──
+    # ── pdf_manipulator patch ── python API exposes office conversion +
+    # full extraction ──
     "office",
+    "extract",
     # ── end pdf_manipulator patch ──
     "pyo3",
     "pyo3-log",
@@ -467,12 +469,19 @@ debug-span-merging = []
 # reachable graph into the binary, defeating LTO dead-code elimination.
 # Default OFF here; enable for upstream-style standalone use and for
 # `cargo test` (the test suites cover these surfaces).
-public-api = ["signatures", "barcodes", "office"]
+public-api = ["signatures", "barcodes", "office", "extract"]
 
 # ── pdf_manipulator patch ── PDF↔office conversion (DOCX/PPTX/XLSX import +
-# export). Gates office_oxide plus the converters that feed it; the
-# extraction pipeline (markdown/html/text) is independent and always built.
-office = ["dep:office_oxide"]
+# export). Gates office_oxide plus the converters that feed it. Requires
+# extract: converting a PDF to office extracts its content first.
+office = ["dep:office_oxide", "extract"]
+
+# Text-extraction support data/algorithms that only extraction reaches.
+# Accumulating gate (see docs/PLAN_OP_TRIMMING.md dominoes): today the
+# Adobe CID→Unicode tables (~0.9 MB); later the extraction algorithms.
+# When off, CID lookups return None and the existing fallback chains
+# degrade gracefully (CJK predefined-CMap text extracts as unknowns).
+extract = []
 # ── end pdf_manipulator patch ──
 # PDF/A validation + conversion (the compliance module, which embeds the
 # Liberation font family + sRGB profile for spec-required font embedding).
