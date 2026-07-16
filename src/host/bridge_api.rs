@@ -1342,6 +1342,39 @@ mod wasm_entry {
         Box::into_raw(lane) as u32
     }
 
+    /// Allocate `size` bytes (align 1) from the module's global allocator.
+    ///
+    /// Stable twin of the glue's internal malloc, for lane_worker.js's JSPI
+    /// driver: wasm-bindgen's `__wbindgen_export_N` aliases are renumbered
+    /// whenever the module's export set changes, so the worker must never
+    /// call those by name. Same allocator and layout as the glue's malloc,
+    /// so buffers are interchangeable with glue-allocated ones.
+    #[wasm_bindgen]
+    pub fn lane_alloc(size: u32) -> u32 {
+        if size == 0 {
+            return 1; // non-null dangling, mirrors the glue's zero-size malloc
+        }
+        unsafe {
+            let layout =
+                std::alloc::Layout::from_size_align_unchecked(size as usize, 1);
+            std::alloc::alloc(layout) as u32
+        }
+    }
+
+    /// Free a buffer from `lane_alloc` or a response buffer handed out by
+    /// `lane_execute` (both come from the same global allocator, align 1).
+    #[wasm_bindgen]
+    pub fn lane_dealloc(ptr: u32, size: u32) {
+        if size == 0 {
+            return;
+        }
+        unsafe {
+            let layout =
+                std::alloc::Layout::from_size_align_unchecked(size as usize, 1);
+            std::alloc::dealloc(ptr as *mut u8, layout);
+        }
+    }
+
     /// Execute one job against this lane's state.
     ///
     /// source_lengths: packed f64 array — each 8 bytes is one source
