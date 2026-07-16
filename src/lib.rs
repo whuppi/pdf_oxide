@@ -277,7 +277,10 @@ pub mod parallel;
 pub mod batch;
 
 // PDF/A compliance validation (v0.3.0)
+// ── pdf_manipulator patch ── (pdfa gate; see feature doc in Cargo.toml)
+#[cfg(feature = "pdfa")]
 pub mod compliance;
+// ── end pdf_manipulator patch ──
 
 // High-level API (v0.3.0)
 pub mod api;

@@ -422,6 +422,9 @@ ml = ["ocr-tract", "dep:linfa", "dep:linfa-clustering", "dep:tokenizers"]
 table-ml = ["ml", "dep:pdfium-render"]
 ocr = ["dep:ort", "dep:imageproc", "dep:ndarray", "dep:ureq"]
 gpu = ["dep:ort", "ml"]
+# ── pdf_manipulator patch: signatures/barcodes are only needed by the
+# public JS API (src/wasm.rs), not the lane bridge — public-api carries
+# them below so lane-only wasm builds can drop both. ──
 wasm = [
     "dep:wasm-bindgen",
     "dep:web-sys",
@@ -431,8 +434,6 @@ wasm = [
     "dep:getrandom_02",
     "dep:serde-wasm-bindgen",
     "logging",
-    "signatures",
-    "barcodes",
 ]
 # OCR in the browser/Deno/edge build (#524): wasm + the *lean* tract
 # backend only (`ocr-tract`, NOT full `ml` — that pulls tokenizers'
@@ -462,7 +463,11 @@ debug-span-merging = []
 # reachable graph into the binary, defeating LTO dead-code elimination.
 # Default OFF here; enable for upstream-style standalone use and for
 # `cargo test` (the test suites cover these surfaces).
-public-api = []
+public-api = ["signatures", "barcodes"]
+# PDF/A validation + conversion (the compliance module, which embeds the
+# Liberation font family + sRGB profile for spec-required font embedding).
+pdfa = []
+# ── end pdf_manipulator patch ──
 # ── end pdf_manipulator patch ──
 
 # Test-support hooks for integration tests. Currently exposes

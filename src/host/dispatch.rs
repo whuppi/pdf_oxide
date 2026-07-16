@@ -317,6 +317,13 @@ pub fn verify_signatures(_doc: &mut PdfDocument) -> Result<bool> {
 
 /// Validate PDF/A compliance at the given level (1=A1b, 2=A2b, 3=A3b).
 pub fn validate_pdf_a(doc: &mut PdfDocument, level: i32) -> Result<ValidationResult> {
+    #[cfg(not(feature = "pdfa"))]
+    {
+        let _ = (doc, level);
+        return Err(Error::InvalidPdf("PDF/A support not enabled in this build".into()));
+    }
+    #[cfg(feature = "pdfa")]
+    {
     use crate::compliance::{validate_pdf_a as do_validate, PdfALevel};
     let pdf_level = match level {
         1 => PdfALevel::A1b,
@@ -331,16 +338,25 @@ pub fn validate_pdf_a(doc: &mut PdfDocument, level: i32) -> Result<ValidationRes
         }),
         Err(_) => Ok(ValidationResult { compliant: false, errors: -1, warnings: 0 }),
     }
+    }
 }
 
 /// Validate PDF/UA compliance at the given level (1=UA1, 2=UA2).
 pub fn validate_pdf_ua(doc: &mut PdfDocument, level: i32) -> Result<bool> {
-    use crate::compliance::pdf_ua::{validate_pdf_ua as do_validate, PdfUaLevel};
-    let ua_level = match level {
-        2 => PdfUaLevel::Ua2,
-        _ => PdfUaLevel::Ua1,
-    };
-    Ok(do_validate(doc, ua_level).map(|r| r.is_compliant).unwrap_or(false))
+    #[cfg(not(feature = "pdfa"))]
+    {
+        let _ = (doc, level);
+        return Err(Error::InvalidPdf("PDF/A support not enabled in this build".into()));
+    }
+    #[cfg(feature = "pdfa")]
+    {
+        use crate::compliance::pdf_ua::{validate_pdf_ua as do_validate, PdfUaLevel};
+        let ua_level = match level {
+            2 => PdfUaLevel::Ua2,
+            _ => PdfUaLevel::Ua1,
+        };
+        Ok(do_validate(doc, ua_level).map(|r| r.is_compliant).unwrap_or(false))
+    }
 }
 
 /// Classify a single page's content type.
@@ -698,6 +714,13 @@ pub fn register_fallback_font(kind: &str, bytes: Vec<u8>) -> Result<()> {
 
 /// Convert the editor's document to PDF/A at the given conformance level.
 pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<()> {
+    #[cfg(not(feature = "pdfa"))]
+    {
+        let _ = (editor, level);
+        return Err(Error::InvalidPdf("PDF/A support not enabled in this build".into()));
+    }
+    #[cfg(feature = "pdfa")]
+    {
     use crate::compliance::PdfALevel;
     let pdf_level = match level {
         1 => PdfALevel::A1b,
@@ -707,6 +730,7 @@ pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<
     let converter = crate::compliance::PdfAConverter::new(pdf_level);
     converter.convert_with_editor(editor)?;
     Ok(())
+    }
 }
 
 // ── Redaction ──

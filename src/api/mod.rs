@@ -128,10 +128,13 @@ pub use crate::rendering::{ImageFormat, PageRenderer, RenderOptions, RenderedIma
 pub use crate::debug::{DebugOptions, DebugVisualizer, ElementColors};
 
 // Re-export PDF/A compliance types
+// ── pdf_manipulator patch ── (pdfa gate)
+#[cfg(feature = "pdfa")]
 pub use crate::compliance::{
     validate_pdf_a, ComplianceError, ComplianceWarning, ErrorCode, PdfALevel, PdfAPart,
     PdfAValidator, ValidationResult, ValidationStats, WarningCode,
 };
+// ── end pdf_manipulator patch ──
 
 // Re-export XFA form types
 pub use crate::xfa::{
