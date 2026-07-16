@@ -34,20 +34,36 @@
 //! # }
 //! ```
 
+// ── pdf_manipulator patch ── these modules feed PDF↔office conversion and
+// import office_oxide; everything else in this tree is office-independent.
+#[cfg(feature = "office")]
 pub mod docx_layout;
+// ── end pdf_manipulator patch ──
 pub mod form_xobject_finder;
 pub mod formula_renderer;
 pub mod html;
 pub(crate) mod layout_lines;
 pub mod markdown;
 pub mod music_region_finder;
+// ── pdf_manipulator patch ──
+#[cfg(feature = "office")]
 pub mod office;
+// ── end pdf_manipulator patch ──
+// ── pdf_manipulator patch ──
+#[cfg(feature = "office")]
 pub mod pdf_to_ir;
+// ── end pdf_manipulator patch ──
+// ── pdf_manipulator patch ──
+#[cfg(feature = "office")]
 pub mod pptx_layout;
+// ── end pdf_manipulator patch ──
 pub mod table_formatter;
 pub mod text_post_processor;
 pub mod whitespace;
+// ── pdf_manipulator patch ──
+#[cfg(feature = "office")]
 pub mod xlsx_layout;
+// ── end pdf_manipulator patch ──
 
 // Re-export main types
 pub use formula_renderer::{FormulaRenderer, RenderedFormula};
@@ -55,8 +71,14 @@ pub use formula_renderer::{FormulaRenderer, RenderedFormula};
 pub use html::HtmlConverter;
 #[allow(deprecated)]
 pub use markdown::MarkdownConverter;
+// ── pdf_manipulator patch ──
+#[cfg(feature = "office")]
 pub use office::{Margins, OfficeConfig, OfficeConverter};
+// ── end pdf_manipulator patch ──
+// ── pdf_manipulator patch ──
+#[cfg(feature = "office")]
 pub use pdf_to_ir::PdfToIrOptions;
+// ── end pdf_manipulator patch ──
 pub use table_formatter::MarkdownTableFormatter;
 pub use text_post_processor::TextPostProcessor;
 pub use whitespace::{cleanup_markdown, normalize_whitespace, remove_page_artifacts};

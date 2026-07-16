@@ -20363,6 +20363,14 @@ impl PdfDocument {
         Ok(result)
     }
 
+    // ── pdf_manipulator patch ── PDF→office export needs office_oxide; the
+    // whole contiguous to_docx/to_pptx/to_xlsx region lives in its own
+    // feature-gated impl block.
+}
+
+#[cfg(feature = "office")]
+impl PdfDocument {
+    // ── end pdf_manipulator patch ──
     /// Convert the entire document to a DOCX file written to `path`.
     ///
     /// # Example
@@ -20618,6 +20626,11 @@ impl PdfDocument {
         let w = office_oxide::create::ir_to_xlsx(&ir);
         w.write_to(writer).map_err(|e| crate::error::Error::InvalidOperation(format!("XLSX export: {e}")))
     }
+    // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch ── closes the feature-gated office impl.
+}
+
+impl PdfDocument {
     // ── end pdf_manipulator patch ──
 
     /// Extract images from a page.

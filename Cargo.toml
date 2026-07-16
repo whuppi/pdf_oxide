@@ -293,8 +293,9 @@ uuid = { version = "1.23", features = ["v4", "js"] }
 qrcode = { version = "0.14", optional = true }
 barcoders = { version = "2.0", optional = true, features = ["image"] }
 
-# ── pdf_manipulator patch: local fork with streaming OPC writer ──
-office_oxide = { path = "../office_oxide", default-features = false }
+# ── pdf_manipulator patch: local fork with streaming OPC writer; optional so
+# the `office` feature can drop PDF↔office conversion from trimmed builds ──
+office_oxide = { path = "../office_oxide", default-features = false, optional = true }
 # ── end pdf_manipulator patch ──
 x509-tsp = { version = "0.1", optional = true }
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
@@ -400,6 +401,9 @@ legacy-crypto = ["dep:md-5"]
 
 # Python bindings (v0.1.0)
 python = [
+    # ── pdf_manipulator patch ── python API exposes office conversion ──
+    "office",
+    # ── end pdf_manipulator patch ──
     "pyo3",
     "pyo3-log",
     "rendering",
@@ -463,7 +467,13 @@ debug-span-merging = []
 # reachable graph into the binary, defeating LTO dead-code elimination.
 # Default OFF here; enable for upstream-style standalone use and for
 # `cargo test` (the test suites cover these surfaces).
-public-api = ["signatures", "barcodes"]
+public-api = ["signatures", "barcodes", "office"]
+
+# ── pdf_manipulator patch ── PDF↔office conversion (DOCX/PPTX/XLSX import +
+# export). Gates office_oxide plus the converters that feed it; the
+# extraction pipeline (markdown/html/text) is independent and always built.
+office = ["dep:office_oxide"]
+# ── end pdf_manipulator patch ──
 # PDF/A validation + conversion (the compliance module, which embeds the
 # Liberation font family + sRGB profile for spec-required font embedding).
 pdfa = []

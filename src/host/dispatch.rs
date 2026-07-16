@@ -812,21 +812,37 @@ pub fn edit_save_encrypted(
 
 /// Convert a PDF to an office format, streaming output to a writer.
 pub fn convert_to_format_writer<W: std::io::Write>(doc: &PdfDocument, format: &str, writer: &mut W) -> Result<()> {
-    match format {
-        "docx" => doc.to_docx_writer_flow(writer),
-        "pptx" => doc.to_pptx_writer_flow(writer),
-        "xlsx" => doc.to_xlsx_writer_flow(writer),
-        _ => Err(Error::InvalidPdf(format!("Unknown conversion format: {}", format))),
+    #[cfg(not(feature = "office"))]
+    {
+        let _ = (doc, format, writer);
+        return Err(Error::InvalidPdf("office support not enabled in this build".into()));
+    }
+    #[cfg(feature = "office")]
+    {
+        match format {
+            "docx" => doc.to_docx_writer_flow(writer),
+            "pptx" => doc.to_pptx_writer_flow(writer),
+            "xlsx" => doc.to_xlsx_writer_flow(writer),
+            _ => Err(Error::InvalidPdf(format!("Unknown conversion format: {}", format))),
+        }
     }
 }
 
 /// Convert a PDF to an office format, returning the bytes.
 pub fn convert_to_format(doc: &PdfDocument, format: &str) -> Result<Vec<u8>> {
-    match format {
-        "docx" => doc.to_docx_bytes(),
-        "pptx" => doc.to_pptx_bytes(),
-        "xlsx" => doc.to_xlsx_bytes(),
-        _ => Err(Error::InvalidPdf(format!("Unknown conversion format: {}", format))),
+    #[cfg(not(feature = "office"))]
+    {
+        let _ = (doc, format);
+        return Err(Error::InvalidPdf("office support not enabled in this build".into()));
+    }
+    #[cfg(feature = "office")]
+    {
+        match format {
+            "docx" => doc.to_docx_bytes(),
+            "pptx" => doc.to_pptx_bytes(),
+            "xlsx" => doc.to_xlsx_bytes(),
+            _ => Err(Error::InvalidPdf(format!("Unknown conversion format: {}", format))),
+        }
     }
 }
 
@@ -834,12 +850,20 @@ pub fn convert_to_format(doc: &PdfDocument, format: &str) -> Result<Vec<u8>> {
 pub fn convert_from_format_writer<R: std::io::Read + std::io::Seek + Send + 'static, W: std::io::Write>(
     reader: R, format: &str, writer: &mut W,
 ) -> Result<()> {
-    let converter = crate::converters::office::OfficeConverter::new();
-    match format {
-        "docx" => converter.convert_docx_reader_to_writer(reader, writer),
-        "pptx" => converter.convert_pptx_reader_to_writer(reader, writer),
-        "xlsx" => converter.convert_xlsx_reader_to_writer(reader, writer),
-        _ => Err(Error::InvalidPdf(format!("Unknown conversion format: {}", format))),
+    #[cfg(not(feature = "office"))]
+    {
+        let _ = (reader, format, writer);
+        return Err(Error::InvalidPdf("office support not enabled in this build".into()));
+    }
+    #[cfg(feature = "office")]
+    {
+        let converter = crate::converters::office::OfficeConverter::new();
+        match format {
+            "docx" => converter.convert_docx_reader_to_writer(reader, writer),
+            "pptx" => converter.convert_pptx_reader_to_writer(reader, writer),
+            "xlsx" => converter.convert_xlsx_reader_to_writer(reader, writer),
+            _ => Err(Error::InvalidPdf(format!("Unknown conversion format: {}", format))),
+        }
     }
 }
 
@@ -1654,6 +1678,22 @@ pub fn builder_save(b: DocumentBuilder) -> Result<Vec<u8>> { b.build() }
 /// Build the document and write the PDF to a positioned writer.
 pub fn builder_save_to_writer(b: DocumentBuilder, writer: &mut impl crate::host::positioned_write::PositionedWrite) -> Result<()> {
     b.build_to_writer(writer)
+}
+
+#[cfg(all(test, not(feature = "office")))]
+mod office_trim_probe_tests {
+    use super::*;
+
+    // A trimmed build must answer an excluded office op with the typed
+    // not-enabled error, never a crash.
+    #[test]
+    fn office_ops_report_not_enabled_when_trimmed() {
+        let err = match convert_from_format_to_bytes(b"PK\x03\x04", "docx") {
+            Ok(_) => panic!("expected not-enabled error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not enabled in this build"));
+    }
 }
 
 #[cfg(all(test, not(feature = "pdfa")))]
