@@ -1716,6 +1716,21 @@ pub fn builder_save_to_writer(b: DocumentBuilder, writer: &mut impl crate::host:
 mod extract_trim_probe_tests {
     use super::*;
 
+    #[test]
+    fn extract_text_reports_not_enabled_when_trimmed() {
+        let mut doc = match PdfDocument::from_bytes(
+            crate::host::dispatch::trim_probe_tests_support::minimal_pdf(),
+        ) {
+            Ok(doc) => doc,
+            Err(e) => panic!("minimal doc must parse: {e}"),
+        };
+        let err = match extract_text(&mut doc, None, "plainText") {
+            Ok(_) => panic!("expected not-enabled error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not enabled in this build"));
+    }
+
     // A trimmed build must answer an excluded extract-family op with the
     // typed not-enabled error, never a crash.
     #[test]
