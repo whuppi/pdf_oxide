@@ -250,7 +250,10 @@ pub mod xfa;
 pub mod editor;
 
 // Text search (v0.3.0)
+// ── pdf_manipulator patch ── search runs on extracted spans.
+#[cfg(feature = "extract")]
 pub mod search;
+// ── end pdf_manipulator patch ──
 
 // Page rendering to images (optional, v0.3.0)
 #[cfg(feature = "rendering")]
