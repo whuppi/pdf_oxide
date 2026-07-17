@@ -4,9 +4,11 @@
 **/*.rs.bk
 *.pdb
 
-# Cargo.lock - include for binaries, exclude for libraries
-# For a library, uncomment the next line:
-/Cargo.lock
+# ── pdf_manipulator patch ──
+# Cargo.lock ships: this vendored engine builds app-style (pinned deps,
+# reproducible consumer compiles), and pub tarball filtering honors this
+# file — ignoring the lock here silently drops it from published packages.
+# ── end pdf_manipulator patch ──
 
 # Python
 __pycache__/
