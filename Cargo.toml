@@ -476,11 +476,12 @@ public-api = ["signatures", "barcodes", "office", "extract"]
 # extract: converting a PDF to office extracts its content first.
 office = ["dep:office_oxide", "extract"]
 
-# Text-extraction support data/algorithms that only extraction reaches.
-# Accumulating gate (see docs/PLAN_OP_TRIMMING.md dominoes): today the
-# Adobe CID→Unicode tables (~0.9 MB); later the extraction algorithms.
-# When off, CID lookups return None and the existing fallback chains
-# degrade gracefully (CJK predefined-CMap text extracts as unknowns).
+# Text extraction and everything built on it: the extract/search/classify
+# dispatch entry points and the Adobe CID→Unicode tables (~0.9 MB of const
+# data). With the feature off, those entry points answer a typed
+# not-enabled error, LTO drops the unreachable extraction code, and CID
+# lookups return None so the existing font-fallback chains degrade
+# gracefully (CJK predefined-CMap text extracts as unknowns).
 extract = []
 # ── end pdf_manipulator patch ──
 # PDF/A validation + conversion (the compliance module, which embeds the
