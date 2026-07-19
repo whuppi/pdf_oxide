@@ -27,11 +27,15 @@ fn main() -> anyhow::Result<()> {
     let out_dir = PathBuf::from(&args[2]);
     fs::create_dir_all(&out_dir)?;
 
+    // omit_default_module_path defaults to TRUE in the library (the CLI
+    // forces it false) — keep the no-arg `init()` sibling-URL fallback
+    // the glue always shipped with, or downstream loaders break.
     let mut bindgen = wasm_bindgen_cli_support::Bindgen::new();
     bindgen
         .input_path(&input)
         .web(true)?
         .typescript(false)
+        .omit_default_module_path(false)
         .out_name("pdf_oxide")
         .generate(&out_dir)?;
 
