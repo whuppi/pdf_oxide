@@ -1,5 +1,8 @@
 [workspace]
-members = [".", "pdf_oxide_mcp", "pdf_oxide_cli", "pdf_oxide_jni"]
+# ── pdf_manipulator patch: bindgen_runner runs wasm-bindgen + wasm-opt as
+# workspace-locked library calls, so no external CLI installs can drift ──
+members = [".", "pdf_oxide_mcp", "pdf_oxide_cli", "pdf_oxide_jni", "bindgen_runner"]
+# ── end pdf_manipulator patch ──
 exclude = ["js"]
 
 # cargo-shear exemptions: these optional deps are referenced from `[features]`
