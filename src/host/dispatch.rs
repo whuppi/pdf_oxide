@@ -716,6 +716,17 @@ pub fn edit_set_form_field_value(editor: &mut DocumentEditor, name: &str, value:
     editor.set_form_field_value(name, FormFieldValue::Text(value.to_string()))
 }
 
+/// Check or clear a checkbox field.
+///
+/// The string lane above reads a button value as an appearance-state name, so
+/// it can already turn a checkbox on when the caller knows the name. This lane
+/// exists for the caller who does not: `true` selects whichever on-state the
+/// widget offers.
+pub fn edit_set_checkbox_field_value(editor: &mut DocumentEditor, name: &str, checked: bool) -> Result<()> {
+    use crate::editor::form_fields::FormFieldValue;
+    editor.set_form_field_value(name, FormFieldValue::Boolean(checked))
+}
+
 /// Resize a named image XObject on a page.
 pub fn edit_resize_image(editor: &mut DocumentEditor, page: usize, name: &str, width: f32, height: f32) -> Result<()> {
     editor.resize_image(page, name, width, height)

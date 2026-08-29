@@ -498,14 +498,23 @@ impl PdfDocument {
             Some("Btn") => {
                 // Button field - determine if checkbox, radio, or push button
                 let ff = field_flags.unwrap_or(0);
-                // Bit 17 (0x10000): Radio buttons
-                // Bit 16 (0x8000): Push buttons
-                if ff & 0x10000 != 0 {
+                // ── pdf_manipulator patch: Radio and Pushbutton were swapped ──
+                // ISO 32000-1 Table 227 numbers bit positions from 1, so a
+                // flag's value is 1 << (position - 1): Radio is position 16
+                // (0x8000), Pushbutton is position 17 (0x10000). These two were
+                // read the other way round, so every spec-conformant radio
+                // group parsed as a push button — no /AS tracking, no
+                // appearance regeneration — and every push button parsed as a
+                // radio. The `field_flags` module in extractors/forms.rs
+                // already spells the correct values; use it rather than
+                // repeating the literals, so the two cannot drift apart again.
+                if ff & crate::extractors::forms::field_flags::RADIO != 0 {
                     // Radio button
                     Some(WidgetFieldType::Radio {
                         selected: appearance_state.clone(),
                     })
-                } else if ff & 0x8000 != 0 {
+                } else if ff & crate::extractors::forms::field_flags::PUSH_BUTTON != 0 {
+                // ── end pdf_manipulator patch ──
                     // Push button
                     Some(WidgetFieldType::Button)
                 } else {
