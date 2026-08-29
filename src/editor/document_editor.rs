@@ -1651,6 +1651,143 @@ impl DocumentEditor {
         Ok(())
     }
 
+    // ── pdf_manipulator patch: button on-state resolution (#215) ──
+
+    /// The on-state names a widget offers, read from its `/AP` `/N` state
+    /// dictionary with `/Off` removed (ISO 32000-1 §12.7.4.2.3).
+    ///
+    /// Empty when `/AP` `/N` is a single stream rather than a state dictionary
+    /// — the shape a writer leaves when it drew only the current state. The
+    /// caller then falls back to regenerating an appearance.
+    fn widget_on_states(&mut self, widget: &HashMap<String, Object>) -> Vec<String> {
+        let ap = match widget.get("AP") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            Some(Object::Reference(r)) => match self.source.load_object(*r) {
+                Ok(Object::Dictionary(d)) => d,
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        let normal = match ap.get("N") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            Some(Object::Reference(r)) => match self.source.load_object(*r) {
+                Ok(Object::Dictionary(d)) => d,
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        // A Form XObject is the single-stream shape, not a state dictionary.
+        if normal.get("Type").and_then(|t| t.as_name()) == Some("XObject") {
+            return Vec::new();
+        }
+        let mut states: Vec<String> = normal.keys().filter(|k| *k != "Off").cloned().collect();
+        states.sort();
+        states
+    }
+
+    /// The appearance-state name a button field's `/V` should carry for
+    /// `value`, or `None` for the off state.
+    ///
+    /// A button's value is a *name* — one of the states its `/AP` `/N` offers —
+    /// never text to draw. Bindings that can only send a string (the Dart
+    /// bridge before `setCheckboxFieldValue`, FDF imports) therefore arrive as
+    /// `Text`, and are read here as that name.
+    ///
+    /// `available` is the widget's own on-states, and an exact match against it
+    /// always wins: a Yes/No radio group really does have a state named `No`,
+    /// so the word can only be read as "off" once the widget has said it offers
+    /// no such state. After that, a word that plainly means on or off is taken
+    /// at its word — `Boolean(true)` and `"yes"` alike take the widget's only
+    /// on-state, which is why a box named `/On` no longer needs the caller to
+    /// know that. Any other unrecognised name selects nothing rather than
+    /// guessing which state was meant.
+    fn button_on_state(
+        value: &crate::editor::form_fields::FormFieldValue,
+        available: &[String],
+    ) -> Option<String> {
+        use crate::editor::form_fields::FormFieldValue;
+        // The single state a widget offers, when it offers exactly one — what
+        // a value that means "on" without naming a state must resolve to.
+        let sole_on_state = || match available {
+            [one] => Some(one.clone()),
+            _ => None,
+        };
+        match value {
+            FormFieldValue::Boolean(true) => {
+                sole_on_state().or_else(|| Some("Yes".to_string()))
+            },
+            FormFieldValue::Boolean(false) | FormFieldValue::None => None,
+            FormFieldValue::Text(s) | FormFieldValue::Choice(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                // State names are case-sensitive; an offered name is the answer.
+                if available.iter().any(|a| a == s) {
+                    return Some(s.to_string());
+                }
+                let word = s.to_ascii_lowercase();
+                if matches!(word.as_str(), "off" | "no" | "false" | "0") {
+                    return None;
+                }
+                if matches!(word.as_str(), "yes" | "on" | "true" | "1") {
+                    return sole_on_state().or_else(|| {
+                        // No state dictionary to resolve against — the caller's
+                        // word is all there is.
+                        available.is_empty().then(|| s.to_string())
+                    });
+                }
+                // An unrecognised name: trust it only when there is no state
+                // dictionary that could have contradicted it.
+                available.is_empty().then(|| s.to_string())
+            },
+            FormFieldValue::MultiChoice(_) => None,
+        }
+    }
+
+    /// Every on-state a *field* offers: the union across its `/Kids` for a radio
+    /// group, or the merged field+widget's own states.
+    ///
+    /// Both the save path and the flattener resolve a value against this, never
+    /// against one kid's states. Resolving per kid would answer a question the
+    /// kid cannot see: `"on"` names no state in a `/Red` + `/Blue` group, but
+    /// each kid alone has exactly one state, so every kid would light while the
+    /// save path — which sees both — wrote `/Off`.
+    fn field_on_states(&mut self, field: &HashMap<String, Object>) -> Vec<String> {
+        let widget_refs = self.field_widget_refs(field);
+        if widget_refs.is_empty() {
+            return self.widget_on_states(field);
+        }
+        let mut all = Vec::new();
+        for wref in widget_refs {
+            if let Ok(w) = self.source.load_object(wref) {
+                if let Some(wd) = w.as_dict() {
+                    all.extend(self.widget_on_states(&wd.clone()));
+                }
+            }
+        }
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    /// The widget dictionaries a field's `/AS` must be written to: its `/Kids`
+    /// for a radio group, or the field dictionary itself for a merged
+    /// field+widget (ISO 32000-1 §12.7.4.1).
+    fn field_widget_refs(&mut self, field: &HashMap<String, Object>) -> Vec<ObjectRef> {
+        let kids = match field.get("Kids") {
+            Some(Object::Array(a)) => a.clone(),
+            Some(Object::Reference(r)) => match self.source.load_object(*r) {
+                Ok(Object::Array(a)) => a,
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        kids.iter().filter_map(|k| k.as_reference()).collect()
+    }
+
+    // ── end pdf_manipulator patch ──
+
     /// Sync modified form fields into `modified_objects` for incremental save.
     ///
     /// For each modified field wrapper, loads the original PDF annotation object,
@@ -1658,10 +1795,14 @@ impl DocumentEditor {
     /// updated object into `modified_objects`. Also sets `/NeedAppearances true`
     /// in the AcroForm dictionary so PDF readers regenerate appearance streams.
     fn flush_form_fields_to_modified_objects(&mut self) -> Result<()> {
+        use crate::editor::form_fields::FormFieldValue;
         use crate::extractors::forms::FieldType;
 
         // Collect field data we need before mutating self
-        let fields_to_flush: Vec<(u32, u16, Object, bool)> = {
+        // ── pdf_manipulator patch: carry the typed value, not just the Object,
+        // so the button lane below can resolve an appearance-state name from it
+        // (an Object::Name has already lost the distinction). ──
+        let fields_to_flush: Vec<(u32, u16, FormFieldValue, bool)> = {
             let mut result = Vec::new();
             for wrapper in self.modified_form_fields.values() {
                 if !wrapper.is_modified() || wrapper.is_new() {
@@ -1673,10 +1814,11 @@ impl DocumentEditor {
                 };
 
                 // Build the new /V value from the modified value
-                let new_value: Object = match &wrapper.modified_value {
-                    Some(val) => val.into(),
+                let new_value: FormFieldValue = match &wrapper.modified_value {
+                    Some(val) => val.clone(),
                     None => continue,
                 };
+        // ── end pdf_manipulator patch ──
 
                 let is_button = wrapper
                     .field_type()
@@ -1699,12 +1841,57 @@ impl DocumentEditor {
             };
 
             let mut new_dict = dict;
-            new_dict.insert("V".to_string(), new_value.clone());
 
-            // For button fields (checkboxes/radios), also update /AS to match /V
+            // ── pdf_manipulator patch: button /V and /AS are names (#215) ──
+            // A button field's /V and every widget's /AS are appearance-state
+            // *names*, not text strings (ISO 32000-1 §12.7.4.2.3). This wrote
+            // `Object::from(&FormFieldValue)` into both, which for the string
+            // lane emits `/V (Yes)` — a text string no viewer matches against
+            // /AP /N — and for the boolean lane emits a hardcoded `/Yes` that
+            // misses a box whose on-state is named `/On`. Resolve the name from
+            // the widget's own /AP /N instead, and put /AS on the widget that
+            // owns it: a radio group's states live on its /Kids, not on the
+            // parent field dictionary.
             if *is_button {
-                new_dict.insert("AS".to_string(), new_value.clone());
+                let widget_refs = self.field_widget_refs(&new_dict);
+                let available = self.field_on_states(&new_dict);
+                let target = Self::button_on_state(new_value, &available);
+                let v_name = target.clone().unwrap_or_else(|| "Off".to_string());
+                new_dict.insert("V".to_string(), Object::Name(v_name));
+
+                if widget_refs.is_empty() {
+                    // Merged field + widget — /AS belongs on this dictionary.
+                    new_dict.insert(
+                        "AS".to_string(),
+                        Object::Name(target.clone().unwrap_or_else(|| "Off".to_string())),
+                    );
+                } else {
+                    // Radio group — exactly the kid offering the chosen state
+                    // turns on; every sibling goes to /Off.
+                    for wref in widget_refs {
+                        let kid = match self.source.load_object(wref) {
+                            Ok(k) => k,
+                            Err(_) => continue,
+                        };
+                        let kid_dict = match kid.as_dict() {
+                            Some(d) => d.clone(),
+                            None => continue,
+                        };
+                        let offers = self.widget_on_states(&kid_dict);
+                        let kid_state = match &target {
+                            Some(t) if offers.iter().any(|o| o == t) => t.clone(),
+                            _ => "Off".to_string(),
+                        };
+                        let mut new_kid = kid_dict;
+                        new_kid.insert("AS".to_string(), Object::Name(kid_state));
+                        self.modified_objects
+                            .insert(wref.id, Object::Dictionary(new_kid));
+                    }
+                }
+            } else {
+                new_dict.insert("V".to_string(), Object::from(new_value));
             }
+            // ── end pdf_manipulator patch ──
 
             self.modified_objects
                 .insert(*obj_id, Object::Dictionary(new_dict));
@@ -6087,6 +6274,42 @@ impl DocumentEditor {
                 None => continue,
             };
 
+            // ── pdf_manipulator patch: modified buttons flatten in their new
+            // state (#215) ──
+            // A button's new value is a state name, and the paths below cannot
+            // see it: the text branch only understands Text/Choice values and
+            // would leave field_type's `checked` flag alone, while the /AP
+            // branch reads the document's stale /AS. Both bake the unchecked
+            // appearance over a box the caller had checked. Pick the state
+            // first, then prefer the widget's own /AP stream for it — that is
+            // what a viewer would draw — and regenerate only when the widget
+            // carries no state dictionary to pick from.
+            if let Some(state) = self.modified_button_state(&annotation)? {
+                let mut updated = annotation.clone();
+                updated.appearance_state =
+                    Some(state.clone().unwrap_or_else(|| "Off".to_string()));
+                updated.field_type = match updated.field_type {
+                    Some(crate::annotation_types::WidgetFieldType::Radio { .. }) => {
+                        Some(crate::annotation_types::WidgetFieldType::Radio {
+                            selected: state.clone(),
+                        })
+                    },
+                    _ => Some(crate::annotation_types::WidgetFieldType::Checkbox {
+                        checked: state.is_some(),
+                    }),
+                };
+                if let Ok(Some(app)) = self.extract_widget_appearance(&updated, &raw_dict.clone()) {
+                    appearances.push(app);
+                    continue;
+                }
+                if let Some(generated) = self.generate_widget_appearance(&updated)? {
+                    appearances.push(generated);
+                }
+                // Off with no /Off stream draws nothing — correct, not a warning.
+                continue;
+            }
+            // ── end pdf_manipulator patch ──
+
             // If this widget's value was changed via set_form_field_value, the
             // document's stored /AP is stale — it still renders the original
             // value or the empty placeholder the form writer never refreshed.
@@ -6100,13 +6323,32 @@ impl DocumentEditor {
             // /NeedAppearances true — which our save path sets whenever a value is
             // written, deliberately leaving the /AP a placeholder — take the parsed
             // /V instead and regenerate. Same regeneration block, two text sources.
-            let regen_text = self.modified_widget_text(&annotation).or_else(|| {
-                if self.source.acroform_needs_appearances() {
-                    annotation.field_value.clone().filter(|s| !s.is_empty())
-                } else {
-                    None
-                }
-            });
+            // ── pdf_manipulator patch: buttons are not text (#215) ──
+            // A button's /V is an appearance-state name, so the /NeedAppearances
+            // fallback below would feed "Yes" in as a value to draw. It reaches
+            // generate_widget_appearance, which ignores the text and emits its
+            // own synthetic checkmark — discarding the /Yes artwork the document
+            // actually ships. Buttons fall through to the /AP branch instead,
+            // which picks the stream their /AS names, and only regenerate when
+            // the widget carries no state dictionary at all.
+            let is_button_widget = matches!(
+                annotation.field_type,
+                Some(crate::annotation_types::WidgetFieldType::Checkbox { .. })
+                    | Some(crate::annotation_types::WidgetFieldType::Radio { .. })
+                    | Some(crate::annotation_types::WidgetFieldType::Button)
+            );
+            let regen_text = if is_button_widget {
+                None
+            } else {
+                self.modified_widget_text(&annotation).or_else(|| {
+                    if self.source.acroform_needs_appearances() {
+                        annotation.field_value.clone().filter(|s| !s.is_empty())
+                    } else {
+                        None
+                    }
+                })
+            };
+            // ── end pdf_manipulator patch ──
             if let Some(text) = regen_text {
                 // ── end pdf_manipulator patch ──
                 // Values with CJK/emoji glyphs the /DA font cannot render are
@@ -6195,6 +6437,108 @@ impl DocumentEditor {
             _ => None,
         }
     }
+
+    // ── pdf_manipulator patch: modified-button state for flattening (#215) ──
+
+    /// The appearance state `annotation`'s widget must flatten in, when its
+    /// field's value was changed this session.
+    ///
+    /// `Some(Some(name))` turns the widget on in that state, `Some(None)` turns
+    /// it off, `None` means this widget's field was not modified as a button
+    /// and the caller should fall through to its other paths.
+    ///
+    /// The flattener cannot read the widget's own `/AS` here: the document on
+    /// disk still says `/Off`, because the new value lives only in
+    /// `modified_form_fields` until save. Reading it anyway is what baked the
+    /// unchecked appearance over a box the caller had checked.
+    fn modified_button_state(
+        &mut self,
+        annotation: &crate::annotations::Annotation,
+    ) -> Result<Option<Option<String>>> {
+        use crate::annotation_types::WidgetFieldType;
+        use crate::extractors::forms::FieldType;
+
+        // Only button widgets have appearance states to choose between.
+        match annotation.field_type {
+            Some(WidgetFieldType::Checkbox { .. }) | Some(WidgetFieldType::Radio { .. }) => {},
+            _ => return Ok(None),
+        }
+        let raw_dict = match &annotation.raw_dict {
+            Some(d) => d.clone(),
+            None => return Ok(None),
+        };
+
+        // Locate the modified field that owns this widget. A merged
+        // field+widget carries its own /T; a radio kid carries none, and is
+        // owned by whichever ancestor the /Parent chain reaches.
+        let mut owner: Option<&FormFieldWrapper> = None;
+        if let Some(name) = annotation.field_name.as_deref() {
+            owner = self.modified_form_fields.get(name).or_else(|| {
+                self.modified_form_fields
+                    .iter()
+                    .find(|(full, _)| full.rsplit('.').next() == Some(name))
+                    .map(|(_, w)| w)
+            });
+        }
+        if owner.is_none() {
+            let mut parent = raw_dict.get("Parent").and_then(|p| p.as_reference());
+            let mut depth = 0;
+            while let (Some(pref), true) = (parent, depth < 10) {
+                depth += 1;
+                if let Some(w) = self
+                    .modified_form_fields
+                    .values()
+                    .find(|w| w.object_ref().map(|r| r.id) == Some(pref.id))
+                {
+                    owner = Some(w);
+                    break;
+                }
+                parent = match self.source.load_object(pref) {
+                    Ok(obj) => obj
+                        .as_dict()
+                        .and_then(|d| d.get("Parent"))
+                        .and_then(|p| p.as_reference()),
+                    Err(_) => None,
+                };
+            }
+        }
+        // Take what we need and drop the borrow before touching self again.
+        let (value, owner_ref) = {
+            let owner = match owner {
+                Some(w) => w,
+                None => return Ok(None),
+            };
+            if owner.field_type().map(|ft| *ft != FieldType::Button).unwrap_or(false) {
+                return Ok(None);
+            }
+            (owner.value(), owner.object_ref())
+        };
+
+        // Resolve against the states the whole FIELD offers — the same set the
+        // save path sees — so a group answers once. Resolving against this one
+        // widget's states would let an on-word light every kid of a group while
+        // the save path wrote /Off.
+        let available = match owner_ref.and_then(|r| self.source.load_object(r).ok()) {
+            Some(field) => match field.as_dict() {
+                Some(d) => self.field_on_states(&d.clone()),
+                None => self.widget_on_states(&raw_dict),
+            },
+            None => self.widget_on_states(&raw_dict),
+        };
+        let target = Self::button_on_state(&value, &available);
+
+        // The field chose one state; this widget lights only if it offers it.
+        if let Some(name) = &target {
+            let mine = self.widget_on_states(&raw_dict);
+            if !mine.is_empty() && !mine.iter().any(|a| a == name) {
+                // A sibling's state — this widget stays off.
+                return Ok(Some(None));
+            }
+        }
+        Ok(Some(target))
+    }
+
+    // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: widget-appearance generation moved to
     // form_regen.rs (`impl PdfDocument`) so the page renderer can share it —

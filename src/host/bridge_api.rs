@@ -532,6 +532,14 @@ fn do_editor_mutate(
             )?;
             ok_response()
         }
+        "setCheckboxFieldValue" => {
+            dispatch::edit_set_checkbox_field_value(
+                editor,
+                req.get_str("fieldName").unwrap_or(""),
+                req.get_bool("checked").unwrap_or(false),
+            )?;
+            ok_response()
+        }
         "cropMargins" => {
             dispatch::edit_crop_margins(
                 editor,
