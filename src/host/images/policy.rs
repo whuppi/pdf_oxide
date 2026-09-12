@@ -1,0 +1,464 @@
+//! What to do with an image: a pure decision over its classification, the
+//! places it is drawn, and the caller's policy. No I/O, no pixels.
+//!
+//! This file is part of the pdf_manipulator host layer (NOT upstream).
+
+use crate::content::Matrix;
+
+use super::classify::{ColorModel, Encoding, Kind, Unsupported};
+
+/// How far the pipeline may go. Mirrors `PdfImagePolicy` on the Dart side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Policy {
+    /// Target resolution for RGB and CMYK images; `None` never downsamples them.
+    pub color_dpi: Option<f64>,
+    /// Target resolution for gray images.
+    pub gray_dpi: Option<f64>,
+    /// Target resolution for bilevel images.
+    pub mono_dpi: Option<f64>,
+    /// Downsample only when the effective resolution exceeds target × threshold.
+    pub threshold: f64,
+    /// Quality for every JPEG the pipeline writes.
+    pub jpeg_quality: u8,
+    /// May a losslessly stored continuous-tone image become a JPEG.
+    pub allow_lossy: bool,
+    /// CMYK output becomes RGB.
+    pub convert_cmyk_to_rgb: bool,
+    /// Images narrower or shorter than this are kept.
+    pub min_pixels: u32,
+}
+
+/// One placement of an image: the CTM in effect at its `Do`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Use {
+    /// The CTM at the `Do`, enclosing forms composed in.
+    pub ctm: Matrix,
+}
+
+/// The effective resolution of one placement: pixels per inch along the
+/// tighter axis. `None` when the CTM collapses the image.
+pub fn use_ppi(width: u32, height: u32, ctm: &Matrix) -> Option<f64> {
+    let side_x = (ctm.a as f64).hypot(ctm.b as f64);
+    let side_y = (ctm.c as f64).hypot(ctm.d as f64);
+    if side_x < 1e-6 || side_y < 1e-6 {
+        return None;
+    }
+    let ppi_x = width as f64 * 72.0 / side_x;
+    let ppi_y = height as f64 * 72.0 / side_y;
+    Some(ppi_x.min(ppi_y))
+}
+
+/// The most demanding placement: the lowest effective resolution.
+pub fn ppi_min(kind: &Kind, uses: &[Use]) -> Option<f64> {
+    uses.iter()
+        .filter_map(|u| use_ppi(kind.width, kind.height, &u.ctm))
+        .fold(None, |acc, p| Some(acc.map_or(p, |a: f64| a.min(p))))
+}
+
+/// The codec the pipeline writes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Output {
+    /// Gray or RGB JPEG.
+    Jpeg {
+        /// Encoder quality, 1–100.
+        quality: u8,
+        /// CMYK samples become RGB before encoding.
+        convert_cmyk: bool,
+    },
+    /// Flate with PNG predictors, 8 bits, same colour model.
+    FlatePredicted,
+    /// CCITT Group 4, 1 bit.
+    CcittG4,
+}
+
+/// Why an image is left as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepReason {
+    /// Outside what the pipeline re-encodes.
+    Unsupported(Unsupported),
+    /// Narrower or shorter than `Policy::min_pixels`.
+    TooSmall,
+    /// No placement with a usable CTM.
+    NoPlacement,
+    /// A target resolution exists and the image is at or under it.
+    WithinResolution,
+    /// Nothing was asked that could make it smaller.
+    AlreadyOptimal,
+    /// Re-encoding produced no smaller stream.
+    NotSmaller,
+    /// The stored samples could not be decoded.
+    Undecodable,
+}
+
+/// What the pipeline does with one image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decision {
+    /// Leave the object as stored.
+    Keep(KeepReason),
+    /// Decode, optionally resample, encode, replace.
+    Reencode {
+        /// New pixel size when downsampling; `None` keeps the size.
+        target: Option<(u32, u32)>,
+        /// The codec to write.
+        output: Output,
+    },
+}
+
+fn target_dpi(kind: &Kind, policy: &Policy) -> Option<f64> {
+    match kind.color {
+        ColorModel::Bilevel => policy.mono_dpi,
+        ColorModel::Gray => policy.gray_dpi,
+        ColorModel::Rgb | ColorModel::Cmyk => policy.color_dpi,
+        ColorModel::Other => None,
+    }
+}
+
+fn output_for(kind: &Kind, policy: &Policy) -> Output {
+    match kind.color {
+        ColorModel::Bilevel => Output::CcittG4,
+        ColorModel::Gray | ColorModel::Rgb if policy.allow_lossy => Output::Jpeg {
+            quality: policy.jpeg_quality,
+            convert_cmyk: false,
+        },
+        ColorModel::Cmyk if policy.allow_lossy && policy.convert_cmyk_to_rgb => Output::Jpeg {
+            quality: policy.jpeg_quality,
+            convert_cmyk: true,
+        },
+        _ => Output::FlatePredicted,
+    }
+}
+
+/// The decision table. Rows are evaluated top to bottom; the first match wins.
+pub fn decide(kind: &Kind, uses: &[Use], policy: &Policy) -> Decision {
+    if let Some(u) = kind.unsupported() {
+        return Decision::Keep(KeepReason::Unsupported(u));
+    }
+    if kind.width < policy.min_pixels || kind.height < policy.min_pixels {
+        return Decision::Keep(KeepReason::TooSmall);
+    }
+    let Some(ppi) = ppi_min(kind, uses) else {
+        return Decision::Keep(KeepReason::NoPlacement);
+    };
+    if let Some(target) = target_dpi(kind, policy) {
+        if ppi > target * policy.threshold {
+            let scale = target / ppi;
+            let new_w = ((kind.width as f64 * scale).round() as u32).max(1);
+            let new_h = ((kind.height as f64 * scale).round() as u32).max(1);
+            return Decision::Reencode {
+                target: Some((new_w, new_h)),
+                output: output_for(kind, policy),
+            };
+        }
+    }
+    // Not downsampled from here on. "Within resolution" when a target existed
+    // and the image sits under it; "already optimal" when nothing was asked.
+    let kept = if target_dpi(kind, policy).is_some() {
+        KeepReason::WithinResolution
+    } else {
+        KeepReason::AlreadyOptimal
+    };
+    match kind.encoding {
+        // A JPEG re-encoded in place only loses another generation.
+        Encoding::Jpeg => return Decision::Keep(kept),
+        Encoding::Ccitt if kind.color == ColorModel::Bilevel => return Decision::Keep(kept),
+        _ => {},
+    }
+    // A palette image is already compact; only a lossy codec or a smaller
+    // size can beat it, and neither applies here.
+    if kind.indexed && !policy.allow_lossy {
+        return Decision::Keep(KeepReason::AlreadyOptimal);
+    }
+    Decision::Reencode {
+        target: None,
+        output: output_for(kind, policy),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::images::classify::Masks;
+
+    fn kind(encoding: Encoding, color: ColorModel, bits: u8, width: u32, height: u32) -> Kind {
+        Kind {
+            encoding,
+            color,
+            indexed: false,
+            image_mask: false,
+            bits,
+            masks: Masks::default(),
+            width,
+            height,
+            compressed_len: 1000,
+        }
+    }
+
+    /// A placement `pt` points wide and high, axis aligned.
+    fn placed(pt: f32) -> Use {
+        Use {
+            ctm: Matrix {
+                a: pt,
+                b: 0.0,
+                c: 0.0,
+                d: pt,
+                e: 10.0,
+                f: 10.0,
+            },
+        }
+    }
+
+    fn screen() -> Policy {
+        Policy {
+            color_dpi: Some(72.0),
+            gray_dpi: Some(72.0),
+            mono_dpi: Some(300.0),
+            threshold: 1.5,
+            jpeg_quality: 60,
+            allow_lossy: true,
+            convert_cmyk_to_rgb: true,
+            min_pixels: 32,
+        }
+    }
+
+    fn lossless() -> Policy {
+        Policy {
+            color_dpi: None,
+            gray_dpi: None,
+            mono_dpi: None,
+            allow_lossy: false,
+            convert_cmyk_to_rgb: false,
+            ..screen()
+        }
+    }
+
+    #[test]
+    fn effective_ppi_uses_the_tighter_axis_and_survives_rotation() {
+        // 128 px over 32 pt = 288 ppi on both axes.
+        assert_eq!(use_ppi(128, 128, &placed(32.0).ctm), Some(288.0));
+        // Rotated 90°: a = 0, b = 32, c = -32, d = 0 — same sides.
+        let rotated = Matrix {
+            a: 0.0,
+            b: 32.0,
+            c: -32.0,
+            d: 0.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        assert_eq!(use_ppi(128, 128, &rotated), Some(288.0));
+        // Anisotropic: 128 px over 64 pt horizontally (144) and 32 pt vertically (288) → 144.
+        let wide = Matrix {
+            a: 64.0,
+            b: 0.0,
+            c: 0.0,
+            d: 32.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        assert_eq!(use_ppi(128, 128, &wide), Some(144.0));
+        assert_eq!(
+            use_ppi(
+                128,
+                128,
+                &Matrix {
+                    a: 0.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 32.0,
+                    e: 0.0,
+                    f: 0.0
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_most_demanding_placement_decides() {
+        let k = kind(Encoding::Raw, ColorModel::Gray, 8, 32, 32);
+        // 32 px at 32 pt (72 ppi) and at 8 pt (288 ppi): the 72 ppi use wins.
+        assert_eq!(ppi_min(&k, &[placed(8.0), placed(32.0)]), Some(72.0));
+        assert_eq!(
+            decide(&k, &[placed(8.0), placed(32.0)], &screen()),
+            Decision::Reencode {
+                target: None,
+                output: Output::Jpeg {
+                    quality: 60,
+                    convert_cmyk: false
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_kinds_are_kept_before_any_other_rule() {
+        let mut k = kind(Encoding::Jpx, ColorModel::Rgb, 8, 4, 4);
+        assert_eq!(
+            decide(&k, &[], &screen()),
+            Decision::Keep(KeepReason::Unsupported(Unsupported::Jpx))
+        );
+        k.encoding = Encoding::Raw;
+        k.color = ColorModel::Other;
+        assert_eq!(
+            decide(&k, &[], &screen()),
+            Decision::Keep(KeepReason::Unsupported(Unsupported::OtherColor))
+        );
+        k.color = ColorModel::Rgb;
+        k.masks.color_key_mask = true;
+        assert_eq!(
+            decide(&k, &[], &screen()),
+            Decision::Keep(KeepReason::Unsupported(Unsupported::ColorKeyMask))
+        );
+    }
+
+    #[test]
+    fn small_and_unplaced_images_are_kept() {
+        let k = kind(Encoding::Raw, ColorModel::Rgb, 8, 2, 2);
+        assert_eq!(decide(&k, &[placed(100.0)], &screen()), Decision::Keep(KeepReason::TooSmall));
+        let k = kind(Encoding::Raw, ColorModel::Rgb, 8, 128, 128);
+        assert_eq!(decide(&k, &[], &screen()), Decision::Keep(KeepReason::NoPlacement));
+    }
+
+    #[test]
+    fn downsampling_targets_the_policy_resolution_only_past_the_threshold() {
+        let k = kind(Encoding::Raw, ColorModel::Rgb, 8, 128, 128);
+        // 288 ppi > 72 × 1.5 → 128 × 72 / 288 = 32 px.
+        assert_eq!(
+            decide(&k, &[placed(32.0)], &screen()),
+            Decision::Reencode {
+                target: Some((32, 32)),
+                output: Output::Jpeg {
+                    quality: 60,
+                    convert_cmyk: false
+                },
+            }
+        );
+        // 100 ppi ≤ 108 → no downsample, still re-encoded (lossless source, lossy allowed).
+        assert_eq!(
+            decide(&k, &[placed(92.16)], &screen()),
+            Decision::Reencode {
+                target: None,
+                output: Output::Jpeg {
+                    quality: 60,
+                    convert_cmyk: false
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_jpeg_is_reencoded_only_when_downsampled() {
+        let k = kind(Encoding::Jpeg, ColorModel::Rgb, 8, 128, 128);
+        assert_eq!(
+            decide(&k, &[placed(128.0)], &screen()),
+            Decision::Keep(KeepReason::WithinResolution)
+        );
+        assert_eq!(
+            decide(&k, &[placed(128.0)], &lossless()),
+            Decision::Keep(KeepReason::AlreadyOptimal)
+        );
+        assert!(matches!(
+            decide(&k, &[placed(32.0)], &screen()),
+            Decision::Reencode {
+                target: Some((32, 32)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cmyk_output_follows_the_conversion_flag() {
+        let k = kind(Encoding::Jpeg, ColorModel::Cmyk, 8, 64, 64);
+        assert_eq!(
+            decide(&k, &[placed(16.0)], &screen()),
+            Decision::Reencode {
+                target: Some((16, 16)),
+                output: Output::Jpeg {
+                    quality: 60,
+                    convert_cmyk: true
+                },
+            }
+        );
+        let print = Policy {
+            color_dpi: Some(300.0),
+            gray_dpi: Some(300.0),
+            mono_dpi: Some(1200.0),
+            convert_cmyk_to_rgb: false,
+            ..screen()
+        };
+        // 288 ppi ≤ 450: kept.
+        assert_eq!(
+            decide(&k, &[placed(16.0)], &print),
+            Decision::Keep(KeepReason::WithinResolution)
+        );
+        // Forced past the threshold without conversion: Flate CMYK.
+        assert_eq!(
+            decide(&k, &[placed(4.0)], &print),
+            Decision::Reencode {
+                target: Some((17, 17)),
+                output: Output::FlatePredicted,
+            }
+        );
+    }
+
+    #[test]
+    fn bilevel_goes_to_ccitt_and_ccitt_stays_unless_downsampled() {
+        let flate = kind(Encoding::Raw, ColorModel::Bilevel, 1, 64, 64);
+        assert_eq!(
+            decide(&flate, &[placed(16.0)], &screen()),
+            Decision::Reencode {
+                target: None,
+                output: Output::CcittG4
+            }
+        );
+        assert_eq!(
+            decide(&flate, &[placed(16.0)], &lossless()),
+            Decision::Reencode {
+                target: None,
+                output: Output::CcittG4
+            }
+        );
+        let g4 = kind(Encoding::Ccitt, ColorModel::Bilevel, 1, 64, 64);
+        assert_eq!(
+            decide(&g4, &[placed(16.0)], &screen()),
+            Decision::Keep(KeepReason::WithinResolution)
+        );
+        assert_eq!(
+            decide(&g4, &[placed(16.0)], &lossless()),
+            Decision::Keep(KeepReason::AlreadyOptimal)
+        );
+        // 1200 ppi > 300 × 1.5 → 16 px.
+        assert_eq!(
+            decide(&g4, &[placed(3.84)], &screen()),
+            Decision::Reencode {
+                target: Some((16, 16)),
+                output: Output::CcittG4
+            }
+        );
+    }
+
+    #[test]
+    fn lossless_policy_never_picks_a_lossy_codec_and_leaves_palettes_alone() {
+        let rgb = kind(Encoding::Raw, ColorModel::Rgb, 16, 64, 64);
+        assert_eq!(
+            decide(&rgb, &[placed(64.0)], &lossless()),
+            Decision::Reencode {
+                target: None,
+                output: Output::FlatePredicted
+            }
+        );
+        let mut indexed = kind(Encoding::Raw, ColorModel::Rgb, 4, 64, 64);
+        indexed.indexed = true;
+        assert_eq!(
+            decide(&indexed, &[placed(16.0)], &lossless()),
+            Decision::Keep(KeepReason::AlreadyOptimal)
+        );
+        assert!(matches!(
+            decide(&indexed, &[placed(16.0)], &screen()),
+            Decision::Reencode {
+                target: Some((16, 16)),
+                output: Output::Jpeg { .. }
+            }
+        ));
+    }
+
+}

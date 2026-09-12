@@ -3503,6 +3503,21 @@ impl<'doc> PdfImageHandle<'doc> {
     pub fn indexed_base(&self) -> Option<ColorSpace> {
         self.indexed_base
     }
+
+    // ── pdf_manipulator patch: identity and placement for the host image pipeline ──
+    /// The XObject this handle was built from; `None` for an inline image.
+    pub fn object_ref(&self) -> Option<ObjectRef> {
+        match &self.source {
+            PdfImageSource::XObject(r) => Some(*r),
+            PdfImageSource::Inline { .. } => None,
+        }
+    }
+
+    /// The CTM in effect at the `Do` (composed through enclosing forms).
+    pub fn ctm(&self) -> crate::content::Matrix {
+        self.ctm
+    }
+    // ── end pdf_manipulator patch ──
 }
 
 impl std::fmt::Debug for PdfImageHandle<'_> {

@@ -568,8 +568,20 @@ pub fn edit_page_media_box(editor: &mut DocumentEditor, page: usize) -> Result<(
 /// bounds and the full transform. The name is what `edit_resize_image`
 /// takes; an out-of-range page is an error, a page without images an
 /// empty list.
-pub fn edit_page_images(editor: &mut DocumentEditor, page: usize) -> Result<Vec<crate::editor::ImageInfo>> {
-    editor.get_page_images(page)
+pub fn edit_page_images(
+    editor: &mut DocumentEditor,
+    page: usize,
+) -> Result<Vec<crate::editor::ImageInfo>> {
+    // Upstream records every `Do` (forms included); the contract is images.
+    let placed = editor.get_page_images(page)?;
+    let source_page = editor.page_order_visible()[page] as usize;
+    let page_ref = editor.source().get_page_ref(source_page)?;
+    let image_names =
+        crate::host::images::inventory::page_image_xobject_names(editor.source(), page_ref)?;
+    Ok(placed
+        .into_iter()
+        .filter(|i| image_names.contains(&i.name))
+        .collect())
 }
 
 // ── Metadata setters ──
@@ -658,33 +670,110 @@ pub fn edit_flatten_all_annotations(editor: &mut DocumentEditor) -> Result<()> {
     editor.flatten_all_annotations()
 }
 
-/// Compress the document. A no-op: stream deflation is a save-time
-/// option (SaveOptions.compress) and image recompression is the
-/// separate `optimizeImages` op — nothing is left for this call.
-pub fn edit_compress(editor: &mut DocumentEditor, _quality: u8) -> Result<()> {
-    let _ = editor;
-    Ok(())
+/// The `reduceImages` knobs as they arrive on the wire (`PdfImagePolicy`);
+/// the field meanings are documented on `host::images::policy::Policy`.
+pub struct ImagePolicyArgs {
+    /// Target ppi for RGB and CMYK images; `None` never downsamples them.
+    pub color_dpi: Option<f64>,
+    /// Target ppi for gray images.
+    pub gray_dpi: Option<f64>,
+    /// Target ppi for bilevel images.
+    pub mono_dpi: Option<f64>,
+    /// Downsample only above target × threshold.
+    pub threshold: f64,
+    /// JPEG quality 1–100.
+    pub jpeg_quality: u8,
+    /// Lossless sources may become JPEG.
+    pub allow_lossy: bool,
+    /// CMYK output becomes RGB.
+    pub convert_cmyk_to_rgb: bool,
+    /// Images narrower or shorter than this are kept.
+    pub min_pixels: u32,
 }
 
-/// Recompress images above `min_size` bytes at the given quality. Returns count optimized.
-pub fn edit_optimize_images(editor: &mut DocumentEditor, quality: u8, min_size: u32) -> Result<usize> {
-    // Image optimizer runs on the source document's object graph.
-    // Modified objects are staged via insert_modified for the next save.
+/// One `reduceImages` report row in wire vocabulary; the field meanings
+/// are documented on `host::images::report::Outcome`.
+pub struct ImageOutcomeRow {
+    /// Object number.
+    pub object_id: u32,
+    /// `raw|jpeg|jpx|ccitt|jbig2|unknown`.
+    pub encoding: &'static str,
+    /// `bilevel|gray|rgb|cmyk|other`.
+    pub color: &'static str,
+    /// Palette indices as stored.
+    pub indexed: bool,
+    /// Bits per component as stored.
+    pub bits: u8,
+    /// Pixel width before.
+    pub width: u32,
+    /// Pixel height before.
+    pub height: u32,
+    /// An `/SMask` is attached.
+    pub soft_mask: bool,
+    /// Placements across the visible pages.
+    pub uses: u32,
+    /// Effective ppi of the most demanding placement.
+    pub ppi_min: Option<f64>,
+    /// `kept|recompressed|downsampled`.
+    pub action: &'static str,
+    /// Keep reason, or `""`.
+    pub keep_reason: &'static str,
+    /// Stored bytes before, parent plus soft mask.
+    pub bytes_before: u64,
+    /// Stored bytes after.
+    pub bytes_after: u64,
+    /// Pixel width after.
+    pub width_after: u32,
+    /// Pixel height after.
+    pub height_after: u32,
+}
+
+/// Re-encode and downsample the document's images under a policy; one row per image.
+pub fn edit_reduce_images(
+    editor: &mut DocumentEditor,
+    args: ImagePolicyArgs,
+) -> Result<Vec<ImageOutcomeRow>> {
     #[cfg(feature = "rendering")]
     {
-        let mut mods = std::collections::HashMap::new();
-        let count = crate::host::image_optimizer::optimize_images(
-            editor.source(), &mut mods, quality, min_size,
-        )?;
-        for (id, obj) in mods {
-            editor.insert_modified(id, obj);
-        }
-        Ok(count)
+        use crate::host::images::policy::Policy;
+        let policy = Policy {
+            color_dpi: args.color_dpi,
+            gray_dpi: args.gray_dpi,
+            mono_dpi: args.mono_dpi,
+            threshold: args.threshold,
+            jpeg_quality: args.jpeg_quality,
+            allow_lossy: args.allow_lossy,
+            convert_cmyk_to_rgb: args.convert_cmyk_to_rgb,
+            min_pixels: args.min_pixels,
+        };
+        let report = crate::host::images::execute::reduce_images(editor, &policy)?;
+        Ok(report
+            .images
+            .into_iter()
+            .map(|o| ImageOutcomeRow {
+                object_id: o.object_id,
+                encoding: o.kind.encoding.wire_name(),
+                color: o.kind.color.wire_name(),
+                indexed: o.kind.indexed,
+                bits: o.kind.bits,
+                width: o.kind.width,
+                height: o.kind.height,
+                soft_mask: o.kind.masks.soft_mask.is_some(),
+                uses: o.uses,
+                ppi_min: o.ppi_min,
+                action: o.action.wire_name(),
+                keep_reason: o.keep_reason.map_or("", |r| r.wire_name()),
+                bytes_before: o.bytes_before,
+                bytes_after: o.bytes_after,
+                width_after: o.width_after,
+                height_after: o.height_after,
+            })
+            .collect())
     }
     #[cfg(not(feature = "rendering"))]
     {
-        let _ = (editor, quality, min_size);
-        Ok(0)
+        let _ = (editor, args);
+        Ok(Vec::new())
     }
 }
 
@@ -738,6 +827,30 @@ pub fn edit_set_checkbox_field_value(editor: &mut DocumentEditor, name: &str, ch
 /// Resize a named image XObject on a page.
 pub fn edit_resize_image(editor: &mut DocumentEditor, page: usize, name: &str, width: f32, height: f32) -> Result<()> {
     editor.resize_image(page, name, width, height)
+}
+
+/// Move a named image XObject on a page to a new lower-left corner.
+pub fn edit_reposition_image(
+    editor: &mut DocumentEditor,
+    page: usize,
+    name: &str,
+    x: f32,
+    y: f32,
+) -> Result<()> {
+    editor.reposition_image(page, name, x, y)
+}
+
+/// Move and resize a named image XObject on a page in one edit.
+pub fn edit_set_image_bounds(
+    editor: &mut DocumentEditor,
+    page: usize,
+    name: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> Result<()> {
+    editor.set_image_bounds(page, name, x, y, width, height)
 }
 
 /// Convert the document to PDF/A at the given level (1=A1b, 2=A2b, 3=A3b).

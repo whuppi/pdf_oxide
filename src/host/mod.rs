@@ -17,8 +17,7 @@ pub mod lane_state;
 pub mod ops;
 pub mod positioned_write;
 pub mod font_optimizer;
-#[cfg(feature = "rendering")]
-pub mod image_optimizer;
+pub mod images;
 #[cfg(feature = "signatures")]
 pub mod sign;
 

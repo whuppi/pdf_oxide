@@ -408,18 +408,38 @@ fn do_editor_mutate(
             dispatch::edit_apply_redactions_destructive(editor)?;
             ok_response()
         }
-        "compress" => {
-            dispatch::edit_compress(editor, req.get_i32("quality").unwrap_or(75) as u8)?;
-            ok_response()
-        }
-        "optimizeImages" => {
-            let count = dispatch::edit_optimize_images(
-                editor,
-                req.get_i32("quality").unwrap_or(75) as u8,
-                req.get_i32("minSize").unwrap_or(128) as u32,
-            )?;
+        "reduceImages" => {
+            let policy = dispatch::ImagePolicyArgs {
+                color_dpi: req.get_f64("colorDpi"),
+                gray_dpi: req.get_f64("grayDpi"),
+                mono_dpi: req.get_f64("monoDpi"),
+                threshold: req.get_f64("threshold").unwrap_or(1.5),
+                jpeg_quality: req.get_i32("jpegQuality").unwrap_or(75).clamp(1, 100) as u8,
+                allow_lossy: req.get_bool("allowLossy").unwrap_or(true),
+                convert_cmyk_to_rgb: req.get_bool("convertCmykToRgb").unwrap_or(false),
+                min_pixels: req.get_i32("minPixels").unwrap_or(32).max(0) as u32,
+            };
+            let rows = dispatch::edit_reduce_images(editor, policy)?;
             let mut w = ResponseWriter::ok();
-            w.put_i32("count", count as i32);
+            w.put_map_list("images", rows.len(), |i, item| {
+                let r = &rows[i];
+                item.put_i32("objectId", r.object_id as i32);
+                item.put_str("encoding", r.encoding);
+                item.put_str("color", r.color);
+                item.put_bool("indexed", r.indexed);
+                item.put_i32("bits", r.bits as i32);
+                item.put_i32("width", r.width as i32);
+                item.put_i32("height", r.height as i32);
+                item.put_bool("softMask", r.soft_mask);
+                item.put_i32("uses", r.uses as i32);
+                item.put_f64("ppiMin", r.ppi_min.unwrap_or(-1.0));
+                item.put_str("action", r.action);
+                item.put_str("keepReason", r.keep_reason);
+                item.put_i64("bytesBefore", r.bytes_before as i64);
+                item.put_i64("bytesAfter", r.bytes_after as i64);
+                item.put_i32("widthAfter", r.width_after as i32);
+                item.put_i32("heightAfter", r.height_after as i32);
+            });
             Ok(w.finish())
         }
         "embedFile" => {
@@ -559,6 +579,28 @@ fn do_editor_mutate(
                 editor,
                 req.get_i32("page").unwrap_or(0) as usize,
                 req.get_str("imageName").unwrap_or(""),
+                req.get_f64("width").unwrap_or(100.0) as f32,
+                req.get_f64("height").unwrap_or(100.0) as f32,
+            )?;
+            ok_response()
+        }
+        "repositionImage" => {
+            dispatch::edit_reposition_image(
+                editor,
+                req.get_i32("page").unwrap_or(0) as usize,
+                req.get_str("imageName").unwrap_or(""),
+                req.get_f64("x").unwrap_or(0.0) as f32,
+                req.get_f64("y").unwrap_or(0.0) as f32,
+            )?;
+            ok_response()
+        }
+        "setImageBounds" => {
+            dispatch::edit_set_image_bounds(
+                editor,
+                req.get_i32("page").unwrap_or(0) as usize,
+                req.get_str("imageName").unwrap_or(""),
+                req.get_f64("x").unwrap_or(0.0) as f32,
+                req.get_f64("y").unwrap_or(0.0) as f32,
                 req.get_f64("width").unwrap_or(100.0) as f32,
                 req.get_f64("height").unwrap_or(100.0) as f32,
             )?;

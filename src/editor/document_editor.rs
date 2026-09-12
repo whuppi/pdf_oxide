@@ -2118,6 +2118,19 @@ impl DocumentEditor {
         self.source.decrypt_stream_for_copy(obj, r)
     }
 
+    // ── pdf_manipulator patch: the page walk writes staged objects ──
+    /// Like `load_source_object`, but a staged replacement wins: the
+    /// resource walk writes XObjects and ExtGStates before the sweep, and
+    /// the sweep skips ids already written, so a lookup that ignores
+    /// `modified_objects` here would drop every staged image on save.
+    fn staged_or_source_object(&self, r: ObjectRef) -> Result<Object> {
+        match self.modified_objects.get(&r.id) {
+            Some(m) => Ok(m.clone()),
+            None => self.load_source_object(r),
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Stage a trimmed /Pages dict into modified_objects so that
     /// collect_reachable_ids() only walks kept pages. Returns the
     /// prior value to restore after GC completes.
@@ -3820,7 +3833,7 @@ impl DocumentEditor {
                                                     Object::Dictionary(d) => Some(d.clone()),
                                                     Object::Reference(r) => {
                                                         let loaded =
-                                                            self.load_source_object(*r).map_err(|e| {
+                                                            self.staged_or_source_object(*r).map_err(|e| {
                                                                 log::warn!("Failed to load resource object {} during save: {}", r.id, e);
                                                                 e
                                                             }).ok();
@@ -3852,7 +3865,7 @@ impl DocumentEditor {
                                                         {
                                                             if !written_ids.contains(&ref_obj.id) {
                                                                 if let Ok(xobj_obj) =
-                                                                    self.load_source_object(ref_obj)
+                                                                    self.staged_or_source_object(ref_obj)
                                                                 {
                                                                     let offset =
                                                                         writer.position();
@@ -3881,7 +3894,7 @@ impl DocumentEditor {
                                                     Object::Dictionary(d) => Some(d.clone()),
                                                     Object::Reference(r) => {
                                                         let loaded =
-                                                            self.load_source_object(*r).map_err(|e| {
+                                                            self.staged_or_source_object(*r).map_err(|e| {
                                                                 log::warn!("Failed to load resource object {} during save: {}", r.id, e);
                                                                 e
                                                             }).ok();
@@ -3912,7 +3925,7 @@ impl DocumentEditor {
                                                         {
                                                             if !written_ids.contains(&ref_obj.id) {
                                                                 if let Ok(obj) =
-                                                                    self.load_source_object(ref_obj)
+                                                                    self.staged_or_source_object(ref_obj)
                                                                 {
                                                                     let offset =
                                                                         writer.position();
@@ -8332,7 +8345,40 @@ impl DocumentEditor {
         let operators = parse_content_stream(content_data)?;
         let mut output = Vec::new();
 
-        // Track the last cm operator to potentially modify it
+        // ── pdf_manipulator patch: modifications are in PAGE space ──
+        // get_page_images reports each image's COMPOSED matrix (its own
+        // cm concatenated with every enclosing cm), so x/y/width/height
+        // handed back here mean page-space values. Overwriting the inner
+        // cm with them ignored the enclosing transform: an image drawn as
+        // `q 1 0 0 1 56 700 cm  100 0 0 80 0 0 cm /Im1 Do Q` repositioned
+        // to x=76 landed at 56+76. Track the CTM exactly as the listing
+        // does and set the inner matrix so the composition is the request.
+        type M = [f32; 6];
+        fn mul(m: M, n: M) -> M {
+            // row-vector convention, same as the CTM tracking in
+            // get_page_images: result = m · n (m applied first)
+            [
+                m[0] * n[0] + m[1] * n[2],
+                m[0] * n[1] + m[1] * n[3],
+                m[2] * n[0] + m[3] * n[2],
+                m[2] * n[1] + m[3] * n[3],
+                m[4] * n[0] + m[5] * n[2] + n[4],
+                m[4] * n[1] + m[5] * n[3] + n[5],
+            ]
+        }
+        fn inverse(m: M) -> Option<M> {
+            let det = m[0] * m[3] - m[1] * m[2];
+            if det.abs() < f32::EPSILON {
+                return None;
+            }
+            let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
+            Some([a, b, c, d, -(m[4] * a + m[5] * c), -(m[4] * b + m[5] * d)])
+        }
+        let identity: M = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let mut ctm_stack: Vec<M> = Vec::new();
+        let mut current_ctm = identity;
+        // ── end pdf_manipulator patch ──
+
         let mut i = 0;
         while i < operators.len() {
             let op = &operators[i];
@@ -8340,6 +8386,18 @@ impl DocumentEditor {
             // Look for pattern: q ... cm ... Do ... Q
             // We need to find cm operators that precede Do operators
             match op {
+                // ── pdf_manipulator patch: keep the CTM stack in step ──
+                crate::content::operators::Operator::SaveState => {
+                    ctm_stack.push(current_ctm);
+                    self.serialize_operator(&mut output, op);
+                },
+                crate::content::operators::Operator::RestoreState => {
+                    if let Some(saved) = ctm_stack.pop() {
+                        current_ctm = saved;
+                    }
+                    self.serialize_operator(&mut output, op);
+                },
+                // ── end pdf_manipulator patch ──
                 crate::content::operators::Operator::Cm { a, b, c, d, e, f } => {
                     // Look ahead to see if next relevant op is Do
                     let mut j = i + 1;
@@ -8358,21 +8416,65 @@ impl DocumentEditor {
                         j += 1;
                     }
 
+                    let inner: M = [*a, *b, *c, *d, *e, *f];
                     if let Some(name) = found_do {
                         if let Some(modification) = modifications.get(&name) {
-                            // Apply modification to the matrix
-                            let new_a = modification.width.unwrap_or(*a);
-                            let new_d = modification.height.unwrap_or(*d);
-                            let new_e = modification.x.unwrap_or(*e);
-                            let new_f = modification.y.unwrap_or(*f);
-
+                            // ── pdf_manipulator patch: compose, edit, decompose ──
+                            // Edit the composed matrix in page space: move the
+                            // translation, rescale each axis along its current
+                            // direction, then map back through the enclosing
+                            // transform. A singular enclosing transform (nothing
+                            // visible anyway) falls back to editing the inner
+                            // matrix directly, as before.
+                            let composed = mul(inner, current_ctm);
+                            let mut wanted = composed;
+                            if let Some(width) = modification.width {
+                                let len =
+                                    (composed[0] * composed[0] + composed[1] * composed[1]).sqrt();
+                                if len > f32::EPSILON {
+                                    wanted[0] = composed[0] / len * width;
+                                    wanted[1] = composed[1] / len * width;
+                                }
+                            }
+                            if let Some(height) = modification.height {
+                                let len =
+                                    (composed[2] * composed[2] + composed[3] * composed[3]).sqrt();
+                                if len > f32::EPSILON {
+                                    wanted[2] = composed[2] / len * height;
+                                    wanted[3] = composed[3] / len * height;
+                                }
+                            }
+                            if let Some(x) = modification.x {
+                                wanted[4] = x;
+                            }
+                            if let Some(y) = modification.y {
+                                wanted[5] = y;
+                            }
+                            let new_inner = match inverse(current_ctm) {
+                                Some(inv) => mul(wanted, inv),
+                                None => [
+                                    modification.width.unwrap_or(*a),
+                                    *b,
+                                    *c,
+                                    modification.height.unwrap_or(*d),
+                                    modification.x.unwrap_or(*e),
+                                    modification.y.unwrap_or(*f),
+                                ],
+                            };
                             output.extend_from_slice(
                                 format!(
                                     "{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm\n",
-                                    new_a, b, c, new_d, new_e, new_f
+                                    new_inner[0],
+                                    new_inner[1],
+                                    new_inner[2],
+                                    new_inner[3],
+                                    new_inner[4],
+                                    new_inner[5]
                                 )
                                 .as_bytes(),
                             );
+                            current_ctm = mul(new_inner, current_ctm);
+                            // ── end pdf_manipulator patch ──
                             i += 1;
                             continue;
                         }
@@ -8383,6 +8485,9 @@ impl DocumentEditor {
                         format!("{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm\n", a, b, c, d, e, f)
                             .as_bytes(),
                     );
+                    // ── pdf_manipulator patch ──
+                    current_ctm = mul(inner, current_ctm);
+                    // ── end pdf_manipulator patch ──
                 },
                 _ => {
                     // Serialize the operator
