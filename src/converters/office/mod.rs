@@ -1753,7 +1753,7 @@ fn render_table<'a>(
 fn render_table_chunk<'a>(
     page: FluentPageBuilder<'a>,
     t: &IrTable,
-    _config: &OfficeConfig,
+    config: &OfficeConfig,
     col_start: usize,
     col_end: usize,
     repeat_first_col: bool,
@@ -1765,16 +1765,6 @@ fn render_table_chunk<'a>(
     let has_header = t.rows.first().is_some_and(|r| r.is_header);
 
     const MIN_COL_PT: f32 = 20.0;
-    // Wider cell padding (default is 4pt) so adjacent cell text doesn't run
-    // together when extracted: PDF text extraction insets a space when the
-    // gap between two text fragments exceeds a fraction of the font size,
-    // and 4pt of padding falls just below that threshold for default 11pt
-    // body text. 6pt on each side (12pt total between cells) gives
-    // extractors a reliable signal.
-    let mut cfg = StreamingTableConfig::new()
-        .repeat_header(true)
-        .cell_padding(6.0, 2.0, 2.0)
-        .mode_sample(50, MIN_COL_PT, 300.0);
 
     let header_row = if has_header { Some(&t.rows[0]) } else { None };
     let resolve_col_idx = |i: usize| -> usize {
@@ -1788,6 +1778,71 @@ fn render_table_chunk<'a>(
             col_start + i
         }
     };
+
+    // ── pdf_manipulator patch: honor declared column widths (#243) ──
+    // A DOCX table declares its column widths (w:tblGrid, carried on the
+    // IR as column_widths_twips). Sizing columns by sampling cell content
+    // ignored that declaration entirely: eleven prose columns each grew
+    // toward the 300 pt cap and the row ran to ~3.4x the page width, off
+    // the page. Use the declared widths (twips → pt), scaled down
+    // proportionally when their sum exceeds the usable page width; sample
+    // only when the document declares nothing, with the per-column cap
+    // bounded so a chunk can never outgrow the page.
+    let (page_w, _) = page.page_dimensions();
+    let usable_w = (page_w - config.margins.left - config.margins.right).max(MIN_COL_PT);
+    let declared: Vec<f32> = t
+        .column_widths_twips
+        .iter()
+        .map(|&w| w as f32 / 20.0)
+        .collect();
+    let widths: Option<Vec<f32>> = if declared.iter().any(|&w| w > 0.0) {
+        // The declared list may be shorter than the column count, and a
+        // zero width declares nothing — those columns take the mean of
+        // the real declarations.
+        let real: Vec<f32> = declared.iter().copied().filter(|&w| w > 0.0).collect();
+        let mean = real.iter().sum::<f32>() / real.len() as f32;
+        let mut ws: Vec<f32> = (0..chunk_n)
+            .map(|i| {
+                declared
+                    .get(resolve_col_idx(i))
+                    .copied()
+                    .filter(|&w| w > 0.0)
+                    .unwrap_or(mean)
+            })
+            .collect();
+        let sum: f32 = ws.iter().sum();
+        if sum > usable_w {
+            let k = usable_w / sum;
+            for w in &mut ws {
+                *w *= k;
+            }
+        }
+        Some(ws)
+    } else {
+        None
+    };
+    // ── end pdf_manipulator patch ──
+
+    // Wider cell padding (default is 4pt) so adjacent cell text doesn't run
+    // together when extracted: PDF text extraction insets a space when the
+    // gap between two text fragments exceeds a fraction of the font size,
+    // and 4pt of padding falls just below that threshold for default 11pt
+    // body text. 6pt on each side (12pt total between cells) gives
+    // extractors a reliable signal.
+    let mut cfg = StreamingTableConfig::new()
+        .repeat_header(true)
+        .cell_padding(6.0, 2.0, 2.0);
+    // ── pdf_manipulator patch: fixed widths when declared (#243) ──
+    cfg = match &widths {
+        Some(_) => cfg.mode_fixed(),
+        None => cfg.mode_sample(
+            50,
+            MIN_COL_PT,
+            (usable_w / chunk_n as f32).max(MIN_COL_PT),
+        ),
+    };
+    // ── end pdf_manipulator patch ──
+
     for i in 0..chunk_n {
         let actual = resolve_col_idx(i);
         let mut name = header_row
@@ -1799,7 +1854,13 @@ fn render_table_chunk<'a>(
         if !name.is_empty() && !name.ends_with(' ') {
             name.push(' ');
         }
-        cfg = cfg.column(StreamingColumn::new(name));
+        let mut col = StreamingColumn::new(name);
+        // ── pdf_manipulator patch: declared width per column (#243) ──
+        if let Some(ws) = &widths {
+            col = col.width_pt(ws[i]);
+        }
+        // ── end pdf_manipulator patch ──
+        cfg = cfg.column(col);
     }
 
     let mut st = page.streaming_table(cfg);
