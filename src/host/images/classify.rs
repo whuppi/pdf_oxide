@@ -79,6 +79,10 @@ pub struct Kind {
     pub height: u32,
     /// Stream bytes as stored (filters applied).
     pub compressed_len: u64,
+    /// For a stored JPEG, the quality its luminance quantization table
+    /// encodes on the 1–100 scale; `None` when the table is not the
+    /// standard one scaled, or the stream is not a plain JPEG.
+    pub jpeg_quality: Option<u8>,
 }
 
 /// Why an image is outside what the pipeline re-encodes.
@@ -125,8 +129,8 @@ impl Kind {
     }
 }
 
-/// Classify an image XObject from its dictionary and stored length.
-pub fn classify(doc: &PdfDocument, dict: &HashMap<String, Object>, compressed_len: u64) -> Kind {
+/// Classify an image XObject from its dictionary and stored bytes.
+pub fn classify(doc: &PdfDocument, dict: &HashMap<String, Object>, data: &[u8]) -> Kind {
     let filters = filter_names(doc, dict);
     let encoding = match filters.last().map(|n| PdfFilter::from_name(n)) {
         None
@@ -176,7 +180,97 @@ pub fn classify(doc: &PdfDocument, dict: &HashMap<String, Object>, compressed_le
         masks: masks(doc, dict),
         width: int("Width").unwrap_or(0).max(0) as u32,
         height: int("Height").unwrap_or(0).max(0) as u32,
-        compressed_len,
+        compressed_len: data.len() as u64,
+        // Only a bare DCT stream is a JPEG we can read the tables of.
+        jpeg_quality: if encoding == Encoding::Jpeg && filters.len() == 1 {
+            estimate_jpeg_quality(data)
+        } else {
+            None
+        },
+    }
+}
+
+/// The luminance quantization table of ITU-T T.81 Annex K, in natural
+/// order. The sum is what the estimate uses, so the order is irrelevant.
+const ANNEX_K_LUMA: [u32; 64] = [
+    16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113,
+    92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+];
+
+/// The quality (1–100) a JPEG's luminance quantization table encodes,
+/// assuming the common encoders' scaling of the Annex K table
+/// (`scale = q < 50 ? 5000 / q : 200 − 2q`, entries `(base × scale + 50) / 100`).
+/// Inverts that from the table sum; `None` when no DQT table 0 is found.
+pub fn estimate_jpeg_quality(jpeg: &[u8]) -> Option<u8> {
+    let mut i = 2usize; // past SOI
+    while i + 4 <= jpeg.len() {
+        if jpeg[i] != 0xFF {
+            return None;
+        }
+        let marker = jpeg[i + 1];
+        if marker == 0xFF {
+            i += 1;
+            continue;
+        }
+        if marker == 0xDA || marker == 0xD9 {
+            return None; // start of scan / end of image without a table 0
+        }
+        let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        if len < 2 || i + 2 + len > jpeg.len() {
+            return None;
+        }
+        if marker == 0xDB {
+            let mut p = i + 4;
+            let end = i + 2 + len;
+            while p < end {
+                let precision16 = jpeg[p] >> 4 == 1;
+                let id = jpeg[p] & 0x0F;
+                let entry = if precision16 { 2 } else { 1 };
+                if p + 1 + 64 * entry > end {
+                    return None;
+                }
+                if id == 0 {
+                    let sum: u32 = (0..64)
+                        .map(|k| {
+                            let at = p + 1 + k * entry;
+                            if precision16 {
+                                u16::from_be_bytes([jpeg[at], jpeg[at + 1]]) as u32
+                            } else {
+                                jpeg[at] as u32
+                            }
+                        })
+                        .sum();
+                    let base: u32 = ANNEX_K_LUMA.iter().sum();
+                    // scale in percent, from the table sum ratio.
+                    let scale = (sum as f64 * 100.0 / base as f64).round().max(1.0);
+                    let quality = if scale <= 100.0 { (200.0 - scale) / 2.0 } else { 5000.0 / scale };
+                    return Some(quality.round().clamp(1.0, 100.0) as u8);
+                }
+                p += 1 + 64 * entry;
+            }
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::images::encode::encode_jpeg;
+    use crate::host::images::policy::Subsampling;
+
+    #[test]
+    fn estimated_quality_round_trips_the_encoder() {
+        let (w, h) = (16u32, 16u32);
+        let gray: Vec<u8> = (0..w * h).map(|i| (i * 7 % 256) as u8).collect();
+        for q in [20u8, 50, 75, 90, 95] {
+            let jpeg = encode_jpeg(&gray, w, h, 1, q, Subsampling::Half).unwrap();
+            let got = estimate_jpeg_quality(&jpeg).unwrap();
+            assert!((got as i32 - q as i32).abs() <= 1, "q {q} estimated {got}");
+        }
+        assert_eq!(estimate_jpeg_quality(b"not a jpeg"), None);
     }
 }
 

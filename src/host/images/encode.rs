@@ -180,8 +180,7 @@ pub fn encode_jpeg(
         Subsampling::Full => SamplingFactor::F_1_1,
         Subsampling::Half => SamplingFactor::F_2_2,
     });
-    // Per-image Huffman tables: the lossless part of what jpegoptim and
-    // mozjpeg do, a few percent smaller for free.
+    // Per-image Huffman tables: a few percent smaller, lossless.
     encoder.set_optimized_huffman_tables(true);
     encoder
         .encode(samples, w16, h16, color)

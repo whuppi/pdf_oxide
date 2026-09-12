@@ -693,6 +693,8 @@ pub struct ImagePolicyArgs {
     pub min_savings: f64,
     /// `auto` | `full` | `half` chroma subsampling for written JPEGs.
     pub chroma: String,
+    /// Re-encode stored JPEGs at the policy quality even without a downsample.
+    pub recompress_jpeg: bool,
 }
 
 /// One `reduceImages` report row in wire vocabulary; the field meanings
@@ -755,6 +757,7 @@ pub fn edit_reduce_images(
                 "half" => crate::host::images::policy::Chroma::Half,
                 _ => crate::host::images::policy::Chroma::Auto,
             },
+            recompress_jpeg: args.recompress_jpeg,
         };
         let report = crate::host::images::execute::reduce_images(editor, &policy)?;
         Ok(report

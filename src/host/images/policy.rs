@@ -27,18 +27,19 @@ pub struct Policy {
     /// Images narrower or shorter than this are kept.
     pub min_pixels: u32,
     /// A re-encode is written only when it saves at least this fraction of
-    /// the stored bytes (parent plus soft mask). Acrobat's optimizer keeps
-    /// "only if there is a reduction in size"; jpegoptim's `--threshold`
-    /// names the same guard in percent. 0 means any reduction.
+    /// the stored bytes (parent plus soft mask); 0 means any reduction.
+    /// Guards trading quality for a few percent.
     pub min_savings: f64,
     /// Chroma subsampling for the JPEGs written.
     pub chroma: Chroma,
+    /// Re-encode a stored JPEG at `jpeg_quality` even when it is not
+    /// downsampled. Off, a JPEG changes only when its pixels do; on,
+    /// `min_savings` still decides whether the result is worth keeping.
+    pub recompress_jpeg: bool,
 }
 
-/// How chroma is subsampled in a written JPEG. Distiller and Ghostscript
-/// tie it to the preset (4:2:0 for screen and ebook, 4:4:4 for printer and
-/// prepress); libvips ties it to quality (4:4:4 from Q 90). `Auto` is the
-/// libvips rule; the presets pin what Distiller pins.
+/// How chroma is subsampled in a written JPEG. `Auto` follows quality:
+/// 4:2:0 below 90, 4:4:4 from 90; a preset may pin either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chroma {
     /// 4:4:4 when `jpeg_quality` ≥ 90, 4:2:0 below.
@@ -204,7 +205,19 @@ pub fn decide(kind: &Kind, uses: &[Use], policy: &Policy) -> Decision {
         KeepReason::AlreadyOptimal
     };
     match kind.encoding {
-        // A JPEG re-encoded in place only loses another generation.
+        // A JPEG re-encoded in place only loses another generation, so it
+        // happens only when the policy asks, a lossy codec is allowed, and
+        // the stored quality is above the target — a JPEG already at or
+        // below it is done, which is what makes a second pass a no-op.
+        Encoding::Jpeg if policy.recompress_jpeg && policy.allow_lossy => {
+            return match kind.jpeg_quality {
+                Some(q) if q <= policy.jpeg_quality => Decision::Keep(KeepReason::AlreadyOptimal),
+                _ => Decision::Reencode {
+                    target: None,
+                    output: output_for(kind, policy),
+                },
+            };
+        },
         Encoding::Jpeg => return Decision::Keep(kept),
         Encoding::Ccitt if kind.color == ColorModel::Bilevel => return Decision::Keep(kept),
         _ => {},
@@ -236,6 +249,7 @@ mod tests {
             width,
             height,
             compressed_len: 1000,
+            jpeg_quality: None,
         }
     }
 
@@ -265,6 +279,7 @@ mod tests {
             min_pixels: 32,
             min_savings: 0.0,
             chroma: Chroma::Auto,
+            recompress_jpeg: false,
         }
     }
 
@@ -526,5 +541,25 @@ mod tests {
         p.chroma = Chroma::Half;
         p.jpeg_quality = 100;
         assert_eq!(p.subsampling(), Subsampling::Half);
+    }
+
+    #[test]
+    fn recompress_jpeg_reencodes_a_jpeg_only_when_asked_and_lossy() {
+        let k = kind(Encoding::Jpeg, ColorModel::Rgb, 8, 128, 128);
+        let mut p = screen();
+        p.recompress_jpeg = true;
+        assert!(matches!(
+            decide(&k, &[placed(128.0)], &p),
+            Decision::Reencode { target: None, output: Output::Jpeg { quality: 60, .. } }
+        ));
+        p.allow_lossy = false;
+        assert_eq!(decide(&k, &[placed(128.0)], &p), Decision::Keep(KeepReason::WithinResolution));
+        // Stored quality at or below the target: nothing left to take.
+        p.allow_lossy = true;
+        let mut done = k.clone();
+        done.jpeg_quality = Some(60);
+        assert_eq!(decide(&done, &[placed(128.0)], &p), Decision::Keep(KeepReason::AlreadyOptimal));
+        done.jpeg_quality = Some(61);
+        assert!(matches!(decide(&done, &[placed(128.0)], &p), Decision::Reencode { .. }));
     }
 }

@@ -38,7 +38,7 @@ pub fn reduce_images(editor: &mut DocumentEditor, policy: &Policy) -> Result<Rep
         let Object::Stream { dict, data } = &object else {
             continue;
         };
-        let kind = classify(editor.source(), dict, data.len() as u64);
+        let kind = classify(editor.source(), dict, data);
         let uses: Vec<Use> = entry.placements.iter().map(|&ctm| Use { ctm }).collect();
         let mask_before = match kind.masks.soft_mask {
             Some(r) => stream_len(editor, r)?,

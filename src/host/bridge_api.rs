@@ -420,6 +420,7 @@ fn do_editor_mutate(
                 min_pixels: req.get_i32("minPixels").unwrap_or(32).max(0) as u32,
                 min_savings: req.get_f64("minSavings").unwrap_or(0.1),
                 chroma: req.get_str("chroma").unwrap_or("auto").to_string(),
+                recompress_jpeg: req.get_bool("recompressJpeg").unwrap_or(false),
             };
             let rows = dispatch::edit_reduce_images(editor, policy)?;
             let mut w = ResponseWriter::ok();
