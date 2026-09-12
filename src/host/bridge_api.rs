@@ -410,10 +410,10 @@ fn do_editor_mutate(
         }
         "reduceImages" => {
             let policy = dispatch::ImagePolicyArgs {
-                color_dpi: req.get_f64("colorDpi"),
-                gray_dpi: req.get_f64("grayDpi"),
-                mono_dpi: req.get_f64("monoDpi"),
-                threshold: req.get_f64("threshold").unwrap_or(1.5),
+                color_ppi: req.get_f64("colorPpi"),
+                gray_ppi: req.get_f64("grayPpi"),
+                mono_ppi: req.get_f64("monoPpi"),
+                downsample_threshold: req.get_f64("downsampleThreshold").unwrap_or(1.5),
                 jpeg_quality: req.get_i32("jpegQuality").unwrap_or(75).clamp(1, 100) as u8,
                 allow_lossy: req.get_bool("allowLossy").unwrap_or(true),
                 convert_cmyk_to_rgb: req.get_bool("convertCmykToRgb").unwrap_or(false),

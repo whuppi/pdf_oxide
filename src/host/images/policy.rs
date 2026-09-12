@@ -11,13 +11,13 @@ use super::classify::{ColorModel, Encoding, Kind, Unsupported};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
     /// Target resolution for RGB and CMYK images; `None` never downsamples them.
-    pub color_dpi: Option<f64>,
+    pub color_ppi: Option<f64>,
     /// Target resolution for gray images.
-    pub gray_dpi: Option<f64>,
+    pub gray_ppi: Option<f64>,
     /// Target resolution for bilevel images.
-    pub mono_dpi: Option<f64>,
+    pub mono_ppi: Option<f64>,
     /// Downsample only when the effective resolution exceeds target × threshold.
-    pub threshold: f64,
+    pub downsample_threshold: f64,
     /// Quality for every JPEG the pipeline writes.
     pub jpeg_quality: u8,
     /// May a losslessly stored continuous-tone image become a JPEG.
@@ -148,11 +148,11 @@ pub enum Decision {
     },
 }
 
-fn target_dpi(kind: &Kind, policy: &Policy) -> Option<f64> {
+fn target_ppi(kind: &Kind, policy: &Policy) -> Option<f64> {
     match kind.color {
-        ColorModel::Bilevel => policy.mono_dpi,
-        ColorModel::Gray => policy.gray_dpi,
-        ColorModel::Rgb | ColorModel::Cmyk => policy.color_dpi,
+        ColorModel::Bilevel => policy.mono_ppi,
+        ColorModel::Gray => policy.gray_ppi,
+        ColorModel::Rgb | ColorModel::Cmyk => policy.color_ppi,
         ColorModel::Other => None,
     }
 }
@@ -185,8 +185,8 @@ pub fn decide(kind: &Kind, uses: &[Use], policy: &Policy) -> Decision {
     let Some(ppi) = ppi_min(kind, uses) else {
         return Decision::Keep(KeepReason::NoPlacement);
     };
-    if let Some(target) = target_dpi(kind, policy) {
-        if ppi > target * policy.threshold {
+    if let Some(target) = target_ppi(kind, policy) {
+        if ppi > target * policy.downsample_threshold {
             let scale = target / ppi;
             let new_w = ((kind.width as f64 * scale).round() as u32).max(1);
             let new_h = ((kind.height as f64 * scale).round() as u32).max(1);
@@ -198,7 +198,7 @@ pub fn decide(kind: &Kind, uses: &[Use], policy: &Policy) -> Decision {
     }
     // Not downsampled from here on. "Within resolution" when a target existed
     // and the image sits under it; "already optimal" when nothing was asked.
-    let kept = if target_dpi(kind, policy).is_some() {
+    let kept = if target_ppi(kind, policy).is_some() {
         KeepReason::WithinResolution
     } else {
         KeepReason::AlreadyOptimal
@@ -255,10 +255,10 @@ mod tests {
 
     fn screen() -> Policy {
         Policy {
-            color_dpi: Some(72.0),
-            gray_dpi: Some(72.0),
-            mono_dpi: Some(300.0),
-            threshold: 1.5,
+            color_ppi: Some(72.0),
+            gray_ppi: Some(72.0),
+            mono_ppi: Some(300.0),
+            downsample_threshold: 1.5,
             jpeg_quality: 60,
             allow_lossy: true,
             convert_cmyk_to_rgb: true,
@@ -270,9 +270,9 @@ mod tests {
 
     fn lossless() -> Policy {
         Policy {
-            color_dpi: None,
-            gray_dpi: None,
-            mono_dpi: None,
+            color_ppi: None,
+            gray_ppi: None,
+            mono_ppi: None,
             allow_lossy: false,
             convert_cmyk_to_rgb: false,
             ..screen()
@@ -431,9 +431,9 @@ mod tests {
             }
         );
         let print = Policy {
-            color_dpi: Some(300.0),
-            gray_dpi: Some(300.0),
-            mono_dpi: Some(1200.0),
+            color_ppi: Some(300.0),
+            gray_ppi: Some(300.0),
+            mono_ppi: Some(1200.0),
             convert_cmyk_to_rgb: false,
             ..screen()
         };

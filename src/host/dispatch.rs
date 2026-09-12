@@ -674,13 +674,13 @@ pub fn edit_flatten_all_annotations(editor: &mut DocumentEditor) -> Result<()> {
 /// the field meanings are documented on `host::images::policy::Policy`.
 pub struct ImagePolicyArgs {
     /// Target ppi for RGB and CMYK images; `None` never downsamples them.
-    pub color_dpi: Option<f64>,
+    pub color_ppi: Option<f64>,
     /// Target ppi for gray images.
-    pub gray_dpi: Option<f64>,
+    pub gray_ppi: Option<f64>,
     /// Target ppi for bilevel images.
-    pub mono_dpi: Option<f64>,
+    pub mono_ppi: Option<f64>,
     /// Downsample only above target × threshold.
-    pub threshold: f64,
+    pub downsample_threshold: f64,
     /// JPEG quality 1–100.
     pub jpeg_quality: u8,
     /// Lossless sources may become JPEG.
@@ -741,10 +741,10 @@ pub fn edit_reduce_images(
     {
         use crate::host::images::policy::Policy;
         let policy = Policy {
-            color_dpi: args.color_dpi,
-            gray_dpi: args.gray_dpi,
-            mono_dpi: args.mono_dpi,
-            threshold: args.threshold,
+            color_ppi: args.color_ppi,
+            gray_ppi: args.gray_ppi,
+            mono_ppi: args.mono_ppi,
+            downsample_threshold: args.downsample_threshold,
             jpeg_quality: args.jpeg_quality,
             allow_lossy: args.allow_lossy,
             convert_cmyk_to_rgb: args.convert_cmyk_to_rgb,
