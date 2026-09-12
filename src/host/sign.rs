@@ -200,9 +200,9 @@ fn build_cms_from_digest(
 
     let cert = X509Certificate::from_der(&credentials.certificate)
         .map_err(|e| Error::InvalidPdf(format!("cannot parse certificate: {e}")))?;
-    let issuer_der = cert.tbs_certificate.issuer.to_der()
+    let issuer_der = cert.tbs_certificate().issuer().to_der()
         .map_err(|e| Error::InvalidPdf(format!("encode issuer: {e}")))?;
-    let serial_der = cert.tbs_certificate.serial_number.to_der()
+    let serial_der = cert.tbs_certificate().serial_number().to_der()
         .map_err(|e| Error::InvalidPdf(format!("encode serial: {e}")))?;
 
     let rsa_key = RsaPrivateKey::from_pkcs8_der(&credentials.private_key)

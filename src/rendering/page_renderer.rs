@@ -9026,6 +9026,11 @@ impl PageRenderer {
                             doc,
                             page_num,
                             &Object::Dictionary(std::collections::HashMap::new()),
+                            // A regenerated widget appearance renders in its
+                            // own initial state: no caller clip, nothing
+                            // inherited from the page's graphics state.
+                            None,
+                            None,
                         )?;
                         self.fonts = old_fonts;
                         self.color_spaces = old_cs;

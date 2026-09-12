@@ -123,7 +123,6 @@ impl DocumentInfo {
     // `decode_pdf_text_string`) — `from_utf8_lossy` turned PDFDocEncoding
     // and UTF-16BE metadata into U+FFFD mojibake. ──
     pub fn from_object(obj: &Object) -> Self {
-        use crate::optional_content::decode_pdf_text_string;
         let mut info = Self::default();
 
         if let Some(dict) = obj.as_dict() {
