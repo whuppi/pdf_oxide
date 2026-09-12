@@ -26,6 +26,48 @@ pub struct Policy {
     pub convert_cmyk_to_rgb: bool,
     /// Images narrower or shorter than this are kept.
     pub min_pixels: u32,
+    /// A re-encode is written only when it saves at least this fraction of
+    /// the stored bytes (parent plus soft mask). Acrobat's optimizer keeps
+    /// "only if there is a reduction in size"; jpegoptim's `--threshold`
+    /// names the same guard in percent. 0 means any reduction.
+    pub min_savings: f64,
+    /// Chroma subsampling for the JPEGs written.
+    pub chroma: Chroma,
+}
+
+/// How chroma is subsampled in a written JPEG. Distiller and Ghostscript
+/// tie it to the preset (4:2:0 for screen and ebook, 4:4:4 for printer and
+/// prepress); libvips ties it to quality (4:4:4 from Q 90). `Auto` is the
+/// libvips rule; the presets pin what Distiller pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chroma {
+    /// 4:4:4 when `jpeg_quality` ≥ 90, 4:2:0 below.
+    Auto,
+    /// 4:4:4 — every chroma sample kept; text and hard colour edges stay crisp.
+    Full,
+    /// 4:2:0 — chroma at half resolution both ways; smallest, fine for photos.
+    Half,
+}
+
+/// The resolved subsampling an encoder is told to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subsampling {
+    /// 4:4:4.
+    Full,
+    /// 4:2:0.
+    Half,
+}
+
+impl Policy {
+    /// The subsampling this policy writes.
+    pub fn subsampling(&self) -> Subsampling {
+        match self.chroma {
+            Chroma::Full => Subsampling::Full,
+            Chroma::Half => Subsampling::Half,
+            Chroma::Auto if self.jpeg_quality >= 90 => Subsampling::Full,
+            Chroma::Auto => Subsampling::Half,
+        }
+    }
 }
 
 /// One placement of an image: the CTM in effect at its `Do`.
@@ -64,6 +106,8 @@ pub enum Output {
         quality: u8,
         /// CMYK samples become RGB before encoding.
         convert_cmyk: bool,
+        /// Chroma subsampling to write.
+        subsampling: Subsampling,
     },
     /// Flate with PNG predictors, 8 bits, same colour model.
     FlatePredicted,
@@ -84,8 +128,8 @@ pub enum KeepReason {
     WithinResolution,
     /// Nothing was asked that could make it smaller.
     AlreadyOptimal,
-    /// Re-encoding produced no smaller stream.
-    NotSmaller,
+    /// Re-encoding did not save `Policy::min_savings` of the stored bytes.
+    BelowMinSavings,
     /// The stored samples could not be decoded.
     Undecodable,
 }
@@ -119,10 +163,12 @@ fn output_for(kind: &Kind, policy: &Policy) -> Output {
         ColorModel::Gray | ColorModel::Rgb if policy.allow_lossy => Output::Jpeg {
             quality: policy.jpeg_quality,
             convert_cmyk: false,
+            subsampling: policy.subsampling(),
         },
         ColorModel::Cmyk if policy.allow_lossy && policy.convert_cmyk_to_rgb => Output::Jpeg {
             quality: policy.jpeg_quality,
             convert_cmyk: true,
+            subsampling: policy.subsampling(),
         },
         _ => Output::FlatePredicted,
     }
@@ -217,6 +263,8 @@ mod tests {
             allow_lossy: true,
             convert_cmyk_to_rgb: true,
             min_pixels: 32,
+            min_savings: 0.0,
+            chroma: Chroma::Auto,
         }
     }
 
@@ -283,7 +331,8 @@ mod tests {
                 target: None,
                 output: Output::Jpeg {
                     quality: 60,
-                    convert_cmyk: false
+                    convert_cmyk: false,
+                    subsampling: Subsampling::Half,
                 },
             }
         );
@@ -328,7 +377,8 @@ mod tests {
                 target: Some((32, 32)),
                 output: Output::Jpeg {
                     quality: 60,
-                    convert_cmyk: false
+                    convert_cmyk: false,
+                    subsampling: Subsampling::Half,
                 },
             }
         );
@@ -339,7 +389,8 @@ mod tests {
                 target: None,
                 output: Output::Jpeg {
                     quality: 60,
-                    convert_cmyk: false
+                    convert_cmyk: false,
+                    subsampling: Subsampling::Half,
                 },
             }
         );
@@ -374,7 +425,8 @@ mod tests {
                 target: Some((16, 16)),
                 output: Output::Jpeg {
                     quality: 60,
-                    convert_cmyk: true
+                    convert_cmyk: true,
+                    subsampling: Subsampling::Half,
                 },
             }
         );
@@ -461,4 +513,18 @@ mod tests {
         ));
     }
 
+
+    #[test]
+    fn chroma_auto_follows_quality_and_presets_can_pin_it() {
+        let mut p = screen();
+        assert_eq!(p.subsampling(), Subsampling::Half);
+        p.jpeg_quality = 90;
+        assert_eq!(p.subsampling(), Subsampling::Full);
+        p.jpeg_quality = 85;
+        p.chroma = Chroma::Full;
+        assert_eq!(p.subsampling(), Subsampling::Full);
+        p.chroma = Chroma::Half;
+        p.jpeg_quality = 100;
+        assert_eq!(p.subsampling(), Subsampling::Half);
+    }
 }

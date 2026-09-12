@@ -73,7 +73,7 @@ pub fn reduce_images(editor: &mut DocumentEditor, policy: &Policy) -> Result<Rep
                     target,
                     output,
                 ) {
-                    Ok(applied) if applied.bytes < bytes_before => {
+                    Ok(applied) if saves_enough(applied.bytes, bytes_before, policy.min_savings) => {
                         outcome.action = if target.is_some() {
                             Action::Downsampled
                         } else {
@@ -87,7 +87,7 @@ pub fn reduce_images(editor: &mut DocumentEditor, policy: &Policy) -> Result<Rep
                             editor.insert_modified(r.id, obj);
                         }
                     },
-                    Ok(_) => outcome.keep_reason = Some(KeepReason::NotSmaller),
+                    Ok(_) => outcome.keep_reason = Some(KeepReason::BelowMinSavings),
                     Err(_) => outcome.keep_reason = Some(KeepReason::Undecodable),
                 }
             },
@@ -95,6 +95,11 @@ pub fn reduce_images(editor: &mut DocumentEditor, policy: &Policy) -> Result<Rep
         report.images.push(outcome);
     }
     Ok(report)
+}
+
+/// Strictly smaller, and by at least `min_savings` of the stored bytes.
+fn saves_enough(after: u64, before: u64, min_savings: f64) -> bool {
+    after < before && (before - after) as f64 >= before as f64 * min_savings.clamp(0.0, 1.0)
 }
 
 /// The object as this session sees it: a staged replacement wins over the source.
@@ -167,8 +172,9 @@ fn apply(
         Output::Jpeg {
             quality,
             convert_cmyk,
+            subsampling,
         } => {
-            let bytes = encode_jpeg(&samples.data, w, h, samples.channels, quality)?;
+            let bytes = encode_jpeg(&samples.data, w, h, samples.channels, quality, subsampling)?;
             new_dict.insert("Filter".to_string(), Object::Name("DCTDecode".to_string()));
             new_dict.insert("BitsPerComponent".to_string(), Object::Integer(8));
             if convert_cmyk {

@@ -112,7 +112,7 @@ impl KeepReason {
             KeepReason::NoPlacement => "noPlacement",
             KeepReason::WithinResolution => "withinResolution",
             KeepReason::AlreadyOptimal => "alreadyOptimal",
-            KeepReason::NotSmaller => "notSmaller",
+            KeepReason::BelowMinSavings => "belowMinSavings",
             KeepReason::Undecodable => "undecodable",
         }
     }

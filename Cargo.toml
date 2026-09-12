@@ -188,7 +188,8 @@ unicode-normalization = "0.1"                                # NFC composition o
 
 # Image processing
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
-jpeg-decoder = "0.3"                                                                       # Direct decoder access for CMYK JPEGs (Adobe inversion handling)
+jpeg-decoder = "0.3"
+jpeg-encoder = "0.7.1"                                                                       # Baseline JPEG with chroma subsampling control + optimized Huffman tables (image reducer)                                                                       # Direct decoder access for CMYK JPEGs (Adobe inversion handling)
 base64 = "0.23"                                                                            # For embedding images as data URIs
 fax = "0.3"                                                                                # CCITT Group 3/4 decompression for scanned PDFs (more lenient with malformed EOFB)
 
@@ -336,7 +337,6 @@ tempfile = "3.27"
 crc32fast = "1.5"
 wasm-bindgen-test = "0.3"
 hex-literal = "1.1.0"
-jpeg-encoder = "0.7.1"
 
 # `criterion` pulls `rayon`, which cannot target wasm32. Benches only
 # ever run natively, so keep criterion out of the wasm32 dev-dep graph

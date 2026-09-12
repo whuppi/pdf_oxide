@@ -689,6 +689,10 @@ pub struct ImagePolicyArgs {
     pub convert_cmyk_to_rgb: bool,
     /// Images narrower or shorter than this are kept.
     pub min_pixels: u32,
+    /// Minimum saving as a fraction of the stored bytes; 0 = any reduction.
+    pub min_savings: f64,
+    /// `auto` | `full` | `half` chroma subsampling for written JPEGs.
+    pub chroma: String,
 }
 
 /// One `reduceImages` report row in wire vocabulary; the field meanings
@@ -745,6 +749,12 @@ pub fn edit_reduce_images(
             allow_lossy: args.allow_lossy,
             convert_cmyk_to_rgb: args.convert_cmyk_to_rgb,
             min_pixels: args.min_pixels,
+            min_savings: args.min_savings,
+            chroma: match args.chroma.as_str() {
+                "full" => crate::host::images::policy::Chroma::Full,
+                "half" => crate::host::images::policy::Chroma::Half,
+                _ => crate::host::images::policy::Chroma::Auto,
+            },
         };
         let report = crate::host::images::execute::reduce_images(editor, &policy)?;
         Ok(report

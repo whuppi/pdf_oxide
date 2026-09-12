@@ -2,13 +2,15 @@
 //! buffers; nothing here reads a PDF.
 
 use std::convert::Infallible;
-use std::io::{Cursor, Write};
+use std::io::Write;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use image::codecs::jpeg::JpegEncoder;
 
 use crate::error::{Error, Result};
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+
+use super::policy::Subsampling;
 
 /// Flate output with the PNG predictor parameters a reader needs.
 pub struct FlateEncoded {
@@ -156,6 +158,7 @@ pub fn encode_jpeg(
     height: u32,
     channels: u8,
     quality: u8,
+    subsampling: Subsampling,
 ) -> Result<Vec<u8>> {
     if !matches!(channels, 1 | 3) {
         return Err(Error::Image(format!("encode_jpeg: channels must be 1 or 3, got {channels}")));
@@ -165,19 +168,24 @@ pub fn encode_jpeg(
     }
     expect_buffer_len(samples, width, height, channels as u32, "encode_jpeg")?;
 
-    let color = if channels == 1 {
-        image::ExtendedColorType::L8
-    } else {
-        image::ExtendedColorType::Rgb8
+    // Baseline JPEG carries dimensions in 16 bits.
+    let (w16, h16) = match (u16::try_from(width), u16::try_from(height)) {
+        (Ok(w), Ok(h)) => (w, h),
+        _ => return Err(Error::Image(format!("encode_jpeg: {width}x{height} exceeds 65535"))),
     };
+    let color = if channels == 1 { ColorType::Luma } else { ColorType::Rgb };
     let mut bytes = Vec::new();
-    {
-        let mut cursor = Cursor::new(&mut bytes);
-        let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
-        encoder
-            .encode(samples, width, height, color)
-            .map_err(|e| Error::Image(format!("encode_jpeg: {e}")))?;
-    }
+    let mut encoder = Encoder::new(&mut bytes, quality);
+    encoder.set_sampling_factor(match subsampling {
+        Subsampling::Full => SamplingFactor::F_1_1,
+        Subsampling::Half => SamplingFactor::F_2_2,
+    });
+    // Per-image Huffman tables: the lossless part of what jpegoptim and
+    // mozjpeg do, a few percent smaller for free.
+    encoder.set_optimized_huffman_tables(true);
+    encoder
+        .encode(samples, w16, h16, color)
+        .map_err(|e| Error::Image(format!("encode_jpeg: {e}")))?;
     Ok(bytes)
 }
 
@@ -290,7 +298,7 @@ mod tests {
                 samples.push(((x + y) * 4) as u8);
             }
         }
-        let bytes = encode_jpeg(&samples, width, height, 1, 90).expect("encodes");
+        let bytes = encode_jpeg(&samples, width, height, 1, 90, Subsampling::Half).expect("encodes");
         let decoded = image::load_from_memory(&bytes)
             .expect("valid jpeg")
             .into_luma8();
@@ -302,7 +310,7 @@ mod tests {
     #[test]
     fn jpeg_rejects_four_channels() {
         let samples = vec![0u8; 4 * 4 * 4];
-        assert!(encode_jpeg(&samples, 4, 4, 4, 75).is_err());
+        assert!(encode_jpeg(&samples, 4, 4, 4, 75, Subsampling::Half).is_err());
     }
 
     #[test]
@@ -337,7 +345,27 @@ mod tests {
     #[test]
     fn every_encoder_rejects_a_short_buffer() {
         assert!(encode_flate_predicted(&[0u8; 5], 4, 4, 3).is_err());
-        assert!(encode_jpeg(&[0u8; 5], 4, 4, 1, 75).is_err());
+        assert!(encode_jpeg(&[0u8; 5], 4, 4, 1, 75, Subsampling::Half).is_err());
         assert!(encode_ccitt_g4(&[0u8; 5], 4, 4).is_err());
+    }
+
+    #[test]
+    fn full_chroma_costs_more_bytes_than_half_and_both_decode() {
+        // Hard colour edges: the case where 4:2:0 smears and 4:4:4 earns its bytes.
+        let (w, h) = (32u32, 32u32);
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let red = (x / 4 + y / 4) % 2 == 0;
+                rgb.extend_from_slice(if red { &[220, 20, 20] } else { &[20, 20, 220] });
+            }
+        }
+        let half = encode_jpeg(&rgb, w, h, 3, 85, Subsampling::Half).expect("half");
+        let full = encode_jpeg(&rgb, w, h, 3, 85, Subsampling::Full).expect("full");
+        assert!(full.len() > half.len(), "full {} vs half {}", full.len(), half.len());
+        for bytes in [&half, &full] {
+            let img = image::load_from_memory(bytes).expect("decodes");
+            assert_eq!((img.width(), img.height()), (w, h));
+        }
     }
 }

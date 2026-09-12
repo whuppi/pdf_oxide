@@ -418,6 +418,8 @@ fn do_editor_mutate(
                 allow_lossy: req.get_bool("allowLossy").unwrap_or(true),
                 convert_cmyk_to_rgb: req.get_bool("convertCmykToRgb").unwrap_or(false),
                 min_pixels: req.get_i32("minPixels").unwrap_or(32).max(0) as u32,
+                min_savings: req.get_f64("minSavings").unwrap_or(0.1),
+                chroma: req.get_str("chroma").unwrap_or("auto").to_string(),
             };
             let rows = dispatch::edit_reduce_images(editor, policy)?;
             let mut w = ResponseWriter::ok();
