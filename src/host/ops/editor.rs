@@ -73,6 +73,34 @@ op_unit!(
 );
 
 op_unit!(
+    PAGE_IMAGES,
+    "editorPageImages",
+    pdf_op_editor_page_images_anchor,
+    |ctx| {
+        handle_with_editor(ctx.state, ctx.req, |editor, req| {
+            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let images = dispatch::edit_page_images(editor, page)?;
+            let mut w = ResponseWriter::ok();
+            w.put_map_list("images", images.len(), |i, item| {
+                let img = &images[i];
+                item.put_str("name", &img.name);
+                item.put_f64("x", img.bounds[0] as f64);
+                item.put_f64("y", img.bounds[1] as f64);
+                item.put_f64("width", img.bounds[2] as f64);
+                item.put_f64("height", img.bounds[3] as f64);
+                item.put_f64("a", img.matrix[0] as f64);
+                item.put_f64("b", img.matrix[1] as f64);
+                item.put_f64("c", img.matrix[2] as f64);
+                item.put_f64("d", img.matrix[3] as f64);
+                item.put_f64("e", img.matrix[4] as f64);
+                item.put_f64("f", img.matrix[5] as f64);
+            });
+            Ok(w.finish())
+        })
+    }
+);
+
+op_unit!(
     REDACTION_COUNT,
     "editorRedactionCount",
     pdf_op_editor_redaction_count_anchor,

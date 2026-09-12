@@ -564,6 +564,14 @@ pub fn edit_page_media_box(editor: &mut DocumentEditor, page: usize) -> Result<(
     Ok((mb[0], mb[1], mb[2], mb[3]))
 }
 
+/// List the image XObjects placed on a page: resource name, placement
+/// bounds and the full transform. The name is what `edit_resize_image`
+/// takes; an out-of-range page is an error, a page without images an
+/// empty list.
+pub fn edit_page_images(editor: &mut DocumentEditor, page: usize) -> Result<Vec<crate::editor::ImageInfo>> {
+    editor.get_page_images(page)
+}
+
 // ── Metadata setters ──
 
 /// Set the document title.
