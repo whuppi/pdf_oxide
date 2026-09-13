@@ -201,11 +201,19 @@ pub(crate) fn handle_editor_merge_from(
     req: &Request<'_>,
     merge_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
+    // An absent `pages` key means every page; an empty list would mean
+    // "merge nothing", which no caller can express and none wants.
+    let pages: Option<Vec<usize>> = req
+        .get_int_list("pages")
+        .map(|p| p.iter().map(|&i| i as usize).collect());
     let Some(editor) = state.editors.get_mut(&req_handle(req)) else {
         return ResponseWriter::error("editor not found");
     };
     let result = if let Some(reader) = merge_reader {
-        editor.merge_from_reader(reader.0)
+        match pages {
+            Some(ref pages) => editor.merge_pages_from_reader(reader.0, pages),
+            None => editor.merge_from_reader(reader.0),
+        }
     } else if let Some(other) = req.get_bytes("otherBytes") {
         editor.merge_from_bytes(other)
     } else {
@@ -397,15 +405,62 @@ fn do_editor_mutate(
             ok_response()
         }
         "flattenForms" => {
-            dispatch::edit_flatten_forms(editor)?;
+            let page = req.get_i32("page").map(|p| p as usize);
+            dispatch::edit_flatten_forms(editor, page)?;
             ok_response()
         }
-        "flattenAllAnnotations" => {
-            dispatch::edit_flatten_all_annotations(editor)?;
+        "flattenAnnotations" => {
+            let page = req.get_i32("page").map(|p| p as usize);
+            dispatch::edit_flatten_annotations(editor, page)?;
             ok_response()
         }
-        "applyRedactionsDestructive" => {
-            dispatch::edit_apply_redactions_destructive(editor)?;
+        "clearEraseRegions" => {
+            let page = req.get_i32("page").unwrap_or(0) as usize;
+            dispatch::edit_clear_erase_regions(editor, page);
+            ok_response()
+        }
+        "applyRedactions" => {
+            let report = dispatch::edit_apply_redactions(editor)?;
+            let mut w = ResponseWriter::ok();
+            w.put_i32("regions", report.regions as i32);
+            w.put_i32("glyphsRemoved", report.glyphs_removed as i32);
+            w.put_i32("imagesModified", report.images_modified as i32);
+            w.put_i32("imagesRemoved", report.images_removed as i32);
+            w.put_i32("pathsPruned", report.paths_pruned as i32);
+            w.put_i32("xobjectsSpecialized", report.xobjects_specialized as i32);
+            Ok(w.finish())
+        }
+        "sanitize" => {
+            dispatch::edit_sanitize(
+                editor,
+                req.get_bool("metadata").unwrap_or(true),
+                req.get_bool("javascript").unwrap_or(true),
+                req.get_bool("embeddedFiles").unwrap_or(false),
+            )?;
+            ok_response()
+        }
+        "setPageMediaBox" => {
+            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let x = req.get_f64("x").unwrap_or(0.0) as f32;
+            let y = req.get_f64("y").unwrap_or(0.0) as f32;
+            let width = req.get_f64("width").unwrap_or(0.0) as f32;
+            let height = req.get_f64("height").unwrap_or(0.0) as f32;
+            dispatch::edit_set_page_media_box(editor, page, [x, y, x + width, y + height])?;
+            ok_response()
+        }
+        "setPageCropBox" => {
+            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let x = req.get_f64("x").unwrap_or(0.0) as f32;
+            let y = req.get_f64("y").unwrap_or(0.0) as f32;
+            let width = req.get_f64("width").unwrap_or(0.0) as f32;
+            let height = req.get_f64("height").unwrap_or(0.0) as f32;
+            dispatch::edit_set_page_crop_box(editor, page, [x, y, x + width, y + height])?;
+            ok_response()
+        }
+        "setPageRotation" => {
+            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let degrees = req.get_i32("degrees").unwrap_or(0);
+            dispatch::edit_set_page_rotation(editor, page, degrees)?;
             ok_response()
         }
         "reduceImages" => {
@@ -453,15 +508,27 @@ fn do_editor_mutate(
             } else {
                 req.get_bytes("data").unwrap_or(&[]).to_vec()
             };
-            dispatch::edit_embed_file(editor, name, data)?;
+            dispatch::edit_embed_file(
+                editor,
+                name,
+                data,
+                req.get_str("description").unwrap_or(""),
+                req.get_str("mimeType").unwrap_or(""),
+                req.get_str("relationship").unwrap_or(""),
+            )?;
             ok_response()
         }
         "eraseRegions" => {
             let page = req.get_i32("page").unwrap_or(0) as usize;
             let coords = req.get_f64_list("regions").unwrap_or(&[]);
+            // The wire carries origin + size per region; the engine's
+            // region set takes two corners (`RedactionRegion::from_rect`).
             let rects: Vec<[f32; 4]> = coords.chunks(4)
                 .filter(|c| c.len() == 4)
-                .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32])
+                .map(|c| {
+                    let (x, y) = (c[0] as f32, c[1] as f32);
+                    [x, y, x + c[2] as f32, y + c[3] as f32]
+                })
                 .collect();
             dispatch::edit_erase_regions(editor, page, &rects)?;
             ok_response()
@@ -610,20 +677,128 @@ fn do_editor_mutate(
             ok_response()
         }
         "addRedaction" => {
+            // `RedactionRegion::from_rect` takes two corners; the wire
+            // carries origin + size, like every other rect on the surface.
+            let x = req.get_f64("x").unwrap_or(0.0) as f32;
+            let y = req.get_f64("y").unwrap_or(0.0) as f32;
+            let width = req.get_f64("width").unwrap_or(100.0) as f32;
+            let height = req.get_f64("height").unwrap_or(50.0) as f32;
             dispatch::edit_add_redaction(
                 editor,
                 req.get_i32("page").unwrap_or(0) as usize,
-                [
-                    req.get_f64("x").unwrap_or(0.0) as f32,
-                    req.get_f64("y").unwrap_or(0.0) as f32,
-                    req.get_f64("width").unwrap_or(100.0) as f32,
-                    req.get_f64("height").unwrap_or(50.0) as f32,
-                ],
+                [x, y, x + width, y + height],
             )?;
             ok_response()
         }
         "scrubMetadata" => {
             dispatch::edit_scrub_metadata(editor)?;
+            ok_response()
+        }
+        "removeFormField" => {
+            dispatch::edit_remove_form_field(editor, req.get_str("name").unwrap_or(""))?;
+            ok_response()
+        }
+        "setFormFieldReadOnly" => {
+            dispatch::edit_set_form_field_readonly(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_bool("readOnly").unwrap_or(false),
+            )?;
+            ok_response()
+        }
+        "setFormFieldRequired" => {
+            dispatch::edit_set_form_field_required(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_bool("required").unwrap_or(false),
+            )?;
+            ok_response()
+        }
+        "setFormFieldTooltip" => {
+            dispatch::edit_set_form_field_tooltip(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_str("tooltip").unwrap_or(""),
+            )?;
+            ok_response()
+        }
+        "setFormFieldBounds" => {
+            dispatch::edit_set_form_field_bounds(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_f64("x").unwrap_or(0.0) as f32,
+                req.get_f64("y").unwrap_or(0.0) as f32,
+                req.get_f64("width").unwrap_or(0.0) as f32,
+                req.get_f64("height").unwrap_or(0.0) as f32,
+            )?;
+            ok_response()
+        }
+        "setFormFieldMaxLength" => {
+            dispatch::edit_set_form_field_max_length(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_i32("maxLength").unwrap_or(0) as u32,
+            )?;
+            ok_response()
+        }
+        "setFormFieldAlignment" => {
+            dispatch::edit_set_form_field_alignment(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_i32("alignment").unwrap_or(0) as u32,
+            )?;
+            ok_response()
+        }
+        "setFormFieldBackgroundColor" => {
+            dispatch::edit_set_form_field_background_color(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                [
+                    req.get_f64("r").unwrap_or(0.0) as f32,
+                    req.get_f64("g").unwrap_or(0.0) as f32,
+                    req.get_f64("b").unwrap_or(0.0) as f32,
+                ],
+            )?;
+            ok_response()
+        }
+        "setFormFieldBorderColor" => {
+            dispatch::edit_set_form_field_border_color(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                [
+                    req.get_f64("r").unwrap_or(0.0) as f32,
+                    req.get_f64("g").unwrap_or(0.0) as f32,
+                    req.get_f64("b").unwrap_or(0.0) as f32,
+                ],
+            )?;
+            ok_response()
+        }
+        "setFormFieldBorderWidth" => {
+            dispatch::edit_set_form_field_border_width(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_f64("width").unwrap_or(0.0) as f32,
+            )?;
+            ok_response()
+        }
+        "setFormFieldAppearance" => {
+            dispatch::edit_set_form_field_appearance(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_str("font").unwrap_or("Helv"),
+                req.get_f64("fontSize").unwrap_or(12.0),
+                req.get_f64("r").unwrap_or(0.0),
+                req.get_f64("g").unwrap_or(0.0),
+                req.get_f64("b").unwrap_or(0.0),
+            )?;
+            ok_response()
+        }
+        "setFormFieldFlags" => {
+            dispatch::edit_set_form_field_flags(
+                editor,
+                req.get_str("name").unwrap_or(""),
+                req.get_i32("flags").unwrap_or(0) as u32,
+            )?;
             ok_response()
         }
         _ => Err(Error::InvalidPdf(format!("unknown editOp: {edit_op}"))),
@@ -821,6 +996,30 @@ fn convert_to_with_doc(
             }
             Err(e) => ResponseWriter::error(&e.to_string()),
         }
+    }
+}
+
+/// Convert an XFA document to a plain AcroForm document. One-shot: the
+/// source is opened here, converted, and streamed to the sink.
+pub(crate) fn handle_convert_xfa_to_acroform(
+    req: &Request<'_>,
+    source_bytes: Option<&[u8]>,
+    source_reader: Option<BoxedReader>,
+    sink_writer: Option<BoxedWriter>,
+) -> Vec<u8> {
+    let mut doc = match open_source(source_bytes, source_reader, "convertXfaToAcroForm") {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = authenticate_or_refuse(&doc, req.get_str("password")) {
+        return resp;
+    }
+    let Some(mut writer) = sink_writer else {
+        return ResponseWriter::error("convertXfaToAcroForm requires a sink");
+    };
+    match dispatch::convert_xfa_to_acroform(&mut doc, &mut writer) {
+        Ok(()) => ok_flag("streamed"),
+        Err(e) => ResponseWriter::error(&e.to_string()),
     }
 }
 

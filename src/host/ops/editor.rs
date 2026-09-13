@@ -73,6 +73,30 @@ op_unit!(
 );
 
 op_unit!(
+    PAGE_CROP_BOX,
+    "editorPageCropBox",
+    pdf_op_editor_page_crop_box_anchor,
+    |ctx| {
+        handle_with_editor(ctx.state, ctx.req, |editor, req| {
+            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let cropped = dispatch::edit_page_crop_box(editor, page)?;
+            let mut w = ResponseWriter::ok();
+            match cropped {
+                Some((x, y, w2, h)) => {
+                    w.put_bool("has", true);
+                    w.put_f64("x", x as f64);
+                    w.put_f64("y", y as f64);
+                    w.put_f64("width", w2 as f64);
+                    w.put_f64("height", h as f64);
+                }
+                None => w.put_bool("has", false),
+            }
+            Ok(w.finish())
+        })
+    }
+);
+
+op_unit!(
     PAGE_IMAGES,
     "editorPageImages",
     pdf_op_editor_page_images_anchor,

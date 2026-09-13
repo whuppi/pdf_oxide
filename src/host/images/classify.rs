@@ -255,24 +255,6 @@ pub fn estimate_jpeg_quality(jpeg: &[u8]) -> Option<u8> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::host::images::encode::encode_jpeg;
-    use crate::host::images::policy::Subsampling;
-
-    #[test]
-    fn estimated_quality_round_trips_the_encoder() {
-        let (w, h) = (16u32, 16u32);
-        let gray: Vec<u8> = (0..w * h).map(|i| (i * 7 % 256) as u8).collect();
-        for q in [20u8, 50, 75, 90, 95] {
-            let jpeg = encode_jpeg(&gray, w, h, 1, q, Subsampling::Half).unwrap();
-            let got = estimate_jpeg_quality(&jpeg).unwrap();
-            assert!((got as i32 - q as i32).abs() <= 1, "q {q} estimated {got}");
-        }
-        assert_eq!(estimate_jpeg_quality(b"not a jpeg"), None);
-    }
-}
 
 /// `/Filter` as a list of names (a single name, an array, or absent).
 pub fn filter_names(doc: &PdfDocument, dict: &HashMap<String, Object>) -> Vec<String> {
@@ -398,4 +380,23 @@ fn masks(doc: &PdfDocument, dict: &HashMap<String, Object>) -> Masks {
         .unwrap_or(0)
         > 0;
     masks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::images::encode::encode_jpeg;
+    use crate::host::images::policy::Subsampling;
+
+    #[test]
+    fn estimated_quality_round_trips_the_encoder() {
+        let (w, h) = (16u32, 16u32);
+        let gray: Vec<u8> = (0..w * h).map(|i| (i * 7 % 256) as u8).collect();
+        for q in [20u8, 50, 75, 90, 95] {
+            let jpeg = encode_jpeg(&gray, w, h, 1, q, Subsampling::Half).unwrap();
+            let got = estimate_jpeg_quality(&jpeg).unwrap();
+            assert!((got as i32 - q as i32).abs() <= 1, "q {q} estimated {got}");
+        }
+        assert_eq!(estimate_jpeg_quality(b"not a jpeg"), None);
+    }
 }

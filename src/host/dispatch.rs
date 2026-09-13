@@ -415,6 +415,174 @@ pub fn plan_split_by_bookmarks(doc: &mut PdfDocument) -> Result<Vec<BookmarkSpli
     }).collect())
 }
 
+// ── XFA ──
+
+/// What a document's XFA packet declares. `has_xfa false` means the
+/// document has no XFA at all; the counts are −1 then.
+pub struct XfaInfoRow {
+    /// Whether the document carries an XFA packet.
+    pub has_xfa: bool,
+    /// Number of XFA fields, or −1 when there is no XFA.
+    pub field_count: i32,
+    /// Number of XFA pages, or −1 when there is no XFA.
+    pub page_count: i32,
+    /// The distinct XFA field types, sorted.
+    pub field_types: Vec<String>,
+}
+
+/// Read the document's XFA structure without converting it.
+pub fn doc_xfa(doc: &mut PdfDocument) -> Result<XfaInfoRow> {
+    let analysis = crate::xfa::analyze_xfa_document(doc)?;
+    Ok(XfaInfoRow {
+        has_xfa: analysis.has_xfa,
+        field_count: analysis.field_count.map_or(-1, |n| n as i32),
+        page_count: analysis.page_count.map_or(-1, |n| n as i32),
+        field_types: analysis.field_types,
+    })
+}
+
+/// Convert an XFA document into a plain AcroForm document, written to the
+/// sink in bounded chunks. Errors when the document has no XFA.
+pub fn convert_xfa_to_acroform<W: std::io::Write>(
+    doc: &mut PdfDocument,
+    writer: &mut W,
+) -> Result<()> {
+    let bytes = crate::xfa::convert_xfa_document(doc, None)?;
+    for chunk in bytes.chunks(256 * 1024) {
+        writer.write_all(chunk).map_err(|e| Error::InvalidPdf(e.to_string()))?;
+    }
+    Ok(())
+}
+
+// ── Form fields ──
+
+/// One AcroForm field in wire vocabulary; the field meanings are documented
+/// on `crate::extractors::forms::FormField`.
+pub struct FormFieldRow {
+    /// Fully qualified (dotted) field name.
+    pub name: String,
+    /// `text|checkbox|radioGroup|comboBox|listBox|button|signature|unknown`.
+    pub field_type: &'static str,
+    /// `text|checked|choice|multiChoice|none`.
+    pub value_kind: &'static str,
+    /// Populated when `value_kind == "text"` or `"choice"`.
+    pub text: String,
+    /// Populated when `value_kind == "checked"`.
+    pub checked: bool,
+    /// Populated when `value_kind == "multiChoice"`.
+    pub choices: Vec<String>,
+    /// `/TU`, or `""` for none.
+    pub tooltip: String,
+    /// Whether the first widget carries a `/Rect`.
+    pub has_bounds: bool,
+    /// Bounds x, valid only when `has_bounds`.
+    pub x: f64,
+    /// Bounds y, valid only when `has_bounds`.
+    pub y: f64,
+    /// Bounds width, valid only when `has_bounds`.
+    pub width: f64,
+    /// Bounds height, valid only when `has_bounds`.
+    pub height: f64,
+    /// `/MaxLen`, or −1 for none.
+    pub max_length: i32,
+    /// `/Q`, or −1 for none.
+    pub alignment: i32,
+    /// `/Ff` bit 1.
+    pub read_only: bool,
+    /// `/Ff` bit 2.
+    pub required: bool,
+}
+
+/// Read every AcroForm field of a document: name, type, value, tooltip,
+/// bounds, max length, alignment and the readOnly/required flags.
+pub fn doc_form_fields(doc: &mut PdfDocument) -> Result<Vec<FormFieldRow>> {
+    use crate::extractors::forms::{FieldType, FieldValue, FormExtractor};
+
+    let fields = FormExtractor::extract_fields(doc)?;
+    Ok(fields
+        .into_iter()
+        .map(|f| {
+            let flags = f.flags.unwrap_or(0);
+            let field_type: &'static str = match &f.field_type {
+                FieldType::Button => {
+                    if flags & (1 << 15) != 0 {
+                        "radioGroup"
+                    } else if flags & (1 << 16) != 0 {
+                        "button"
+                    } else {
+                        "checkbox"
+                    }
+                }
+                FieldType::Text => "text",
+                FieldType::Choice => {
+                    if flags & (1 << 17) != 0 {
+                        "comboBox"
+                    } else {
+                        "listBox"
+                    }
+                }
+                FieldType::Signature => "signature",
+                FieldType::Unknown(_) => "unknown",
+            };
+            let (value_kind, text, checked, choices): (&'static str, String, bool, Vec<String>) =
+                match (&f.field_type, &f.value) {
+                    (_, FieldValue::Text(s)) => ("text", s.clone(), false, Vec::new()),
+                    (_, FieldValue::Boolean(b)) => ("checked", String::new(), *b, Vec::new()),
+                    (FieldType::Button, FieldValue::Name(n)) => {
+                        ("checked", String::new(), n != "Off", Vec::new())
+                    }
+                    (_, FieldValue::Name(n)) => ("choice", n.clone(), false, Vec::new()),
+                    (_, FieldValue::Array(arr)) => ("multiChoice", String::new(), false, arr.clone()),
+                    (_, FieldValue::None) => ("none", String::new(), false, Vec::new()),
+                };
+            let (has_bounds, x, y, width, height) = match f.bounds {
+                Some([x0, y0, x1, y1]) => (true, x0, y0, x1 - x0, y1 - y0),
+                None => (false, 0.0, 0.0, 0.0, 0.0),
+            };
+            FormFieldRow {
+                name: f.full_name,
+                field_type,
+                value_kind,
+                text,
+                checked,
+                choices,
+                tooltip: f.tooltip.unwrap_or_default(),
+                has_bounds,
+                x,
+                y,
+                width,
+                height,
+                max_length: f.max_length.map_or(-1, |n| n as i32),
+                alignment: f.alignment.map_or(-1, |n| n as i32),
+                read_only: flags & 1 != 0,
+                required: flags & 2 != 0,
+            }
+        })
+        .collect())
+}
+
+/// Export every AcroForm field's current value as FDF or XFDF, written to
+/// the sink in bounded chunks — the document is never held as one blob.
+pub fn doc_export_form_data<W: std::io::Write>(
+    doc: &mut PdfDocument,
+    format: &str,
+    writer: &mut W,
+) -> Result<()> {
+    use crate::extractors::forms::FormExtractor;
+    use crate::fdf::{FdfWriter, XfdfWriter};
+
+    let fields = FormExtractor::extract_fields(doc)?;
+    let bytes = if format == "fdf" {
+        FdfWriter::from_fields(fields).to_bytes()?
+    } else {
+        XfdfWriter::from_fields(fields).to_bytes()
+    };
+    for chunk in bytes.chunks(256 * 1024) {
+        writer.write_all(chunk).map_err(|e| Error::InvalidPdf(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Render a page to a PNG-encoded image, optionally constrained to max
 /// dimensions. Uses the default render options (PNG output).
 pub fn render_page(doc: &mut PdfDocument, page: usize, max_width: u32, max_height: u32) -> Result<RenderedPage> {
@@ -558,10 +726,52 @@ pub fn edit_is_modified(editor: &DocumentEditor) -> bool {
     editor.is_modified()
 }
 
-/// Get the media box (x, y, width, height) for a page.
+/// Get the media box (x, y, width, height) for a page. `get_page_media_box`
+/// returns `[x0, y0, x1, y1]`; the corners are converted to an origin and a
+/// size so the wire never carries a box a caller could add the origin to
+/// twice.
 pub fn edit_page_media_box(editor: &mut DocumentEditor, page: usize) -> Result<(f32, f32, f32, f32)> {
     let mb = editor.get_page_media_box(page)?;
-    Ok((mb[0], mb[1], mb[2], mb[3]))
+    Ok((mb[0], mb[1], mb[2] - mb[0], mb[3] - mb[1]))
+}
+
+/// Get the crop box (x, y, width, height) for a page, or `None` when the
+/// page has no `/CropBox` — it then defaults to the MediaBox, and we
+/// report the absence rather than inventing the inherited value.
+pub fn edit_page_crop_box(
+    editor: &mut DocumentEditor,
+    page: usize,
+) -> Result<Option<(f32, f32, f32, f32)>> {
+    let cb = editor.get_page_crop_box(page)?;
+    Ok(cb.map(|c| (c[0], c[1], c[2] - c[0], c[3] - c[1])))
+}
+
+/// Set the MediaBox of a page from an `[x0, y0, x1, y1]` rectangle.
+pub fn edit_set_page_media_box(
+    editor: &mut DocumentEditor,
+    page: usize,
+    box_: [f32; 4],
+) -> Result<()> {
+    editor.set_page_media_box(page, box_)
+}
+
+/// Set the CropBox of a page from an `[x0, y0, x1, y1]` rectangle.
+pub fn edit_set_page_crop_box(
+    editor: &mut DocumentEditor,
+    page: usize,
+    box_: [f32; 4],
+) -> Result<()> {
+    editor.set_page_crop_box(page, box_)
+}
+
+/// Set a page's absolute rotation (0/90/180/270). Unlike `edit_rotate_pages`
+/// (relative, additive), this replaces the stored rotation outright.
+pub fn edit_set_page_rotation(
+    editor: &mut DocumentEditor,
+    page: usize,
+    degrees: i32,
+) -> Result<()> {
+    editor.set_page_rotation(page, degrees)
 }
 
 /// List the image XObjects placed on a page: resource name, placement
@@ -660,14 +870,28 @@ pub fn edit_merge(editor: &mut DocumentEditor, secondary_bytes: &[Vec<u8>]) -> R
 
 // ── Content operations ──
 
-/// Flatten interactive form fields into page content.
-pub fn edit_flatten_forms(editor: &mut DocumentEditor) -> Result<()> {
-    editor.flatten_forms()
+/// Flatten interactive form fields into page content. `page == None`
+/// flattens every page; `Some(page)` flattens only that page's widgets.
+pub fn edit_flatten_forms(editor: &mut DocumentEditor, page: Option<usize>) -> Result<()> {
+    match page {
+        None => editor.flatten_forms(),
+        Some(p) => editor.flatten_forms_on_page(p),
+    }
 }
 
-/// Flatten all annotations into page content.
-pub fn edit_flatten_all_annotations(editor: &mut DocumentEditor) -> Result<()> {
-    editor.flatten_all_annotations()
+/// Flatten annotations into page content. `page == None` flattens every
+/// page; `Some(page)` flattens only that page's annotations.
+pub fn edit_flatten_annotations(editor: &mut DocumentEditor, page: Option<usize>) -> Result<()> {
+    match page {
+        None => editor.flatten_all_annotations(),
+        Some(p) => editor.flatten_page_annotations(p),
+    }
+}
+
+/// Clear the queued destructive-erase regions on a page without applying
+/// them.
+pub fn edit_clear_erase_regions(editor: &mut DocumentEditor, page: usize) {
+    editor.clear_erase_regions(page);
 }
 
 /// The `reduceImages` knobs as they arrive on the wire (`PdfImagePolicy`);
@@ -802,9 +1026,75 @@ pub fn edit_unembed_standard_fonts(editor: &mut DocumentEditor) -> Result<usize>
     Ok(count)
 }
 
-/// Embed a file attachment into the document.
-pub fn edit_embed_file(editor: &mut DocumentEditor, name: &str, data: Vec<u8>) -> Result<()> {
-    editor.embed_file(name, data)
+/// Embed a file attachment into the document. `description`, `mime_type`
+/// and `relationship` are omitted from the file spec when empty.
+pub fn edit_embed_file(
+    editor: &mut DocumentEditor,
+    name: &str,
+    data: Vec<u8>,
+    description: &str,
+    mime_type: &str,
+    relationship: &str,
+) -> Result<()> {
+    use crate::writer::{AFRelationship, EmbeddedFile};
+
+    let mut file = EmbeddedFile::new(name, data);
+    if !description.is_empty() {
+        file.description = Some(description.to_string());
+    }
+    if !mime_type.is_empty() {
+        file.mime_type = Some(mime_type.to_string());
+    }
+    file.af_relationship = match relationship {
+        "source" => Some(AFRelationship::Source),
+        "data" => Some(AFRelationship::Data),
+        "alternative" => Some(AFRelationship::Alternative),
+        "supplement" => Some(AFRelationship::Supplement),
+        "unspecified" => Some(AFRelationship::Unspecified),
+        _ => None,
+    };
+    editor.embed_file_with_options(file)
+}
+
+// ── Attachments ──
+
+/// One attachment of a document in wire vocabulary.
+pub struct AttachmentRow {
+    /// The file spec's `/UF`, or `/F` when there is no Unicode name.
+    pub name: String,
+    /// Declared byte size, or −1 when the file spec declares none.
+    pub size: i64,
+    /// `/Desc`, or `""` for none.
+    pub description: String,
+    /// MIME type from the stream's `/Subtype`, or `""` for none.
+    pub mime_type: String,
+}
+
+/// List every attachment in the document's embedded-files name tree.
+/// Metadata only — no attachment's bytes are decoded.
+pub fn doc_attachments(doc: &mut PdfDocument) -> Result<Vec<AttachmentRow>> {
+    Ok(crate::host::attachments::list_attachments(doc)?
+        .into_iter()
+        .map(|a| AttachmentRow {
+            name: a.name,
+            size: a.size,
+            description: a.description,
+            mime_type: a.mime_type,
+        })
+        .collect())
+}
+
+/// Write the attachment named `name` to the sink in bounded chunks.
+pub fn doc_extract_attachment<W: std::io::Write>(
+    doc: &mut PdfDocument,
+    name: &str,
+    writer: &mut W,
+) -> Result<()> {
+    let bytes = crate::host::attachments::attachment_bytes(doc, name)?;
+    for chunk in bytes.chunks(256 * 1024) {
+        writer.write_all(chunk).map_err(|e| Error::InvalidPdf(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Erase rectangular regions from a page's content.
@@ -835,6 +1125,91 @@ pub fn edit_set_form_field_value(editor: &mut DocumentEditor, name: &str, value:
 pub fn edit_set_checkbox_field_value(editor: &mut DocumentEditor, name: &str, checked: bool) -> Result<()> {
     use crate::editor::form_fields::FormFieldValue;
     editor.set_form_field_value(name, FormFieldValue::Boolean(checked))
+}
+
+// ── Form field property mutations ──
+
+/// Remove a form field (and its widget) from the document.
+pub fn edit_remove_form_field(editor: &mut DocumentEditor, name: &str) -> Result<()> {
+    editor.remove_form_field(name)
+}
+
+/// Set a form field's read-only flag.
+pub fn edit_set_form_field_readonly(editor: &mut DocumentEditor, name: &str, readonly: bool) -> Result<()> {
+    editor.set_form_field_readonly(name, readonly)
+}
+
+/// Set a form field's required flag.
+pub fn edit_set_form_field_required(editor: &mut DocumentEditor, name: &str, required: bool) -> Result<()> {
+    editor.set_form_field_required(name, required)
+}
+
+/// Set a form field's tooltip (`/TU`).
+pub fn edit_set_form_field_tooltip(editor: &mut DocumentEditor, name: &str, tooltip: &str) -> Result<()> {
+    editor.set_form_field_tooltip(name, tooltip)
+}
+
+/// Set a form field's bounding rectangle (`/Rect` of its first widget).
+pub fn edit_set_form_field_bounds(
+    editor: &mut DocumentEditor,
+    name: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> Result<()> {
+    editor.set_form_field_rect(name, crate::geometry::Rect::new(x, y, width, height))
+}
+
+/// Set a form field's maximum text length (`/MaxLen`).
+pub fn edit_set_form_field_max_length(editor: &mut DocumentEditor, name: &str, max_length: u32) -> Result<()> {
+    editor.set_form_field_max_length(name, max_length)
+}
+
+/// Set a form field's text alignment (`/Q`: 0 left, 1 center, 2 right).
+pub fn edit_set_form_field_alignment(editor: &mut DocumentEditor, name: &str, alignment: u32) -> Result<()> {
+    editor.set_form_field_alignment(name, alignment)
+}
+
+/// Set a form field's background color (`/MK /BG`).
+pub fn edit_set_form_field_background_color(
+    editor: &mut DocumentEditor,
+    name: &str,
+    color: [f32; 3],
+) -> Result<()> {
+    editor.set_form_field_background_color(name, color)
+}
+
+/// Set a form field's border color (`/MK /BC`).
+pub fn edit_set_form_field_border_color(editor: &mut DocumentEditor, name: &str, color: [f32; 3]) -> Result<()> {
+    editor.set_form_field_border_color(name, color)
+}
+
+/// Set a form field's border width (`/BS /W`).
+pub fn edit_set_form_field_border_width(editor: &mut DocumentEditor, name: &str, width: f32) -> Result<()> {
+    editor.set_form_field_border_width(name, width)
+}
+
+/// Set a form field's default appearance (`/DA`): font resource name, size
+/// and text color. Builds the raw DA string the engine stores — the only
+/// place raw DA syntax is written.
+pub fn edit_set_form_field_appearance(
+    editor: &mut DocumentEditor,
+    name: &str,
+    font: &str,
+    font_size: f64,
+    r: f64,
+    g: f64,
+    b: f64,
+) -> Result<()> {
+    let da = format!("/{font} {font_size} Tf {r} {g} {b} rg");
+    editor.set_form_field_default_appearance(name, da)
+}
+
+/// Set a form field's flag bits directly (`/Ff`, OR of `PdfFormFieldFlag`
+/// bit values).
+pub fn edit_set_form_field_flags(editor: &mut DocumentEditor, name: &str, flags: u32) -> Result<()> {
+    editor.set_form_field_flags(name, flags)
 }
 
 /// Resize a named image XObject on a page.
@@ -922,10 +1297,40 @@ pub fn edit_redaction_count(editor: &mut DocumentEditor, page: usize) -> Result<
     editor.redaction_count(page)
 }
 
+/// One `applyRedactions` report in wire vocabulary; the field meanings are
+/// documented on `crate::redaction::RedactionReport`.
+pub struct RedactionReportRow {
+    /// Number of regions applied.
+    pub regions: usize,
+    /// Glyphs physically removed from content streams.
+    pub glyphs_removed: usize,
+    /// Images whose covered pixels were overwritten and re-encoded.
+    pub images_modified: usize,
+    /// Images deleted entirely (fully covered).
+    pub images_removed: usize,
+    /// Path subpaths dropped or geometry-clipped.
+    pub paths_pruned: usize,
+    /// Shared XObjects/patterns/Type3 fonts cloned-and-specialized.
+    pub xobjects_specialized: usize,
+}
+
+impl From<crate::redaction::RedactionReport> for RedactionReportRow {
+    fn from(r: crate::redaction::RedactionReport) -> Self {
+        Self {
+            regions: r.regions,
+            glyphs_removed: r.glyphs_removed,
+            images_modified: r.images_modified,
+            images_removed: r.images_removed,
+            paths_pruned: r.paths_pruned,
+            xobjects_specialized: r.xobjects_specialized,
+        }
+    }
+}
+
 /// Apply all pending redactions, permanently removing redacted content.
-pub fn edit_apply_redactions_destructive(editor: &mut DocumentEditor) -> Result<()> {
-    editor.apply_redactions_destructive(crate::redaction::RedactionOptions::default())?;
-    Ok(())
+pub fn edit_apply_redactions(editor: &mut DocumentEditor) -> Result<RedactionReportRow> {
+    let report = editor.apply_redactions_destructive(crate::redaction::RedactionOptions::default())?;
+    Ok(report.into())
 }
 
 /// Remove document metadata (info dict, XMP, etc.).
@@ -934,6 +1339,24 @@ pub fn edit_scrub_metadata(editor: &mut DocumentEditor) -> Result<()> {
         scrub_metadata: true,
         remove_javascript: false,
         remove_embedded_files: false,
+        ..Default::default()
+    };
+    editor.sanitize_document(opts)?;
+    Ok(())
+}
+
+/// Sanitize the document per `PdfSanitizeOptions`: scrub metadata, strip
+/// JavaScript and/or drop embedded files.
+pub fn edit_sanitize(
+    editor: &mut DocumentEditor,
+    metadata: bool,
+    javascript: bool,
+    embedded_files: bool,
+) -> Result<()> {
+    let opts = crate::redaction::RedactionOptions {
+        scrub_metadata: metadata,
+        remove_javascript: javascript,
+        remove_embedded_files: embedded_files,
         ..Default::default()
     };
     editor.sanitize_document(opts)?;
@@ -1439,7 +1862,10 @@ pub fn edit_add_stamp(
     x: f32, y: f32, w: f32, h: f32, opacity: f32,
 ) -> Result<()> {
     use crate::geometry::Rect;
-    let rect = Rect::new(x, y, x + w, y + h);
+    // `Rect::new` takes (x, y, width, height) — passing the far corner
+    // makes the stamp's /Rect and its appearance BBox grow with the
+    // placement, so the label lands off-page for any y above the middle.
+    let rect = Rect::new(x, y, w, h);
     let st = stamp_type_from_int(stamp_type);
     let mut annot = crate::writer::StampAnnotation::new(rect, st);
     if opacity > 0.0 && opacity < 1.0 {
@@ -1799,7 +2225,9 @@ pub fn replay_page_ops(builder: &mut DocumentBuilder, default_size: PageSize, op
                     PageOp::HorizontalRule => page.horizontal_rule(),
                     PageOp::Image { data, x, y, w, h, alt } => {
                         match crate::writer::ImageData::from_bytes(&data) {
-                            Ok(img) => page.image_with_alt(img, crate::geometry::Rect::new(x, y, x + w, y + h), &alt),
+                            // `Rect::new` takes (x, y, width, height): the far
+                            // corner here scaled every image by its own origin.
+                            Ok(img) => page.image_with_alt(img, crate::geometry::Rect::new(x, y, w, h), &alt),
                             Err(_) => page, // skip — image data unparseable
                         }
                     }

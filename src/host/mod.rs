@@ -7,6 +7,7 @@
 //! `native/` (lane threads, condvar I/O) and `wasm/` (JS-callback I/O)
 //! are the per-target edges. Each module's own header states its job.
 
+pub mod attachments;
 pub mod binary_codec;
 pub mod bridge_api;
 pub mod constants;

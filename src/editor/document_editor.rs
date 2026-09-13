@@ -520,6 +520,15 @@ pub struct DocumentEditor {
     /// Each entry contains a page object and all its dependent objects,
     /// with references remapped to new IDs in this document.
     merged_pages: Vec<MergedPageData>,
+    // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
+    /// Root field references imported by a merge, already renumbered into
+    /// this document. Appended to the saved catalog's `/AcroForm /Fields`.
+    merged_form_fields: Vec<ObjectRef>,
+    /// The merged document's `/DR` and `/DA`, imported alongside its
+    /// fields; used only when this document's AcroForm has neither.
+    merged_acroform_dr: Option<Object>,
+    merged_acroform_da: Option<Object>,
+    // ── end pdf_manipulator patch ──
 }
 
 /// Data for a single page imported from another PDF during a merge operation.
@@ -641,6 +650,11 @@ impl DocumentEditor {
             deleted_form_fields: HashSet::new(),
             acroform_modified: false,
             merged_pages: Vec::new(),
+            // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
+            merged_form_fields: Vec::new(),
+            merged_acroform_dr: None,
+            merged_acroform_da: None,
+            // ── end pdf_manipulator patch ──
         })
     }
 
@@ -681,6 +695,11 @@ impl DocumentEditor {
             deleted_form_fields: HashSet::new(),
             acroform_modified: false,
             merged_pages: Vec::new(),
+            // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
+            merged_form_fields: Vec::new(),
+            merged_acroform_dr: None,
+            merged_acroform_da: None,
+            // ── end pdf_manipulator patch ──
         })
     }
 
@@ -725,6 +744,11 @@ impl DocumentEditor {
             deleted_form_fields: HashSet::new(),
             acroform_modified: false,
             merged_pages: Vec::new(),
+            // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
+            merged_form_fields: Vec::new(),
+            merged_acroform_dr: None,
+            merged_acroform_da: None,
+            // ── end pdf_manipulator patch ──
         })
     }
 
@@ -1367,15 +1391,126 @@ impl DocumentEditor {
         let mut source_doc = PdfDocument::from_external_reader(reader)?;
         self.merge_from_document(&mut source_doc)
     }
+
+    /// Selective twin of `merge_from_reader`: imports only `pages`, in the
+    /// order given.
+    pub(crate) fn merge_pages_from_reader(
+        &mut self,
+        reader: Box<dyn crate::document::ReadSeek>,
+        pages: &[usize],
+    ) -> Result<usize> {
+        let mut source_doc = PdfDocument::from_external_reader(reader)?;
+        self.merge_pages_from_document(&mut source_doc, pages)
+    }
+
     fn merge_from_document(&mut self, source_doc: &mut PdfDocument) -> Result<usize> {
         let source_page_count = source_doc.page_count()?;
-        if source_page_count == 0 { return Ok(0); }
-        for page_idx in 0..source_page_count {
-            let page_data = self.import_page_from_document(source_doc, page_idx)?;
+        let pages: Vec<usize> = (0..source_page_count).collect();
+        self.merge_pages_from_document(source_doc, &pages)
+    }
+
+    /// The page-selection core every merge entry point shares.
+    ///
+    /// One `id_map` spans the whole merge, so an object two imported pages
+    /// share keeps one identity — which is also what lets the source's
+    /// `/AcroForm /Fields` entries be renumbered onto the imported field
+    /// objects (`carry_merged_acroform`).
+    fn merge_pages_from_document(
+        &mut self,
+        source_doc: &mut PdfDocument,
+        pages: &[usize],
+    ) -> Result<usize> {
+        let source_page_count = source_doc.page_count()?;
+        for &page in pages {
+            if page >= source_page_count {
+                return Err(Error::InvalidPdf(format!(
+                    "Page index {} out of range (source has {} pages)",
+                    page, source_page_count
+                )));
+            }
+        }
+        if pages.is_empty() {
+            return Ok(0);
+        }
+
+        let mut id_map: HashMap<u32, u32> = HashMap::new();
+        for &page_idx in pages {
+            let page_data =
+                self.import_page_from_document(source_doc, page_idx, &mut id_map)?;
             self.merged_pages.push(page_data);
         }
+        self.carry_merged_acroform(source_doc, &mut id_map)?;
         self.is_modified = true;
-        Ok(source_page_count)
+        Ok(pages.len())
+    }
+
+    /// Record the merged document's root form fields under their new object
+    /// ids, plus its `/DR` and `/DA`. Without this the imported widgets are
+    /// on the page but in no `/AcroForm /Fields` array, so the saved file
+    /// has fields no reader can find and no setter can reach.
+    ///
+    /// A field whose widgets all live on pages this merge did not import is
+    /// skipped: its object was never renumbered, so it has no identity here.
+    fn carry_merged_acroform(
+        &mut self,
+        source_doc: &mut PdfDocument,
+        id_map: &mut HashMap<u32, u32>,
+    ) -> Result<()> {
+        let catalog = match source_doc.catalog() {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let acroform_entry = catalog.as_dict().and_then(|d| d.get("AcroForm")).cloned();
+        let acroform: HashMap<String, Object> = match acroform_entry {
+            Some(Object::Dictionary(d)) => d,
+            Some(Object::Reference(r)) => match source_doc.load_object(r) {
+                Ok(Object::Dictionary(d)) => d,
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+
+        let fields = match acroform.get("Fields") {
+            Some(Object::Array(arr)) => arr.clone(),
+            Some(Object::Reference(r)) => match source_doc.load_object(*r) {
+                Ok(Object::Array(arr)) => arr,
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        for entry in &fields {
+            if let Some(field_ref) = entry.as_reference() {
+                if let Some(&new_id) = id_map.get(&field_ref.id) {
+                    self.merged_form_fields.push(ObjectRef::new(new_id, 0));
+                }
+            }
+        }
+
+        if self.merged_acroform_da.is_none() {
+            if let Some(da @ Object::String(_)) = acroform.get("DA") {
+                self.merged_acroform_da = Some(da.clone());
+            }
+        }
+        if self.merged_acroform_dr.is_none() {
+            if let Some(dr) = acroform.get("DR").cloned() {
+                let mut collected: Vec<(u32, Object)> = Vec::new();
+                let imported = self.deep_import_object(
+                    source_doc,
+                    &dr,
+                    id_map,
+                    &mut collected,
+                    &mut HashSet::new(),
+                )?;
+                // The resource objects ride with the pages they were
+                // imported beside — the save writer emits every merged
+                // page's dependent objects.
+                if let Some(last) = self.merged_pages.last_mut() {
+                    last.objects.extend(collected);
+                }
+                self.merged_acroform_dr = Some(imported);
+            }
+        }
+        Ok(())
     }
     // ── end pdf_manipulator patch ──
 
@@ -1387,6 +1522,11 @@ impl DocumentEditor {
         &mut self,
         source: &mut PdfDocument,
         page_index: usize,
+        // ── pdf_manipulator patch: the caller owns the id map ──
+        // It spans every page of one merge, so shared objects are imported
+        // once and the merge can look up a field's new id afterwards.
+        id_map: &mut HashMap<u32, u32>,
+        // ── end pdf_manipulator patch ──
     ) -> Result<MergedPageData> {
         let page_ref = source.get_page_ref(page_index)?;
         let page_obj = source.load_object(page_ref)?;
@@ -1400,8 +1540,6 @@ impl DocumentEditor {
             page_obj
         };
 
-        // Map from source object ID -> new object ID in this document
-        let mut id_map: HashMap<u32, u32> = HashMap::new();
         // Collected objects: new_id -> remapped object
         let mut collected: Vec<(u32, Object)> = Vec::new();
 
@@ -1409,7 +1547,7 @@ impl DocumentEditor {
         let final_page = self.deep_import_object(
             source,
             &stripped_page,
-            &mut id_map,
+            id_map,
             &mut collected,
             &mut HashSet::new(),
         )?;
@@ -1523,29 +1661,9 @@ impl DocumentEditor {
         pages: &[usize],
     ) -> Result<usize> {
         let mut source_doc = PdfDocument::open(source_path.as_ref())?;
-        let source_page_count = source_doc.page_count()?;
-
-        // Validate page indices
-        for &page in pages {
-            if page >= source_page_count {
-                return Err(Error::InvalidPdf(format!(
-                    "Page index {} out of range (source has {} pages)",
-                    page, source_page_count
-                )));
-            }
-        }
-
-        if pages.is_empty() {
-            return Ok(0);
-        }
-
-        for &page_idx in pages {
-            let page_data = self.import_page_from_document(&mut source_doc, page_idx)?;
-            self.merged_pages.push(page_data);
-        }
-
-        self.is_modified = true;
-        Ok(pages.len())
+        // ── pdf_manipulator patch: shared core with merge_pages_from_reader ──
+        self.merge_pages_from_document(&mut source_doc, pages)
+        // ── end pdf_manipulator patch ──
     }
 
     // === Internal save helpers ===
@@ -1852,11 +1970,30 @@ impl DocumentEditor {
         use crate::editor::form_fields::FormFieldValue;
         use crate::extractors::forms::FieldType;
 
-        // Collect field data we need before mutating self
-        // ── pdf_manipulator patch: carry the typed value, not just the Object,
-        // so the button lane below can resolve an appearance-state name from it
-        // (an Object::Name has already lost the distinction). ──
-        let fields_to_flush: Vec<(u32, u16, FormFieldValue, bool)> = {
+        // ── pdf_manipulator patch: a property-only change (tooltip, rect, max
+        // length, alignment, flags, colors, border, appearance) must reach the
+        // saved object graph even when the field's /V was never touched — the
+        // wrapper's `is_modified()` already covers that; only `modified_value`
+        // gated the loop before, silently dropping every other setter on save
+        // (they only ever took effect through `flattenForms`, which reads the
+        // wrapper directly instead of going through this function). Carry every
+        // `modified_*` field, not just the typed value. ──
+        struct FieldFlush {
+            obj_ref: ObjectRef,
+            value: Option<FormFieldValue>,
+            is_button: bool,
+            tooltip: Option<String>,
+            rect: Option<Rect>,
+            max_length: Option<u32>,
+            alignment: Option<u32>,
+            flags: Option<u32>,
+            background_color: Option<[f32; 3]>,
+            border_color: Option<[f32; 3]>,
+            border_width: Option<f32>,
+            default_appearance: Option<String>,
+        }
+
+        let fields_to_flush: Vec<FieldFlush> = {
             let mut result = Vec::new();
             for wrapper in self.modified_form_fields.values() {
                 if !wrapper.is_modified() || wrapper.is_new() {
@@ -1866,27 +2003,32 @@ impl DocumentEditor {
                     Some(r) => r,
                     None => continue,
                 };
-
-                // Build the new /V value from the modified value
-                let new_value: FormFieldValue = match &wrapper.modified_value {
-                    Some(val) => val.clone(),
-                    None => continue,
-                };
-        // ── end pdf_manipulator patch ──
-
                 let is_button = wrapper
                     .field_type()
                     .map(|ft| *ft == FieldType::Button)
                     .unwrap_or(false);
-
-                result.push((obj_ref.id, obj_ref.gen, new_value, is_button));
+                result.push(FieldFlush {
+                    obj_ref,
+                    value: wrapper.modified_value.clone(),
+                    is_button,
+                    tooltip: wrapper.modified_tooltip.clone(),
+                    rect: wrapper.modified_rect,
+                    max_length: wrapper.modified_max_length,
+                    alignment: wrapper.modified_alignment,
+                    flags: wrapper.modified_flags,
+                    background_color: wrapper.modified_background_color,
+                    border_color: wrapper.modified_border_color,
+                    border_width: wrapper.modified_border_width,
+                    default_appearance: wrapper.modified_default_appearance.clone(),
+                });
             }
             result
         };
+        // ── end pdf_manipulator patch ──
 
         // Now load and update each field object
-        for (obj_id, obj_gen, new_value, is_button) in &fields_to_flush {
-            let obj_ref = ObjectRef::new(*obj_id, *obj_gen);
+        for flush in &fields_to_flush {
+            let obj_ref = flush.obj_ref;
             let original = self.source.load_object(obj_ref)?;
 
             let dict = match original.as_dict() {
@@ -1906,49 +2048,137 @@ impl DocumentEditor {
             // the widget's own /AP /N instead, and put /AS on the widget that
             // owns it: a radio group's states live on its /Kids, not on the
             // parent field dictionary.
-            if *is_button {
-                let widget_refs = self.field_widget_refs(&new_dict);
-                let available = self.field_on_states(&new_dict);
-                let target = Self::button_on_state(new_value, &available);
-                let v_name = target.clone().unwrap_or_else(|| "Off".to_string());
-                new_dict.insert("V".to_string(), Object::Name(v_name));
+            if let Some(new_value) = &flush.value {
+                if flush.is_button {
+                    let widget_refs = self.field_widget_refs(&new_dict);
+                    let available = self.field_on_states(&new_dict);
+                    let target = Self::button_on_state(new_value, &available);
+                    let v_name = target.clone().unwrap_or_else(|| "Off".to_string());
+                    new_dict.insert("V".to_string(), Object::Name(v_name));
 
-                if widget_refs.is_empty() {
-                    // Merged field + widget — /AS belongs on this dictionary.
-                    new_dict.insert(
-                        "AS".to_string(),
-                        Object::Name(target.clone().unwrap_or_else(|| "Off".to_string())),
-                    );
+                    if widget_refs.is_empty() {
+                        // Merged field + widget — /AS belongs on this dictionary.
+                        new_dict.insert(
+                            "AS".to_string(),
+                            Object::Name(target.clone().unwrap_or_else(|| "Off".to_string())),
+                        );
+                    } else {
+                        // Radio group — exactly the kid offering the chosen state
+                        // turns on; every sibling goes to /Off.
+                        for wref in widget_refs {
+                            let kid = match self.source.load_object(wref) {
+                                Ok(k) => k,
+                                Err(_) => continue,
+                            };
+                            let kid_dict = match kid.as_dict() {
+                                Some(d) => d.clone(),
+                                None => continue,
+                            };
+                            let offers = self.widget_on_states(&kid_dict);
+                            let kid_state = match &target {
+                                Some(t) if offers.iter().any(|o| o == t) => t.clone(),
+                                _ => "Off".to_string(),
+                            };
+                            let mut new_kid = kid_dict;
+                            new_kid.insert("AS".to_string(), Object::Name(kid_state));
+                            self.modified_objects
+                                .insert(wref.id, Object::Dictionary(new_kid));
+                        }
+                    }
                 } else {
-                    // Radio group — exactly the kid offering the chosen state
-                    // turns on; every sibling goes to /Off.
-                    for wref in widget_refs {
-                        let kid = match self.source.load_object(wref) {
-                            Ok(k) => k,
-                            Err(_) => continue,
-                        };
-                        let kid_dict = match kid.as_dict() {
-                            Some(d) => d.clone(),
-                            None => continue,
-                        };
-                        let offers = self.widget_on_states(&kid_dict);
-                        let kid_state = match &target {
-                            Some(t) if offers.iter().any(|o| o == t) => t.clone(),
-                            _ => "Off".to_string(),
-                        };
-                        let mut new_kid = kid_dict;
-                        new_kid.insert("AS".to_string(), Object::Name(kid_state));
-                        self.modified_objects
-                            .insert(wref.id, Object::Dictionary(new_kid));
+                    new_dict.insert("V".to_string(), Object::from(new_value));
+                }
+            }
+            // ── end pdf_manipulator patch ──
+
+            // ── pdf_manipulator patch: property-only mutations (tooltip, rect,
+            // max length, alignment, flags, colors, border, appearance) written
+            // into the same field object /V was written to above. The reader
+            // (`FormExtractor::extract_fields`) resolves every one of these keys
+            // from the field's own dict regardless of whether the field is
+            // merged with its widget or has separate `/Kids`, so writing them
+            // here is what `formField(name)` reads back. `/Rect` and `/MK` are
+            // additionally mirrored onto every kid widget when the field has
+            // one, so a viewer reading the widget annotation (not the field
+            // dict) sees the same rect/appearance characteristics.
+            let widget_refs = self.field_widget_refs(&new_dict);
+
+            if let Some(ref tooltip) = flush.tooltip {
+                new_dict.insert("TU".to_string(), Object::text_string(tooltip));
+            }
+            if let Some(rect) = flush.rect {
+                let rect_obj = Object::Array(vec![
+                    Object::Real(rect.x as f64),
+                    Object::Real(rect.y as f64),
+                    Object::Real((rect.x + rect.width) as f64),
+                    Object::Real((rect.y + rect.height) as f64),
+                ]);
+                new_dict.insert("Rect".to_string(), rect_obj.clone());
+                for &wref in &widget_refs {
+                    if let Ok(kid) = self.source.load_object(wref) {
+                        if let Some(kd) = kid.as_dict() {
+                            let mut new_kid = kd.clone();
+                            new_kid.insert("Rect".to_string(), rect_obj.clone());
+                            self.modified_objects.insert(wref.id, Object::Dictionary(new_kid));
+                        }
                     }
                 }
-            } else {
-                new_dict.insert("V".to_string(), Object::from(new_value));
+            }
+            if let Some(max_length) = flush.max_length {
+                new_dict.insert("MaxLen".to_string(), Object::Integer(max_length as i64));
+            }
+            if let Some(alignment) = flush.alignment {
+                new_dict.insert("Q".to_string(), Object::Integer(alignment as i64));
+            }
+            if let Some(flags) = flush.flags {
+                new_dict.insert("Ff".to_string(), Object::Integer(flags as i64));
+            }
+            if flush.background_color.is_some() || flush.border_color.is_some() {
+                let mut mk = new_dict
+                    .get("MK")
+                    .and_then(|o| self.source.resolve_object(o).ok())
+                    .and_then(|o| o.as_dict().cloned())
+                    .unwrap_or_default();
+                if let Some(bg) = flush.background_color {
+                    mk.insert(
+                        "BG".to_string(),
+                        Object::Array(bg.iter().map(|c| Object::Real(*c as f64)).collect()),
+                    );
+                }
+                if let Some(bc) = flush.border_color {
+                    mk.insert(
+                        "BC".to_string(),
+                        Object::Array(bc.iter().map(|c| Object::Real(*c as f64)).collect()),
+                    );
+                }
+                let mk_obj = Object::Dictionary(mk);
+                new_dict.insert("MK".to_string(), mk_obj.clone());
+                for &wref in &widget_refs {
+                    if let Ok(kid) = self.source.load_object(wref) {
+                        if let Some(kd) = kid.as_dict() {
+                            let mut new_kid = kd.clone();
+                            new_kid.insert("MK".to_string(), mk_obj.clone());
+                            self.modified_objects.insert(wref.id, Object::Dictionary(new_kid));
+                        }
+                    }
+                }
+            }
+            if let Some(width) = flush.border_width {
+                let mut bs = new_dict
+                    .get("BS")
+                    .and_then(|o| self.source.resolve_object(o).ok())
+                    .and_then(|o| o.as_dict().cloned())
+                    .unwrap_or_default();
+                bs.insert("W".to_string(), Object::Real(width as f64));
+                new_dict.insert("BS".to_string(), Object::Dictionary(bs));
+            }
+            if let Some(ref da) = flush.default_appearance {
+                new_dict.insert("DA".to_string(), Object::text_string(da));
             }
             // ── end pdf_manipulator patch ──
 
             self.modified_objects
-                .insert(*obj_id, Object::Dictionary(new_dict));
+                .insert(obj_ref.id, Object::Dictionary(new_dict));
         }
 
         // Set /NeedAppearances true in the AcroForm dictionary
@@ -2399,6 +2629,22 @@ impl DocumentEditor {
                 }
             }
 
+            // ── pdf_manipulator patch: drop removed fields from the saved
+            // AcroForm and their widgets from each page's /Annots (see
+            // `remove_deleted_form_fields_from_acroform`). Same guard as the
+            // #647 block above: the flatten branches rebuild the AcroForm
+            // their own way and must not be clobbered here.
+            if !self.remove_acroform && self.flatten_forms_pages.is_empty() {
+                if let Some(catalog_dict) = catalog_obj.as_dict() {
+                    if let Some(rebuilt) = self.remove_deleted_form_fields_from_acroform(catalog_dict)? {
+                        let mut new_catalog = catalog_dict.clone();
+                        new_catalog.insert("AcroForm".to_string(), rebuilt);
+                        catalog_obj = Object::Dictionary(new_catalog);
+                    }
+                }
+            }
+            // ── end pdf_manipulator patch ──
+
             // Only genuinely NEW fields need freshly-allocated objects plus
             // /Fields and /Annots entries. Existing fields keep their object
             // ids and their place in /Fields/Annots (updated in place above).
@@ -2527,6 +2773,56 @@ impl DocumentEditor {
                 }
             }
         }
+
+        // ── pdf_manipulator patch: merged pages keep their form fields ──
+        // The merge imported each field object (`carry_merged_acroform`),
+        // but only the target's own AcroForm reaches the saved catalog, so
+        // without this the merged widgets belong to no field: they are in
+        // no `/Fields` array, `FormExtractor` cannot see them and
+        // `modify_form_field` cannot reach them.
+        if !self.merged_form_fields.is_empty() && !self.remove_acroform {
+            let merged_fields = self.merged_form_fields.clone();
+            let merged_dr = self.merged_acroform_dr.clone();
+            let merged_da = self.merged_acroform_da.clone();
+            let acroform_entry =
+                catalog_obj.as_dict().and_then(|d| d.get("AcroForm")).cloned();
+            let mut acroform: HashMap<String, Object> = match acroform_entry {
+                Some(Object::Dictionary(d)) => d,
+                Some(Object::Reference(r)) => match self.source.load_object(r) {
+                    Ok(Object::Dictionary(d)) => d,
+                    _ => HashMap::new(),
+                },
+                _ => HashMap::new(),
+            };
+            let mut fields = match acroform.get("Fields") {
+                Some(Object::Array(arr)) => arr.clone(),
+                Some(Object::Reference(r)) => match self.source.load_object(*r) {
+                    Ok(Object::Array(arr)) => arr,
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            for field_ref in merged_fields {
+                fields.push(Object::Reference(field_ref));
+            }
+            acroform.insert("Fields".to_string(), Object::Array(fields));
+            if !acroform.contains_key("DR") {
+                if let Some(dr) = merged_dr {
+                    acroform.insert("DR".to_string(), dr);
+                }
+            }
+            if !acroform.contains_key("DA") {
+                if let Some(da) = merged_da {
+                    acroform.insert("DA".to_string(), da);
+                }
+            }
+            if let Some(catalog_dict) = catalog_obj.as_dict() {
+                let mut new_catalog = catalog_dict.clone();
+                new_catalog.insert("AcroForm".to_string(), Object::Dictionary(acroform));
+                catalog_obj = Object::Dictionary(new_catalog);
+            }
+        }
+        // ── end pdf_manipulator patch ──
 
         // Write embedded files and update catalog if any files are pending
         let mut embedded_file_refs: Vec<(String, ObjectRef)> = Vec::new();
@@ -5564,6 +5860,100 @@ impl DocumentEditor {
         new_acroform.insert("Fields".to_string(), Object::Array(surviving));
         Ok(Some(Object::Dictionary(new_acroform)))
     }
+
+    // ── pdf_manipulator patch: `remove_form_field` must reach the saved file ──
+    // `deleted_form_fields` was consulted only by the in-memory query helpers
+    // (`has_form_field`, `get_form_fields`, `modify_form_field`); the save
+    // writer never dropped the field from `/AcroForm /Fields` nor its widget
+    // from the owning page's `/Annots`, so a "removed" field reappeared on
+    // reopen. Filters both, modelled on `rebuild_partial_acroform` above.
+    /// Rebuilds the AcroForm's `/Fields` array to drop every field named in
+    /// `self.deleted_form_fields`, and stages each owning page's `/Annots`
+    /// with that field's widget removed. Returns `None` when there is
+    /// nothing to remove (unchanged catalog).
+    fn remove_deleted_form_fields_from_acroform(
+        &mut self,
+        catalog_dict: &HashMap<String, Object>,
+    ) -> Result<Option<Object>> {
+        use crate::extractors::forms::FormExtractor;
+
+        if self.deleted_form_fields.is_empty() {
+            return Ok(None);
+        }
+
+        let acroform_obj = match catalog_dict.get("AcroForm") {
+            Some(o) => o.clone(),
+            None => return Ok(None),
+        };
+        let acroform_dict: HashMap<String, Object> = match acroform_obj {
+            Object::Dictionary(d) => d,
+            Object::Reference(r) => match self.source.load_object(r)? {
+                Object::Dictionary(d) => d,
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let fields_array = match acroform_dict.get("Fields") {
+            Some(Object::Array(arr)) => arr.clone(),
+            Some(Object::Reference(r)) => match self.source.load_object(*r) {
+                Ok(Object::Array(arr)) => arr,
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        // The object id of every deleted field — `remove_form_field` names the
+        // field the caller asked for, which is the terminal/root field itself.
+        let deleted_ids: HashSet<u32> = FormExtractor::extract_fields(&self.source)?
+            .into_iter()
+            .filter(|f| self.deleted_form_fields.contains(&f.full_name))
+            .filter_map(|f| f.object_ref.map(|r| r.id))
+            .collect();
+        if deleted_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let surviving: Vec<Object> = fields_array
+            .into_iter()
+            .filter(|entry| entry.as_reference().map(|r| !deleted_ids.contains(&r.id)).unwrap_or(true))
+            .collect();
+        let mut new_acroform = acroform_dict.clone();
+        new_acroform.insert("Fields".to_string(), Object::Array(surviving));
+
+        // Strip the deleted widgets from every page's /Annots (a merged
+        // field/widget appears there directly; the id set covers that case).
+        for page_ref in self.source.all_page_refs().unwrap_or_default() {
+            let page_obj = match self.source.load_object(page_ref) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            let page_dict = match page_obj.as_dict() {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+            let annots = match page_dict.get("Annots") {
+                Some(Object::Array(arr)) => arr.clone(),
+                Some(Object::Reference(r)) => match self.source.load_object(*r) {
+                    Ok(Object::Array(arr)) => arr,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let filtered: Vec<Object> = annots
+                .iter()
+                .filter(|a| a.as_reference().map(|r| !deleted_ids.contains(&r.id)).unwrap_or(true))
+                .cloned()
+                .collect();
+            if filtered.len() != annots.len() {
+                let mut new_page = page_dict;
+                new_page.insert("Annots".to_string(), Object::Array(filtered));
+                self.modified_objects.insert(page_ref.id, Object::Dictionary(new_page));
+            }
+        }
+
+        Ok(Some(Object::Dictionary(new_acroform)))
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Returns true if `field_ref` or any of its descendants has a widget whose
     /// `/P` page reference maps to a page that was NOT flattened.

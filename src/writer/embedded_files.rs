@@ -145,7 +145,14 @@ impl EmbeddedFile {
 
         // Subtype is the MIME type if provided
         if let Some(ref mime) = self.mime_type {
-            dict.insert("Subtype".to_string(), Object::Name(mime.replace('/', "#2F")));
+            // ── pdf_manipulator patch: the serializer owns name escaping ──
+            // Pre-escaping the solidus here double-escaped it: the name
+            // writer turns the `#` into `#23`, so `text/plain` reached the
+            // file as `/text#232Fplain` and read back as `text#2Fplain`.
+            // Store the raw MIME type and let one layer do the escaping
+            // (ISO 32000-1 §7.3.5).
+            dict.insert("Subtype".to_string(), Object::Name(mime.clone()));
+            // ── end pdf_manipulator patch ──
         }
 
         // Build Params dictionary

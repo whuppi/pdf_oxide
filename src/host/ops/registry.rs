@@ -17,17 +17,23 @@ static OPS: &[&OpEntry] = &[
     &builder::PAGE_OP,
     &builder::SAVE,
     &builder::SET_METADATA,
-    // convert (office capability)
+    // convert (office capability, plus core XFA conversion)
     &convert::CONVERT_TO,
     &convert::CONVERT_TO_PDF,
+    &convert::CONVERT_XFA_TO_ACROFORM,
     // doc
+    &doc::ATTACHMENTS,
     &doc::CLASSIFY_DOCUMENT,
     &doc::CLASSIFY_PAGE,
     &doc::DISPOSE,
+    &doc::EXPORT_FORM_DATA,
     &doc::EXTRACT,
+    &doc::EXTRACT_ATTACHMENT,
+    &doc::FORM_FIELDS,
     &doc::OPEN,
     &doc::PLAN_SPLIT_BY_BOOKMARKS,
     &doc::SEARCH,
+    &doc::XFA,
     // editor
     &editor::DISPOSE,
     &editor::EXTRACT_PAGES,
@@ -36,6 +42,7 @@ static OPS: &[&OpEntry] = &[
     &editor::MERGE_FROM,
     &editor::MUTATE,
     &editor::OPEN,
+    &editor::PAGE_CROP_BOX,
     &editor::PAGE_IMAGES,
     &editor::PAGE_MEDIA_BOX,
     &editor::REDACTION_COUNT,

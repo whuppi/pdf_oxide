@@ -316,6 +316,19 @@ impl ResponseWriter {
         self.inc_count();
     }
 
+    /// Write a string list field.
+    pub fn put_string_list(&mut self, key: &str, val: &[&str]) {
+        self.write_key(key);
+        self.buf.push(9);
+        self.buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        for s in val {
+            let bytes = s.as_bytes();
+            self.buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            self.buf.extend_from_slice(bytes);
+        }
+        self.inc_count();
+    }
+
     /// Write a list of map (key-value) entries.
     pub fn put_map_list<F>(&mut self, key: &str, count: usize, mut write_item: F)
     where F: FnMut(usize, &mut ResponseWriter)
