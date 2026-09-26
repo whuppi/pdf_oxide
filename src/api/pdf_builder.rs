@@ -1597,9 +1597,6 @@ impl Pdf {
     ///     println!("Found '{}' on page {}", result.text, result.page);
     /// }
     /// ```
-    // ── pdf_manipulator patch ── search needs the extract feature.
-    #[cfg(feature = "extract")]
-    // ── end pdf_manipulator patch ──
     pub fn search(&mut self, pattern: &str) -> Result<Vec<crate::search::SearchResult>> {
         use crate::search::{SearchOptions, TextSearcher};
 
@@ -1629,9 +1626,6 @@ impl Pdf {
     ///     .with_page_range(0, 5);
     /// let results = pdf.search_with_options("hello", options)?;
     /// ```
-    // ── pdf_manipulator patch ── search needs the extract feature.
-    #[cfg(feature = "extract")]
-    // ── end pdf_manipulator patch ──
     pub fn search_with_options(
         &mut self,
         pattern: &str,
@@ -1653,9 +1647,6 @@ impl Pdf {
     /// # Arguments
     /// * `page` - Page number (0-indexed)
     /// * `pattern` - Regex pattern to search for
-    // ── pdf_manipulator patch ── search needs the extract feature.
-    #[cfg(feature = "extract")]
-    // ── end pdf_manipulator patch ──
     pub fn search_page(
         &mut self,
         page: usize,
@@ -1690,9 +1681,6 @@ impl Pdf {
     /// pdf.highlight_matches(&results, [1.0, 1.0, 0.0])?; // Yellow highlight
     /// pdf.save("highlighted.pdf")?;
     /// ```
-    // ── pdf_manipulator patch ── consumes search results (extract feature).
-    #[cfg(feature = "extract")]
-    // ── end pdf_manipulator patch ──
     pub fn highlight_matches(
         &mut self,
         results: &[crate::search::SearchResult],
