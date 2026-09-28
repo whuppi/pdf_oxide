@@ -1169,9 +1169,9 @@ impl DocumentEditor {
             return copy.save_to_bytes();
         }
 
-        // Fast path: serialise once with a trimmed page_order and a staged
-        // Pages dict, so collect_reachable_ids() drops orphan objects from
-        // dropped pages instead of walking the original page tree.
+        // ── pdf_manipulator patch: no staged /Pages; the save prunes (#261) ──
+        // Fast path: serialise once with a trimmed page_order. The save's
+        // prune plan drops everything only the other pages reach.
         let visible: Vec<i32> = self
             .page_order
             .iter()
@@ -1179,53 +1179,6 @@ impl DocumentEditor {
             .copied()
             .collect();
         let new_order: Vec<i32> = pages.iter().map(|&i| visible[i]).collect();
-
-        // Stage a trimmed /Pages dict in modified_objects so GC reachability
-        // sees only kept pages. write_full_to_writer rebuilds its own Kids
-        // list, so this staging only matters for the GC walk.
-        let pages_ref = self
-            .source
-            .trailer()
-            .as_dict()
-            .and_then(|d| d.get("Root"))
-            .and_then(|r| r.as_reference())
-            .and_then(|catalog_ref| self.source.load_object(catalog_ref).ok())
-            .and_then(|catalog_obj| {
-                catalog_obj
-                    .as_dict()
-                    .and_then(|d| d.get("Pages"))
-                    .and_then(|p| p.as_reference())
-            });
-
-        // Resolve all leaf page refs in one tree walk (avoids O(n²) of calling
-        // get_page_ref(i) per index).
-        let all_refs = self.source.all_page_refs().unwrap_or_default();
-
-        let staged_pages: Option<(u32, Option<Object>)> = if let Some(pages_ref) = pages_ref {
-            let pages_obj = self.source.load_object(pages_ref).ok();
-            let pages_dict = pages_obj.as_ref().and_then(|p| p.as_dict()).cloned();
-            if let Some(mut new_pages_dict) = pages_dict {
-                let mut kids: Vec<Object> = Vec::with_capacity(new_order.len());
-                for &leaf_idx in &new_order {
-                    if leaf_idx >= 0 {
-                        let idx = leaf_idx as usize;
-                        if idx < all_refs.len() {
-                            kids.push(Object::Reference(all_refs[idx]));
-                        }
-                    }
-                }
-                new_pages_dict.insert("Count".to_string(), Object::Integer(kids.len() as i64));
-                new_pages_dict.insert("Kids".to_string(), Object::Array(kids));
-                let prior = self
-                    .modified_objects
-                    .insert(pages_ref.id, Object::Dictionary(new_pages_dict));
-                Some((pages_ref.id, prior))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         let saved_order = std::mem::replace(&mut self.page_order, new_order);
         let saved_is_modified = std::mem::replace(&mut self.is_modified, true);
@@ -1235,16 +1188,7 @@ impl DocumentEditor {
         // Always restore — even on Err — so the document is observably unchanged.
         self.page_order = saved_order;
         self.is_modified = saved_is_modified;
-        if let Some((pages_id, prior)) = staged_pages {
-            match prior {
-                Some(prev_obj) => {
-                    self.modified_objects.insert(pages_id, prev_obj);
-                },
-                None => {
-                    self.modified_objects.remove(&pages_id);
-                },
-            }
-        }
+        // ── end pdf_manipulator patch ──
 
         result
     }
@@ -2267,17 +2211,22 @@ impl DocumentEditor {
         // ── end pdf_manipulator patch ──
     }
 
-    // ── pdf_manipulator patch: zero-clone BFS for GC + trimmed pages staging ──
+    // ── pdf_manipulator patch: zero-clone BFS for GC ──
     /// Collect all object IDs reachable from the catalog root via BFS.
     ///
     /// Used by garbage collection: any source-document object not in this set is
-    /// an orphan and can be omitted from the output.  Modified objects are
-    /// consulted first so that references introduced by edits are honoured.
+    /// an orphan and can be omitted from the output.  The prune plan's
+    /// overrides, then modified objects, are consulted first so that
+    /// references introduced by edits are honoured, and the walk never
+    /// enters an object the plan excludes (#261).
     ///
     /// Zero-clone: borrows cached objects via collect_refs_of() instead of
     /// cloning every Object. For modified objects, borrows from the HashMap
     /// directly. Uses a bit-vec for O(1) membership checks.
-    fn collect_reachable_ids(&self) -> std::collections::HashSet<u32> {
+    fn collect_reachable_ids(
+        &self,
+        prune: &crate::host::page_prune::PagePrune,
+    ) -> std::collections::HashSet<u32> {
         fn push_refs(obj: &Object, out: &mut Vec<u32>) {
             match obj {
                 Object::Reference(r) => out.push(r.id),
@@ -2314,13 +2263,15 @@ impl DocumentEditor {
 
         while let Some(id) = queue.pop() {
             let idx = id as usize;
-            if idx >= max_id || seen[idx] {
+            if idx >= max_id || seen[idx] || prune.excluded.contains(&id) {
                 continue;
             }
             seen[idx] = true;
 
             refs_buf.clear();
-            if let Some(m) = self.modified_objects.get(&id) {
+            if let Some(o) = prune.overrides.get(&id) {
+                push_refs(o, &mut refs_buf);
+            } else if let Some(m) = self.modified_objects.get(&id) {
                 push_refs(m, &mut refs_buf);
             } else {
                 self.source.collect_refs_of(id, &mut refs_buf);
@@ -2361,43 +2312,6 @@ impl DocumentEditor {
     }
     // ── end pdf_manipulator patch ──
 
-    /// Stage a trimmed /Pages dict into modified_objects so that
-    /// collect_reachable_ids() only walks kept pages. Returns the
-    /// prior value to restore after GC completes.
-    pub(crate) fn stage_trimmed_pages_for_gc(&mut self) -> Option<(u32, Option<Object>)> {
-        let pages_ref = self
-            .source
-            .trailer()
-            .as_dict()
-            .and_then(|d| d.get("Root"))
-            .and_then(|r| r.as_reference())
-            .and_then(|catalog_ref| self.source.load_object(catalog_ref).ok())
-            .and_then(|catalog_obj| {
-                catalog_obj.as_dict()
-                    .and_then(|d| d.get("Pages"))
-                    .and_then(|p| p.as_reference())
-            })?;
-
-        let all_refs = self.source.all_page_refs().unwrap_or_default();
-        let pages_obj = self.source.load_object(pages_ref).ok()?;
-        let pages_dict = pages_obj.as_dict()?.clone();
-
-        let mut new_dict = pages_dict;
-        let mut kids: Vec<Object> = Vec::new();
-        for &idx in &self.page_order {
-            if idx >= 0 {
-                let i = idx as usize;
-                if i < all_refs.len() {
-                    kids.push(Object::Reference(all_refs[i]));
-                }
-            }
-        }
-        new_dict.insert("Count".to_string(), Object::Integer(kids.len() as i64));
-        new_dict.insert("Kids".to_string(), Object::Array(kids));
-
-        let prior = self.modified_objects.insert(pages_ref.id, Object::Dictionary(new_dict));
-        Some((pages_ref.id, prior))
-    }
     // ── end pdf_manipulator patch ──
 
     /// Write a full rewrite of the PDF to a generic writer.
@@ -2427,6 +2341,10 @@ impl DocumentEditor {
         if self.source.is_encrypted() && !self.source.is_authenticated() {
             return Err(Error::EncryptedPdf);
         }
+
+        // ── pdf_manipulator patch: what the save drops with dropped pages (#261) ──
+        let prune = crate::host::page_prune::plan(&self.source, &self.modified_objects, &self.page_order);
+        // ── end pdf_manipulator patch ──
 
         /// Compress a stream object with FlateDecode if it has no filter yet.
         fn compress_stream_if_raw(obj: Object) -> Object {
@@ -2897,6 +2815,12 @@ impl DocumentEditor {
             }
         }
 
+        // ── pdf_manipulator patch: catalog entries for dropped pages removed (#261) ──
+        if let Object::Dictionary(ref mut d) = catalog_obj {
+            prune.tidy_catalog(d);
+        }
+        // ── end pdf_manipulator patch ──
+
         let offset = writer.position();
         let bytes =
             serialize_obj(&serializer, catalog_ref.id, 0, &catalog_obj, &encryption_handler);
@@ -2989,7 +2913,10 @@ impl DocumentEditor {
                                 // source here drops the staged /Contents pointer:
                                 // the new content stream becomes an orphan and
                                 // the edit vanishes from the saved document.
-                                let page_obj = if let Some(staged) =
+                                // The page's re-parented form (#261) wins over both.
+                                let page_obj = if let Some(pruned) = prune.overrides.get(&page_ref.id) {
+                                    pruned.clone()
+                                } else if let Some(staged) =
                                     self.modified_objects.get(&page_ref.id)
                                 {
                                     staged.clone()
@@ -4829,29 +4756,15 @@ impl DocumentEditor {
         written_ids.clear();
         written_ids.extend(xref_entries.iter().map(|(id, _, _, _)| *id));
 
-        // ── pdf_manipulator patch: GC sees the trimmed page tree ──
-        // Stage a trimmed /Pages dict so GC sees only kept pages.
-        // Without this, GC walks the original page tree and marks every
-        // object reachable — dropping almost nothing.
-        let staged_pages_prior: Option<(u32, Option<Object>)> =
-            if options.garbage_collect {
-                self.stage_trimmed_pages_for_gc()
-            } else {
-                None
-            };
-
+        // ── pdf_manipulator patch: GC walks the pruned page tree (#261) ──
+        // The walk never enters a dropped page, an inner /Pages node or a
+        // dropped page's own annotation, and reads the plan's overrides,
+        // so nothing that only a dropped page reaches is written.
         let reachable_ids = if options.garbage_collect {
-            Some(self.collect_reachable_ids())
+            Some(self.collect_reachable_ids(&prune))
         } else {
             None
         };
-        // Restore original /Pages so the page-loop rebuild is unaffected.
-        if let Some((pages_id, prior)) = staged_pages_prior {
-            match prior {
-                Some(prev) => { self.modified_objects.insert(pages_id, prev); }
-                None => { self.modified_objects.remove(&pages_id); }
-            }
-        }
         // ── end pdf_manipulator patch ──
 
         let all_source_ids = self.source.all_object_ids();
@@ -4865,13 +4778,22 @@ impl DocumentEditor {
             if self.redacted_orphan_ids.contains(&obj_id) {
                 continue;
             }
+            // ── pdf_manipulator patch: dropped pages never written (#261) ──
+            if prune.excluded.contains(&obj_id) {
+                continue;
+            }
+            // ── end pdf_manipulator patch ──
             if let Some(ref reachable) = reachable_ids {
                 if !reachable.contains(&obj_id) {
                     continue;
                 }
             }
             // Prefer a staged modification over the original source object.
-            let loaded = if let Some(m) = self.modified_objects.get(&obj_id) {
+            // ── pdf_manipulator patch: the prune plan's override wins (#261) ──
+            let loaded = if let Some(o) = prune.overrides.get(&obj_id) {
+                Ok(o.clone())
+            } else if let Some(m) = self.modified_objects.get(&obj_id) {
+            // ── end pdf_manipulator patch ──
                 Ok(m.clone())
             } else {
                 self.load_source_object(ObjectRef { id: obj_id, gen: 0 })
@@ -4911,6 +4833,9 @@ impl DocumentEditor {
                 .modified_objects
                 .iter()
                 .filter(|(&id, _)| !already_written.contains(&id))
+                // ── pdf_manipulator patch: dropped pages never written (#261) ──
+                .filter(|(&id, _)| !prune.excluded.contains(&id))
+                // ── end pdf_manipulator patch ──
                 .map(|(&id, obj)| (id, obj.clone()))
                 .collect();
             for (obj_id, obj) in new_objs {
@@ -8268,7 +8193,13 @@ impl DocumentEditor {
             self.modified_info = Some(DocumentInfo::default());
         }
 
-        let reachable = self.collect_reachable_ids();
+        // ── pdf_manipulator patch: the same prune plan the save uses (#261) ──
+        let reachable = self.collect_reachable_ids(&crate::host::page_prune::plan(
+            &self.source,
+            &self.modified_objects,
+            &self.page_order,
+        ));
+        // ── end pdf_manipulator patch ──
 
         // Expand the catalog-derived roots → full subtree, excluding
         // anything still reachable after the scrub (a genuinely shared

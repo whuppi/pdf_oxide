@@ -1316,7 +1316,8 @@ pub(crate) fn handle_editor_save(
     }
 }
 
-/// Editor extract pages — select → save(sink) → restore page_order.
+/// Editor extract pages — select → save(sink) → restore page_order. The
+/// save's prune plan drops everything only the other pages reach (#261).
 /// Editor state is unchanged after the call. O(1) streaming via sink.
 pub(crate) fn handle_editor_extract_pages(
     state: &mut LaneState,
@@ -1352,9 +1353,6 @@ pub(crate) fn handle_editor_extract_pages(
     let saved_modified = editor.is_modified();
     editor.set_modified(true);
 
-    // Stage trimmed /Pages for GC (same as extract_pages_to_bytes).
-    let staged = editor.stage_trimmed_pages_for_gc();
-
     let result = if let Some(mut writer) = sink_writer {
         dispatch::edit_save_with_options(
             editor, &mut writer, &crate::editor::SaveOptions::full_rewrite(),
@@ -1368,12 +1366,6 @@ pub(crate) fn handle_editor_extract_pages(
     // Always restore — even on error.
     *editor.page_order_mut() = saved_order;
     editor.set_modified(saved_modified);
-    if let Some((pages_id, prior)) = staged {
-        match prior {
-            Some(prev) => { editor.modified_objects_mut().insert(pages_id, prev); }
-            None => { editor.modified_objects_mut().remove(&pages_id); }
-        }
-    }
 
     match result {
         Ok(()) => {

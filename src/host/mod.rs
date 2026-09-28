@@ -16,6 +16,7 @@ pub mod fallback_fonts;
 pub mod lane_state;
 /// Per-op dispatch units (entry + handler + linker anchor).
 pub mod ops;
+pub(crate) mod page_prune;
 pub mod positioned_write;
 pub mod font_optimizer;
 pub mod images;
