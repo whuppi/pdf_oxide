@@ -13,7 +13,8 @@
 //!   walk never enters: dropped page leaves, every intermediate `/Pages`
 //!   node, and annotations only dropped pages list. A reference that is
 //!   left pointing at one of them names a missing object, which a reader
-//!   takes as null (ISO 32000-1 §7.3.10).
+//!   takes as null (ISO 32000-1 §7.3.10). A save without garbage
+//!   collection also skips everything only these objects reach.
 //! - `overrides`: replacement objects the save writes instead of the
 //!   staged or source object: each kept page re-parented to the root with
 //!   the attributes it inherited from a dropped node copied onto it, and
@@ -153,7 +154,26 @@ impl Planner<'_> {
             return;
         }
         self.exclude_dropped_annotations(&kept, &leaves);
-        self.prune_named_dests(&catalog);
+        // A named destination may name another one, so removing one can
+        // make another dead: prune until a pass removes no name.
+        let mut view = catalog.clone();
+        loop {
+            let removed = self.removed_names.len();
+            self.prune_named_dests(&view);
+            for (key, _, after) in &self.out.catalog_edits {
+                match after {
+                    Some(v) => {
+                        view.insert(key.clone(), v.clone());
+                    },
+                    None => {
+                        view.remove(key);
+                    },
+                }
+            }
+            if self.removed_names.len() == removed {
+                break;
+            }
+        }
         self.prune_outlines(&catalog);
         self.prune_links(&kept);
         self.prune_open_action(&catalog);
@@ -303,7 +323,13 @@ impl Planner<'_> {
         }
     }
 
+    /// Records an edit of a catalog entry. A later edit of the same entry
+    /// replaces the value to write and keeps the value first read.
     fn catalog_edit(&mut self, catalog: &Dict, key: &str, after: Option<Object>) {
+        if let Some(edit) = self.out.catalog_edits.iter_mut().find(|(k, _, _)| k == key) {
+            edit.2 = after;
+            return;
+        }
         if let Some(before) = catalog.get(key) {
             self.out
                 .catalog_edits

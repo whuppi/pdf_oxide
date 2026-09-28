@@ -2286,6 +2286,48 @@ impl DocumentEditor {
             .collect()
     }
 
+    // ── pdf_manipulator patch: what only a dropped page reaches (#261) ──
+    /// The objects reachable from the prune plan's excluded objects (dropped
+    /// pages, inner /Pages nodes, dropped-page annotations) and from nothing
+    /// the kept document reaches. A save without garbage collection writes
+    /// every other source object, so it skips these by name.
+    fn dropped_only_ids(
+        &self,
+        prune: &crate::host::page_prune::PagePrune,
+    ) -> std::collections::HashSet<u32> {
+        fn push_refs(obj: &Object, out: &mut Vec<u32>) {
+            match obj {
+                Object::Reference(r) => out.push(r.id),
+                Object::Array(arr) => arr.iter().for_each(|o| push_refs(o, out)),
+                Object::Dictionary(d) => d.values().for_each(|o| push_refs(o, out)),
+                Object::Stream { dict, .. } => dict.values().for_each(|o| push_refs(o, out)),
+                _ => {},
+            }
+        }
+
+        let mut only = std::collections::HashSet::new();
+        if prune.excluded.is_empty() {
+            return only;
+        }
+        let kept = self.collect_reachable_ids(prune);
+        let mut queue: Vec<u32> = prune.excluded.iter().copied().collect();
+        let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
+        while let Some(id) = queue.pop() {
+            if kept.contains(&id) || !only.insert(id) {
+                continue;
+            }
+            refs_buf.clear();
+            if let Some(m) = self.modified_objects.get(&id) {
+                push_refs(m, &mut refs_buf);
+            } else {
+                self.source.collect_refs_of(id, &mut refs_buf);
+            }
+            queue.extend_from_slice(&refs_buf);
+        }
+        only
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Load an object from `self.source` for copying into the output file,
     /// decrypting its stream data (if any) so it survives into an output
     /// with no `/Encrypt` dictionary of its own (#1032). A no-op beyond the
@@ -4765,6 +4807,13 @@ impl DocumentEditor {
         } else {
             None
         };
+        // Without GC the sweep writes every source object, so the objects
+        // only a dropped page reaches are named and skipped instead.
+        let dropped_only = if options.garbage_collect {
+            std::collections::HashSet::new()
+        } else {
+            self.dropped_only_ids(&prune)
+        };
         // ── end pdf_manipulator patch ──
 
         let all_source_ids = self.source.all_object_ids();
@@ -4779,7 +4828,7 @@ impl DocumentEditor {
                 continue;
             }
             // ── pdf_manipulator patch: dropped pages never written (#261) ──
-            if prune.excluded.contains(&obj_id) {
+            if prune.excluded.contains(&obj_id) || dropped_only.contains(&obj_id) {
                 continue;
             }
             // ── end pdf_manipulator patch ──
@@ -4834,7 +4883,7 @@ impl DocumentEditor {
                 .iter()
                 .filter(|(&id, _)| !already_written.contains(&id))
                 // ── pdf_manipulator patch: dropped pages never written (#261) ──
-                .filter(|(&id, _)| !prune.excluded.contains(&id))
+                .filter(|(&id, _)| !prune.excluded.contains(&id) && !dropped_only.contains(&id))
                 // ── end pdf_manipulator patch ──
                 .map(|(&id, obj)| (id, obj.clone()))
                 .collect();
