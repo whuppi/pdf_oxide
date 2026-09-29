@@ -2550,7 +2550,9 @@ impl DocumentEditor {
         // Binary marker per spec (bytes > 127 to indicate binary content)
         writer.write_all(b"%\x80\x81\x82\x83\n")?;
 
-        let serializer = ObjectSerializer::compact();
+        // ── pdf_manipulator patch: references to what the save leaves out are null (#261) ──
+        let serializer = ObjectSerializer::compact().nulling(prune.excluded.clone());
+        // ── end pdf_manipulator patch ──
 
         // Set up encryption if configured
         let (file_id, encrypt_dict, encryption_handler) =

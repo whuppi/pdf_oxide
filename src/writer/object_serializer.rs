@@ -19,6 +19,11 @@ pub struct ObjectSerializer {
     /// Current indentation level for pretty printing
     #[allow(dead_code)]
     indent_level: usize,
+    // ── pdf_manipulator patch: references to unwritten objects as null ──
+    /// Object ids a reference to is written as `null` (ISO 32000-1
+    /// §7.3.10: a reference to a missing object is the null object).
+    null_refs: std::collections::HashSet<u32>,
+    // ── end pdf_manipulator patch ──
 }
 
 impl ObjectSerializer {
@@ -32,8 +37,29 @@ impl ObjectSerializer {
         Self {
             compact: true,
             indent_level: 0,
+            // ── pdf_manipulator patch: references to unwritten objects as null ──
+            null_refs: Default::default(),
+            // ── end pdf_manipulator patch ──
         }
     }
+
+    // ── pdf_manipulator patch: references to unwritten objects as null ──
+    /// This serializer, writing every reference to one of `ids` as `null`:
+    /// a save that leaves those objects out says so in every place that
+    /// pointed at them, instead of leaving a dangling reference.
+    pub(crate) fn nulling(mut self, ids: std::collections::HashSet<u32>) -> Self {
+        self.null_refs = ids;
+        self
+    }
+
+    fn write_reference<W: Write>(&self, w: &mut W, r: &ObjectRef) -> std::io::Result<()> {
+        if self.null_refs.contains(&r.id) {
+            write!(w, "null")
+        } else {
+            write!(w, "{} {} R", r.id, r.gen)
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Serialize an object to bytes.
     pub fn serialize(&self, obj: &Object) -> Vec<u8> {
@@ -106,7 +132,9 @@ impl ObjectSerializer {
             Object::Stream { dict, data } => {
                 self.write_stream_encrypted(w, dict, data, obj_num, gen_num, handler)
             },
-            Object::Reference(r) => write!(w, "{} {} R", r.id, r.gen),
+            // ── pdf_manipulator patch: references to unwritten objects as null ──
+            Object::Reference(r) => self.write_reference(w, r),
+            // ── end pdf_manipulator patch ──
         }
     }
 
@@ -197,7 +225,9 @@ impl ObjectSerializer {
             Object::Array(arr) => self.write_array(w, arr),
             Object::Dictionary(dict) => self.write_dictionary(w, dict),
             Object::Stream { dict, data } => self.write_stream(w, dict, data),
-            Object::Reference(r) => write!(w, "{} {} R", r.id, r.gen),
+            // ── pdf_manipulator patch: references to unwritten objects as null ──
+            Object::Reference(r) => self.write_reference(w, r),
+            // ── end pdf_manipulator patch ──
         }
     }
 
