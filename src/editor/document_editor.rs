@@ -1767,6 +1767,129 @@ impl DocumentEditor {
         Ok(())
     }
 
+    // ── pdf_manipulator patch: what an incremental save appends ──
+    /// Why an incremental save cannot carry the staged edits, or `None`.
+    ///
+    /// An append keeps every original byte, so it can only carry an edit
+    /// whose whole effect is a set of replaced or new objects. It refuses
+    /// an edit that removes content (the original bytes would still hold
+    /// it) and an edit the full rewrite materializes in its page loop:
+    /// every editor field the page loop reads at write time must be
+    /// listed here, or an incremental save silently drops that edit.
+    pub(crate) fn incremental_refusal(&self) -> Option<&'static str> {
+        let identity = self.page_order.len() == self.original_page_count
+            && self.page_order.iter().enumerate().all(|(i, &p)| p == i as i32);
+        Some(if !identity {
+            "pages were removed or reordered, and the original bytes would keep removed ones"
+        } else if !self.merged_pages.is_empty() || !self.merged_form_fields.is_empty() {
+            "pages were merged in"
+        } else if !self.apply_redactions_pages.is_empty()
+            || !self.redaction_regions.is_empty()
+            || !self.redacted_content.is_empty()
+            || !self.redacted_orphan_ids.is_empty()
+        {
+            "content was redacted or scrubbed, and the original bytes would keep it"
+        } else if !self.deleted_form_fields.is_empty() || self.remove_acroform {
+            "form fields were removed, and the original bytes would keep them"
+        } else if self.structure_modified
+            || !self.modified_content.is_empty()
+            || !self.overlay_additions.is_empty()
+            || !self.erase_regions.is_empty()
+            || !self.image_modifications.is_empty()
+        {
+            "page content was drawn, erased or rebuilt"
+        } else if !self.modified_annotations.is_empty()
+            || !self.flatten_annotations_pages.is_empty()
+            || !self.flatten_forms_pages.is_empty()
+        {
+            "annotations were changed or flattened"
+        } else if !self.embedded_files.is_empty() {
+            "files were embedded"
+        } else if !self.new_objects.is_empty()
+            || self.modified_form_fields.values().any(|w| w.is_new())
+        {
+            "form fields or objects were added"
+        } else if self.source.is_encrypted() {
+            "the source is encrypted"
+        } else if self.source.xref_repaired() {
+            "the source's cross-reference table was broken and rebuilt on open"
+        } else if self.source.header_offset() != 0 {
+            "bytes precede the PDF header"
+        } else {
+            return None;
+        })
+    }
+
+    /// Whether the staged edits only set form field values: what a
+    /// certifying signature's DocMDP levels 2 and 3 allow. It fails
+    /// closed: an object staged by an earlier save's form flush counts
+    /// as another change.
+    pub(crate) fn incremental_value_only(&self) -> bool {
+        self.modified_objects.is_empty()
+            && self.modified_info.is_none()
+            && self.modified_page_props.is_empty()
+            && self.modified_form_fields.values().filter(|w| w.is_modified()).all(|w| {
+                w.modified_flags.is_none()
+                    && w.modified_tooltip.is_none()
+                    && w.modified_rect.is_none()
+                    && w.modified_default_value.is_none()
+                    && w.modified_max_length.is_none()
+                    && w.modified_alignment.is_none()
+                    && w.modified_default_appearance.is_none()
+                    && w.modified_background_color.is_none()
+                    && w.modified_border_color.is_none()
+                    && w.modified_border_width.is_none()
+            })
+    }
+
+    /// The objects an incremental save appends. Call it only after
+    /// [`Self::incremental_refusal`] returned `None`.
+    pub(crate) fn incremental_objects(
+        &mut self,
+    ) -> Result<crate::host::incremental::IncrementalChanges> {
+        if self.acroform_modified {
+            self.flush_form_fields_to_modified_objects()?;
+        }
+        let mut objects: std::collections::BTreeMap<u32, Object> =
+            self.modified_objects.iter().map(|(&id, o)| (id, o.clone())).collect();
+        if !self.modified_page_props.is_empty() {
+            let refs = self.source.all_page_refs()?;
+            let mut props: Vec<_> = self.modified_page_props.iter().collect();
+            props.sort_by_key(|(i, _)| **i);
+            for (&index, p) in props {
+                let r = *refs.get(index).ok_or_else(|| {
+                    Error::InvalidPdf(format!("page {index} is not in the source"))
+                })?;
+                let base = match objects.get(&r.id) {
+                    Some(o) => o.clone(),
+                    None => self.source.load_object(r)?,
+                };
+                objects.insert(r.id, self.apply_page_props_to_object(&base, p)?);
+            }
+        }
+        let mut info_id = None;
+        if let Some(info) = self.build_info_object() {
+            let id = match self
+                .source
+                .trailer()
+                .as_dict()
+                .and_then(|d| d.get("Info"))
+                .and_then(|i| i.as_reference())
+            {
+                Some(r) => r.id,
+                None => self.allocate_object_id(),
+            };
+            objects.insert(id, info);
+            info_id = Some(id);
+        }
+        Ok(crate::host::incremental::IncrementalChanges {
+            objects: objects.into_iter().collect(),
+            info_id,
+            next_id: self.next_object_id,
+        })
+    }
+    // ── end pdf_manipulator patch ──
+
     // ── pdf_manipulator patch: button on-state resolution (#215) ──
 
     /// The on-state names a widget offers, read from its `/AP` `/N` state
@@ -4848,6 +4971,17 @@ impl DocumentEditor {
                 self.load_source_object(ObjectRef { id: obj_id, gen: 0 })
             };
             match loaded {
+                // ── pdf_manipulator patch: source containers are never copied (#261) ──
+                // The rewrite writes each object on its own and a fresh xref
+                // table, so the source's object streams and xref streams are
+                // dead weight, and an object stream still holds every object
+                // packed in it: a dropped page's dictionary, a field's value.
+                Ok(Object::Stream { ref dict, .. })
+                    if matches!(
+                        dict.get("Type").and_then(|t| t.as_name()),
+                        Some("ObjStm") | Some("XRef")
+                    ) => {},
+                // ── end pdf_manipulator patch ──
                 Ok(obj) => {
                     let obj = if options.compress {
                         compress_stream_if_raw(obj)

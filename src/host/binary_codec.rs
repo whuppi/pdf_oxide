@@ -11,6 +11,8 @@
 //!   Response: [status:u8] [num_fields:u16le] [fields...]
 //!             status 0 = error: [msg_len:u32le] [msg:utf8]
 //!             status 1 = ok:    [fields...]
+//!             status 2 = cancelled
+//!             status 3 = incremental save refused: [msg_len:u32le] [msg:utf8]
 //!   Field:    [key_len:u8] [key:utf8] [type:u8] [value...]
 //!
 //! Type codes:
@@ -242,6 +244,15 @@ impl ResponseWriter {
     /// to their typed cancellation error, never by message matching.
     pub fn cancelled() -> Vec<u8> {
         vec![2]
+    }
+
+    /// Encode a complete incremental-refused response (status 3): the
+    /// staged edits cannot be appended to the source, and a full rewrite
+    /// can save them. Hosts map it to their typed refusal error.
+    pub fn incremental_refused(msg: &str) -> Vec<u8> {
+        let mut buf = Self::error(msg);
+        buf[0] = 3;
+        buf
     }
 
     /// Encode a complete error response with the given message.

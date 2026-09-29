@@ -20,6 +20,7 @@ pub(crate) mod page_prune;
 pub mod positioned_write;
 pub mod font_optimizer;
 pub mod images;
+pub(crate) mod incremental;
 #[cfg(feature = "signatures")]
 pub mod sign;
 

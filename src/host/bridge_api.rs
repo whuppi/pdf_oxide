@@ -286,6 +286,9 @@ pub(crate) fn handle_open(
                 item.put_f64("width", p.width);
                 item.put_f64("height", p.height);
                 item.put_i32("rotation", p.rotation);
+                if let Some(label) = &p.label {
+                    item.put_str("label", label);
+                }
             });
             w.finish()
         }
@@ -1297,22 +1300,29 @@ pub(crate) fn handle_editor_save(
         ..Default::default()
     };
 
-    if let Some(mut writer) = sink_writer {
-        match dispatch::edit_save_with_options(editor, &mut writer, &options) {
-            Ok(()) => {
-                ok_flag("streamed")
+    match (options.incremental, sink_writer) {
+        (true, Some(mut writer)) => {
+            use crate::host::incremental::{write, IncrementalError};
+            match write(editor, &mut writer, &options) {
+                Ok(()) => ok_flag("streamed"),
+                Err(IncrementalError::Refused(why)) => ResponseWriter::incremental_refused(&why),
+                Err(IncrementalError::Failed(e)) => ResponseWriter::error(&e.to_string()),
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
-        }
-    } else {
-        match editor.save_to_bytes_with_options(options) {
+        },
+        (false, Some(mut writer)) => {
+            match dispatch::edit_save_with_options(editor, &mut writer, &options) {
+                Ok(()) => ok_flag("streamed"),
+                Err(e) => ResponseWriter::error(&e.to_string()),
+            }
+        },
+        (_, None) => match editor.save_to_bytes_with_options(options) {
             Ok(bytes) => {
                 let mut w = ResponseWriter::ok();
                 w.put_bytes("data", &bytes);
                 w.finish()
-            }
+            },
             Err(e) => ResponseWriter::error(&e.to_string()),
-        }
+        },
     }
 }
 
@@ -1343,6 +1353,9 @@ pub(crate) fn handle_editor_extract_pages(
                 "page index {} out of range (document has {} pages)", p, page_count
             ));
         }
+    }
+    if let Err(e) = dispatch::refuse_repeated_pages(pages.iter().map(|&p| p as usize)) {
+        return ResponseWriter::error(&e.to_string());
     }
 
     let visible: Vec<i32> = editor.page_order_visible();

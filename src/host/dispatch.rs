@@ -65,6 +65,8 @@ pub struct PageInfo {
     pub height: f64,
     /// Page rotation in degrees (0, 90, 180, 270).
     pub rotation: i32,
+    /// The page's label from the catalog's `/PageLabels`, when it has one.
+    pub label: Option<String>,
 }
 
 /// Result of text extraction from one or more pages.
@@ -203,6 +205,13 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     let enc_algo: u8 = doc.encryption_algorithm().unwrap_or(0);
     let perms: u8 = doc.permission_bits().map(|p| p as u8).unwrap_or(0xFF);
 
+    // One read of the /PageLabels number tree; a document without one
+    // has no labels, not labels that repeat the page numbers.
+    let labels = {
+        use crate::extractors::page_labels::PageLabelExtractor;
+        let ranges = PageLabelExtractor::extract(doc).unwrap_or_default();
+        (!ranges.is_empty()).then(|| PageLabelExtractor::get_all_labels(&ranges, page_count))
+    };
     let mut pages = Vec::with_capacity(page_count);
     for i in 0..page_count {
         let (x0, y0, x1, y1) = doc.get_page_media_box(i).unwrap_or((0.0, 0.0, 612.0, 792.0));
@@ -211,6 +220,7 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
             width: (x1 - x0) as f64,
             height: (y1 - y0) as f64,
             rotation,
+            label: labels.as_ref().and_then(|l| l.get(i).cloned()),
         });
     }
 
@@ -830,7 +840,21 @@ pub fn edit_set_creation_date(editor: &mut DocumentEditor, value: &str) {
 
 /// Keep only the specified pages (by index), removing all others.
 pub fn edit_select_pages(editor: &mut DocumentEditor, pages: &[usize]) -> Result<()> {
+    refuse_repeated_pages(pages.iter().copied())?;
     editor.select_pages(pages)
+}
+
+/// Refuses a page list that names a page twice. The save writes a page
+/// under its own object id, so a repeat would write one object twice and
+/// give it two places in the page tree, which a page cannot have.
+pub(crate) fn refuse_repeated_pages(pages: impl IntoIterator<Item = usize>) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for p in pages {
+        if !seen.insert(p) {
+            return Err(Error::InvalidPdf(format!("page {p} is listed twice")));
+        }
+    }
+    Ok(())
 }
 
 /// Delete pages by index. Uses select_pages with the inverse set —
@@ -1371,6 +1395,9 @@ pub fn edit_save_with_options(
     writer: &mut impl crate::host::positioned_write::PositionedWrite,
     options: &crate::editor::SaveOptions,
 ) -> Result<()> {
+    if options.incremental {
+        return Ok(crate::host::incremental::write(editor, writer, options)?);
+    }
     editor.write_full_to_writer(writer, options)
 }
 
@@ -1389,7 +1416,7 @@ pub fn edit_save(
         garbage_collect,
         ..Default::default()
     };
-    editor.write_full_to_writer(writer, &options)
+    edit_save_with_options(editor, writer, &options)
 }
 
 /// Save with AES-256 encryption, returning the encrypted bytes.

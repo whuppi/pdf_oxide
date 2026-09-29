@@ -432,6 +432,11 @@ pub struct PdfDocument {
     /// Byte offset where PDF header was found (may not be 0 for malformed PDFs)
     #[allow(dead_code)]
     header_offset: u64,
+    // ── pdf_manipulator patch: the incremental save refuses a repaired file ──
+    /// Whether opening rebuilt the cross-reference table from a scan, so
+    /// the source's own xref does not describe it.
+    xref_repaired: bool,
+    // ── end pdf_manipulator patch ──
     /// Font cache keyed by indirect ObjectRef to avoid re-parsing fonts across pages.
     /// Arc-wrapped to eliminate deep cloning when populating per-page TextExtractor.
     /// Bounded at 512 entries — TeX PDFs can create unique font objects per page.
@@ -1303,6 +1308,9 @@ impl PdfDocument {
             encrypt_dict_ref: Mutex::new(None),
             options: ParserOptions::default(),
             header_offset,
+            // ── pdf_manipulator patch: the incremental save refuses a repaired file ──
+            xref_repaired: xref_reconstructed,
+            // ── end pdf_manipulator patch ──
             font_cache: Mutex::new(BoundedEntryCache::new(512)),
             font_set_cache: Mutex::new(BoundedEntryCache::new(256)),
             font_fingerprint_cache: Mutex::new(BoundedEntryCache::new(256)),
@@ -2235,6 +2243,50 @@ impl PdfDocument {
         ids.dedup();
         ids
     }
+
+    // ── pdf_manipulator patch: raw source access for the incremental save ──
+    /// The source's length in bytes.
+    pub(crate) fn source_len(&self) -> Result<u64> {
+        let mut r = self.reader.lock_or_recover();
+        Ok(r.seek(SeekFrom::End(0))?)
+    }
+
+    /// Fills `buf` from the source at `offset`; returns the bytes read,
+    /// fewer than `buf.len()` only at the end of the source.
+    pub(crate) fn read_source_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let mut r = self.reader.lock_or_recover();
+        r.seek(SeekFrom::Start(offset))?;
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = r.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        Ok(filled)
+    }
+
+    /// Where the header was found; not 0 when bytes precede `%PDF`.
+    pub(crate) fn header_offset(&self) -> u64 {
+        self.header_offset
+    }
+
+    /// Whether opening rebuilt the cross-reference table from a scan.
+    pub(crate) fn xref_repaired(&self) -> bool {
+        self.xref_repaired
+    }
+
+    /// The generation of object `id` in the cross-reference table: its
+    /// own for an uncompressed object, 0 for one in an object stream.
+    pub(crate) fn object_generation(&self, id: u32) -> Option<u16> {
+        let e = self.xref.get(id).filter(|e| e.in_use)?;
+        Some(match e.entry_type {
+            crate::xref::XRefEntryType::Compressed => 0,
+            _ => e.generation,
+        })
+    }
+    // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: zero-clone ref extraction for GC ──
     /// Extract all object IDs referenced by the given object without cloning.

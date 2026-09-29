@@ -126,11 +126,12 @@ impl Planner<'_> {
             return;
         };
         let leaves = self.doc.all_page_refs().unwrap_or_default();
-        let kept: Vec<ObjectRef> = page_order
+        let kept_idx: Vec<usize> = page_order
             .iter()
             .filter(|&&i| i >= 0 && (i as usize) < leaves.len())
-            .map(|&i| leaves[i as usize])
+            .map(|&i| i as usize)
             .collect();
+        let kept: Vec<ObjectRef> = kept_idx.iter().map(|&i| leaves[i]).collect();
         let kept_ids: HashSet<u32> = kept.iter().map(|r| r.id).collect();
         self.dropped_pages = leaves
             .iter()
@@ -148,6 +149,8 @@ impl Planner<'_> {
                 self.reparent(*r, root, &inner);
             }
         }
+
+        self.renumber_page_labels(&catalog, &kept_idx);
 
         // Nothing to prune: the tree was flat and every page is kept.
         if self.dropped_pages.is_empty() {
@@ -178,6 +181,91 @@ impl Planner<'_> {
         self.prune_links(&kept);
         self.prune_open_action(&catalog);
         self.prune_acroform(&catalog);
+    }
+
+    /// Rebuilds `/PageLabels` for the kept pages in their new order
+    /// (ISO 32000-1 §12.4.2). The number tree is keyed by page index, so
+    /// after a drop or a reorder every range after the change labels the
+    /// wrong pages. Each kept page keeps the label it had: a new range
+    /// starts wherever the old range or the run of consecutive pages
+    /// breaks, with `/St` moved on by the pages skipped.
+    fn renumber_page_labels(&mut self, catalog: &Dict, kept_idx: &[usize]) {
+        let Some(labels) = catalog.get("PageLabels").cloned() else {
+            return;
+        };
+        if kept_idx.iter().enumerate().all(|(j, &i)| i == j) {
+            return;
+        }
+        let mut ranges: Vec<(usize, Dict)> = Vec::new();
+        self.collect_number_tree(&labels, &mut ranges, &mut HashSet::new());
+        ranges.sort_by_key(|(start, _)| *start);
+
+        let mut nums = Vec::new();
+        let mut prev: Option<(Option<usize>, usize)> = None;
+        for (j, &i) in kept_idx.iter().enumerate() {
+            let range = ranges.iter().rposition(|(start, _)| *start <= i);
+            if prev == Some((range, i.wrapping_sub(1))) {
+                prev = Some((range, i));
+                continue;
+            }
+            prev = Some((range, i));
+            let dict = match range {
+                Some(k) => {
+                    let (start, ref d) = ranges[k];
+                    let mut d = d.clone();
+                    let st = d.get("St").and_then(|s| s.as_integer()).unwrap_or(1);
+                    d.insert("St".into(), Object::Integer(st + (i - start) as i64));
+                    d
+                },
+                // A page before the first range: decimal, its own number.
+                None => HashMap::from([
+                    ("S".to_string(), Object::Name("D".into())),
+                    ("St".to_string(), Object::Integer(i as i64 + 1)),
+                ]),
+            };
+            nums.push(Object::Integer(j as i64));
+            nums.push(Object::Dictionary(dict));
+        }
+        let tree = Object::Dictionary(HashMap::from([("Nums".to_string(), Object::Array(nums))]));
+        let new = self.edit(&labels, |_, _| Some(tree));
+        if new.is_some() {
+            self.catalog_edit(catalog, "PageLabels", new);
+        }
+    }
+
+    /// The `(page index, label dictionary)` pairs of a number tree.
+    fn collect_number_tree(
+        &self,
+        node: &Object,
+        out: &mut Vec<(usize, Dict)>,
+        visited: &mut HashSet<u32>,
+    ) {
+        if let Object::Reference(r) = node {
+            if !visited.insert(r.id) {
+                return;
+            }
+        }
+        let Some(Object::Dictionary(d)) = self.resolve(node) else {
+            return;
+        };
+        if let Some(Object::Array(pairs)) = d.get("Nums").and_then(|n| self.resolve(n)) {
+            for pair in pairs.chunks(2) {
+                if let [key, value] = pair {
+                    if let (Some(k), Some(Object::Dictionary(v))) =
+                        (key.as_integer(), self.resolve(value))
+                    {
+                        if k >= 0 {
+                            out.push((k as usize, v));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(Object::Array(kids)) = d.get("Kids").and_then(|k| self.resolve(k)) {
+            for kid in &kids {
+                self.collect_number_tree(kid, out, visited);
+            }
+        }
     }
 
     /// Every `/Pages` node under `root`, not `root` itself.

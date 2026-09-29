@@ -87,7 +87,9 @@ pub(crate) fn sign_pdf(
     let xref_start = catalog_start + catalog_str.len();
 
     let xref_section = format!(
-        "xref\n{} 2\n{:010} 00000 n \r\n{:010} 00000 n \r\n{} 1\n{:010} 00000 n \r\n",
+        // Each entry is exactly 20 bytes, its end-of-line included
+        // (ISO 32000-1 §7.5.4): "n" then CR LF, never a space before them.
+        "xref\n{} 2\n{:010} 00000 n\r\n{:010} 00000 n\r\n{} 1\n{:010} 00000 n\r\n",
         sig_obj, sig_start, field_start, catalog_id, catalog_start,
     );
     let trailer_section = format!(
