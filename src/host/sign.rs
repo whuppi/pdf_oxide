@@ -1,16 +1,7 @@
-//! O(1)-memory PDF signing with proper AcroForm structure.
-//!
-//! This file is part of the pdf_manipulator host layer (NOT upstream).
-//!
-//! `sign_pdf` reads the source via Read+Seek (64KB chunks), writes the
-//! signed output via Write (sequential, one pass). Peak memory ~128KB.
-//!
-//! Builds CMS/PKCS#7 detached signature with a pre-computed digest —
-//! the same DER assembly the upstream signer uses, but accepting the
-//! digest directly instead of hashing internally. No upstream patches.
-//!
-//! Always writes proper AcroForm structure (field + widget + SigFlags).
-//! Discoverable by Acrobat, Chrome, enumerate_signatures, PAdES validators.
+//! Signs a PDF by appending one update section through the shared
+//! appender ([`super::incremental`]): a signature dictionary, its widget
+//! on page 0, and the form's AcroForm and the page's /Annots, so every
+//! other catalog entry and earlier signature survives the update.
 
 #[cfg(feature = "signatures")]
 use crate::error::{Error, Result};
@@ -18,159 +9,254 @@ use crate::error::{Error, Result};
 #[cfg(feature = "signatures")]
 use crate::signatures::{DigestAlgorithm, SignOptions, SigningCredentials};
 
-/// Sign a PDF with O(1)-memory I/O and proper AcroForm.
+/// Sign a PDF with O(1)-memory I/O: the source is opened as a
+/// [`crate::document::PdfDocument`] and copied to `writer` through a
+/// read-buffer-sized chunk, then one update section.
 ///
-/// Takes concrete `BoxedReader` and `BoxedWriter` from bridge_api.rs —
-/// same wrapper pattern used for editor save. No generics, no `Sized`
-/// issues with trait objects.
+/// The reader is consumed — the document keeps it for every source read.
+/// Takes concrete `BoxedReader` and `BoxedWriter` from bridge_api.rs,
+/// the same wrapper pattern used for editor save.
 #[cfg(feature = "signatures")]
 pub(crate) fn sign_pdf(
-    reader: &mut super::bridge_api::BoxedReader,
-    source_length: u64,
+    reader: super::bridge_api::BoxedReader,
     writer: &mut super::bridge_api::BoxedWriter,
     credentials: &SigningCredentials,
     opts: SignOptions,
+    signed_at_unix_secs: u64,
 ) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let signer = crate::signatures::PdfSigner::new(credentials.clone(), opts);
-    let src_len = source_length as usize;
-
-    // ── 1. Scan last 4KB for structural info ────────────────────────
-    let tail_size = 4096usize.min(src_len);
-    let mut tail = vec![0u8; tail_size];
-    reader.seek(SeekFrom::End(-(tail_size as i64)))?;
-    reader.read_exact(&mut tail)?;
-
-    let prev_startxref = scan_startxref(&tail)
-        .ok_or_else(|| Error::InvalidPdf("cannot find startxref".into()))?;
-    let root_ref_str = scan_root_ref(&tail)
-        .ok_or_else(|| Error::InvalidPdf("cannot find /Root ref".into()))?;
-    let next_obj = scan_next_obj_num(&tail)
-        .ok_or_else(|| Error::InvalidPdf("cannot find /Size".into()))?;
-
-    let catalog_id: u64 = root_ref_str.split_whitespace().next()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| Error::InvalidPdf("cannot parse catalog ID".into()))?;
-
-    // ── 2. Build incremental objects ────────────────────────────────
-    let sig_obj = next_obj;
-    let field_obj = next_obj + 1;
-
-    let sig_dict = build_sig_dict(&signer, sig_obj);
-    let contents_in_dict = find_contents_offset(sig_dict.as_bytes())
-        .ok_or_else(|| Error::InvalidPdf("cannot find /Contents offset".into()))?;
-
-    let field_str = format!(
-        "{} 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Sig \
-         /T (Sig1) /V {} 0 R /Rect [0 0 0 0] /F 132 >>\nendobj\n",
-        field_obj, sig_obj,
-    );
-    // Read the /Pages reference from the original catalog so the
-    // replacement preserves the page tree. Without this, the signed
-    // PDF is structurally invalid (missing /Pages).
-    let pages_ref = scan_pages_ref(reader, catalog_id, prev_startxref)
-        .unwrap_or_else(|| "1 0 R".to_string());
-    reader.seek(SeekFrom::Start(0))?;
-
-    let catalog_str = format!(
-        "{} 0 obj\n<< /Type /Catalog /Pages {} \
-         /AcroForm << /Fields [{} 0 R] /SigFlags 3 >> >>\nendobj\n",
-        catalog_id, pages_ref, field_obj,
-    );
-
-    // ── 3. Compute layout ───────────────────────────────────────────
-    let sig_start = src_len;
-    let field_start = sig_start + sig_dict.len();
-    let catalog_start = field_start + field_str.len();
-    let xref_start = catalog_start + catalog_str.len();
-
-    let xref_section = format!(
-        // Each entry is exactly 20 bytes, its end-of-line included
-        // (ISO 32000-1 §7.5.4): "n" then CR LF, never a space before them.
-        "xref\n{} 2\n{:010} 00000 n\r\n{:010} 00000 n\r\n{} 1\n{:010} 00000 n\r\n",
-        sig_obj, sig_start, field_start, catalog_id, catalog_start,
-    );
-    let trailer_section = format!(
-        "trailer\n<< /Size {} /Prev {} /Root {} 0 R >>\n",
-        field_obj + 1, prev_startxref, catalog_id,
-    );
-    let eof_section = format!("startxref\n{}\n%%EOF\n", xref_start);
-
-    let total_len = src_len
-        + sig_dict.len() + field_str.len() + catalog_str.len()
-        + xref_section.len() + trailer_section.len() + eof_section.len();
-
-    // ── 4. Compute ByteRange ────────────────────────────────────────
-    let contents_abs = sig_start + contents_in_dict;
-    let contents_size = signer.placeholder_size();
-    let after_contents = contents_abs + contents_size;
-    let byte_range: [i64; 4] = [
-        0, contents_abs as i64, after_contents as i64,
-        (total_len - after_contents) as i64,
-    ];
-
-    let patched_sig = patch_byterange(sig_dict, &byte_range);
-    let sig_bytes = patched_sig.as_bytes();
-    let after_in_dict = contents_in_dict + contents_size;
-
-    // ── 5. Hash signed ranges (O(1)-memory, read-buffer-sized chunks) ─
+    use crate::document::PdfDocument;
     use crate::host::constants::READ_BUF_CAPACITY;
+    use crate::host::incremental::{build_update, doc_mdp_level};
+    use crate::object::{Object, ObjectRef};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let doc = PdfDocument::from_external_reader(reader.0)?;
+    let signer = crate::signatures::PdfSigner::new(credentials.clone(), opts);
+    let contents_size = signer.placeholder_size();
+
+    // Refusals, decided before the first byte is written.
+    if doc.is_encrypted() {
+        return Err(Error::Unsupported(
+            "sign: an encrypted source is not supported".into(),
+        ));
+    }
+    if doc.xref_repaired() {
+        return Err(Error::Unsupported(
+            "sign: the source's cross-reference was repaired; save it with a full rewrite first"
+                .into(),
+        ));
+    }
+    if doc_mdp_level(&doc) == Some(1) {
+        return Err(Error::Unsupported(
+            "sign: the document is certified against any change".into(),
+        ));
+    }
+
+    // Ids: the first free id is the trailer's /Size.
+    let next = doc
+        .trailer()
+        .as_dict()
+        .and_then(|d| d.get("Size"))
+        .and_then(|s| s.as_integer())
+        .and_then(|s| u32::try_from(s.max(0)).ok())
+        .ok_or_else(|| Error::InvalidPdf("sign: the source's trailer has no /Size".into()))?;
+    let sig_id = next;
+    let widget_id = next + 1;
+    let widget_ref = ObjectRef::new(widget_id, 0);
+
+    // The signature dictionary, written by hand so the fixed-width
+    // /ByteRange and /Contents placeholders stay patchable in place.
+    let sig_dict = build_sig_dict(&signer, sig_id, signed_at_unix_secs);
+    let contents_in_dict = find_contents_offset(sig_dict.as_bytes())
+        .ok_or_else(|| Error::InvalidPdf("sign: cannot find the /Contents placeholder".into()))?;
+
+    let page_ref = doc.get_page_ref(0)?;
+    let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
+
+    // The widget: a zero-area invisible signature field annotation.
+    let field_name = next_field_name(&doc)?;
+    objects.push((
+        widget_id,
+        format!(
+            "{widget_id} 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Sig \
+             /T ({field_name}) /V {sig_id} 0 R /Rect [0 0 0 0] /F 132 /P {page_ref} >>\nendobj\n"
+        )
+        .into_bytes(),
+    ));
+
+    // The widget joins page 0's /Annots: absent or a direct array, the
+    // page object is rewritten with the new array; an indirect one is
+    // rewritten on its own and the page untouched.
+    let page_dict = doc
+        .load_object(page_ref)?
+        .as_dict()
+        .cloned()
+        .ok_or_else(|| Error::InvalidPdf("sign: the source's page 0 is not a dictionary".into()))?;
+    let direct_annots = match page_dict.get("Annots") {
+        None | Some(Object::Array(_)) => {
+            let mut items = page_dict
+                .get("Annots")
+                .and_then(Object::as_array)
+                .cloned()
+                .unwrap_or_default();
+            items.push(Object::Reference(widget_ref));
+            Some(items)
+        }
+        Some(Object::Reference(r)) => {
+            let arr = doc.load_object(*r)?;
+            let mut items = arr
+                .as_array()
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidPdf("sign: the page's /Annots is not an array".into())
+                })?;
+            items.push(Object::Reference(widget_ref));
+            push_rewrite(&doc, &mut objects, r.id, Object::Array(items))?;
+            None
+        }
+        Some(_) => {
+            return Err(Error::InvalidPdf(
+                "sign: the page's /Annots is not an array".into(),
+            ))
+        }
+    };
+    if let Some(items) = direct_annots {
+        let mut page = page_dict;
+        page.insert("Annots".into(), Object::Array(items));
+        push_rewrite(&doc, &mut objects, page_ref.id, Object::Dictionary(page))?;
+    }
+
+    // The form gains the field: a missing AcroForm is added to a copy of
+    // the catalog, a direct one is rewritten in that copy, an indirect
+    // one is rewritten in place and the catalog untouched.
+    let root_ref = doc
+        .trailer()
+        .as_dict()
+        .and_then(|d| d.get("Root"))
+        .and_then(Object::as_reference)
+        .ok_or_else(|| Error::InvalidPdf("sign: the source's trailer has no /Root".into()))?;
+    let catalog_dict = doc
+        .catalog()?
+        .as_dict()
+        .cloned()
+        .ok_or_else(|| Error::InvalidPdf("sign: the source's catalog is not a dictionary".into()))?;
+    match catalog_dict.get("AcroForm").cloned() {
+        None => {
+            let mut catalog = catalog_dict;
+            catalog.insert(
+                "AcroForm".into(),
+                Object::Dictionary(HashMap::from([
+                    (
+                        "Fields".to_string(),
+                        Object::Array(vec![Object::Reference(widget_ref)]),
+                    ),
+                    ("SigFlags".to_string(), Object::Integer(3)),
+                ])),
+            );
+            push_rewrite(&doc, &mut objects, root_ref.id, Object::Dictionary(catalog))?;
+        }
+        Some(Object::Dictionary(acro)) => {
+            let acro = acroform_with_field(&doc, acro, widget_ref, &mut objects)?;
+            let mut catalog = catalog_dict;
+            catalog.insert("AcroForm".into(), Object::Dictionary(acro));
+            push_rewrite(&doc, &mut objects, root_ref.id, Object::Dictionary(catalog))?;
+        }
+        Some(Object::Reference(r)) => {
+            let acro_obj = doc.load_object(r)?;
+            let acro = acro_obj
+                .as_dict()
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidPdf("sign: the source's AcroForm is not a dictionary".into())
+                })?;
+            let acro = acroform_with_field(&doc, acro, widget_ref, &mut objects)?;
+            push_rewrite(&doc, &mut objects, r.id, Object::Dictionary(acro))?;
+        }
+        Some(_) => {
+            return Err(Error::InvalidPdf(
+                "sign: the source's AcroForm is not a dictionary".into(),
+            ))
+        }
+    }
+
+    objects.push((sig_id, sig_dict.into_bytes()));
+    objects.sort_by_key(|(id, _)| *id);
+    let i_sig = objects
+        .iter()
+        .position(|(id, _)| *id == sig_id)
+        .ok_or_else(|| Error::InvalidPdf("sign: the signature object is missing".into()))?;
+
+    let mut section = build_update(&doc, &objects, None, widget_id + 1)?;
+
+    // The digest covers the source, the newline and every section byte
+    // outside the /Contents gap; the /ByteRange names exactly that.
+    let contents_off = section.object_offsets[i_sig] + contents_in_dict;
+    let gap_start = section.base + contents_off as u64;
+    let gap_end = gap_start + contents_size as u64;
+    let total = section.base + section.bytes.len() as u64;
+    let byte_range: [i64; 4] = [
+        0,
+        gap_start as i64,
+        gap_end as i64,
+        (total - gap_end) as i64,
+    ];
+    if !patch_byterange(
+        &mut section.bytes,
+        section.object_offsets[i_sig],
+        &byte_range,
+    ) {
+        return Err(Error::InvalidPdf(
+            "sign: cannot find the /ByteRange placeholder".into(),
+        ));
+    }
+
+    let len = doc.source_len()?;
     let mut hasher = Sha256::new();
     let mut chunk = vec![0u8; READ_BUF_CAPACITY];
-
-    reader.seek(SeekFrom::Start(0))?;
-    let mut rem = src_len;
-    while rem > 0 {
-        let n = rem.min(chunk.len());
-        reader.read_exact(&mut chunk[..n])?;
+    let mut at = 0u64;
+    while at < len {
+        let n = doc.read_source_at(at, &mut chunk)?;
+        if n == 0 {
+            return Err(Error::InvalidPdf("sign: source ended before its length".into()));
+        }
         hasher.update(&chunk[..n]);
-        rem -= n;
+        at += n as u64;
     }
-    hasher.update(&sig_bytes[..contents_in_dict]);
-
-    hasher.update(&sig_bytes[after_in_dict..]);
-    hasher.update(field_str.as_bytes());
-    hasher.update(catalog_str.as_bytes());
-    hasher.update(xref_section.as_bytes());
-    hasher.update(trailer_section.as_bytes());
-    hasher.update(eof_section.as_bytes());
+    if section.base > len {
+        hasher.update(b"\n");
+    }
+    hasher.update(&section.bytes[..contents_off]);
+    hasher.update(&section.bytes[contents_off + contents_size..]);
 
     let message_digest = hasher.finalize().to_vec();
-
-    // ── 6. Build CMS blob from pre-computed digest ──────────────────
-    let cms_der = build_cms_from_digest(
-        credentials, &message_digest, DigestAlgorithm::Sha256,
-    )?;
+    let cms_der = build_cms_from_digest(credentials, &message_digest, DigestAlgorithm::Sha256)?;
 
     let hex = hex_encode(&cms_der);
     let pad_len = (contents_size - 2) - hex.len();
     let mut contents_val = String::with_capacity(contents_size);
     contents_val.push('<');
     contents_val.push_str(&hex);
-    for _ in 0..pad_len { contents_val.push('0'); }
-    contents_val.push('>');
-
-    // ── 7. Write output — one pass, sequential ──────────────────────
-    reader.seek(SeekFrom::Start(0))?;
-    rem = src_len;
-    while rem > 0 {
-        let n = rem.min(chunk.len());
-        reader.read_exact(&mut chunk[..n])?;
-        writer.write_all(&chunk[..n])?;
-        rem -= n;
+    for _ in 0..pad_len {
+        contents_val.push('0');
     }
+    contents_val.push('>');
+    section.bytes[contents_off..contents_off + contents_size]
+        .copy_from_slice(contents_val.as_bytes());
 
-    writer.write_all(&sig_bytes[..contents_in_dict])?;
-    writer.write_all(contents_val.as_bytes())?;
-    writer.write_all(&sig_bytes[after_in_dict..])?;
-    writer.write_all(field_str.as_bytes())?;
-    writer.write_all(catalog_str.as_bytes())?;
-    writer.write_all(xref_section.as_bytes())?;
-    writer.write_all(trailer_section.as_bytes())?;
-    writer.write_all(eof_section.as_bytes())?;
-
+    // Write output: the source, then the section.
+    let mut at = 0u64;
+    while at < len {
+        let n = (len - at).min(chunk.len() as u64) as usize;
+        doc.read_source_at(at, &mut chunk[..n])?;
+        writer.write_all(&chunk[..n])?;
+        at += n as u64;
+    }
+    if section.base > len {
+        writer.write_all(b"\n")?;
+    }
+    writer.write_all(&section.bytes)?;
     Ok(())
 }
 
@@ -296,91 +382,151 @@ fn build_cms_from_digest(
 // ── Helpers ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "signatures")]
-fn scan_startxref(tail: &[u8]) -> Option<u64> {
-    let pos = tail.windows(9).rposition(|w| w == b"startxref")?;
-    let after = &tail[pos + 9..];
-    let s = std::str::from_utf8(after).ok()?;
-    let trimmed = s.trim_start_matches([' ', '\r', '\n']);
-    let end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(trimmed.len());
-    trimmed[..end].parse().ok()
+fn push_rewrite(
+    doc: &crate::document::PdfDocument,
+    objects: &mut Vec<(u32, Vec<u8>)>,
+    id: u32,
+    obj: crate::object::Object,
+) -> Result<()> {
+    use crate::writer::ObjectSerializer;
+    let gen = doc.object_generation(id).unwrap_or(0);
+    let bytes = ObjectSerializer::compact().serialize_indirect(id, gen, &obj);
+    objects.push((id, bytes));
+    Ok(())
+}
+
+/// Adds the widget to an AcroForm dictionary: /Fields gains the widget
+/// (an indirect /Fields array is rewritten as its own object and the
+/// reference kept) and /SigFlags keeps its other bits.
+#[cfg(feature = "signatures")]
+fn acroform_with_field(
+    doc: &crate::document::PdfDocument,
+    mut acro: std::collections::HashMap<String, crate::object::Object>,
+    widget_ref: crate::object::ObjectRef,
+    objects: &mut Vec<(u32, Vec<u8>)>,
+) -> Result<std::collections::HashMap<String, crate::object::Object>> {
+    use crate::object::Object;
+    match acro.get("Fields").cloned() {
+        Some(Object::Array(mut items)) => {
+            items.push(Object::Reference(widget_ref));
+            acro.insert("Fields".into(), Object::Array(items));
+        }
+        Some(Object::Reference(r)) => {
+            let arr = doc.load_object(r)?;
+            let mut items = arr
+                .as_array()
+                .cloned()
+                .ok_or_else(|| Error::InvalidPdf("sign: the form's /Fields is not an array".into()))?;
+            items.push(Object::Reference(widget_ref));
+            push_rewrite(doc, objects, r.id, Object::Array(items))?;
+        }
+        _ => {
+            acro.insert(
+                "Fields".into(),
+                Object::Array(vec![Object::Reference(widget_ref)]),
+            );
+        }
+    }
+    let flags = acro
+        .get("SigFlags")
+        .and_then(Object::as_integer)
+        .unwrap_or(0);
+    acro.insert("SigFlags".into(), Object::Integer(flags | 3));
+    Ok(acro)
+}
+
+/// `SigN`, the smallest N >= 1 that is not the /T of any top-level
+/// entry of the form's /Fields.
+#[cfg(feature = "signatures")]
+fn next_field_name(doc: &crate::document::PdfDocument) -> Result<String> {
+    use crate::object::Object;
+    let fields = doc
+        .catalog()
+        .ok()
+        .and_then(|c| c.as_dict().and_then(|d| d.get("AcroForm")).cloned())
+        .map(|acro| match acro {
+            Object::Reference(r) => doc.load_object(r),
+            other => Ok(other),
+        })
+        .transpose()?
+        .and_then(|acro| acro.as_dict().and_then(|d| d.get("Fields")).cloned())
+        .map(|fields| match fields {
+            Object::Reference(r) => doc.load_object(r),
+            other => Ok(other),
+        })
+        .transpose()?;
+    let taken: Vec<String> = fields
+        .and_then(|f| f.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|f| match f {
+            Object::Reference(r) => doc.load_object(*r).ok(),
+            other => Some(other.clone()),
+        })
+        .filter_map(|f| f.as_dict().and_then(|d| d.get("T")).cloned())
+        .filter_map(|t| match t {
+            Object::String(bytes) => String::from_utf8(bytes).ok(),
+            _ => None,
+        })
+        .collect();
+    let mut n = 1;
+    while taken.contains(&format!("Sig{n}")) {
+        n += 1;
+    }
+    Ok(format!("Sig{n}"))
 }
 
 #[cfg(feature = "signatures")]
-fn scan_root_ref(tail: &[u8]) -> Option<String> {
-    let pattern = b"/Root ";
-    let pos = tail.windows(pattern.len()).rposition(|w| w == pattern)?;
-    let after = &tail[pos + pattern.len()..];
-    let end = after.iter()
-        .position(|&b| b == b'/' || b == b'>' || b == b'\n')
-        .unwrap_or(after.len().min(40));
-    let s = std::str::from_utf8(&after[..end]).ok()?.trim();
-    (!s.is_empty()).then(|| s.to_string())
-}
-
-#[cfg(feature = "signatures")]
-fn scan_pages_ref(reader: &mut (impl std::io::Read + std::io::Seek), catalog_id: u64, xref_offset: u64) -> Option<String> {
-    use std::io::SeekFrom;
-    // Read the xref table to find catalog object offset, then read
-    // the catalog object to extract /Pages reference.
-    // Fall back: scan the full file for the catalog object header.
-    let header = format!("{} 0 obj", catalog_id);
-    let header_bytes = header.as_bytes();
-
-    // Read from the xref offset area backward to find the catalog
-    let scan_size = 32768usize;
-    let scan_start = if xref_offset > scan_size as u64 { xref_offset - scan_size as u64 } else { 0 };
-    let mut buf = vec![0u8; (xref_offset as usize).min(scan_size)];
-    reader.seek(SeekFrom::Start(scan_start)).ok()?;
-    let n = reader.read(&mut buf).ok()?;
-    let buf = &buf[..n];
-
-    // Find the catalog object
-    let pos = buf.windows(header_bytes.len()).rposition(|w| w == header_bytes)?;
-    let after = &buf[pos..];
-    let s = std::str::from_utf8(after).ok()?;
-
-    // Extract /Pages N 0 R
-    let pages_pos = s.find("/Pages ")?;
-    let after_pages = &s[pages_pos + "/Pages ".len()..];
-    let end = after_pages.find(|c: char| c == '/' || c == '>' || c == '\n')
-        .unwrap_or(after_pages.len().min(40));
-    let pages_ref = after_pages[..end].trim();
-    (!pages_ref.is_empty()).then(|| pages_ref.to_string())
-}
-
-#[cfg(feature = "signatures")]
-fn scan_next_obj_num(tail: &[u8]) -> Option<u64> {
-    let pattern = b"/Size ";
-    let pos = tail.windows(pattern.len()).rposition(|w| w == pattern)?;
-    let after = &tail[pos + pattern.len()..];
-    let s = std::str::from_utf8(after).ok()?;
-    let trimmed = s.trim_start_matches(' ');
-    let end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(trimmed.len());
-    trimmed[..end].parse().ok()
-}
-
-#[cfg(feature = "signatures")]
-fn build_sig_dict(signer: &crate::signatures::PdfSigner, obj_num: u64) -> String {
+fn build_sig_dict(signer: &crate::signatures::PdfSigner, obj_num: u32, signed_at_unix_secs: u64) -> String {
     let placeholder = signer.generate_contents_placeholder();
     let opts = signer.options();
     let mut d = format!(
-        "{} 0 obj\n<< /Type /Sig\n/Filter /Adobe.PPKLite\n\
+        "{obj_num} 0 obj\n<< /Type /Sig\n/Filter /Adobe.PPKLite\n\
          /SubFilter /adbe.pkcs7.detached\n\
          /ByteRange [0000000000 0000000000 0000000000 0000000000]\n\
-         /Contents {}\n",
-        obj_num, placeholder,
+         /Contents {placeholder}\n\
+         /M ({})\n",
+        crate::signatures::pdf_date_from_unix_secs(signed_at_unix_secs),
     );
     if let Some(name) = extract_cn_from_der(&signer.credentials().certificate) {
-        d.push_str(&format!("/Name ({})\n", name));
+        d.push_str(&format!("/Name {}\n", pdf_literal(&name)));
     }
     if let Some(ref r) = opts.reason {
-        d.push_str(&format!("/Reason ({})\n", r));
+        d.push_str(&format!("/Reason {}\n", pdf_literal(r)));
     }
     if let Some(ref l) = opts.location {
-        d.push_str(&format!("/Location ({})\n", l));
+        d.push_str(&format!("/Location {}\n", pdf_literal(l)));
     }
     d.push_str(">>\nendobj\n");
     d
+}
+
+/// A PDF text string literal (ISO 32000-1 §7.9.2.2): `\`, `(` and `)`
+/// escaped inside `( … )`; text with any non-ASCII character written as
+/// UTF-16BE with a BOM in hex form.
+#[cfg(feature = "signatures")]
+fn pdf_literal(s: &str) -> String {
+    if s.is_ascii() {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('(');
+        for c in s.chars() {
+            match c {
+                '\\' | '(' | ')' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+        out.push(')');
+        out
+    } else {
+        let units: Vec<u16> = std::iter::once(0xFEFF)
+            .chain(s.encode_utf16())
+            .collect();
+        let hex: String = units.iter().map(|u| format!("{u:04X}")).collect();
+        format!("<{hex}>")
+    }
 }
 
 // Extract the Common Name (CN, OID 2.5.4.3) from a DER-encoded X.509
@@ -413,15 +559,52 @@ fn find_contents_offset(data: &[u8]) -> Option<usize> {
     Some(pos + "/Contents ".len())
 }
 
+/// Writes `br` over the fixed-width /ByteRange placeholder in `bytes`,
+/// searched from `from` — same width, so no later offset moves. Returns
+/// false when the placeholder is not there.
 #[cfg(feature = "signatures")]
-fn patch_byterange(mut text: String, br: &[i64; 4]) -> String {
-    let placeholder = "0000000000 0000000000 0000000000 0000000000";
+fn patch_byterange(bytes: &mut [u8], from: usize, br: &[i64; 4]) -> bool {
+    let placeholder = b"0000000000 0000000000 0000000000 0000000000";
     let replacement = format!("{:>10} {:>10} {:>10} {:>10}", br[0], br[1], br[2], br[3]);
-    text = text.replace(placeholder, &replacement);
-    text
+    let Some(at) = bytes[from..]
+        .windows(placeholder.len())
+        .position(|w| w == placeholder)
+    else {
+        return false;
+    };
+    let at = from + at;
+    bytes[at..at + placeholder.len()].copy_from_slice(replacement.as_bytes());
+    true
 }
 
 #[cfg(feature = "signatures")]
 fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(all(test, feature = "signatures"))]
+mod tests {
+    use super::pdf_literal;
+
+    #[test]
+    fn pdf_literal_plain_text_stays_a_plain_string() {
+        assert_eq!(pdf_literal("signed in Zurich"), "(signed in Zurich)");
+    }
+
+    #[test]
+    fn pdf_literal_escapes_parens_and_backslash() {
+        assert_eq!(pdf_literal("a (b) \\ c"), "(a \\(b\\) \\\\ c)");
+    }
+
+    #[test]
+    fn pdf_literal_writes_non_ascii_text_as_utf16be_hex() {
+        assert_eq!(pdf_literal("Zürich"), "<FEFF005A00FC0072006900630068>");
+    }
+
+    #[test]
+    fn pdf_literal_escapes_inside_a_mixed_string() {
+        // One non-ASCII character switches the whole literal to hex form,
+        // where `(` and `)` need no escaping.
+        assert_eq!(pdf_literal("Zü(ch)"), "<FEFF005A00FC0028006300680029>");
+    }
 }

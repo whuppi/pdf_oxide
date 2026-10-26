@@ -48,9 +48,11 @@ impl SignatureVerifier {
 
         let mut info = SignatureInfo::default();
 
+        // ── pdf_manipulator patch ──
+        // Text strings may be UTF-16BE with a BOM (ISO 32000-1 §7.9.2.2).
         // Extract /Name
         if let Some(Object::String(name)) = dict.get("Name") {
-            info.signer_name = Some(String::from_utf8_lossy(name).to_string());
+            info.signer_name = Some(crate::object::decode_pdf_text_string(name));
         }
 
         // Extract /M (signing time)
@@ -60,18 +62,19 @@ impl SignatureVerifier {
 
         // Extract /Reason
         if let Some(Object::String(reason)) = dict.get("Reason") {
-            info.reason = Some(String::from_utf8_lossy(reason).to_string());
+            info.reason = Some(crate::object::decode_pdf_text_string(reason));
         }
 
         // Extract /Location
         if let Some(Object::String(location)) = dict.get("Location") {
-            info.location = Some(String::from_utf8_lossy(location).to_string());
+            info.location = Some(crate::object::decode_pdf_text_string(location));
         }
 
         // Extract /ContactInfo
         if let Some(Object::String(contact)) = dict.get("ContactInfo") {
-            info.contact_info = Some(String::from_utf8_lossy(contact).to_string());
+            info.contact_info = Some(crate::object::decode_pdf_text_string(contact));
         }
+        // ── end pdf_manipulator patch ──
 
         // Extract /SubFilter
         if let Some(Object::Name(sub_filter)) = dict.get("SubFilter") {

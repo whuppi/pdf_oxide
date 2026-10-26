@@ -58,6 +58,12 @@ mod enumerate;
 #[cfg(feature = "signatures")]
 pub mod pades;
 mod pdf_date;
+// ── pdf_manipulator patch ──
+// The host's signer writes the signing time its caller passes: wasm32
+// has no clock to read.
+#[cfg(feature = "signatures")]
+pub(crate) use pdf_date::pdf_date_from_unix_secs;
+// ── end pdf_manipulator patch ──
 #[cfg(feature = "signatures")]
 mod sign_bytes;
 mod signer;

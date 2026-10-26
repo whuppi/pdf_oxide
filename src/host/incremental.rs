@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;
 use crate::error::{Error, Result};
 use crate::host::constants::READ_BUF_CAPACITY;
@@ -68,43 +69,39 @@ fn refused(why: &str) -> IncrementalError {
     ))
 }
 
-/// Writes the source and one update section to `out`. A refusal is
-/// decided before the first byte is written and leaves the editor as it was.
-pub(crate) fn write(
-    editor: &mut DocumentEditor,
-    out: &mut impl PositionedWrite,
-    options: &crate::editor::SaveOptions,
-) -> std::result::Result<(), IncrementalError> {
-    if options.encryption.is_some() {
-        return Err(refused("an encryption change rewrites every object"));
-    }
-    if let Some(why) = editor.incremental_refusal() {
-        return Err(refused(why));
-    }
-    check_doc_mdp(editor)?;
-    let changes = editor.incremental_objects()?;
+/// One appended update section, built without an editor: everything
+/// [`write`] and the signer emit after the source's own bytes.
+pub(crate) struct UpdateSection {
+    /// File offset of the section's first byte (the source length, plus
+    /// one when a newline is added after a source that does not end in
+    /// one).
+    pub base: u64,
+    /// The whole section: the objects in the order given, then the xref
+    /// table+trailer or xref stream, then startxref and %%EOF.
+    pub bytes: Vec<u8>,
+    /// Offset of each object within `bytes`, in the order given.
+    pub object_offsets: Vec<usize>,
+}
 
-    let doc = editor.source();
+/// Builds one update section over the source `doc` holds. `objects`
+/// carries already serialized `N G obj … endobj` bytes, sorted by id;
+/// `info_id` is the id the `/Info` dictionary is written at, when it
+/// changed; `next_id` is the first id the caller has not used.
+pub(crate) fn build_update(
+    doc: &PdfDocument,
+    objects: &[(u32, Vec<u8>)],
+    info_id: Option<u32>,
+    next_id: u32,
+) -> Result<UpdateSection> {
     let len = doc.source_len()?;
-    let mut chunk = vec![0u8; READ_BUF_CAPACITY];
-    let mut at = 0u64;
-    let mut last = b'\n';
-    while at < len {
-        let n = doc.read_source_at(at, &mut chunk)?;
-        if n == 0 {
-            return Err(Error::InvalidPdf("source ended before its length".into()).into());
-        }
-        out.write_all(&chunk[..n])?;
-        last = chunk[n - 1];
-        at += n as u64;
-    }
-    // An edit that changes nothing appends nothing.
-    if changes.objects.is_empty() {
-        return Ok(());
-    }
-    if last != b'\n' && last != b'\r' {
-        out.write_all(b"\n")?;
-    }
+    let mut last = [0u8; 1];
+    let newline = if len == 0 {
+        false
+    } else {
+        doc.read_source_at(len - 1, &mut last)?;
+        last[0] != b'\n' && last[0] != b'\r'
+    };
+    let base = len + u64::from(newline);
 
     let prev = last_startxref(doc, len)?;
     let mut head = [0u8; 4];
@@ -112,14 +109,16 @@ pub(crate) fn write(
     let table = &head == b"xref";
 
     let serializer = ObjectSerializer::compact();
-    let mut entries: Vec<(u32, u64, u16)> = Vec::with_capacity(changes.objects.len() + 1);
+    let mut bytes = Vec::new();
+    let mut object_offsets = Vec::with_capacity(objects.len());
+    let mut entries: Vec<(u32, u64, u16)> = Vec::with_capacity(objects.len() + 1);
     let mut digest = <sha2::Sha256 as sha2::Digest>::new();
-    for (id, obj) in &changes.objects {
+    for (id, serialized) in objects {
         let gen = doc.object_generation(*id).unwrap_or(0);
-        entries.push((*id, out.position(), gen));
-        let bytes = serializer.serialize_indirect(*id, gen, obj);
-        sha2::Digest::update(&mut digest, &bytes);
-        out.write_all(&bytes)?;
+        object_offsets.push(bytes.len());
+        entries.push((*id, base + bytes.len() as u64, gen));
+        sha2::Digest::update(&mut digest, serialized);
+        bytes.extend_from_slice(serialized);
     }
 
     let mut trailer = carried_trailer(doc.trailer(), table);
@@ -137,7 +136,7 @@ pub(crate) fn write(
             id[1] = Object::String(hash[..16].to_vec());
         }
     }
-    if let Some(id) = changes.info_id {
+    if let Some(id) = info_id {
         let gen = doc.object_generation(id).unwrap_or(0);
         trailer.insert("Info".into(), Object::Reference(ObjectRef::new(id, gen)));
     }
@@ -149,15 +148,15 @@ pub(crate) fn write(
         .unwrap_or(0)
         .max(0) as u32;
     let max_id = entries.iter().map(|e| e.0).max().unwrap_or(0);
-    let mut size = source_size.max(max_id + 1).max(changes.next_id);
+    let mut size = source_size.max(max_id + 1).max(next_id);
 
-    let xref_at = out.position();
+    let xref_at = base + bytes.len() as u64;
     if table {
         trailer.insert("Size".into(), Object::Integer(size as i64));
-        out.write_all(xref_table(&entries).as_bytes())?;
-        out.write_all(b"trailer\n")?;
-        out.write_all(&serializer.serialize(&Object::Dictionary(trailer)))?;
-        out.write_all(b"\n")?;
+        bytes.extend_from_slice(xref_table(&entries).as_bytes());
+        bytes.extend_from_slice(b"trailer\n");
+        bytes.extend_from_slice(&serializer.serialize(&Object::Dictionary(trailer)));
+        bytes.extend_from_slice(b"\n");
     } else {
         // The stream lists itself, so it takes the next free id.
         let stream_id = size;
@@ -185,9 +184,60 @@ pub(crate) fn write(
             dict: trailer,
             data: data.into(),
         };
-        out.write_all(&serializer.serialize_indirect(stream_id, 0, &stream))?;
+        bytes.extend_from_slice(&serializer.serialize_indirect(stream_id, 0, &stream));
     }
-    out.write_all(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes())?;
+    bytes.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+    Ok(UpdateSection {
+        base,
+        bytes,
+        object_offsets,
+    })
+}
+
+/// Writes the source and one update section to `out`. A refusal is
+/// decided before the first byte is written and leaves the editor as it was.
+pub(crate) fn write(
+    editor: &mut DocumentEditor,
+    out: &mut impl PositionedWrite,
+    options: &crate::editor::SaveOptions,
+) -> std::result::Result<(), IncrementalError> {
+    if options.encryption.is_some() {
+        return Err(refused("an encryption change rewrites every object"));
+    }
+    if let Some(why) = editor.incremental_refusal() {
+        return Err(refused(why));
+    }
+    check_doc_mdp(editor)?;
+    let changes = editor.incremental_objects()?;
+
+    let doc = editor.source();
+    let serializer = ObjectSerializer::compact();
+    let mut objects: Vec<(u32, Vec<u8>)> = Vec::with_capacity(changes.objects.len());
+    for (id, obj) in &changes.objects {
+        let gen = doc.object_generation(*id).unwrap_or(0);
+        objects.push((*id, serializer.serialize_indirect(*id, gen, obj)));
+    }
+
+    let len = doc.source_len()?;
+    let mut chunk = vec![0u8; READ_BUF_CAPACITY];
+    let mut at = 0u64;
+    while at < len {
+        let n = doc.read_source_at(at, &mut chunk)?;
+        if n == 0 {
+            return Err(Error::InvalidPdf("source ended before its length".into()).into());
+        }
+        out.write_all(&chunk[..n])?;
+        at += n as u64;
+    }
+    // An edit that changes nothing appends nothing.
+    if changes.objects.is_empty() {
+        return Ok(());
+    }
+    let section = build_update(doc, &objects, changes.info_id, changes.next_id)?;
+    if section.base > len {
+        out.write_all(b"\n")?;
+    }
+    out.write_all(&section.bytes)?;
     Ok(())
 }
 
@@ -285,18 +335,15 @@ fn last_startxref(doc: &crate::document::PdfDocument, len: u64) -> Result<u64> {
     })
 }
 
-/// Refuses an edit a certifying signature forbids (ISO 32000-1 §12.8.2.2).
-/// Level 1 allows no change; levels 2 and 3 allow setting field values
-/// (level 3 also annotations, which this save refuses anyway). So the only
-/// question is level 1 against the rest, and whether the edit set values only.
-fn check_doc_mdp(editor: &DocumentEditor) -> std::result::Result<(), IncrementalError> {
-    let doc = editor.source();
+/// The source's DocMDP certification level (ISO 32000-1 §12.8.2.2),
+/// when a certifying signature carries one: the /P of its
+/// TransformParams, 2 when the params omit it.
+pub(crate) fn doc_mdp_level(doc: &PdfDocument) -> Option<i64> {
     let resolve = |o: &Object| match o {
         Object::Reference(r) => doc.load_object(*r).ok(),
         other => Some(other.clone()),
     };
-    let Some(level) = doc
-        .catalog()
+    doc.catalog()
         .ok()
         .and_then(|c| {
             c.as_dict()
@@ -327,7 +374,14 @@ fn check_doc_mdp(editor: &DocumentEditor) -> std::result::Result<(), Incremental
                     })
                 })
         })
-    else {
+}
+
+/// Refuses an edit a certifying signature forbids (ISO 32000-1 §12.8.2.2).
+/// Level 1 allows no change; levels 2 and 3 allow setting field values
+/// (level 3 also annotations, which this save refuses anyway). So the only
+/// question is level 1 against the rest, and whether the edit set values only.
+fn check_doc_mdp(editor: &DocumentEditor) -> std::result::Result<(), IncrementalError> {
+    let Some(level) = doc_mdp_level(editor.source()) else {
         return Ok(());
     };
     if level == 1 || !editor.incremental_value_only() {

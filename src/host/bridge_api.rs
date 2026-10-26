@@ -1288,11 +1288,11 @@ pub(crate) fn handle_sign(
         ..Default::default()
     };
 
-    if let (Some(mut reader), Some(mut writer)) = (source_reader, sink_writer) {
-        let length = req.get_i64("sourceLength").unwrap_or(0) as u64;
-        match crate::host::sign::sign_pdf(
-            &mut reader, length, &mut writer, &credentials, opts,
-        ) {
+    if let (Some(reader), Some(mut writer)) = (source_reader, sink_writer) {
+        let Some(signed_at) = req.get_i64("signedAt").and_then(|s| u64::try_from(s).ok()) else {
+            return ResponseWriter::error_kind(ErrorKind::InvalidArgument, "sign: missing signedAt");
+        };
+        match crate::host::sign::sign_pdf(reader, &mut writer, &credentials, opts, signed_at) {
             Ok(()) => {
                 ok_flag("signed")
             }
