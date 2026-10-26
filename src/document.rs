@@ -2286,6 +2286,15 @@ impl PdfDocument {
             _ => e.generation,
         })
     }
+
+    /// Whether the cross-reference table marks `id` as a free entry. An
+    /// id with no xref entry at all (only in the object cache) is not free.
+    pub(crate) fn is_free_entry(&self, id: u32) -> bool {
+        self.xref
+            .get(id)
+            .map(|e| !e.in_use)
+            .unwrap_or(false)
+    }
     // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: zero-clone ref extraction for GC ──

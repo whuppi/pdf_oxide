@@ -781,16 +781,24 @@ impl DocumentEditor {
         // ── end pdf_manipulator patch ──
     }
 
-    /// Find the maximum object ID in the document.
+    // ── pdf_manipulator patch: no /Size never collides new ids ──
+    /// Find the maximum object ID in the document: the largest of
+    /// `/Size - 1` (an object id is one below `/Size`, the entry count)
+    /// and the largest object number in the xref. A source can claim a
+    /// `/Size` smaller than its real content (or none at all), so only
+    /// the xref's own numbers prove which ids are taken; callers add 1.
     fn find_max_object_id(doc: &PdfDocument) -> u32 {
-        // Get /Size from trailer - this is the number of xref entries (max ID + 1)
-        doc.trailer()
+        let size_max = doc
+            .trailer()
             .as_dict()
             .and_then(|d| d.get("Size"))
             .and_then(|s| s.as_integer())
-            .map(|size| size as u32)
-            .unwrap_or(100) // Fallback to reasonable default
+            .and_then(|size| u32::try_from(size).ok())
+            .and_then(|size| size.checked_sub(1));
+        let xref_max = doc.all_object_ids().pop().unwrap_or(0);
+        size_max.unwrap_or(0).max(xref_max)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Allocate a new object ID.
     fn allocate_object_id(&mut self) -> u32 {
@@ -2551,7 +2559,9 @@ impl DocumentEditor {
         writer.write_all(b"%\x80\x81\x82\x83\n")?;
 
         // ── pdf_manipulator patch: references to what the save leaves out are null (#261) ──
-        let serializer = ObjectSerializer::compact().nulling(prune.excluded.clone());
+        let serializer = ObjectSerializer::compact()
+            .nulling(prune.excluded.clone())
+            .zero_generations();
         // ── end pdf_manipulator patch ──
 
         // Set up encryption if configured
@@ -4222,29 +4232,26 @@ impl DocumentEditor {
                                                 let xobject_dict = match xobjects {
                                                     Object::Dictionary(d) => Some(d.clone()),
                                                     Object::Reference(r) => {
-                                                        let loaded =
-                                                            self.staged_or_source_object(*r).map_err(|e| {
-                                                                log::warn!("Failed to load resource object {} during save: {}", r.id, e);
-                                                                e
-                                                            }).ok();
+                                                        // ── pdf_manipulator patch: a save never drops an unreadable object ──
+                                                        // A resource object the page references
+                                                        // that cannot be read would dangle in the
+                                                        // output xref; fail the save instead.
+                                                        let obj = self.staged_or_source_object(*r)?;
                                                         if !written_ids.contains(&r.id) {
-                                                            if let Some(ref obj) = loaded {
-                                                                let offset =
-                                                                    writer.position();
-                                                                let bytes = serialize_obj(
-                                                                    &serializer,
-                                                                    r.id,
-                                                                    0,
-                                                                    obj,
-                                                                    &encryption_handler,
-                                                                );
-                                                                writer.write_all(&bytes)?;
-                                                                xref_entries
-                                                                    .push((r.id, offset, 0, true));
-                                                                written_ids.insert(r.id);
-                                                            }
+                                                            let offset = writer.position();
+                                                            let bytes = serialize_obj(
+                                                                &serializer,
+                                                                r.id,
+                                                                0,
+                                                                &obj,
+                                                                &encryption_handler,
+                                                            );
+                                                            writer.write_all(&bytes)?;
+                                                            xref_entries.push((r.id, offset, 0, true));
+                                                            written_ids.insert(r.id);
                                                         }
-                                                        loaded.and_then(|o| o.as_dict().cloned())
+                                                        obj.as_dict().cloned()
+                                                        // ── end pdf_manipulator patch ──
                                                     },
                                                     _ => None,
                                                 };
@@ -4283,29 +4290,26 @@ impl DocumentEditor {
                                                 let gs_dict = match gs_obj {
                                                     Object::Dictionary(d) => Some(d.clone()),
                                                     Object::Reference(r) => {
-                                                        let loaded =
-                                                            self.staged_or_source_object(*r).map_err(|e| {
-                                                                log::warn!("Failed to load resource object {} during save: {}", r.id, e);
-                                                                e
-                                                            }).ok();
+                                                        // ── pdf_manipulator patch: a save never drops an unreadable object ──
+                                                        // A resource object the page references
+                                                        // that cannot be read would dangle in the
+                                                        // output xref; fail the save instead.
+                                                        let obj = self.staged_or_source_object(*r)?;
                                                         if !written_ids.contains(&r.id) {
-                                                            if let Some(ref obj) = loaded {
-                                                                let offset =
-                                                                    writer.position();
-                                                                let bytes = serialize_obj(
-                                                                    &serializer,
-                                                                    r.id,
-                                                                    0,
-                                                                    obj,
-                                                                    &encryption_handler,
-                                                                );
-                                                                writer.write_all(&bytes)?;
-                                                                xref_entries
-                                                                    .push((r.id, offset, 0, true));
-                                                                written_ids.insert(r.id);
-                                                            }
+                                                            let offset = writer.position();
+                                                            let bytes = serialize_obj(
+                                                                &serializer,
+                                                                r.id,
+                                                                0,
+                                                                &obj,
+                                                                &encryption_handler,
+                                                            );
+                                                            writer.write_all(&bytes)?;
+                                                            xref_entries.push((r.id, offset, 0, true));
+                                                            written_ids.insert(r.id);
                                                         }
-                                                        loaded.and_then(|o| o.as_dict().cloned())
+                                                        obj.as_dict().cloned()
+                                                        // ── end pdf_manipulator patch ──
                                                     },
                                                     _ => None,
                                                 };
@@ -4946,6 +4950,14 @@ impl DocumentEditor {
             if obj_id == 0 || written_ids.contains(&obj_id) {
                 continue;
             }
+            // ── pdf_manipulator patch: free entries skipped, unreadable objects refused ──
+            // Free xref entries hold no object; `all_object_ids` unions the
+            // whole table, free slots included, so skip them before loading
+            // instead of treating their load failure as a damaged file.
+            if self.source.is_free_entry(obj_id) {
+                continue;
+            }
+            // ── end pdf_manipulator patch ──
             // #231 G6: never emit the original content stream of a
             // destructively-redacted page (it holds the secret bytes),
             // regardless of GC reachability.
@@ -4996,13 +5008,9 @@ impl DocumentEditor {
                     xref_entries.push((obj_id, offset, 0, true));
                     written_ids.insert(obj_id);
                 },
-                Err(e) => {
-                    log::debug!(
-                        "write_full_to_writer: skipping unloadable object {} during sweep: {}",
-                        obj_id,
-                        e
-                    );
-                },
+                // ── pdf_manipulator patch: an unreadable in-use object fails the save ──
+                Err(e) => return Err(e),
+                // ── end pdf_manipulator patch ──
             }
         }
 
@@ -12070,9 +12078,10 @@ mod tests {
     #[test]
     fn test_find_max_object_id() {
         let editor = create_test_editor();
-        // Our minimal PDF has /Size 4 in the trailer, so max_id should be 4
+        // Our minimal PDF has /Size 4 and objects 1..3 in its xref, so the
+        // maximum object id is 3 (/Size is the entry count, one above it).
         let max = DocumentEditor::find_max_object_id(&editor.source);
-        assert_eq!(max, 4);
+        assert_eq!(max, 3);
     }
 
     // =========================================================================

@@ -23,6 +23,9 @@ pub struct ObjectSerializer {
     /// Object ids a reference to is written as `null` (ISO 32000-1
     /// §7.3.10: a reference to a missing object is the null object).
     null_refs: std::collections::HashSet<u32>,
+    /// Write every reference with generation 0: a full rewrite writes
+    /// every object at generation 0, so `5 1 R` would name nothing.
+    zero_generations: bool,
     // ── end pdf_manipulator patch ──
 }
 
@@ -39,6 +42,7 @@ impl ObjectSerializer {
             indent_level: 0,
             // ── pdf_manipulator patch: references to unwritten objects as null ──
             null_refs: Default::default(),
+            zero_generations: false,
             // ── end pdf_manipulator patch ──
         }
     }
@@ -52,11 +56,19 @@ impl ObjectSerializer {
         self
     }
 
+    /// This serializer, writing every reference with generation 0, for a
+    /// save that writes every object at generation 0.
+    pub(crate) fn zero_generations(mut self) -> Self {
+        self.zero_generations = true;
+        self
+    }
+
     fn write_reference<W: Write>(&self, w: &mut W, r: &ObjectRef) -> std::io::Result<()> {
         if self.null_refs.contains(&r.id) {
             write!(w, "null")
         } else {
-            write!(w, "{} {} R", r.id, r.gen)
+            let gen = if self.zero_generations { 0 } else { r.gen };
+            write!(w, "{} {} R", r.id, gen)
         }
     }
     // ── end pdf_manipulator patch ──
