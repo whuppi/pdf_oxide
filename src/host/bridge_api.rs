@@ -1147,8 +1147,9 @@ pub(crate) fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink
         None => return ResponseWriter::error("builder not found"),
     };
 
+    let compress = req.get_bool("compress").unwrap_or(true);
     let ops = state.page_ops.remove(&hid).unwrap_or_default();
-    let mut builder = builder;
+    let mut builder = builder.compress_streams(compress);
     if !ops.is_empty() {
         dispatch::replay_page_ops(&mut builder, PageSize::A4, ops);
     }
