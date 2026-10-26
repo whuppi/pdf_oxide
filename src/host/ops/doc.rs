@@ -1,7 +1,7 @@
 // Document-handle ops: open/dispose plus read ops that reuse the parsed
 // document via handleId. Core — always built.
 
-use crate::host::binary_codec::ResponseWriter;
+use crate::host::binary_codec::{ErrorKind, ResponseWriter};
 use crate::host::bridge_api::{handle_open, handle_with_doc, ok_flag, req_handle};
 use crate::host::dispatch;
 use crate::host::ops::op_unit;
@@ -140,6 +140,40 @@ op_unit!(ATTACHMENTS, "attachments", pdf_op_attachments_anchor, |ctx| {
             item.put_i64("size", a.size);
             item.put_str("description", &a.description);
             item.put_str("mimeType", &a.mime_type);
+        });
+        Ok(w.finish())
+    })
+});
+
+op_unit!(ANNOTATIONS, "annotations", pdf_op_annotations_anchor, |ctx| {
+    handle_with_doc(ctx.state, ctx.req, |doc, req| {
+        let page = match req.get_i32("page") {
+            Some(p) => p,
+            None => {
+                return Ok(ResponseWriter::error_kind(
+                    ErrorKind::InvalidArgument,
+                    "annotations requires a page",
+                ))
+            }
+        };
+        let count = doc.page_count()?;
+        if page < 0 || page as usize >= count {
+            return Ok(ResponseWriter::page_range(page, count as i32));
+        }
+        let rows = dispatch::doc_annotations(doc, page as usize)?;
+        let mut w = ResponseWriter::ok();
+        w.put_map_list("annotations", rows.len(), |i, item| {
+            let a = &rows[i];
+            item.put_str("subtype", &a.subtype);
+            item.put_bool("hasRect", a.rect.is_some());
+            let [x1, y1, x2, y2] = a.rect.unwrap_or([0.0; 4]);
+            item.put_f64("x", x1);
+            item.put_f64("y", y1);
+            item.put_f64("width", x2 - x1);
+            item.put_f64("height", y2 - y1);
+            item.put_str("contents", &a.contents);
+            item.put_str("author", &a.author);
+            item.put_str("fieldName", &a.field_name);
         });
         Ok(w.finish())
     })

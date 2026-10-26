@@ -1108,6 +1108,38 @@ pub fn doc_attachments(doc: &mut PdfDocument) -> Result<Vec<AttachmentRow>> {
         .collect())
 }
 
+// ── Annotations ──
+
+/// One page annotation in wire vocabulary.
+pub struct AnnotationRow {
+    /// The `/Subtype` name (e.g. "Text", "Widget"), or `""` when absent.
+    pub subtype: String,
+    /// `/Rect` as `[x1, y1, x2, y2]` with `x1 <= x2` and `y1 <= y2`,
+    /// or `None` when the annotation declares no rectangle.
+    pub rect: Option<[f64; 4]>,
+    /// `/Contents`, or `""` when absent.
+    pub contents: String,
+    /// `/T` (author/title), or `""` when absent.
+    pub author: String,
+    /// `/T` on a widget (form field name), or `""` when absent.
+    pub field_name: String,
+}
+
+/// List one page's annotations in `/Annots` order.
+pub fn doc_annotations(doc: &mut PdfDocument, page: usize) -> Result<Vec<AnnotationRow>> {
+    Ok(doc.get_annotations(page)?
+        .into_iter()
+        .map(|a| AnnotationRow {
+            subtype: a.subtype.unwrap_or_default(),
+            rect: a.rect.map(|r| [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]),
+            contents: a.contents.unwrap_or_default(),
+            // A widget's /T is its field name, never an author.
+            author: if a.field_name.is_some() { String::new() } else { a.author.unwrap_or_default() },
+            field_name: a.field_name.unwrap_or_default(),
+        })
+        .collect())
+}
+
 /// Write the attachment named `name` to the sink in bounded chunks.
 pub fn doc_extract_attachment<W: std::io::Write>(
     doc: &mut PdfDocument,

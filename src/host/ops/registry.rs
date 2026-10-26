@@ -22,6 +22,7 @@ static OPS: &[&OpEntry] = &[
     &convert::CONVERT_TO_PDF,
     &convert::CONVERT_XFA_TO_ACROFORM,
     // doc
+    &doc::ANNOTATIONS,
     &doc::ATTACHMENTS,
     &doc::CLASSIFY_DOCUMENT,
     &doc::CLASSIFY_PAGE,
