@@ -9,11 +9,18 @@
 //! Format:
 //!   Request:  [op_len:u8] [op:utf8] [num_fields:u16le] [fields...]
 //!   Response: [status:u8] [num_fields:u16le] [fields...]
-//!             status 0 = error: [msg_len:u32le] [msg:utf8]
+//!             status 0 = error: [kind:u8] [num_fields:u16le] [fields...]
+//!                      field `message` (string) always present; kind
+//!                      pageRange (8) also carries i32 `page` and
+//!                      `pageCount`
 //!             status 1 = ok:    [fields...]
 //!             status 2 = cancelled
-//!             status 3 = incremental save refused: [msg_len:u32le] [msg:utf8]
 //!   Field:    [key_len:u8] [key:utf8] [type:u8] [value...]
+//!
+//! Error kinds:
+//!   0=engine  1=invalidArgument  2=io  3=corrupted  4=unsupported
+//!   5=passwordRequired  6=wrongPassword  7=crypto  8=pageRange
+//!   9=incrementalRefused
 //!
 //! Type codes:
 //!   0=null  1=i32  2=i64  3=f64  4=bool  5=string  6=bytes
@@ -225,6 +232,57 @@ fn read_value<'a>(r: &mut Reader<'a>) -> Result<FieldValue<'a>, &'static str> {
 // Response writer
 // ═══════════════════════════════════════════════════════════════════
 
+/// Error kinds carried in byte 1 of an error response. The value is the
+/// wire byte; hosts map it to their typed error class.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Unclassified engine failure.
+    Engine = 0,
+    /// Caller passed an argument the op rejects.
+    InvalidArgument = 1,
+    /// Underlying I/O failed.
+    Io = 2,
+    /// The document is malformed beyond use.
+    Corrupted = 3,
+    /// The build excludes this feature, or the PDF feature is unsupported.
+    Unsupported = 4,
+    /// The document needs a user password that was not supplied.
+    PasswordRequired = 5,
+    /// A password was supplied but does not open the document.
+    WrongPassword = 6,
+    /// A crypto operation (signing, credentials) failed.
+    Crypto = 7,
+    /// A page index falls outside the document.
+    PageRange = 8,
+    /// An incremental save refused the staged edits; a full rewrite can save them.
+    IncrementalRefused = 9,
+}
+
+/// Map a library error to the wire kind. Unlisted variants (including the
+/// cfg-gated Ml/Ocr ones) fall to Engine so any feature set compiles.
+pub fn kind_of(e: &crate::Error) -> ErrorKind {
+    use crate::Error;
+    match e {
+        Error::InvalidHeader(_)
+        | Error::InvalidXref
+        | Error::ParseError { .. }
+        | Error::UnexpectedEof
+        | Error::ObjectNotFound(_, _)
+        | Error::InvalidObjectType { .. }
+        | Error::CircularReference(_)
+        | Error::RecursionLimitExceeded(_)
+        | Error::Decode(_) => ErrorKind::Corrupted,
+        Error::Io(_) => ErrorKind::Io,
+        Error::Unsupported(_)
+        | Error::UnsupportedFilter(_)
+        | Error::UnsupportedVersion(_) => ErrorKind::Unsupported,
+        Error::EncryptedPdf => ErrorKind::PasswordRequired,
+        Error::InvalidOperation(_) => ErrorKind::InvalidArgument,
+        _ => ErrorKind::Engine,
+    }
+}
+
 /// Builds a binary response with typed key-value fields.
 pub struct ResponseWriter {
     buf: Vec<u8>,
@@ -246,23 +304,41 @@ impl ResponseWriter {
         vec![2]
     }
 
-    /// Encode a complete incremental-refused response (status 3): the
-    /// staged edits cannot be appended to the source, and a full rewrite
-    /// can save them. Hosts map it to their typed refusal error.
-    pub fn incremental_refused(msg: &str) -> Vec<u8> {
-        let mut buf = Self::error(msg);
-        buf[0] = 3;
+    /// Encode a complete error response carrying [kind] and one string
+    /// field `message`.
+    pub fn error_kind(kind: ErrorKind, msg: &str) -> Vec<u8> {
+        let mut w = Self::ok();
+        w.put_str("message", msg);
+        let mut buf = w.finish();
+        buf[0] = 0;
+        buf.insert(1, kind as u8);
         buf
     }
 
-    /// Encode a complete error response with the given message.
-    pub fn error(msg: &str) -> Vec<u8> {
-        let msg_bytes = msg.as_bytes();
-        let mut buf = Vec::with_capacity(5 + msg_bytes.len());
-        buf.push(0); // status = error
-        buf.extend_from_slice(&(msg_bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(msg_bytes);
+    /// Encode an error response typed from a library error.
+    pub fn error_of(e: &crate::Error) -> Vec<u8> {
+        Self::error_kind(kind_of(e), &e.to_string())
+    }
+
+    /// Encode a page-range error with the offending page and the count.
+    pub fn page_range(page: i32, page_count: i32) -> Vec<u8> {
+        let mut w = Self::ok();
+        w.put_str(
+            "message",
+            &format!("page {page} out of range (document has {page_count} pages)"),
+        );
+        w.put_i32("page", page);
+        w.put_i32("pageCount", page_count);
+        let mut buf = w.finish();
+        buf[0] = 0;
+        buf.insert(1, ErrorKind::PageRange as u8);
         buf
+    }
+
+    /// Encode a complete unclassified (Engine) error response with the
+    /// given message.
+    pub fn error(msg: &str) -> Vec<u8> {
+        Self::error_kind(ErrorKind::Engine, msg)
     }
 
     /// Write an i32 field.
@@ -529,9 +605,77 @@ mod tests {
     fn response_writer_error() {
         let bytes = ResponseWriter::error("something broke");
         assert_eq!(bytes[0], 0); // status error
-        let msg_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
-        let msg = std::str::from_utf8(&bytes[5..5 + msg_len]).unwrap();
-        assert_eq!(msg, "something broke");
+        assert_eq!(bytes[1], ErrorKind::Engine as u8);
+        let field_count = u16::from_le_bytes([bytes[2], bytes[3]]);
+        assert_eq!(field_count, 1);
+        // field: key_len, key, type, len, value
+        let mut i = 4;
+        let key_len = bytes[i] as usize;
+        i += 1;
+        assert_eq!(&bytes[i..i + key_len], b"message");
+        i += key_len;
+        assert_eq!(bytes[i], 5); // string type
+        i += 1;
+        let msg_len = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        assert_eq!(&bytes[i..i + msg_len], b"something broke");
+    }
+
+    #[test]
+    fn error_kind_bytes_layout() {
+        let bytes = ResponseWriter::error_kind(ErrorKind::Unsupported, "nope");
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], ErrorKind::Unsupported as u8);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 1);
+    }
+
+    #[test]
+    fn page_range_carries_both_ints() {
+        let bytes = ResponseWriter::page_range(99, 1);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], ErrorKind::PageRange as u8);
+        // Layout: [status][kind][field_count u16 LE][fields...].
+        let mut r = Reader::new(&bytes[2..]);
+        let field_count = r.u16().unwrap() as usize;
+        assert_eq!(field_count, 3);
+        let mut found_page = None;
+        let mut found_count = None;
+        for _ in 0..field_count {
+            let key_len = r.u8().unwrap() as usize;
+            let key = r.utf8(key_len).unwrap().to_string();
+            let value = read_value(&mut r).unwrap();
+            match key.as_str() {
+                "page" => {
+                    if let FieldValue::I32(n) = value {
+                        found_page = Some(n);
+                    }
+                }
+                "pageCount" => {
+                    if let FieldValue::I32(n) = value {
+                        found_count = Some(n);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(found_page, Some(99));
+        assert_eq!(found_count, Some(1));
+    }
+
+    #[test]
+    fn kind_of_maps_expected_variants() {
+        assert_eq!(
+            kind_of(&crate::Error::EncryptedPdf),
+            ErrorKind::PasswordRequired
+        );
+        assert_eq!(
+            kind_of(&crate::Error::InvalidHeader("x".into())),
+            ErrorKind::Corrupted
+        );
+        assert_eq!(
+            kind_of(&crate::Error::InvalidOperation("x".into())),
+            ErrorKind::InvalidArgument
+        );
     }
 
     #[test]

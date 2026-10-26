@@ -163,7 +163,7 @@ op_unit!(
         };
         match dispatch::doc_extract_attachment(doc, &name, &mut writer) {
             Ok(()) => ok_flag("streamed"),
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     }
 );
@@ -187,7 +187,7 @@ op_unit!(
         };
         match dispatch::doc_export_form_data(doc, &format, &mut writer) {
             Ok(()) => ok_flag("streamed"),
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     }
 );

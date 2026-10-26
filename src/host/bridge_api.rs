@@ -20,7 +20,7 @@
 //! targets. 100% platform-agnostic. No locks — a lane's state has
 //! exactly one owner thread, so handlers take `&mut LaneState`.
 
-use crate::host::binary_codec::{Request, ResponseWriter};
+use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::dispatch;
 use crate::host::lane_state::LaneState;
 
@@ -139,10 +139,10 @@ fn open_source(
 ) -> Result<PdfDocument, Vec<u8>> {
     if let Some(reader) = source_reader {
         PdfDocument::from_external_reader(reader.0)
-            .map_err(|e| ResponseWriter::error(&e.to_string()))
+            .map_err(|e| ResponseWriter::error_of(&e))
     } else if let Some(bytes) = source_bytes {
         PdfDocument::from_bytes(bytes.to_vec())
-            .map_err(|e| ResponseWriter::error(&e.to_string()))
+            .map_err(|e| ResponseWriter::error_of(&e))
     } else {
         Err(ResponseWriter::error(&format!("no source for {op}")))
     }
@@ -221,7 +221,7 @@ pub(crate) fn handle_editor_merge_from(
     };
     match result {
         Ok(_) => ok_flag("merged"),
-        Err(e) => ResponseWriter::error(&e.to_string()),
+        Err(e) => ResponseWriter::error_of(&e),
     }
 }
 
@@ -237,12 +237,15 @@ pub(crate) fn handle_editor_merge_from(
 fn authenticate_or_refuse(doc: &PdfDocument, password: Option<&str>) -> Option<Vec<u8>> {
     match doc.authenticate(password.unwrap_or("").as_bytes()) {
         Ok(true) => None,
-        Ok(false) => Some(ResponseWriter::error(if password.is_some() {
-            "wrong password"
+        Ok(false) => Some(if password.is_some() {
+            ResponseWriter::error_kind(ErrorKind::WrongPassword, "wrong password")
         } else {
-            "password required: document is encrypted with a user password"
-        })),
-        Err(e) => Some(ResponseWriter::error(&e.to_string())),
+            ResponseWriter::error_kind(
+                ErrorKind::PasswordRequired,
+                "password required: document is encrypted with a user password",
+            )
+        }),
+        Err(e) => Some(ResponseWriter::error_of(&e)),
     }
 }
 
@@ -292,7 +295,7 @@ pub(crate) fn handle_open(
             });
             w.finish()
         }
-        Err(e) => ResponseWriter::error(&e.to_string()),
+        Err(e) => ResponseWriter::error_of(&e),
     }
 }
 
@@ -312,7 +315,7 @@ pub(crate) fn handle_editor_open(
     }
     let editor = match DocumentEditor::from_document(doc) {
         Ok(e) => e,
-        Err(e) => return ResponseWriter::error(&e.to_string()),
+        Err(e) => return ResponseWriter::error_of(&e),
     };
     let hid = state.next_handle_id();
     state.editors.insert(hid, editor);
@@ -329,7 +332,7 @@ where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
     match docs.get_mut(&hid) {
         Some(doc) => match f(doc, req) {
             Ok(bytes) => bytes,
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         },
         None => ResponseWriter::error("document not found"),
     }
@@ -343,7 +346,7 @@ where F: FnOnce(&mut DocumentEditor, &Request<'_>) -> crate::error::Result<Vec<u
     match editors.get_mut(&hid) {
         Some(editor) => match f(editor, req) {
             Ok(bytes) => bytes,
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         },
         None => ResponseWriter::error("editor not found"),
     }
@@ -367,7 +370,7 @@ pub(crate) fn handle_editor_mutate(
 
     match do_editor_mutate(editor, edit_op, req, data_reader) {
         Ok(bytes) => bytes,
-        Err(e) => ResponseWriter::error(&e.to_string()),
+        Err(e) => ResponseWriter::error_of(&e),
     }
 }
 
@@ -942,7 +945,7 @@ pub(crate) fn handle_register_fallback_font(
     };
     match crate::host::dispatch::register_fallback_font(kind, bytes) {
         Ok(()) => ResponseWriter::ok().finish(),
-        Err(e) => ResponseWriter::error(&e.to_string()),
+        Err(e) => ResponseWriter::error_of(&e),
     }
 }
 
@@ -988,7 +991,7 @@ fn convert_to_with_doc(
             Ok(()) => {
                 ok_flag("streamed")
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     } else {
         match dispatch::convert_to_format(doc, format) {
@@ -997,7 +1000,7 @@ fn convert_to_with_doc(
                 w.put_bytes("data", &bytes);
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     }
 }
@@ -1022,7 +1025,7 @@ pub(crate) fn handle_convert_xfa_to_acroform(
     };
     match dispatch::convert_xfa_to_acroform(&mut doc, &mut writer) {
         Ok(()) => ok_flag("streamed"),
-        Err(e) => ResponseWriter::error(&e.to_string()),
+        Err(e) => ResponseWriter::error_of(&e),
     }
 }
 
@@ -1041,14 +1044,14 @@ pub(crate) fn handle_convert_to_pdf(
                 Ok(()) => {
                     ok_flag("streamed")
                 }
-                Err(e) => ResponseWriter::error(&e.to_string()),
+                Err(e) => ResponseWriter::error_of(&e),
             }
         } else if let Some(bytes) = source_bytes {
             match dispatch::convert_from_format_writer(std::io::Cursor::new(bytes.to_vec()), format, &mut writer) {
                 Ok(()) => {
                     ok_flag("streamed")
                 }
-                Err(e) => ResponseWriter::error(&e.to_string()),
+                Err(e) => ResponseWriter::error_of(&e),
             }
         } else {
             ResponseWriter::error("no source for convertToPdf")
@@ -1058,7 +1061,9 @@ pub(crate) fn handle_convert_to_pdf(
         let data = if let Some(mut reader) = source_reader {
             match read_all_from_reader(&mut reader) {
                 Ok(d) => d,
-                Err(e) => return ResponseWriter::error(&e.to_string()),
+                Err(e) => {
+                    return ResponseWriter::error_kind(ErrorKind::Io, &e.to_string())
+                }
             }
         } else if let Some(b) = source_bytes {
             b.to_vec()
@@ -1071,7 +1076,7 @@ pub(crate) fn handle_convert_to_pdf(
                 w.put_bytes("data", &bytes);
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     }
 }
@@ -1095,7 +1100,7 @@ pub(crate) fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink
             Ok(()) => {
                 ok_flag("streamed")
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     } else {
         match dispatch::builder_save(builder) {
@@ -1104,7 +1109,7 @@ pub(crate) fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink
                 w.put_bytes("data", &bytes);
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     }
 }
@@ -1135,7 +1140,7 @@ pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, s
                 w.put_i32("itemCount", count as i32);
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     } else {
         let page = req.get_i32("page").unwrap_or(0) as usize;
@@ -1147,7 +1152,7 @@ pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, s
                 w.put_bytes("data", &result.data);
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     }
 }
@@ -1170,7 +1175,7 @@ pub(crate) fn handle_extract_images_streamed(state: &mut LaneState, req: &Reques
                 w.put_i32("itemCount", count as i32);
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     } else {
         match dispatch::extract_images(doc, page) {
@@ -1187,7 +1192,7 @@ pub(crate) fn handle_extract_images_streamed(state: &mut LaneState, req: &Reques
                 });
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     }
 }
@@ -1211,7 +1216,12 @@ pub(crate) fn handle_sign(
 
     let credentials = match credentials {
         Ok(c) => c,
-        Err(e) => return ResponseWriter::error(&format!("sign: invalid credentials: {e}")),
+        Err(e) => {
+            return ResponseWriter::error_kind(
+                ErrorKind::Crypto,
+                &format!("sign: invalid credentials: {e}"),
+            )
+        }
     };
 
     let opts = SignOptions {
@@ -1228,7 +1238,7 @@ pub(crate) fn handle_sign(
             Ok(()) => {
                 ok_flag("signed")
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     } else if let Some(bytes) = source_bytes {
         match crate::signatures::sign_pdf_bytes(bytes, &credentials, opts) {
@@ -1237,7 +1247,7 @@ pub(crate) fn handle_sign(
                 w.put_bytes("data", &signed);
                 w.finish()
             }
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         }
     } else {
         ResponseWriter::error("sign: no source provided")
@@ -1251,7 +1261,7 @@ pub(crate) fn handle_sign(
     _source_bytes: Option<&[u8]>,
     _sink_writer: Option<BoxedWriter>,
 ) -> Vec<u8> {
-    ResponseWriter::error("signatures feature not enabled")
+    ResponseWriter::error_kind(ErrorKind::Unsupported, "signatures feature not enabled")
 }
 
 pub(crate) fn handle_editor_save(
@@ -1305,14 +1315,16 @@ pub(crate) fn handle_editor_save(
             use crate::host::incremental::{write, IncrementalError};
             match write(editor, &mut writer, &options) {
                 Ok(()) => ok_flag("streamed"),
-                Err(IncrementalError::Refused(why)) => ResponseWriter::incremental_refused(&why),
-                Err(IncrementalError::Failed(e)) => ResponseWriter::error(&e.to_string()),
+                Err(IncrementalError::Refused(why)) => {
+                    ResponseWriter::error_kind(ErrorKind::IncrementalRefused, &why)
+                }
+                Err(IncrementalError::Failed(e)) => ResponseWriter::error_of(&e),
             }
         },
         (false, Some(mut writer)) => {
             match dispatch::edit_save_with_options(editor, &mut writer, &options) {
                 Ok(()) => ok_flag("streamed"),
-                Err(e) => ResponseWriter::error(&e.to_string()),
+                Err(e) => ResponseWriter::error_of(&e),
             }
         },
         (_, None) => match editor.save_to_bytes_with_options(options) {
@@ -1321,7 +1333,7 @@ pub(crate) fn handle_editor_save(
                 w.put_bytes("data", &bytes);
                 w.finish()
             },
-            Err(e) => ResponseWriter::error(&e.to_string()),
+            Err(e) => ResponseWriter::error_of(&e),
         },
     }
 }
@@ -1343,19 +1355,20 @@ pub(crate) fn handle_editor_extract_pages(
 
     let pages = req.get_int_list("pages").unwrap_or(&[]);
     if pages.is_empty() {
-        return ResponseWriter::error("pages list must not be empty");
+        return ResponseWriter::error_kind(
+            ErrorKind::InvalidArgument,
+            "pages list must not be empty",
+        );
     }
 
     let page_count = editor.current_page_count();
     for &p in pages {
         if (p as usize) >= page_count {
-            return ResponseWriter::error(&format!(
-                "page index {} out of range (document has {} pages)", p, page_count
-            ));
+            return ResponseWriter::page_range(p, page_count as i32);
         }
     }
     if let Err(e) = dispatch::refuse_repeated_pages(pages.iter().map(|&p| p as usize)) {
-        return ResponseWriter::error(&e.to_string());
+        return ResponseWriter::error_of(&e);
     }
 
     let visible: Vec<i32> = editor.page_order_visible();
@@ -1384,7 +1397,7 @@ pub(crate) fn handle_editor_extract_pages(
         Ok(()) => {
             ok_flag("streamed")
         }
-        Err(e) => ResponseWriter::error(&e.to_string()),
+        Err(e) => ResponseWriter::error_of(&e),
     }
 }
 
@@ -1500,9 +1513,9 @@ mod wasm_entry {
                 source_lengths[offset+4], source_lengths[offset+5],
                 source_lengths[offset+6], source_lengths[offset+7],
             ]);
-            if len > 0.0 {
-                sources.push(BoxedReader(Box::new(JsCallbackReader::new(i as u32, len as u64))));
-            }
+            // An empty source stays in the list, as on native: dropping it
+            // would shift every later source's index.
+            sources.push(BoxedReader(Box::new(JsCallbackReader::new(i as u32, len as u64))));
         }
 
         let mut sinks = Vec::new();

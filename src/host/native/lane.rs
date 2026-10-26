@@ -281,8 +281,11 @@ fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) {
     // every other handle on it) alive, at the cost of this one job.
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut sources = Vec::with_capacity(job.sources.len());
+        // An empty source stays in the list: dropping it would shift every
+        // later source's index, and the op must see the empty input to
+        // refuse it as a corrupt file.
         for s in &job.sources {
-            if s.buf != 0 && s.notify.is_some() && s.length > 0 {
+            if s.buf != 0 && s.notify.is_some() {
                 let reader = unsafe {
                     CallbackReader::new(
                         s.buf as *mut u8,

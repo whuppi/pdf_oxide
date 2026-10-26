@@ -246,7 +246,7 @@ pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) ->
     #[cfg(not(feature = "extract"))]
     {
         let _ = (doc, page, format);
-        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+        return Err(Error::Unsupported("extract support not enabled in this build".into()));
     }
     #[cfg(feature = "extract")]
     {
@@ -297,7 +297,7 @@ pub fn search_text(doc: &mut PdfDocument, query: &str, page: Option<usize>) -> R
     #[cfg(not(feature = "extract"))]
     {
         let _ = (doc, query, page);
-        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+        return Err(Error::Unsupported("extract support not enabled in this build".into()));
     }
     #[cfg(feature = "extract")]
     {
@@ -346,7 +346,7 @@ pub fn validate_pdf_a(doc: &mut PdfDocument, level: i32) -> Result<ValidationRes
     #[cfg(not(feature = "pdfa"))]
     {
         let _ = (doc, level);
-        return Err(Error::InvalidPdf("PDF/A support not enabled in this build".into()));
+        return Err(Error::Unsupported("PDF/A support not enabled in this build".into()));
     }
     #[cfg(feature = "pdfa")]
     {
@@ -372,7 +372,7 @@ pub fn validate_pdf_ua(doc: &mut PdfDocument, level: i32) -> Result<bool> {
     #[cfg(not(feature = "pdfa"))]
     {
         let _ = (doc, level);
-        return Err(Error::InvalidPdf("PDF/A support not enabled in this build".into()));
+        return Err(Error::Unsupported("PDF/A support not enabled in this build".into()));
     }
     #[cfg(feature = "pdfa")]
     {
@@ -390,7 +390,7 @@ pub fn classify_page(doc: &mut PdfDocument, page: usize) -> Result<Classificatio
     #[cfg(not(feature = "extract"))]
     {
         let _ = (doc, page);
-        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+        return Err(Error::Unsupported("extract support not enabled in this build".into()));
     }
     #[cfg(feature = "extract")]
     {
@@ -404,7 +404,7 @@ pub fn classify_document(doc: &mut PdfDocument) -> Result<ClassificationResult> 
     #[cfg(not(feature = "extract"))]
     {
         let _ = doc;
-        return Err(Error::InvalidPdf("extract support not enabled in this build".into()));
+        return Err(Error::Unsupported("extract support not enabled in this build".into()));
     }
     #[cfg(feature = "extract")]
     {
@@ -851,7 +851,7 @@ pub(crate) fn refuse_repeated_pages(pages: impl IntoIterator<Item = usize>) -> R
     let mut seen = std::collections::HashSet::new();
     for p in pages {
         if !seen.insert(p) {
-            return Err(Error::InvalidPdf(format!("page {p} is listed twice")));
+            return Err(Error::InvalidOperation(format!("page {p} is listed twice")));
         }
     }
     Ok(())
@@ -1293,7 +1293,7 @@ pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<
     #[cfg(not(feature = "pdfa"))]
     {
         let _ = (editor, level);
-        return Err(Error::InvalidPdf("PDF/A support not enabled in this build".into()));
+        return Err(Error::Unsupported("PDF/A support not enabled in this build".into()));
     }
     #[cfg(feature = "pdfa")]
     {
@@ -1442,7 +1442,7 @@ pub fn convert_to_format_writer<W: std::io::Write>(doc: &PdfDocument, format: &s
     #[cfg(not(feature = "office"))]
     {
         let _ = (doc, format, writer);
-        return Err(Error::InvalidPdf("office support not enabled in this build".into()));
+        return Err(Error::Unsupported("office support not enabled in this build".into()));
     }
     #[cfg(feature = "office")]
     {
@@ -1460,7 +1460,7 @@ pub fn convert_to_format(doc: &PdfDocument, format: &str) -> Result<Vec<u8>> {
     #[cfg(not(feature = "office"))]
     {
         let _ = (doc, format);
-        return Err(Error::InvalidPdf("office support not enabled in this build".into()));
+        return Err(Error::Unsupported("office support not enabled in this build".into()));
     }
     #[cfg(feature = "office")]
     {
@@ -1480,7 +1480,7 @@ pub fn convert_from_format_writer<R: std::io::Read + std::io::Seek + Send + 'sta
     #[cfg(not(feature = "office"))]
     {
         let _ = (reader, format, writer);
-        return Err(Error::InvalidPdf("office support not enabled in this build".into()));
+        return Err(Error::Unsupported("office support not enabled in this build".into()));
     }
     #[cfg(feature = "office")]
     {
