@@ -6,13 +6,12 @@
 //! but never seeks backwards. PositionedWrite captures exactly that:
 //! sequential Write + "where am I?" position query.
 //!
-//! Two impls:
+//! One impl:
 //!   CountingWriter<W: Write> — wraps any Write, tracks position via counter.
-//!     Use for streaming sinks that don't support Seek.
-//!   SeekWriter<W: Write + Seek> — wraps Write+Seek, delegates position to
-//!     stream_position(). Use for Cursor<Vec<u8>>, BufWriter<File>, etc.
+//!     A position is a count of the bytes written, never a seek that can
+//!     fail into 0.
 
-use std::io::{self, Seek, Write};
+use std::io::{self, Write};
 
 /// A writer that knows its current byte position.
 pub trait PositionedWrite: Write {
@@ -56,35 +55,44 @@ impl<W: Write> PositionedWrite for CountingWriter<W> {
     }
 }
 
-/// Wraps any Write+Seek, delegates position to stream_position().
-pub struct SeekWriter<W: Write + Seek> {
-    inner: W,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
 
-impl<W: Write + Seek> SeekWriter<W> {
-    /// Create a new seek-based writer.
-    pub fn new(inner: W) -> Self {
-        Self { inner }
+    /// Accepts at most 3 bytes per call to force short writes.
+    struct ChunkySink {
+        out: Vec<u8>,
     }
 
-    /// Consume the wrapper and return the inner writer.
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
-}
+    impl Write for ChunkySink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = buf.len().min(3);
+            self.out.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
 
-impl<W: Write + Seek> Write for SeekWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+    #[test]
+    fn position_counts_across_writes() {
+        let mut w = CountingWriter::new(Vec::new());
+        w.write_all(b"abc").unwrap();
+        w.write_all(b"de").unwrap();
+        w.write_all(b"fghij").unwrap();
+        assert_eq!(w.position(), 10);
+        assert_eq!(w.into_inner(), b"abcdefghij".to_vec());
     }
-}
 
-impl<W: Write + Seek> PositionedWrite for SeekWriter<W> {
-    fn position(&mut self) -> u64 {
-        self.inner.stream_position().unwrap_or(0)
+    #[test]
+    fn position_tracks_short_inner_writes() {
+        let mut sink = ChunkySink { out: Vec::new() };
+        let mut w = CountingWriter::new(&mut sink);
+        w.write_all(&[0u8; 10]).unwrap();
+        assert_eq!(w.position(), 10);
+        assert_eq!(sink.out.len(), 10);
     }
 }

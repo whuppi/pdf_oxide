@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::BufWriter;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Document metadata (Info dictionary).
@@ -769,13 +769,15 @@ impl DocumentEditor {
     /// Save the document to an in-memory byte vector with specific options.
     pub fn save_to_bytes_with_options(&mut self, options: SaveOptions) -> Result<Vec<u8>> {
         // ── pdf_manipulator patch: route through the streaming writer ──
-        use crate::host::positioned_write::SeekWriter;
+        // A fresh Cursor starts at 0, so the byte count equals the stream
+        // position every offset in the output assumes.
+        use crate::host::positioned_write::CountingWriter;
         if options.incremental {
             return Err(Error::InvalidPdf(
                 "Incremental saves are not supported for in-memory output".to_string(),
             ));
         }
-        let mut writer = SeekWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut writer = CountingWriter::new(std::io::Cursor::new(Vec::new()));
         self.write_full_to_writer(&mut writer, &options)?;
         Ok(writer.into_inner().into_inner())
         // ── end pdf_manipulator patch ──
@@ -1659,17 +1661,18 @@ impl DocumentEditor {
 
         // Read original file
         let original_bytes = self.read_source_bytes()?;
-        let original_len = original_bytes.len();
 
         // Open output file
         let file = File::create(path.as_ref())?;
-        let mut writer = BufWriter::new(file);
-
+        // ── pdf_manipulator patch: positions are a byte count ──
+        // The count includes the original bytes written first, so it is
+        // the file offset of whatever is written next: every offset below
+        // is `writer.position()`, never a seek that can fail into a guess.
+        use crate::host::positioned_write::{CountingWriter, PositionedWrite};
+        let mut writer = CountingWriter::new(BufWriter::new(file));
+        // ── end pdf_manipulator patch ──
         // Write original content
         writer.write_all(&original_bytes)?;
-
-        // Start incremental update section
-        let update_start = original_len as u64;
 
         // Sync form field changes into modified_objects before writing
         if self.acroform_modified {
@@ -1680,9 +1683,10 @@ impl DocumentEditor {
         let mut xref_entries: Vec<(u32, u64, u16)> = Vec::new();
         let serializer = ObjectSerializer::compact();
 
+        // ── pdf_manipulator patch: positions are a byte count ──
         // Write modified objects
         for (&obj_id, obj) in &self.modified_objects {
-            let offset = writer.stream_position().unwrap_or(update_start);
+            let offset = writer.position();
             let bytes = serializer.serialize_indirect(obj_id, 0, obj);
             writer.write_all(&bytes)?;
             xref_entries.push((obj_id, offset, 0));
@@ -1691,14 +1695,15 @@ impl DocumentEditor {
         // Write new Info object if metadata was modified
         if let Some(info_obj) = self.build_info_object() {
             let info_id = self.next_object_id;
-            let offset = writer.stream_position().unwrap_or(update_start);
+            let offset = writer.position();
             let bytes = serializer.serialize_indirect(info_id, 0, &info_obj);
             writer.write_all(&bytes)?;
             xref_entries.push((info_id, offset, 0));
         }
 
         // Write new xref section
-        let xref_offset = writer.stream_position().unwrap_or(update_start);
+        let xref_offset = writer.position();
+        // ── end pdf_manipulator patch ──
         write!(writer, "xref\n")?;
 
         // Sort entries by object ID
@@ -2335,9 +2340,9 @@ impl DocumentEditor {
     #[cfg(not(target_arch = "wasm32"))]
     fn write_full(&mut self, path: impl AsRef<Path>, options: &SaveOptions) -> Result<()> {
         // ── pdf_manipulator patch: route through the streaming writer ──
-        use crate::host::positioned_write::SeekWriter;
+        use crate::host::positioned_write::CountingWriter;
         let file = File::create(path.as_ref())?;
-        let mut writer = SeekWriter::new(BufWriter::new(file));
+        let mut writer = CountingWriter::new(BufWriter::new(file));
         self.write_full_to_writer(&mut writer, options)
         // ── end pdf_manipulator patch ──
     }
@@ -12074,6 +12079,51 @@ mod tests {
     // =========================================================================
     // find_max_object_id
     // =========================================================================
+
+    // ── pdf_manipulator patch: positions are a byte count ──
+    #[test]
+    fn incremental_file_save_writes_offsets_the_xref_can_follow() {
+        // The incremental file save re-reads its source from disk, so the
+        // source file lives until the save is done.
+        let dir = std::env::temp_dir();
+        let src = dir.join(format!("pdf_oxide_incremental_src_{}.pdf", std::process::id()));
+        let out = dir.join(format!("pdf_oxide_incremental_out_{}.pdf", std::process::id()));
+        // A source whose own xref is right, so a repair can only come
+        // from the appended section.
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
+        }
+        let xref_at = pdf.len();
+        pdf.push_str("xref\n0 4\n0000000000 65535 f \n");
+        for off in offsets {
+            pdf.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+        ));
+        std::fs::write(&src, pdf).unwrap();
+        assert!(!PdfDocument::open(&src).unwrap().xref_repaired(), "the source itself must be sound");
+        let mut editor = DocumentEditor::open(&src).unwrap();
+        editor.set_title("Appended");
+        editor.save_with_options(&out, SaveOptions::incremental()).unwrap();
+        let doc = PdfDocument::open(&out).unwrap();
+        let repaired = doc.xref_repaired();
+        let mut reopened = DocumentEditor::open(&out).unwrap();
+        let title = reopened.title().unwrap();
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
+        assert!(!repaired, "the appended xref must point at its objects without repair");
+        assert_eq!(title.as_deref(), Some("Appended"));
+    }
+    // ── end pdf_manipulator patch ──
 
     #[test]
     fn test_find_max_object_id() {

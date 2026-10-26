@@ -2,8 +2,10 @@
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
-//! Implements `Write + Seek` (stream_position only) by calling
+//! Implements `Write` by calling
 //! `host_write_chunk` imported from the JS global scope via wasm_bindgen.
+//! Byte offsets for xref tables come from a counting wrapper
+//! (`CountingWriter`); no seek ever occurs on the output.
 //!
 //! lane_worker.js sets `self.host_write_chunk = hostWriteChunk` before loading WASM.
 //!
@@ -12,7 +14,7 @@
 //! when the buffer is full or on flush/drop. O(1) memory — the buffer
 //! is fixed-size, never grows with PDF size.
 
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use wasm_bindgen::prelude::*;
 use crate::host::constants::WRITE_BUF_CAPACITY;
 
@@ -30,7 +32,6 @@ extern "C" {
 pub struct JsCallbackWriter {
     sink_index: u32,
     buffer: Vec<u8>,
-    position: u64,
 }
 
 impl JsCallbackWriter {
@@ -39,7 +40,6 @@ impl JsCallbackWriter {
         Self {
             sink_index,
             buffer: Vec::with_capacity(WRITE_BUF_CAPACITY),
-            position: 0,
         }
     }
 
@@ -73,7 +73,6 @@ impl Write for JsCallbackWriter {
             let remaining = WRITE_BUF_CAPACITY - self.buffer.len();
             let to_copy = (buf.len() - written).min(remaining);
             self.buffer.extend_from_slice(&buf[written..written + to_copy]);
-            self.position += to_copy as u64;
             written += to_copy;
 
             if self.buffer.len() == WRITE_BUF_CAPACITY {
@@ -91,20 +90,5 @@ impl Write for JsCallbackWriter {
 impl Drop for JsCallbackWriter {
     fn drop(&mut self) {
         let _ = self.flush_buffer();
-    }
-}
-
-impl Seek for JsCallbackWriter {
-    /// Only `stream_position()` is supported (SeekFrom::Current(0)).
-    /// The engine uses this to track byte offsets for xref tables.
-    /// Backward seeking is not supported — output is sequential.
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match pos {
-            SeekFrom::Current(0) => Ok(self.position),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "JsCallbackWriter only supports stream_position",
-            )),
-        }
     }
 }

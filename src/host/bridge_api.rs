@@ -43,25 +43,33 @@ impl std::io::Seek for BoxedReader {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> { self.0.seek(pos) }
 }
 
-/// Concrete wrapper around a boxed Write+Seek+Send trait object.
-pub(crate) struct BoxedWriter(pub(crate) Box<dyn WriteSeekTrait>);
-
-pub(crate) trait WriteSeekTrait: std::io::Write + std::io::Seek + Send {}
-impl<T: std::io::Write + std::io::Seek + Send> WriteSeekTrait for T {}
-
-impl std::io::Write for BoxedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+/// Concrete wrapper around a boxed Write+Send trait object.
+pub(crate) struct BoxedWriter {
+    inner: Box<dyn WriteSend>,
+    written: u64,
 }
 
-impl std::io::Seek for BoxedWriter {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> { self.0.seek(pos) }
+pub(crate) trait WriteSend: std::io::Write + Send {}
+impl<T: std::io::Write + Send> WriteSend for T {}
+
+impl BoxedWriter {
+    pub(crate) fn new(w: impl std::io::Write + Send + 'static) -> Self {
+        Self { inner: Box::new(w), written: 0 }
+    }
+}
+
+impl std::io::Write for BoxedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
 impl crate::host::positioned_write::PositionedWrite for BoxedWriter {
     fn position(&mut self) -> u64 {
-        use std::io::Seek;
-        self.stream_position().unwrap_or(0)
+        self.written
     }
 }
 
@@ -1898,7 +1906,7 @@ mod wasm_entry {
 
         let mut sinks = Vec::new();
         for i in 0..sink_count {
-            sinks.push(BoxedWriter(Box::new(JsCallbackWriter::new(i))));
+            sinks.push(BoxedWriter::new(JsCallbackWriter::new(i)));
         }
 
         handle_request(state, request_bytes, None, sources, sinks)

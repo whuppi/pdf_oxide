@@ -6,9 +6,9 @@
 //! host (Dart main isolate) via shared memory + condvar. The lane
 //! thread blocks until the host acknowledges each chunk.
 //!
-//! Also implements `Seek` for `stream_position()` only — the engine
-//! calls `SeekFrom::Current(0)` to track byte offsets for xref tables.
-//! NO backward seeking ever occurs on the output. Output is sequential.
+//! The engine tracks byte offsets through a counting wrapper
+//! (`CountingWriter`); no seek ever occurs on the output. Output is
+//! sequential.
 //!
 //! O(1)-memory guarantee: at most one shared-buffer chunk (256KB) is
 //! in flight at any time. The output is never buffered in memory.
@@ -21,14 +21,13 @@
 
 use crate::host::native::cancel::CancelToken;
 use crate::host::native::shared_buffer::{self as sb, write_channel as wc};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 
 /// Write+Seek implementation backed by shared-memory I/O with the host.
 pub struct CallbackWriter {
     buf: *mut u8,
     notify_fn: unsafe extern "C" fn(),
     token: CancelToken,
-    position: u64,
     pending: usize,
 }
 
@@ -47,7 +46,7 @@ impl CallbackWriter {
         notify_fn: unsafe extern "C" fn(),
         token: CancelToken,
     ) -> Self {
-        Self { buf, notify_fn, token, position: 0, pending: 0 }
+        Self { buf, notify_fn, token, pending: 0 }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -125,7 +124,6 @@ impl Write for CallbackWriter {
                 std::ptr::copy_nonoverlapping(data[written..].as_ptr(), dst, to_copy);
             }
             self.pending += to_copy;
-            self.position += to_copy as u64;
             written += to_copy;
 
             if self.pending == wc::DATA_CAPACITY {
@@ -146,18 +144,6 @@ impl Drop for CallbackWriter {
     }
 }
 
-impl Seek for CallbackWriter {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match pos {
-            SeekFrom::Current(0) => Ok(self.position),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "CallbackWriter only supports stream_position (SeekFrom::Current(0))",
-            )),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,32 +151,6 @@ mod tests {
     use std::sync::Arc;
 
     unsafe extern "C" fn noop_notify() {}
-
-    #[test]
-    fn stream_position_tracks() {
-        let mut writer = CallbackWriter {
-            buf: std::ptr::null_mut(),
-            notify_fn: noop_notify,
-            token: CancelToken::unconnected(),
-            position: 42,
-            pending: 0,
-        };
-        assert_eq!(writer.seek(SeekFrom::Current(0)).unwrap(), 42);
-    }
-
-    #[test]
-    fn backward_seek_rejected() {
-        let mut writer = CallbackWriter {
-            buf: std::ptr::null_mut(),
-            notify_fn: noop_notify,
-            token: CancelToken::unconnected(),
-            position: 100,
-            pending: 0,
-        };
-        assert!(writer.seek(SeekFrom::Start(0)).is_err());
-        assert!(writer.seek(SeekFrom::Current(-10)).is_err());
-        assert!(writer.seek(SeekFrom::End(0)).is_err());
-    }
 
     #[test]
     fn cancelled_write_returns_non_retryable_error() {
@@ -216,7 +176,6 @@ mod tests {
             buf: std::ptr::null_mut(),
             notify_fn: noop_notify,
             token: CancelToken::unconnected(),
-            position: 0,
             pending: 0,
         };
         assert_eq!(writer.write(&[]).unwrap(), 0);
