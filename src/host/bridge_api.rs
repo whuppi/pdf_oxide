@@ -917,12 +917,70 @@ pub(crate) fn handle_builder_page_op(
         }
     };
 
+    if let Some(msg) = refuse_unattached(
+        state.page_ops.get(&hid).map(Vec::as_slice).unwrap_or(&[]),
+        &op,
+    ) {
+        return ResponseWriter::error_kind(ErrorKind::InvalidArgument, msg);
+    }
+
     state.page_ops
         .entry(hid)
         .or_default()
         .push(op);
 
     ok_flag("buffered")
+}
+
+/// Refuse a field-script or link op queued with nothing on its page to
+/// attach to. The engine drops such calls silently — a field script needs
+/// a `form_field_meta` entry, a link a `last_text_rect` — so the host
+/// refuses at queue time instead of reporting success over an op that
+/// never lands. `queued` is this handle's ops already buffered; the scan
+/// walks back to the most recent page start (`NewPage`, `NewPageSameSize`,
+/// `Done`), which resets both the page's form fields and its last text
+/// rect.
+fn refuse_unattached(
+    queued: &[dispatch::PageOp],
+    op: &dispatch::PageOp,
+) -> Option<&'static str> {
+    use dispatch::PageOp;
+    let unattached = match op {
+        PageOp::FieldKeystroke(_) => "fieldKeystroke needs a form field on this page first",
+        PageOp::FieldFormat(_) => "fieldFormat needs a form field on this page first",
+        PageOp::FieldValidate(_) => "fieldValidate needs a form field on this page first",
+        PageOp::FieldCalculate(_) => "fieldCalculate needs a form field on this page first",
+        PageOp::LinkUrl(_) => "linkUrl needs text on this page first",
+        PageOp::LinkPage(_) => "linkPage needs text on this page first",
+        _ => return None,
+    };
+    let wants_field = matches!(
+        op,
+        PageOp::FieldKeystroke(_)
+            | PageOp::FieldFormat(_)
+            | PageOp::FieldValidate(_)
+            | PageOp::FieldCalculate(_)
+    );
+    let mut has_field = false;
+    let mut has_text = false;
+    for queued_op in queued.iter().rev() {
+        match queued_op {
+            PageOp::NewPage { .. } | PageOp::NewPageSameSize | PageOp::Done => break,
+            PageOp::TextField { .. }
+            | PageOp::Checkbox { .. }
+            | PageOp::ComboBox { .. }
+            | PageOp::PushButton { .. }
+            | PageOp::SignatureField { .. }
+            | PageOp::RadioGroup { .. } => has_field = true,
+            PageOp::Text(_) | PageOp::Heading(_, _) => has_text = true,
+            _ => {}
+        }
+    }
+    if (wants_field && !has_field) || (!wants_field && !has_text) {
+        Some(unattached)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn handle_register_fallback_font(
@@ -1534,5 +1592,68 @@ mod wasm_entry {
         unsafe {
             let _ = Box::from_raw(lane_ptr as *mut LaneState);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_unattached;
+    use crate::host::dispatch::PageOp;
+
+    fn text_field() -> PageOp {
+        PageOp::TextField {
+            name: "field".into(),
+            x: 50.0,
+            y: 700.0,
+            w: 200.0,
+            h: 20.0,
+            default_value: None,
+        }
+    }
+
+    #[test]
+    fn script_with_no_field_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::FieldKeystroke("s".into())),
+            Some("fieldKeystroke needs a form field on this page first")
+        );
+    }
+
+    #[test]
+    fn script_after_a_field_is_allowed() {
+        let queued = vec![text_field()];
+        assert_eq!(refuse_unattached(&queued, &PageOp::FieldFormat("s".into())), None);
+    }
+
+    #[test]
+    fn script_after_a_field_then_new_page_same_size_is_refused() {
+        let queued = vec![text_field(), PageOp::NewPageSameSize];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::FieldValidate("s".into())),
+            Some("fieldValidate needs a form field on this page first")
+        );
+    }
+
+    #[test]
+    fn link_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::LinkUrl("https://example.com".into())),
+            Some("linkUrl needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn link_after_text_is_allowed() {
+        let queued = vec![PageOp::Text("hello".into())];
+        assert_eq!(refuse_unattached(&queued, &PageOp::LinkPage(0)), None);
+    }
+
+    #[test]
+    fn link_after_heading_is_allowed() {
+        let queued = vec![PageOp::Heading(1, "Title".into())];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::LinkUrl("https://example.com".into())),
+            None
+        );
     }
 }
