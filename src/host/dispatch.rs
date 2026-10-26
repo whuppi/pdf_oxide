@@ -2275,6 +2275,210 @@ pub enum PageOp {
     },
     /// Insert a line break.
     Newline,
+    /// Draw inline text at the current position without advancing the line.
+    Inline(String),
+    /// Draw bold inline text at the current position.
+    InlineBold(String),
+    /// Draw italic inline text at the current position.
+    InlineItalic(String),
+    /// Draw inline text in a colour at the current position.
+    InlineColor {
+        /// Red component (0.0-1.0).
+        r: f32,
+        /// Green component (0.0-1.0).
+        g: f32,
+        /// Blue component (0.0-1.0).
+        b: f32,
+        /// Inline text run.
+        text: String,
+    },
+    /// Draw wrapped, horizontally-aligned text inside an exact rectangle.
+    TextInRect {
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Text to wrap and place.
+        text: String,
+        /// Horizontal alignment of each line.
+        align: crate::writer::TextAlign,
+    },
+    /// Draw an unfilled rectangle primitive.
+    Rect(f32, f32, f32, f32),
+    /// Draw a filled rectangle primitive.
+    FilledRect(f32, f32, f32, f32, f32, f32, f32),
+    /// Draw a straight line primitive.
+    Line(f32, f32, f32, f32),
+    /// Draw a stroked rectangle.
+    StrokeRect {
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Stroke width in points.
+        width: f32,
+        /// Red component (0.0-1.0).
+        r: f32,
+        /// Green component (0.0-1.0).
+        g: f32,
+        /// Blue component (0.0-1.0).
+        b: f32,
+    },
+    /// Draw a stroked rectangle with a dash pattern.
+    StrokeRectDashed {
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Stroke width in points.
+        width: f32,
+        /// Red component (0.0-1.0).
+        r: f32,
+        /// Green component (0.0-1.0).
+        g: f32,
+        /// Blue component (0.0-1.0).
+        b: f32,
+        /// On/off dash lengths in points.
+        dash: Vec<f32>,
+        /// Dash phase in points.
+        phase: f32,
+    },
+    /// Draw a stroked line.
+    StrokeLine {
+        /// Start x.
+        x1: f32,
+        /// Start y.
+        y1: f32,
+        /// End x.
+        x2: f32,
+        /// End y.
+        y2: f32,
+        /// Stroke width in points.
+        width: f32,
+        /// Red component (0.0-1.0).
+        r: f32,
+        /// Green component (0.0-1.0).
+        g: f32,
+        /// Blue component (0.0-1.0).
+        b: f32,
+    },
+    /// Draw a stroked line with a dash pattern.
+    StrokeLineDashed {
+        /// Start x.
+        x1: f32,
+        /// Start y.
+        y1: f32,
+        /// End x.
+        x2: f32,
+        /// End y.
+        y2: f32,
+        /// Stroke width in points.
+        width: f32,
+        /// Red component (0.0-1.0).
+        r: f32,
+        /// Green component (0.0-1.0).
+        g: f32,
+        /// Blue component (0.0-1.0).
+        b: f32,
+        /// On/off dash lengths in points.
+        dash: Vec<f32>,
+        /// Dash phase in points.
+        phase: f32,
+    },
+    /// Add a highlight annotation to the last text element.
+    Highlight(f32, f32, f32),
+    /// Add an underline annotation to the last text element.
+    Underline(f32, f32, f32),
+    /// Add a strikeout annotation to the last text element.
+    Strikeout(f32, f32, f32),
+    /// Add a squiggly annotation to the last text element.
+    Squiggly(f32, f32, f32),
+    /// Add a sticky note at the current cursor position.
+    StickyNote(String),
+    /// Add a sticky note at explicit coordinates.
+    StickyNoteAt(f32, f32, String),
+    /// Add a stamp annotation at the current cursor position.
+    Stamp(crate::writer::StampType),
+    /// Add a FreeText annotation inside an exact rectangle.
+    FreeText {
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Note text shown on the page.
+        text: String,
+    },
+    /// Add the preset CONFIDENTIAL watermark.
+    WatermarkConfidential,
+    /// Add the preset DRAFT watermark.
+    WatermarkDraft,
+    /// Add a named-destination link to the last text element.
+    LinkNamed(String),
+    /// Add a JavaScript link to the last text element.
+    LinkJavaScript(String),
+    /// Set the page-open JavaScript action.
+    OnOpen(String),
+    /// Set the page-close JavaScript action.
+    OnClose(String),
+    /// Place an image as an artifact (marked, excluded from reading
+    /// order), at the given rect.
+    ImageArtifact {
+        /// Raw image bytes (JPEG or PNG).
+        data: Vec<u8>,
+        /// X origin.
+        x: f32,
+        /// Y origin.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+    },
+    /// Lay out a buffered table with per-column width and alignment.
+    BufferedTable {
+        /// Header, width (`None` = auto) and alignment per column.
+        columns: Vec<(String, Option<f32>, crate::writer::CellAlign)>,
+        /// Row-major cell text.
+        rows: Vec<Vec<String>>,
+        /// Prepend a bold header row.
+        has_header: bool,
+    },
+    /// Replay a streaming table block with per-column widths and
+    /// extended sizing modes.
+    StreamingTableBlock {
+        /// Header, width and alignment per column.
+        config_columns: Vec<(String, f32, crate::writer::CellAlign)>,
+        /// Repeat the header row on each page.
+        repeat_header: bool,
+        /// Row-major `(text, rowspan)` cells.
+        rows: Vec<Vec<(String, usize)>>,
+        /// One of `fixed`, `sample`, `auto_all`.
+        mode: String,
+        /// Rows sampled for column sizing in `sample` mode.
+        sample_rows: usize,
+        /// Lower clamp on measured column widths (points).
+        min_col_width_pt: f32,
+        /// Upper clamp on measured column widths (points).
+        max_col_width_pt: f32,
+        /// Maximum rowspan.
+        max_rowspan: usize,
+    },
     /// Start a new page with the same dimensions as the current one.
     NewPageSameSize,
     /// Start a new page with custom dimensions.
@@ -2343,6 +2547,145 @@ pub fn replay_page_ops(builder: &mut DocumentBuilder, default_size: PageSize, op
                     PageOp::LinkPage(target) => page.link_page(target),
                     PageOp::Footnote { ref_mark, note_text } => page.footnote(&ref_mark, &note_text),
                     PageOp::Columns { column_count, gap_pt, text } => page.columns(column_count, gap_pt, &text),
+                    PageOp::Inline(ref text) => page.inline(text),
+                    PageOp::InlineBold(ref text) => page.inline_bold(text),
+                    PageOp::InlineItalic(ref text) => page.inline_italic(text),
+                    PageOp::InlineColor { r, g, b, ref text } => page.inline_color(r, g, b, text),
+                    PageOp::TextInRect { x, y, w, h, ref text, align } => page.text_in_rect(
+                        crate::geometry::Rect::new(x, y, w, h),
+                        text,
+                        align,
+                    ),
+                    PageOp::Rect(x, y, w, h) => page.rect(x, y, w, h),
+                    PageOp::FilledRect(x, y, w, h, r, g, b) => page.filled_rect(x, y, w, h, r, g, b),
+                    PageOp::Line(x1, y1, x2, y2) => page.line(x1, y1, x2, y2),
+                    PageOp::StrokeRect { x, y, w, h, width, r, g, b } => {
+                        page.stroke_rect(x, y, w, h, crate::writer::LineStyle::new(width, r, g, b))
+                    }
+                    PageOp::StrokeRectDashed { x, y, w, h, width, r, g, b, dash, phase } => page
+                        .stroke_rect(
+                            x,
+                            y,
+                            w,
+                            h,
+                            crate::writer::LineStyle::new(width, r, g, b).with_dash(&dash, phase),
+                        ),
+                    PageOp::StrokeLine { x1, y1, x2, y2, width, r, g, b } => page.stroke_line(
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        crate::writer::LineStyle::new(width, r, g, b),
+                    ),
+                    PageOp::StrokeLineDashed { x1, y1, x2, y2, width, r, g, b, dash, phase } => page
+                        .stroke_line(
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            crate::writer::LineStyle::new(width, r, g, b).with_dash(&dash, phase),
+                        ),
+                    PageOp::Highlight(r, g, b) => page.highlight((r, g, b)),
+                    PageOp::Underline(r, g, b) => page.underline((r, g, b)),
+                    PageOp::Strikeout(r, g, b) => page.strikeout((r, g, b)),
+                    PageOp::Squiggly(r, g, b) => page.squiggly((r, g, b)),
+                    PageOp::StickyNote(ref text) => page.sticky_note(text),
+                    PageOp::StickyNoteAt(x, y, ref text) => page.sticky_note_at(x, y, text),
+                    PageOp::Stamp(stamp_type) => page.stamp(stamp_type),
+                    PageOp::FreeText { x, y, w, h, ref text } => page.freetext(
+                        crate::geometry::Rect::new(x, y, w, h),
+                        text,
+                    ),
+                    PageOp::WatermarkConfidential => page.watermark_confidential(),
+                    PageOp::WatermarkDraft => page.watermark_draft(),
+                    PageOp::LinkNamed(ref dest) => page.link_named(dest),
+                    PageOp::LinkJavaScript(ref script) => page.link_javascript(script),
+                    PageOp::OnOpen(ref script) => page.on_open(script),
+                    PageOp::OnClose(ref script) => page.on_close(script),
+                    PageOp::ImageArtifact { data, x, y, w, h } => {
+                        match crate::writer::ImageData::from_bytes(&data) {
+                            Ok(img) => page
+                                .image_with_artifact(img, crate::geometry::Rect::new(x, y, w, h)),
+                            Err(_) => page, // skip — image data unparseable
+                        }
+                    }
+                    PageOp::BufferedTable { ref columns, ref rows, has_header } => {
+                        // Same construction as the WASM binding's replay:
+                        // text cells, a bold header row when hasHeader, and
+                        // per-column widths and alignments.
+                        let cell_rows: Vec<Vec<crate::writer::TableCell>> = rows
+                            .iter()
+                            .map(|r| r.iter().map(|c| crate::writer::TableCell::text(c.clone())).collect())
+                            .collect();
+                        let cell_rows = if has_header {
+                            let header: Vec<crate::writer::TableCell> = columns
+                                .iter()
+                                .map(|(h, _, _)| crate::writer::TableCell::text(h.clone()).bold())
+                                .collect();
+                            let mut out = Vec::with_capacity(cell_rows.len() + 1);
+                            out.push(header);
+                            out.extend(cell_rows);
+                            out
+                        } else {
+                            cell_rows
+                        };
+                        let mut table = crate::writer::Table::new(cell_rows);
+                        if has_header {
+                            table = table.with_header_row();
+                        }
+                        let widths: Vec<crate::writer::ColumnWidth> = columns
+                            .iter()
+                            .map(|(_, w, _)| match w {
+                                Some(pt) => crate::writer::ColumnWidth::Fixed(*pt),
+                                None => crate::writer::ColumnWidth::Auto,
+                            })
+                            .collect();
+                        let aligns: Vec<crate::writer::CellAlign> =
+                            columns.iter().map(|(_, _, a)| *a).collect();
+                        table = table.with_column_widths(widths).with_column_aligns(aligns);
+                        page.table(table)
+                    }
+                    PageOp::StreamingTableBlock {
+                        ref config_columns,
+                        repeat_header,
+                        ref rows,
+                        ref mode,
+                        sample_rows,
+                        min_col_width_pt,
+                        max_col_width_pt,
+                        max_rowspan,
+                    } => {
+                        let mut cfg = crate::writer::StreamingTableConfig::new()
+                            .repeat_header(repeat_header)
+                            .max_rowspan(max_rowspan);
+                        cfg = match mode.as_str() {
+                            "sample" => {
+                                cfg.mode_sample(sample_rows, min_col_width_pt, max_col_width_pt)
+                            },
+                            "auto_all" => cfg.mode_auto_all(),
+                            _ => cfg.mode_fixed(),
+                        };
+                        for (header, width, align) in config_columns {
+                            cfg = cfg.column(
+                                crate::writer::StreamingColumn::new(header.clone())
+                                    .width_pt(*width)
+                                    .align(*align),
+                            );
+                        }
+                        let mut t = page.streaming_table(cfg);
+                        for row in rows {
+                            let _ = t.push_row(|r| {
+                                for (text, span) in row {
+                                    if *span > 1 {
+                                        r.span_cell(text.as_str(), *span);
+                                    } else {
+                                        r.cell(text.as_str());
+                                    }
+                                }
+                            });
+                        }
+                        t.finish()
+                    }
                     PageOp::Newline => page.newline(),
                     PageOp::NewPageSameSize => page.new_page_same_size(),
                     PageOp::NewPage { .. } | PageOp::Done => unreachable!(),
