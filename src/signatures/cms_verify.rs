@@ -417,6 +417,20 @@ pub fn verify_signer(contents: &[u8]) -> Result<SignerVerify> {
 ///   (PSS, ECDSA, unknown digest) or the CMS blob lacks a
 ///   `messageDigest` attribute in the first place.
 pub fn verify_signer_detached(contents: &[u8], content: &[u8]) -> Result<SignerVerify> {
+    // ── pdf_manipulator patch ──
+    verify_signer_detached_with(contents, |oid| hash_with_oid(oid, content))
+    // ── end pdf_manipulator patch ──
+}
+
+// ── pdf_manipulator patch ──
+/// Same check as [`verify_signer_detached`], but the content hash is
+/// supplied by the caller instead of computed here in one shot. This
+/// lets a host that streams the document hash each byte-range segment
+/// without loading the whole file into memory.
+pub(crate) fn verify_signer_detached_with(
+    contents: &[u8],
+    hash: impl FnOnce(ObjectIdentifier) -> Option<Vec<u8>>,
+) -> Result<SignerVerify> {
     let sd = parse_signed_data(contents)?;
     let (crypto_outcome, digest_oid) = run_signer_crypto(&sd)?;
 
@@ -437,7 +451,7 @@ pub fn verify_signer_detached(contents: &[u8], content: &[u8]) -> Result<SignerV
         // fully valid against the caller's document.
         return Ok(SignerVerify::Unknown);
     };
-    let Some(actual) = hash_with_oid(digest_oid, content) else {
+    let Some(actual) = hash(digest_oid) else {
         return Ok(SignerVerify::Unknown);
     };
 
@@ -455,6 +469,29 @@ pub fn verify_signer_detached(contents: &[u8], content: &[u8]) -> Result<SignerV
         Ok(SignerVerify::Invalid)
     }
 }
+
+/// A streaming hasher for the digest algorithms the CMS blobs we verify
+/// can name: one of the four SHA variants [`crate::signatures::crypto`] maps.
+/// Returns `None` for any other OID — the caller treats that as
+/// "I don't know how to verify this".
+pub(crate) fn digest_for(oid: ObjectIdentifier) -> Option<Box<dyn sha2::digest::DynDigest>> {
+    use der::oid::db::rfc5912::{ID_SHA_1, ID_SHA_256, ID_SHA_384, ID_SHA_512};
+    use sha1::{Digest as _, Sha1};
+    use sha2::{Sha256, Sha384, Sha512};
+
+    if oid == ID_SHA_1 {
+        Some(Box::new(Sha1::new()))
+    } else if oid == ID_SHA_256 {
+        Some(Box::new(Sha256::new()))
+    } else if oid == ID_SHA_384 {
+        Some(Box::new(Sha384::new()))
+    } else if oid == ID_SHA_512 {
+        Some(Box::new(Sha512::new()))
+    } else {
+        None
+    }
+}
+// ── end pdf_manipulator patch ──
 
 #[cfg(test)]
 mod tests {

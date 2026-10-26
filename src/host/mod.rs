@@ -23,6 +23,8 @@ pub mod images;
 pub(crate) mod incremental;
 #[cfg(feature = "signatures")]
 pub mod sign;
+#[cfg(feature = "signatures")]
+pub(crate) mod verify;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;

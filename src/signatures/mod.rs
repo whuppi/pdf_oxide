@@ -74,6 +74,11 @@ pub use byterange::ByteRangeCalculator;
 pub use cms::extract_signer_certificate_der;
 #[cfg(feature = "signatures")]
 pub use cms_verify::{verify_signer, verify_signer_detached, SignerVerify};
+// ── pdf_manipulator patch ──
+// The host's streaming verify hashes the signed ranges itself.
+#[cfg(feature = "signatures")]
+pub(crate) use cms_verify::{digest_for, verify_signer_detached_with};
+// ── end pdf_manipulator patch ──
 pub use enumerate::{count_signatures, enumerate_signatures};
 #[cfg(feature = "signatures")]
 pub use pades::{

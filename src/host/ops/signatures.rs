@@ -25,6 +25,11 @@ op_unit!(
                 item.put_str("signerName", &s.signer_name);
                 item.put_str("reason", &s.reason);
                 item.put_str("location", &s.location);
+                item.put_bool("isValid", s.is_valid);
+                item.put_bool("coversWholeDocument", s.covers_whole_document);
+                if let Some(secs) = s.signing_time {
+                    item.put_i64("signingTime", secs);
+                }
             });
             Ok(w.finish())
         })

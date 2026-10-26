@@ -105,6 +105,14 @@ pub struct SignatureInfo {
     pub reason: String,
     /// Stated signing location.
     pub location: String,
+    /// Whether the digest of the covered bytes matches and the signer's
+    /// key verifies it.
+    pub is_valid: bool,
+    /// Whether the signed byte ranges reach the last byte of the file.
+    pub covers_whole_document: bool,
+    /// Signing time as printed in the signature, in seconds since the
+    /// epoch; `None` when absent or unparsable.
+    pub signing_time: Option<i64>,
 }
 
 /// Result of enumerating digital signatures.
@@ -320,25 +328,49 @@ pub fn search_text(doc: &mut PdfDocument, query: &str, page: Option<usize>) -> R
     }
 }
 
-/// Enumerate digital signatures in the document.
+/// Enumerate digital signatures in the document, each one's digest and
+/// signer key checked against the bytes its `/ByteRange` covers.
 pub fn get_signatures(_doc: &mut PdfDocument) -> Result<SignaturesResult> {
     #[cfg(feature = "signatures")]
     {
         let sigs = crate::signatures::enumerate_signatures(_doc)?;
-        let signatures = sigs.iter().map(|s| SignatureInfo {
-            signer_name: s.signer_name.clone().unwrap_or_default(),
-            reason: s.reason.clone().unwrap_or_default(),
-            location: s.location.clone().unwrap_or_default(),
-        }).collect();
+        let statuses = super::verify::verify_all(_doc, &sigs)?;
+        let signatures = sigs
+            .iter()
+            .zip(statuses)
+            .map(|(s, status)| SignatureInfo {
+                signer_name: s.signer_name.clone().unwrap_or_default(),
+                reason: s.reason.clone().unwrap_or_default(),
+                location: s.location.clone().unwrap_or_default(),
+                is_valid: matches!(status.check, super::verify::SigCheck::Valid),
+                covers_whole_document: status.covers_whole_document,
+                signing_time: s.signing_time.as_deref().and_then(crate::signatures::parse_pdf_date_to_epoch),
+            })
+            .collect();
         Ok(SignaturesResult { signatures })
     }
     #[cfg(not(feature = "signatures"))]
     { Ok(SignaturesResult { signatures: vec![] }) }
 }
 
-/// Verify digital signatures (stub — always returns false).
-pub fn verify_signatures(_doc: &mut PdfDocument) -> Result<bool> {
-    Ok(false)
+/// Whether the document has at least one signature and every signature
+/// verifies: each digest matches the bytes it covers and the signer's
+/// key verifies it. Certificate trust and revocation are not checked.
+pub fn verify_signatures(doc: &mut PdfDocument) -> Result<bool> {
+    #[cfg(feature = "signatures")]
+    {
+        let sigs = crate::signatures::enumerate_signatures(doc)?;
+        if sigs.is_empty() {
+            return Ok(false);
+        }
+        let statuses = super::verify::verify_all(doc, &sigs)?;
+        Ok(statuses.iter().all(|s| matches!(s.check, super::verify::SigCheck::Valid)))
+    }
+    #[cfg(not(feature = "signatures"))]
+    {
+        let _ = doc;
+        Err(Error::Unsupported("signatures support not enabled in this build".into()))
+    }
 }
 
 /// Validate PDF/A compliance at the given level (1=A1b, 2=A2b, 3=A3b).
