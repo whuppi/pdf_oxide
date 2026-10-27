@@ -37,8 +37,9 @@ pub struct OpenResult {
     pub is_tagged: bool,
     /// Encryption algorithm identifier (0 if not encrypted).
     pub encryption_algorithm: u8,
-    /// Permission flags byte (0xFF if not encrypted).
-    pub permission_bits: u8,
+    /// The /P word as the file stores it, ISO 32000-1 Table 22 bit positions
+    /// (-1, every bit set, when the file is not encrypted).
+    pub permission_bits: i32,
     /// Per-page dimensions and rotation.
     pub pages: Vec<PageInfo>,
     /// Document info Title field.
@@ -211,7 +212,7 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     // Encrypt-dict accessors return None on unencrypted documents —
     // 0 / 0xFF are the wire's "not encrypted / all permitted" values.
     let enc_algo: u8 = doc.encryption_algorithm().unwrap_or(0);
-    let perms: u8 = doc.permission_bits().map(|p| p as u8).unwrap_or(0xFF);
+    let perms: i32 = doc.permission_bits().unwrap_or(-1);
 
     // One read of the /PageLabels number tree; a document without one
     // has no labels, not labels that repeat the page numbers.
