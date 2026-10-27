@@ -528,8 +528,56 @@ pub struct DocumentEditor {
     /// fields; used only when this document's AcroForm has neither.
     merged_acroform_dr: Option<Object>,
     merged_acroform_da: Option<Object>,
+    /// Leaf page refs of `source`, in tree order, computed once per source.
+    /// Page add, delete, move and merge change `page_order` and `merged_pages`
+    /// only, never the source tree, so only a source replacement clears it.
+    source_page_refs: Option<std::sync::Arc<[ObjectRef]>>,
     // ── end pdf_manipulator patch ──
 }
+
+// ── pdf_manipulator patch: the written-id set follows every xref push ──
+/// The output xref entries `(id, offset, gen, in_use)` of a full rewrite,
+/// with the set of ids they hold. `push` is the only way to add an entry
+/// (an inherent method shadows `Vec::push` reached through `DerefMut`), so
+/// `contains_id` is exact at every point without rebuilding the set.
+struct XrefEntries {
+    entries: Vec<(u32, u64, u16, bool)>,
+    ids: HashSet<u32>,
+}
+
+impl XrefEntries {
+    fn new() -> Self {
+        Self { entries: Vec::new(), ids: HashSet::new() }
+    }
+
+    fn push(&mut self, entry: (u32, u64, u16, bool)) {
+        self.ids.insert(entry.0);
+        self.entries.push(entry);
+    }
+
+    fn contains_id(&self, id: u32) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn into_entries(self) -> Vec<(u32, u64, u16, bool)> {
+        self.entries
+    }
+}
+
+impl std::ops::Deref for XrefEntries {
+    type Target = [(u32, u64, u16, bool)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for XrefEntries {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Data for a single page imported from another PDF during a merge operation.
 #[derive(Debug, Clone)]
@@ -654,6 +702,7 @@ impl DocumentEditor {
             merged_form_fields: Vec::new(),
             merged_acroform_dr: None,
             merged_acroform_da: None,
+            source_page_refs: None,
             // ── end pdf_manipulator patch ──
         })
     }
@@ -699,6 +748,7 @@ impl DocumentEditor {
             merged_form_fields: Vec::new(),
             merged_acroform_dr: None,
             merged_acroform_da: None,
+            source_page_refs: None,
             // ── end pdf_manipulator patch ──
         })
     }
@@ -748,6 +798,7 @@ impl DocumentEditor {
             merged_form_fields: Vec::new(),
             merged_acroform_dr: None,
             merged_acroform_da: None,
+            source_page_refs: None,
             // ── end pdf_manipulator patch ──
         })
     }
@@ -833,6 +884,7 @@ impl DocumentEditor {
         }
         let new_bytes = self.save_to_bytes()?;
         self.source = PdfDocument::from_bytes(new_bytes)?;
+        self.source_page_refs = None;
         self.modified_objects.clear();
         self.new_objects.clear();
         self.next_object_id = Self::find_max_object_id(&self.source) + 1;
@@ -847,6 +899,7 @@ impl DocumentEditor {
     /// Clears all staged modifications so subsequent fixes operate on the new document.
     pub(crate) fn replace_source_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
         self.source = PdfDocument::from_bytes(bytes)?;
+        self.source_page_refs = None;
         self.modified_objects.clear();
         self.new_objects.clear();
         self.next_object_id = Self::find_max_object_id(&self.source) + 1;
@@ -933,6 +986,7 @@ impl DocumentEditor {
     ///
     /// This provides access to PdfDocument methods for extraction and conversion.
     pub fn source_mut(&mut self) -> &mut PdfDocument {
+        self.source_page_refs = None;
         &mut self.source
     }
 
@@ -1078,7 +1132,20 @@ impl DocumentEditor {
     }
 
     /// Get the list of page objects in current order.
-    fn get_page_refs(&mut self) -> Result<Vec<ObjectRef>> {
+    fn get_page_refs(&mut self) -> Result<std::sync::Arc<[ObjectRef]>> {
+        if let Some(refs) = &self.source_page_refs {
+            return Ok(std::sync::Arc::clone(refs));
+        }
+        let refs: std::sync::Arc<[ObjectRef]> = self.walk_source_page_refs()?.into();
+        self.source_page_refs = Some(std::sync::Arc::clone(&refs));
+        Ok(refs)
+    }
+
+    /// Walk the source page tree for its leaf refs. A root whose `/Count`
+    /// equals its `/Kids` length is flat: the refs come straight from the
+    /// array, without loading each leaf. Any other root takes the full walk,
+    /// which keeps only kids typed `/Page` and recurses into `/Pages`.
+    fn walk_source_page_refs(&mut self) -> Result<Vec<ObjectRef>> {
         // Get catalog and pages tree
         let catalog = self.source.catalog()?;
         let catalog_dict = catalog
@@ -1102,6 +1169,11 @@ impl DocumentEditor {
             .ok_or_else(|| Error::InvalidPdf("Pages missing /Kids".to_string()))?
             .as_array()
             .ok_or_else(|| Error::InvalidPdf("/Kids is not an array".to_string()))?;
+
+        let count = pages_dict.get("Count").and_then(|c| c.as_integer());
+        if count == i64::try_from(kids.len()).ok() {
+            return self.source.all_page_refs();
+        }
 
         // Collect page references (flattening any intermediate Pages nodes)
         let mut page_refs = Vec::new();
@@ -2509,7 +2581,7 @@ impl DocumentEditor {
         serializer: &ObjectSerializer,
         encrypting_output: bool,
         compress: bool,
-        xref_entries: &mut Vec<(u32, u64, u16, bool)>,
+        xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
         const CHUNK: usize = 64 * 1024;
         const EMPTY_TAIL: &[u8] = b"\nstream\n\nendstream\nendobj\n";
@@ -2732,14 +2804,10 @@ impl DocumentEditor {
             }
         };
 
-        let mut xref_entries: Vec<(u32, u64, u16, bool)> = Vec::new(); // (id, offset, gen, in_use)
-        let mut written_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut xref_entries = XrefEntries::new();
 
         // Object 0 is always free
         xref_entries.push((0, 65535, 65535, false));
-
-        // Collect all objects we need to write
-        let mut objects_to_write: Vec<(u32, Object)> = Vec::new();
 
         // Get catalog and traverse to collect all referenced objects
         let catalog = self.source.catalog()?;
@@ -3123,6 +3191,9 @@ impl DocumentEditor {
                 let pages_obj = self.load_source_object(pages_ref)?;
 
                 // Rebuild Pages tree: filter by page_order, reorder, append merged pages
+                // ── pdf_manipulator patch: the kid list is refs (8 bytes a page); the Kids array object lives only until the Pages object is written ──
+                let mut kid_refs: Vec<ObjectRef> = Vec::new();
+                // ── end pdf_manipulator patch ──
                 let final_pages_obj = if let Some(pages_dict) = pages_obj.as_dict() {
                     let mut new_pages_dict = pages_dict.clone();
 
@@ -3134,23 +3205,26 @@ impl DocumentEditor {
 
                     // Build visible kids in page_order sequence
                     // page_order contains original leaf-page indices; -1 means removed
-                    let mut kids: Vec<Object> = Vec::new();
                     for &order in &self.page_order {
                         if order >= 0 {
                             let idx = order as usize;
                             if idx < original_page_refs.len() {
-                                kids.push(Object::Reference(original_page_refs[idx]));
+                                kid_refs.push(original_page_refs[idx]);
                             }
                         }
                     }
 
                     // Append merged page refs
                     for &page_id in &merged_page_ids {
-                        kids.push(Object::Reference(ObjectRef::new(page_id, 0)));
+                        kid_refs.push(ObjectRef::new(page_id, 0));
                     }
 
-                    new_pages_dict.insert("Kids".to_string(), Object::Array(kids.clone()));
-                    new_pages_dict.insert("Count".to_string(), Object::Integer(kids.len() as i64));
+                    new_pages_dict.insert(
+                        "Kids".to_string(),
+                        Object::Array(kid_refs.iter().map(|&r| Object::Reference(r)).collect()),
+                    );
+                    new_pages_dict
+                        .insert("Count".to_string(), Object::Integer(kid_refs.len() as i64));
 
                     Object::Dictionary(new_pages_dict)
                 } else {
@@ -3167,10 +3241,10 @@ impl DocumentEditor {
                 );
                 writer.write_all(&bytes)?;
                 xref_entries.push((pages_ref.id, offset, 0, true));
+                drop(final_pages_obj);
 
-                // Write individual pages (use final_pages_obj which includes merged pages)
-                if let Some(pages_dict) = final_pages_obj.as_dict() {
-                    if let Some(kids) = pages_dict.get("Kids").and_then(|k| k.as_array()) {
+                // Write individual pages (kid_refs includes merged pages)
+                let kids = kid_refs.iter().map(|&r| Object::Reference(r));
                         // Build a mapping: output loop position → original source page index.
                         // After select_pages() the page_order may differ from 0..n, so all
                         // per-page HashMaps (modified_content, modified_annotations, …) must
@@ -4170,7 +4244,7 @@ impl DocumentEditor {
                                                 .get("Contents")
                                                 .and_then(|c| c.as_reference())
                                             {
-                                                // ── pdf_manipulator patch: staged stream wins over source ──
+                                                // ── pdf_manipulator patch: staged stream wins over source; an unchanged one is copied ──
                                                 // Prefer a staged stream: an
                                                 // under-content edit re-points
                                                 // /Contents at a NEW object that
@@ -4178,30 +4252,44 @@ impl DocumentEditor {
                                                 // Loading it from source yields
                                                 // null, poisons the xref, and the
                                                 // real stream is then skipped as
-                                                // "already written".
-                                                let contents_obj = if let Some(staged) =
-                                                    self.modified_objects.get(&contents_ref.id)
+                                                // "already written". The copy never
+                                                // deflates: this stream was never
+                                                // compressed by the save.
+                                                let staged = self.modified_objects.get(&contents_ref.id);
+                                                if staged.is_some()
+                                                    || !Self::write_source_stream(
+                                                        &self.source,
+                                                        &mut self.next_object_id,
+                                                        contents_ref,
+                                                        writer,
+                                                        &serializer,
+                                                        encryption_handler.is_some(),
+                                                        false,
+                                                        &mut xref_entries,
+                                                    )?
                                                 {
-                                                    staged.clone()
-                                                } else {
-                                                    self.load_source_object(contents_ref)?
-                                                };
+                                                    let contents_obj = if let Some(staged) = staged {
+                                                        staged.clone()
+                                                    } else {
+                                                        self.load_source_object(contents_ref)?
+                                                    };
+                                                    let offset = writer.position();
+                                                    let bytes = serialize_obj(
+                                                        &serializer,
+                                                        contents_ref.id,
+                                                        0,
+                                                        &contents_obj,
+                                                        &encryption_handler,
+                                                    );
+                                                    writer.write_all(&bytes)?;
+                                                    xref_entries.push((
+                                                        contents_ref.id,
+                                                        offset,
+                                                        0,
+                                                        true,
+                                                    ));
+                                                }
                                                 // ── end pdf_manipulator patch ──
-                                                let offset = writer.position();
-                                                let bytes = serialize_obj(
-                                                    &serializer,
-                                                    contents_ref.id,
-                                                    0,
-                                                    &contents_obj,
-                                                    &encryption_handler,
-                                                );
-                                                writer.write_all(&bytes)?;
-                                                xref_entries.push((
-                                                    contents_ref.id,
-                                                    offset,
-                                                    0,
-                                                    true,
-                                                ));
                                             }
                                         }
                                     }
@@ -4288,19 +4376,12 @@ impl DocumentEditor {
                                                     _ => None,
                                                 };
                                                 if let Some(fdict) = font_dict {
-                                                    // Rebuild written_ids for O(1) dedup lookups
-                                                    written_ids.clear();
-                                                    written_ids.extend(
-                                                        xref_entries
-                                                            .iter()
-                                                            .map(|(id, _, _, _)| *id),
-                                                    );
                                                     for font_ref in fdict.values() {
                                                         if let Some(ref_obj) =
                                                             font_ref.as_reference()
                                                         {
                                                             // Check if we've already written this object
-                                                            if !written_ids.contains(&ref_obj.id) {
+                                                            if !xref_entries.contains_id(ref_obj.id) {
                                                                 // Prefer a staged modification over the original source.
                                                                 let font_obj = self
                                                                     .modified_objects
@@ -4325,7 +4406,6 @@ impl DocumentEditor {
                                                                     xref_entries.push((
                                                                         ref_obj.id, offset, 0, true,
                                                                     ));
-                                                                    written_ids.insert(ref_obj.id);
                                                                 }
                                                             }
                                                         }
@@ -4343,7 +4423,7 @@ impl DocumentEditor {
                                                         // that cannot be read would dangle in the
                                                         // output xref; fail the save instead.
                                                         let obj = self.staged_or_source_object(*r)?;
-                                                        if !written_ids.contains(&r.id) {
+                                                        if !xref_entries.contains_id(r.id) {
                                                             let offset = writer.position();
                                                             let bytes = serialize_obj(
                                                                 &serializer,
@@ -4354,7 +4434,6 @@ impl DocumentEditor {
                                                             );
                                                             writer.write_all(&bytes)?;
                                                             xref_entries.push((r.id, offset, 0, true));
-                                                            written_ids.insert(r.id);
                                                         }
                                                         obj.as_dict().cloned()
                                                         // ── end pdf_manipulator patch ──
@@ -4366,10 +4445,10 @@ impl DocumentEditor {
                                                         if let Some(ref_obj) =
                                                             xobj_ref.as_reference()
                                                         {
-                                                            if !written_ids.contains(&ref_obj.id) {
+                                                            if !xref_entries.contains_id(ref_obj.id) {
                                                                 // ── pdf_manipulator patch: unchanged streams copied; an unreadable object fails the save ──
-                                                                if !self.modified_objects.contains_key(&ref_obj.id)
-                                                                    && Self::write_source_stream(
+                                                                if self.modified_objects.contains_key(&ref_obj.id)
+                                                                    || !Self::write_source_stream(
                                                                         &self.source,
                                                                         &mut self.next_object_id,
                                                                         ref_obj,
@@ -4380,8 +4459,6 @@ impl DocumentEditor {
                                                                         &mut xref_entries,
                                                                     )?
                                                                 {
-                                                                    written_ids.insert(ref_obj.id);
-                                                                } else {
                                                                     let xobj_obj =
                                                                         self.staged_or_source_object(ref_obj)?;
                                                                     let offset =
@@ -4397,7 +4474,6 @@ impl DocumentEditor {
                                                                     xref_entries.push((
                                                                         ref_obj.id, offset, 0, true,
                                                                     ));
-                                                                    written_ids.insert(ref_obj.id);
                                                                 }
                                                                 // ── end pdf_manipulator patch ──
                                                             }
@@ -4416,7 +4492,7 @@ impl DocumentEditor {
                                                         // that cannot be read would dangle in the
                                                         // output xref; fail the save instead.
                                                         let obj = self.staged_or_source_object(*r)?;
-                                                        if !written_ids.contains(&r.id) {
+                                                        if !xref_entries.contains_id(r.id) {
                                                             let offset = writer.position();
                                                             let bytes = serialize_obj(
                                                                 &serializer,
@@ -4427,7 +4503,6 @@ impl DocumentEditor {
                                                             );
                                                             writer.write_all(&bytes)?;
                                                             xref_entries.push((r.id, offset, 0, true));
-                                                            written_ids.insert(r.id);
                                                         }
                                                         obj.as_dict().cloned()
                                                         // ── end pdf_manipulator patch ──
@@ -4438,10 +4513,10 @@ impl DocumentEditor {
                                                     for gs_ref in gsd.values() {
                                                         if let Some(ref_obj) = gs_ref.as_reference()
                                                         {
-                                                            if !written_ids.contains(&ref_obj.id) {
+                                                            if !xref_entries.contains_id(ref_obj.id) {
                                                                 // ── pdf_manipulator patch: unchanged streams copied; an unreadable object fails the save ──
-                                                                if !self.modified_objects.contains_key(&ref_obj.id)
-                                                                    && Self::write_source_stream(
+                                                                if self.modified_objects.contains_key(&ref_obj.id)
+                                                                    || !Self::write_source_stream(
                                                                         &self.source,
                                                                         &mut self.next_object_id,
                                                                         ref_obj,
@@ -4452,8 +4527,6 @@ impl DocumentEditor {
                                                                         &mut xref_entries,
                                                                     )?
                                                                 {
-                                                                    written_ids.insert(ref_obj.id);
-                                                                } else {
                                                                     let obj =
                                                                         self.staged_or_source_object(ref_obj)?;
                                                                     let offset =
@@ -4469,7 +4542,6 @@ impl DocumentEditor {
                                                                     xref_entries.push((
                                                                         ref_obj.id, offset, 0, true,
                                                                     ));
-                                                                    written_ids.insert(ref_obj.id);
                                                                 }
                                                                 // ── end pdf_manipulator patch ──
                                                             }
@@ -4949,15 +5021,10 @@ impl DocumentEditor {
                                 page_index += 1;
                             }
                         }
-                    }
-                }
             }
         }
 
         // Write merged pages and their dependent objects
-        // Rebuild written_ids for O(1) dedup lookups in merged page loop
-        written_ids.clear();
-        written_ids.extend(xref_entries.iter().map(|(id, _, _, _)| *id));
         for (page_data, &page_id) in self.merged_pages.iter().zip(merged_page_ids.iter()) {
             // Set /Parent on the merged page to point to the Pages tree root
             let final_page_obj = if let Some(catalog_dict) = catalog_obj.as_dict() {
@@ -4981,19 +5048,17 @@ impl DocumentEditor {
                 serialize_obj(&serializer, page_id, 0, &final_page_obj, &encryption_handler);
             writer.write_all(&bytes)?;
             xref_entries.push((page_id, offset, 0, true));
-            written_ids.insert(page_id);
 
             // Write all dependent objects for this page
             for (obj_id, obj) in &page_data.objects {
                 // Skip if already written (dedup)
-                if written_ids.contains(obj_id) {
+                if xref_entries.contains_id(*obj_id) {
                     continue;
                 }
                 let offset = writer.position();
                 let bytes = serialize_obj(&serializer, *obj_id, 0, obj, &encryption_handler);
                 writer.write_all(&bytes)?;
                 xref_entries.push((*obj_id, offset, 0, true));
-                written_ids.insert(*obj_id);
             }
         }
 
@@ -5051,17 +5116,11 @@ impl DocumentEditor {
         //
         // Solution: after the main traversal, enumerate every object ID in the
         // source document's xref table and write any that were not yet written.
-        // This is safe — written_ids provides O(1) dedup, so already-written
+        // This is safe — `xref_entries` dedups in O(1), so already-written
         // objects are skipped; orphaned objects are harmless in a PDF reader.
         //
         // When garbage_collect=true, only reachable objects are written.
         // When compress=true, raw (unfiltered) streams are FlateDecode-compressed.
-        //
-        // NOTE: `written_ids` must be rebuilt from `xref_entries` here because
-        // the merge-page and parent-field loops above push to `xref_entries`
-        // without updating `written_ids`.
-        written_ids.clear();
-        written_ids.extend(xref_entries.iter().map(|(id, _, _, _)| *id));
 
         // ── pdf_manipulator patch: GC walks the pruned page tree (#261) ──
         // The walk never enters a dropped page, an inner /Pages node or a
@@ -5083,7 +5142,7 @@ impl DocumentEditor {
 
         let all_source_ids = self.source.all_object_ids();
         for obj_id in all_source_ids {
-            if obj_id == 0 || written_ids.contains(&obj_id) {
+            if obj_id == 0 || xref_entries.contains_id(obj_id) {
                 continue;
             }
             // ── pdf_manipulator patch: free entries skipped, unreadable objects refused ──
@@ -5124,7 +5183,6 @@ impl DocumentEditor {
                     &mut xref_entries,
                 )?
             {
-                written_ids.insert(obj_id);
                 continue;
             }
             // ── end pdf_manipulator patch ──
@@ -5160,7 +5218,6 @@ impl DocumentEditor {
                     let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
                     writer.write_all(&bytes)?;
                     xref_entries.push((obj_id, offset, 0, true));
-                    written_ids.insert(obj_id);
                 },
                 // ── pdf_manipulator patch: an unreadable in-use object fails the save ──
                 Err(e) => return Err(e),
@@ -5174,12 +5231,10 @@ impl DocumentEditor {
         // Write any new objects from modified_objects whose IDs are not in the
         // original source xref (e.g. XMP streams allocated by the PDF/A converter).
         {
-            let already_written: std::collections::HashSet<u32> =
-                xref_entries.iter().map(|(id, _, _, _)| *id).collect();
             let new_objs: Vec<(u32, Object)> = self
                 .modified_objects
                 .iter()
-                .filter(|(&id, _)| !already_written.contains(&id))
+                .filter(|(&id, _)| !xref_entries.contains_id(id))
                 // ── pdf_manipulator patch: dropped pages never written (#261) ──
                 .filter(|(&id, _)| !prune.excluded.contains(&id) && !dropped_only.contains(&id))
                 // ── end pdf_manipulator patch ──
@@ -5210,6 +5265,7 @@ impl DocumentEditor {
 
         // Write entries (fill gaps with free entries)
         let mut entry_map: HashMap<u32, (u64, u16, bool)> = xref_entries
+            .into_entries()
             .into_iter()
             .map(|(id, off, gen, used)| (id, (off, gen, used)))
             .collect();
@@ -13182,5 +13238,53 @@ mod tests {
             !pe.page.find_text_containing("OVERLAYTOKEN").is_empty(),
             "overlay text must survive with its font registered"
         );
+    }
+
+    /// Three pages under a nested tree: root `[inner(4, 5), 6]`.
+    fn nested_page_tree_pdf_bytes() -> Vec<u8> {
+        let objs: Vec<&[u8]> = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 3 >>\nendobj\n",
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>\nendobj\n",
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>\nendobj\n",
+            b"5 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>\nendobj\n",
+            b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n",
+        ];
+        let mut body = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for o in &objs {
+            offsets.push(body.len());
+            body.extend_from_slice(o);
+        }
+        let xref_offset = body.len();
+        let mut tail = format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1);
+        for off in &offsets {
+            tail.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        tail.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objs.len() + 1
+        ));
+        [body, tail.into_bytes()].concat()
+    }
+
+    #[test]
+    fn nested_tree_rotates_every_page_and_keeps_the_walk_refs() {
+        let mut editor = open_editor_from_bytes(&nested_page_tree_pdf_bytes(), "nested_rotate");
+
+        let expected: Vec<ObjectRef> = (4..=6).map(|id| ObjectRef::new(id, 0)).collect();
+        assert_eq!(&*editor.get_page_refs().unwrap(), expected.as_slice());
+        assert_eq!(editor.walk_source_page_refs().unwrap(), expected);
+
+        for i in 0..3 {
+            editor.rotate_page_by(i, 90).unwrap();
+        }
+        let bytes = editor.save_to_bytes().unwrap();
+
+        let mut reopened = open_editor_from_bytes(&bytes, "nested_rotate_verify");
+        assert_eq!(reopened.page_count().unwrap(), 3);
+        for i in 0..3 {
+            assert_eq!(reopened.get_page_rotation(i).unwrap(), 90, "page {i}");
+        }
     }
 }
