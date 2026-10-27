@@ -138,12 +138,37 @@ pub(crate) struct StreamHead {
 }
 // ── end pdf_manipulator patch ──
 
-/// Default maximum size in bytes for the object cache (64 MB).
+// ── pdf_manipulator patch: the object cache is a window, not the document ──
+/// Default maximum size in bytes for the object cache (8 MiB).
 ///
-/// This is a soft guardrail, not a hard ceiling. Real memory usage can be
-/// 1.5–2× the cap because `estimate_size` does not account for HashMap bucket
-/// overhead, Arc headers, or allocator padding.
-const DEFAULT_OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// This is a soft guardrail, not a hard ceiling: `estimate_size` counts the
+/// hash tables and buffers an object holds, but not Arc headers or allocator
+/// padding.
+const DEFAULT_OBJECT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: page facts without the page cache ──
+/// The inheritable attributes of a page (ISO 32000-1 §7.7.3.4), each `None`
+/// when absent or malformed up the whole `/Parent` chain.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct PageFacts {
+    /// Normalised `[llx, lly, urx, ury]` of `/MediaBox`.
+    pub(crate) media_box: Option<[f32; 4]>,
+    /// Normalised `[llx, lly, urx, ury]` of `/CropBox`.
+    pub(crate) crop_box: Option<[f32; 4]>,
+    /// Raw `/Rotate`, not yet normalised to a multiple of 90.
+    pub(crate) rotate: Option<i32>,
+}
+
+impl PageFacts {
+    /// `/Rotate` normalised to one of `{0, 90, 180, 270}`; `0` when absent
+    /// or not a multiple of 90, as [`PdfDocument::get_page_rotation`] does.
+    pub(crate) fn rotation(&self) -> i32 {
+        let n = ((self.rotate.unwrap_or(0) % 360) + 360) % 360;
+        if n % 90 == 0 { n } else { 0 }
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Default maximum number of entries for the XObject span/image caches.
 const DEFAULT_XOBJECT_CACHE_MAX_ENTRIES: usize = 1024;
@@ -311,39 +336,45 @@ impl BoundedObjectCache {
         Self::estimate_size_depth(obj, 8)
     }
 
-    /// Rough estimate of an Object's heap size in bytes.
-    /// Recurses into nested containers up to `depth` levels to avoid
-    /// both underestimation and stack overflow on adversarial input.
+    /// Estimate of an Object's size in bytes: the value itself plus what it
+    /// holds on the heap. Recurses into nested containers up to `depth`
+    /// levels to avoid stack overflow on adversarial input.
     fn estimate_size_depth(obj: &Object, depth: u8) -> usize {
+        std::mem::size_of::<Object>() + Self::heap_size(obj, depth)
+    }
+
+    /// Heap bytes an Object holds beyond its own inline size.
+    fn heap_size(obj: &Object, depth: u8) -> usize {
         if depth == 0 {
-            return 64;
+            return std::mem::size_of::<Object>();
         }
         match obj {
-            Object::Stream { dict, data } => {
-                let dict_size: usize = dict
-                    .iter()
-                    .map(|(k, v)| k.len() + 32 + Self::estimate_size_depth(v, depth - 1))
-                    .sum();
-                data.len() + dict_size + 64
-            },
-            Object::Dictionary(d) => {
-                let inner: usize = d
-                    .iter()
-                    .map(|(k, v)| k.len() + 32 + Self::estimate_size_depth(v, depth - 1))
-                    .sum();
-                inner + 64
-            },
+            Object::Stream { dict, data } => Self::dict_heap_size(dict, depth) + data.len(),
+            Object::Dictionary(d) => Self::dict_heap_size(d, depth),
             Object::Array(a) => {
-                let inner: usize = a
-                    .iter()
-                    .map(|v| Self::estimate_size_depth(v, depth - 1))
-                    .sum();
-                inner + 64
+                a.capacity() * std::mem::size_of::<Object>()
+                    + a.iter().map(|v| Self::heap_size(v, depth - 1)).sum::<usize>()
             },
-            Object::String(s) => s.len() + 32,
-            Object::Name(s) => s.len() + 32,
-            _ => 32,
+            Object::String(s) => s.capacity(),
+            Object::Name(s) => s.capacity(),
+            _ => 0,
         }
+    }
+
+    /// Heap bytes of a dictionary: every slot of the hash table (a key, a
+    /// value and one control byte), the keys' own buffers, and what the
+    /// values hold.
+    fn dict_heap_size(d: &HashMap<String, Object>, depth: u8) -> usize {
+        let slot = std::mem::size_of::<String>() + std::mem::size_of::<Object>();
+        let slots = if d.is_empty() {
+            0
+        } else {
+            (d.len() * 8).div_ceil(7).next_power_of_two()
+        };
+        slots * (slot + 1)
+            + d.iter()
+                .map(|(k, v)| k.capacity() + Self::heap_size(v, depth - 1))
+                .sum::<usize>()
     }
 }
 
@@ -4975,6 +5006,77 @@ impl PdfDocument {
         let n = ((raw % 360) + 360) % 360;
         Ok(if n % 90 == 0 { n } else { 0 })
     }
+
+    // ── pdf_manipulator patch: page facts without the page cache ──
+    /// The inheritable page attributes of one page, read by walking `/Parent`
+    /// from the leaf. Nothing is stored in `page_cache`; the objects loaded
+    /// pass through the bounded object cache only.
+    ///
+    /// Boxes are normalised like [`get_page_media_box`](Self::get_page_media_box)
+    /// and rotation like [`get_page_rotation`](Self::get_page_rotation); an
+    /// attribute absent up the whole chain, or malformed, is `None`.
+    pub(crate) fn page_facts(&self, page_ref: ObjectRef) -> Result<PageFacts> {
+        const MAX_LEVELS: usize = 64;
+        let to_f32 = |o: &Object| match self.resolve_obj_ref(o) {
+            Object::Integer(v) => v as f32,
+            Object::Real(v) => v as f32,
+            _ => 0.0,
+        };
+        let rect = |o: &Object| -> Option<[f32; 4]> {
+            let resolved = self.resolve_obj_ref(o);
+            let a = resolved.as_array().filter(|a| a.len() >= 4)?;
+            let (x0, y0, x1, y1) = (to_f32(&a[0]), to_f32(&a[1]), to_f32(&a[2]), to_f32(&a[3]));
+            Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)])
+        };
+
+        let mut facts = PageFacts::default();
+        let (mut media_done, mut crop_done, mut rotate_done) = (false, false, false);
+        let mut seen: HashSet<ObjectRef> = HashSet::new();
+        let mut node_ref = page_ref;
+        for _ in 0..MAX_LEVELS {
+            if !seen.insert(node_ref) {
+                return Err(Error::CircularReference(node_ref));
+            }
+            let node = self.load_object(node_ref)?;
+            let dict = node.as_dict().ok_or_else(|| {
+                Error::InvalidPdf(format!("Page tree node {} is not a dictionary", node_ref.id))
+            })?;
+            if !media_done {
+                if let Some(v) = dict.get("MediaBox") {
+                    media_done = true;
+                    facts.media_box = rect(v);
+                }
+            }
+            if !crop_done {
+                if let Some(v) = dict.get("CropBox") {
+                    crop_done = true;
+                    facts.crop_box = rect(v);
+                }
+            }
+            if !rotate_done {
+                if let Some(v) = dict.get("Rotate") {
+                    rotate_done = true;
+                    facts.rotate = match self.resolve_obj_ref(v) {
+                        Object::Integer(v) => Some(v as i32),
+                        Object::Real(v) => Some(v as i32),
+                        _ => None,
+                    };
+                }
+            }
+            if media_done && crop_done && rotate_done {
+                return Ok(facts);
+            }
+            match dict.get("Parent").and_then(|p| p.as_reference()) {
+                Some(parent) => node_ref = parent,
+                None => return Ok(facts),
+            }
+        }
+        Err(Error::InvalidPdf(format!(
+            "Page tree deeper than {} levels at node {}",
+            MAX_LEVELS, page_ref.id
+        )))
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Get page count using the standard /Count field
     fn get_page_count_standard(&self) -> Result<usize> {
@@ -33852,8 +33954,9 @@ mod tests {
     #[test]
     fn test_bounded_object_cache_byte_budget_eviction() {
         // Use a budget that fits ~2 small objects but not 3
-        let small = Object::Integer(1); // estimate_size = 32
-        let budget = 80; // fits 2 × 32, not 3
+        let small = Object::Integer(1); // estimate_size = size_of::<Object>()
+        let unit = std::mem::size_of::<Object>();
+        let budget = unit * 5 / 2; // fits 2 × unit, not 3
         let mut c = BoundedObjectCache::new(budget);
         c.insert(ObjectRef::new(1, 0), small.clone());
         c.insert(ObjectRef::new(2, 0), small.clone());
@@ -33864,6 +33967,104 @@ mod tests {
         assert!(c.get(&ObjectRef::new(3, 0)).is_some());
         assert!(c.current_bytes <= budget);
     }
+
+    // ── pdf_manipulator patch: honest estimate and page facts ──
+    #[test]
+    fn test_estimate_size_counts_a_page_dictionary_heap() {
+        use std::collections::HashMap;
+        use std::mem::size_of;
+        let mut font = HashMap::new();
+        font.insert("F1".to_string(), Object::Reference(ObjectRef::new(5, 0)));
+        let mut resources = HashMap::new();
+        resources.insert("Font".to_string(), Object::Dictionary(font));
+        let mut page = HashMap::new();
+        page.insert("Type".to_string(), Object::Name("Page".to_string()));
+        page.insert("Parent".to_string(), Object::Reference(ObjectRef::new(2, 0)));
+        page.insert(
+            "MediaBox".to_string(),
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        );
+        page.insert("Resources".to_string(), Object::Dictionary(resources));
+        let page = Object::Dictionary(page);
+
+        // Computed independently of the estimator: 4 entries need 8 slots,
+        // 1 entry needs 1 slot; a slot is a String, an Object and a control
+        // byte. Key and name buffers are exactly as long as their text.
+        let slot = size_of::<String>() + size_of::<Object>() + 1;
+        let expected = size_of::<Object>()
+            + 8 * slot
+            + ("Type".len() + "Parent".len() + "MediaBox".len() + "Resources".len())
+            + "Page".len()
+            + 4 * size_of::<Object>()
+            + (slot + "Font".len())
+            + (slot + "F1".len());
+        let got = BoundedObjectCache::estimate_size(&page);
+        let ratio = got as f64 / expected as f64;
+        assert!(
+            (1.0 / 1.5..=1.5).contains(&ratio),
+            "estimate {got} vs independent sum {expected}"
+        );
+    }
+
+    /// A Pages root (MediaBox, Rotate 90) holding an inner Pages node
+    /// (CropBox) with two leaves, the second overriding MediaBox.
+    fn nested_page_tree_pdf() -> Vec<u8> {
+        let bodies = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 2 /MediaBox [0 0 300 400] /Rotate 90 >>",
+            "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 /CropBox [10 10 200 300] >>",
+            "<< /Type /Page /Parent 3 0 R >>",
+            "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 500 600] >>",
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+        }
+        let xref_at = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                bodies.len() + 1,
+                xref_at
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn test_page_facts_match_get_page_accessors() {
+        let doc = PdfDocument::from_bytes(nested_page_tree_pdf()).unwrap();
+        let refs = doc.all_page_refs().unwrap();
+        assert_eq!(refs, vec![ObjectRef::new(4, 0), ObjectRef::new(5, 0)]);
+        let facts: Vec<PageFacts> = refs.iter().map(|r| doc.page_facts(*r).unwrap()).collect();
+        assert!(
+            doc.page_cache.lock_or_recover().is_empty(),
+            "page_facts must not fill the page cache"
+        );
+        for (i, f) in facts.iter().enumerate() {
+            let (x0, y0, x1, y1) = doc.get_page_media_box(i).unwrap();
+            assert_eq!(f.media_box, Some([x0, y0, x1, y1]), "media box of page {i}");
+            assert_eq!(f.rotation(), doc.get_page_rotation(i).unwrap(), "rotation of page {i}");
+            assert_eq!(f.crop_box, Some([10.0, 10.0, 200.0, 300.0]), "crop box of page {i}");
+        }
+        assert_eq!(facts[0].media_box, Some([0.0, 0.0, 300.0, 400.0]));
+        assert_eq!(facts[1].media_box, Some([0.0, 0.0, 500.0, 600.0]));
+        assert_eq!(facts[0].rotation(), 90);
+    }
+    // ── end pdf_manipulator patch ──
 
     #[test]
     fn test_estimate_size_depth_bottoms_out() {

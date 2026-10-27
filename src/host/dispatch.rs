@@ -220,10 +220,17 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
         let ranges = PageLabelExtractor::extract(doc).unwrap_or_default();
         (!ranges.is_empty()).then(|| PageLabelExtractor::get_all_labels(&ranges, page_count))
     };
+    // The page facts are read through the bounded object cache, never
+    // through `get_page`, whose cache would hold every page dictionary.
+    let page_refs = doc.all_page_refs()?;
     let mut pages = Vec::with_capacity(page_count);
     for i in 0..page_count {
-        let (x0, y0, x1, y1) = doc.get_page_media_box(i).unwrap_or((0.0, 0.0, 612.0, 792.0));
-        let rotation = doc.get_page_rotation(i).unwrap_or(0);
+        let page_ref = *page_refs
+            .get(i)
+            .ok_or_else(|| Error::InvalidPdf(format!("Page {} not found in tree", i)))?;
+        let facts = doc.page_facts(page_ref)?;
+        let [x0, y0, x1, y1] = facts.media_box.unwrap_or([0.0, 0.0, 612.0, 792.0]);
+        let rotation = facts.rotation();
         pages.push(PageInfo {
             width: (x1 - x0) as f64,
             height: (y1 - y0) as f64,
