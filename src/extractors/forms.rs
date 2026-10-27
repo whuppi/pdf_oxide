@@ -195,6 +195,20 @@ pub mod field_flags {
     pub const COMMIT_ON_SEL_CHANGE: u32 = 1 << 26;
 }
 
+// ── pdf_manipulator patch: inheritable field attributes ──
+/// The attributes a field takes from its nearest ancestor that sets them:
+/// /FT, /Ff, /V, /DV, /DA and /Q.
+#[derive(Default, Clone)]
+struct InheritedAttrs {
+    ft: Option<FieldType>,
+    ff: Option<u32>,
+    v: Option<Object>,
+    dv: Option<Object>,
+    da: Option<String>,
+    q: Option<u32>,
+}
+// ── end pdf_manipulator patch ──
+
 /// AcroForm extractor.
 pub struct FormExtractor;
 
@@ -293,9 +307,19 @@ impl FormExtractor {
 
         // Extract fields recursively
         let mut result = Vec::new();
+        // ── pdf_manipulator patch: a field reached twice (a /Kids cycle) is read once ──
+        let mut visited = std::collections::HashSet::new();
         for field_ref in fields_array {
-            Self::extract_field_recursive(doc, field_ref, "", &mut result)?;
+            Self::extract_field_recursive(
+                doc,
+                field_ref,
+                "",
+                &InheritedAttrs::default(),
+                &mut visited,
+                &mut result,
+            )?;
         }
+        // ── end pdf_manipulator patch ──
 
         Ok(result)
     }
@@ -313,15 +337,26 @@ impl FormExtractor {
     /// * `doc` - The PDF document
     /// * `field_ref` - Reference to the field object
     /// * `parent_name` - Full qualified name of parent field (for hierarchy)
+    /// * `inherited` - Attributes the parent resolved (own value, else its ancestors')
+    /// * `visited` - References already read, to stop a /Kids cycle
     /// * `result` - Vector to accumulate extracted fields
     fn extract_field_recursive(
         doc: &PdfDocument,
         field_ref: &Object,
         parent_name: &str,
+        inherited: &InheritedAttrs,
+        visited: &mut std::collections::HashSet<ObjectRef>,
         result: &mut Vec<FormField>,
     ) -> Result<()> {
         // Capture object reference for later modification support
         let object_ref = field_ref.as_reference();
+        // ── pdf_manipulator patch ──
+        if let Some(r) = object_ref {
+            if !visited.insert(r) {
+                return Ok(());
+            }
+        }
+        // ── end pdf_manipulator patch ──
 
         // Resolve field dictionary
         let field = Self::resolve_object(doc, field_ref)?;
@@ -347,6 +382,47 @@ impl FormExtractor {
             format!("{}.{}", parent_name, partial_name)
         };
 
+        // ── pdf_manipulator patch: own entry wins, else the ancestors' ──
+        let own_ft = field_dict
+            .get("FT")
+            .and_then(|obj| Self::resolve_object(doc, obj).ok())
+            .and_then(|obj| obj.as_name().map(|s| s.to_string()))
+            .map(|name| Self::parse_field_type(&name));
+        let own_ff = field_dict
+            .get("Ff")
+            .and_then(|obj| Self::resolve_object(doc, obj).ok())
+            .and_then(|obj| match obj {
+                Object::Integer(i) => Some(i as u32),
+                _ => None,
+            });
+        let own_q = field_dict
+            .get("Q")
+            .and_then(|obj| Self::resolve_object(doc, obj).ok())
+            .and_then(|obj| match obj {
+                Object::Integer(i) => Some(i as u32),
+                _ => None,
+            });
+        let own_da = field_dict
+            .get("DA")
+            .and_then(|obj| Self::resolve_object(doc, obj).ok())
+            .and_then(|obj| obj.as_string().map(|s| s.to_vec()))
+            .and_then(|bytes| Self::decode_text_string(&bytes));
+        let effective = InheritedAttrs {
+            ft: own_ft.clone().or_else(|| inherited.ft.clone()),
+            ff: own_ff.or(inherited.ff),
+            v: field_dict
+                .get("V")
+                .and_then(|obj| Self::resolve_object(doc, obj).ok())
+                .or_else(|| inherited.v.clone()),
+            dv: field_dict
+                .get("DV")
+                .and_then(|obj| Self::resolve_object(doc, obj).ok())
+                .or_else(|| inherited.dv.clone()),
+            da: own_da.or_else(|| inherited.da.clone()),
+            q: own_q.or(inherited.q),
+        };
+        // ── end pdf_manipulator patch ──
+
         // Recurse into Kids and also emit a row for parent fields
         // that carry a /T name, matching pypdf's traversal. The
         // previous behaviour recursed into Kids and dropped any
@@ -358,7 +434,11 @@ impl FormExtractor {
             let kids = Self::resolve_object(doc, kids_ref)?;
             if let Some(kids_array) = kids.as_array() {
                 for kid_ref in kids_array {
-                    Self::extract_field_recursive(doc, kid_ref, &full_name, result)?;
+                    // ── pdf_manipulator patch ──
+                    Self::extract_field_recursive(
+                        doc, kid_ref, &full_name, &effective, visited, result,
+                    )?;
+                    // ── end pdf_manipulator patch ──
                 }
                 true
             } else {
@@ -368,13 +448,17 @@ impl FormExtractor {
             false
         };
 
-        // Extract field type
-        let field_type = field_dict
-            .get("FT")
-            .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .and_then(|obj| obj.as_name().map(|s| s.to_string()))
-            .map(|name| Self::parse_field_type(&name))
+        // ── pdf_manipulator patch: the row's type is the effective one; which
+        // nodes become rows keeps deciding on the node's own /FT, so a
+        // widget kid without /T never surfaces through an inherited type. ──
+        let field_type = effective
+            .ft
+            .clone()
             .unwrap_or(FieldType::Unknown("".to_string()));
+        let no_ft = !own_ft
+            .as_ref()
+            .is_some_and(|t| !matches!(t, FieldType::Unknown(s) if s.is_empty()));
+        // ── end pdf_manipulator patch ──
 
         // only skip the parent when it has NEITHER /FT
         // NOR /T. A parent with /T but no /FT (logical grouping like
@@ -382,24 +466,23 @@ impl FormExtractor {
         // results, matching pypdf's behaviour. The terminal kids that
         // already got their own row carry the actual /V (checkbox
         // /Off/Yes state).
-        let no_ft = matches!(field_type, FieldType::Unknown(ref s) if s.is_empty());
-        if no_ft && (has_kids && partial_name.is_empty()) {
-            // Truly anonymous parent with no /T — nothing to surface.
+        // ── pdf_manipulator patch: a nameless parent is no field ──
+        // A node with kids and no /T is not a field of its own, /FT or
+        // not: its inheritable attributes already flowed to the kids, and
+        // a row for it would carry an empty name.
+        if has_kids && partial_name.is_empty() {
             return Ok(());
         }
+        // ── end pdf_manipulator patch ──
         if no_ft && !has_kids && partial_name.is_empty() {
             // Leaf without /FT or /T — skip.
             return Ok(());
         }
 
         // Extract field flags /Ff
-        let flags = field_dict
-            .get("Ff")
-            .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .and_then(|obj| match obj {
-                Object::Integer(i) => Some(i as u32),
-                _ => None,
-            });
+        // ── pdf_manipulator patch ──
+        let flags = effective.ff;
+        // ── end pdf_manipulator patch ──
 
         // ── pdf_manipulator patch: a radio field's /V is the selected
         // option's export name, whatever it is — "Yes"/"On"/"No"/"Off"
@@ -411,11 +494,13 @@ impl FormExtractor {
         // ── end pdf_manipulator patch ──
 
         // Extract field value
-        let value = field_dict
-            .get("V")
-            .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .map(|obj| Self::parse_field_value_of(&obj, &field_type, is_radio))
+        // ── pdf_manipulator patch ──
+        let value = effective
+            .v
+            .as_ref()
+            .map(|obj| Self::parse_field_value_of(obj, &field_type, is_radio))
             .unwrap_or(FieldValue::None);
+        // ── end pdf_manipulator patch ──
 
         // Extract tooltip
         let tooltip = field_dict
@@ -447,10 +532,12 @@ impl FormExtractor {
             });
 
         // Extract default value /DV
-        let default_value = field_dict
-            .get("DV")
-            .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .map(|obj| Self::parse_field_value_of(&obj, &field_type, is_radio));
+        // ── pdf_manipulator patch ──
+        let default_value = effective
+            .dv
+            .as_ref()
+            .map(|obj| Self::parse_field_value_of(obj, &field_type, is_radio));
+        // ── end pdf_manipulator patch ──
 
         // Extract max length /MaxLen (text fields only)
         let max_length = field_dict
@@ -462,20 +549,14 @@ impl FormExtractor {
             });
 
         // Extract text alignment /Q (0=left, 1=center, 2=right)
-        let alignment = field_dict
-            .get("Q")
-            .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .and_then(|obj| match obj {
-                Object::Integer(i) => Some(i as u32),
-                _ => None,
-            });
+        // ── pdf_manipulator patch ──
+        let alignment = effective.q;
+        // ── end pdf_manipulator patch ──
 
         // Extract default appearance /DA
-        let default_appearance = field_dict
-            .get("DA")
-            .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .and_then(|obj| obj.as_string().map(|s| s.to_vec()))
-            .and_then(|bytes| Self::decode_text_string(&bytes));
+        // ── pdf_manipulator patch ──
+        let default_appearance = effective.da.clone();
+        // ── end pdf_manipulator patch ──
 
         // Extract border style /BS
         let border_style = field_dict
@@ -1323,4 +1404,89 @@ mod tests {
         let value = FormExtractor::parse_field_value(&obj, &FieldType::Text);
         assert!(matches!(value, FieldValue::None));
     }
+
+    // ── pdf_manipulator patch: inheritable field attributes ──
+    fn form_pdf(field_objs: &[&str]) -> Vec<u8> {
+        let mut objs: Vec<String> = vec![
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_string(),
+        ];
+        objs.extend(field_objs.iter().map(|s| s.to_string()));
+        let mut buf = String::from("%PDF-1.7\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(buf.len());
+            buf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+        }
+        let xref_off = buf.len();
+        buf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+        for off in &offsets {
+            buf.push_str(&format!("{:010} 00000 n \n", off));
+        }
+        buf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objs.len() + 1,
+            xref_off
+        ));
+        buf.into_bytes()
+    }
+
+    fn extract(field_objs: &[&str]) -> Vec<FormField> {
+        let doc = PdfDocument::from_bytes(form_pdf(field_objs)).expect("parse fixture");
+        FormExtractor::extract_fields(&doc).expect("extract fields")
+    }
+
+    #[test]
+    fn inherited_ft_and_ff_on_grandparent_read_as_radio_group() {
+        // 4 grandparent (/FT /Btn /Ff radio), 5 parent (/T), 6 and 7 widgets.
+        let fields = extract(&[
+            "<< /FT /Btn /Ff 32768 /Kids [5 0 R] >>",
+            "<< /T (choice) /V /B /Parent 4 0 R /Kids [6 0 R 7 0 R] >>",
+            "<< /Subtype /Widget /Parent 5 0 R /AS /A /Rect [0 0 10 10] >>",
+            "<< /Subtype /Widget /Parent 5 0 R /AS /B /Rect [20 0 30 10] >>",
+        ]);
+        // The anonymous grandparent keeps its own row (it carries its own
+        // /FT, as before); the widgets 6 and 7 get none.
+        let mut ids: Vec<u32> = fields
+            .iter()
+            .map(|f| f.object_ref.expect("indirect field").id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![5], "only the named field surfaces, not its nameless ancestor or its widgets: {fields:?}");
+        let f = fields.iter().find(|f| f.full_name == "choice").expect("radio row");
+        assert_eq!(f.field_type, FieldType::Button);
+        assert_eq!(f.flags, Some(32768));
+        assert_eq!(f.value, FieldValue::Name("B".to_string()));
+    }
+
+    #[test]
+    fn inherited_v_is_read_by_a_kid_with_its_own_name() {
+        let fields = extract(&[
+            "<< /T (group) /FT /Tx /V (shared) /Kids [5 0 R] >>",
+            "<< /T (kid) /Parent 4 0 R >>",
+        ]);
+        let kid = fields.iter().find(|f| f.full_name == "group.kid").expect("kid row");
+        assert_eq!(kid.value, FieldValue::Text("shared".to_string()));
+    }
+
+    #[test]
+    fn inherited_ft_on_parent_makes_the_kid_a_text_field() {
+        let fields = extract(&[
+            "<< /T (group) /FT /Tx /Kids [5 0 R] >>",
+            "<< /T (kid) /Parent 4 0 R >>",
+        ]);
+        let kid = fields.iter().find(|f| f.full_name == "group.kid").expect("kid row");
+        assert_eq!(kid.field_type, FieldType::Text);
+    }
+
+    #[test]
+    fn a_kids_cycle_terminates() {
+        let fields = extract(&[
+            "<< /T (a) /FT /Tx /Kids [5 0 R] >>",
+            "<< /T (b) /Parent 4 0 R /Kids [4 0 R] >>",
+        ]);
+        assert_eq!(fields.len(), 2);
+    }
+    // ── end pdf_manipulator patch ──
 }
