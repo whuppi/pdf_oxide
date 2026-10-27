@@ -1655,7 +1655,7 @@ pub fn edit_watermark(
                     .with_opacity(opacity)
                     .with_color(r, g, b)
                     .with_font("Helvetica", font_size);
-                ed.add_page_annotation(p, wm);
+                ed.add_page_annotation(p, wm)?;
             }
         }
         Ok(())
@@ -1721,7 +1721,7 @@ pub fn edit_watermark(
                         .with_opacity(opacity)
                         .with_color(r, g, b)
                         .with_font("Helvetica", font_size);
-                    editor.add_page_annotation(i, wm);
+                    editor.add_page_annotation(i, wm)?;
                 }
             }
         }

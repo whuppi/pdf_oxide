@@ -1184,6 +1184,36 @@ impl PdfDocument {
     }
     // ── end pdf_manipulator patch ──
 
+    // ── pdf_manipulator patch: a document kept open beside another gets its own small object cache ──
+    /// Like `from_external_reader`, with the object cache bounded at
+    /// `cache_bytes` instead of the default.
+    pub(crate) fn from_external_reader_bounded(
+        reader: Box<dyn ReadSeek>,
+        cache_bytes: usize,
+    ) -> Result<Self> {
+        let mut doc = Self::from_external_reader(reader)?;
+        doc.object_cache = Mutex::new(BoundedObjectCache::new(cache_bytes));
+        Ok(doc)
+    }
+
+    /// Drops every cached object and frees the cache's memory, keeping
+    /// its budget. A document read once per object calls this between
+    /// pieces of work so a full cache does not sit beside the work.
+    pub(crate) fn clear_object_cache(&self) {
+        let mut cache = self.object_cache.lock_or_recover();
+        // Pinned objects exist only here and cannot be re-read: they stay.
+        let pinned: Vec<(ObjectRef, Object)> = cache
+            .pinned
+            .iter()
+            .filter_map(|k| cache.map.get(k).map(|v| (*k, v.clone())))
+            .collect();
+        *cache = BoundedObjectCache::new(cache.max_bytes);
+        for (key, value) in pinned {
+            cache.insert_pinned(key, value);
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Open a PDF document from a file path.
     ///
     /// Reads the entire file into memory, then parses the PDF structure.

@@ -527,20 +527,26 @@ pub struct DocumentEditor {
     deleted_form_fields: HashSet<String>,
     /// Flag indicating AcroForm dictionary needs rebuilding on save
     acroform_modified: bool,
-    /// Pages imported from other PDFs via merge operations.
-    /// Each entry contains a page object and all its dependent objects,
-    /// with references remapped to new IDs in this document.
-    merged_pages: Vec<MergedPageData>,
+    // ── pdf_manipulator patch: a merge keeps its source open and records ids only ──
+    /// One entry per merge: the merged document, kept open for the
+    /// editor's lifetime, and the ids of what the save copies from it.
+    merged_sources: Vec<MergedSource>,
+    /// Rotation and boxes of merged pages, by merged page index (the
+    /// position among all merged pages, in import order).
+    merged_page_props: HashMap<usize, ModifiedPageProps>,
+    // ── end pdf_manipulator patch ──
     // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
     /// Root field references imported by a merge, already renumbered into
     /// this document. Appended to the saved catalog's `/AcroForm /Fields`.
     merged_form_fields: Vec<ObjectRef>,
     /// The merged document's `/DR` and `/DA`, imported alongside its
     /// fields; used only when this document's AcroForm has neither.
-    merged_acroform_dr: Option<Object>,
+    /// Kept in the numbering of the merged document at that index of
+    /// `merged_sources`; the save remaps it.
+    merged_acroform_dr: Option<(usize, Object)>,
     merged_acroform_da: Option<Object>,
     /// Leaf page refs of `source`, in tree order, computed once per source.
-    /// Page add, delete, move and merge change `page_order` and `merged_pages`
+    /// Page add, delete, move and merge change `page_order` and `merged_sources`
     /// only, never the source tree, so only a source replacement clears it.
     source_page_refs: Option<std::sync::Arc<[ObjectRef]>>,
     /// Source index of each visible output page (`page_order` without removed
@@ -594,15 +600,47 @@ impl std::ops::DerefMut for XrefEntries {
 }
 // ── end pdf_manipulator patch ──
 
-/// Data for a single page imported from another PDF during a merge operation.
-#[derive(Debug, Clone)]
-struct MergedPageData {
-    /// The page dictionary object (with remapped references).
-    page_object: Object,
-    /// All dependent objects (fonts, content streams, resources, etc.)
-    /// keyed by their new object ID in this document.
-    objects: Vec<(u32, Object)>,
+// ── pdf_manipulator patch: a merge keeps its source open and records ids only ──
+/// A page imported from a merged document: nothing of it is copied until
+/// the save streams it.
+struct MergedPageImport {
+    /// The page in the merged document.
+    page_ref: ObjectRef,
+    /// The page's id in this document.
+    page_id: u32,
+    /// The slice of `MergedSource::objects` this page reaches first.
+    objects: std::ops::Range<usize>,
 }
+
+/// One merged document and the pages taken from it.
+struct MergedSource {
+    doc: PdfDocument,
+    pages: Vec<MergedPageImport>,
+    /// Every object the pages reach, grouped by the page that met it first:
+    /// `(id in this document, id in the merged document)`. One flat list,
+    /// since a vector per page costs more than its content on a long document.
+    objects: Vec<(u32, u32)>,
+    /// Merged-document id to id in this document, for the whole merge.
+    id_map: HashMap<u32, u32>,
+    /// Page-tree node (merged-document id) to the inheritable attributes
+    /// (§7.7.3.4) a page below it gets, nearest value winning, in the merged
+    /// document's numbering. The save writes them into pages that lack them.
+    inherited: HashMap<u32, Vec<(String, Object)>>,
+}
+
+/// The page attributes a page inherits from its ancestors in the page tree.
+const INHERITABLE: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
+
+/// The object cache of a merged document: it is read once per object, so
+/// the cache only has to hold the walk's working set.
+const MERGED_CACHE_BYTES: usize = 1024 * 1024;
+
+/// A merged page located by its output index.
+enum PageKey {
+    Source(usize),
+    Merged(usize),
+}
+// ── end pdf_manipulator patch ──
 
 /// Tracks modified page properties.
 #[derive(Debug, Clone, Default)]
@@ -712,7 +750,10 @@ impl DocumentEditor {
             modified_form_fields: HashMap::new(),
             deleted_form_fields: HashSet::new(),
             acroform_modified: false,
-            merged_pages: Vec::new(),
+            // ── pdf_manipulator patch: a merge keeps its source open and records ids only ──
+            merged_sources: Vec::new(),
+            merged_page_props: HashMap::new(),
+            // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
             merged_form_fields: Vec::new(),
             merged_acroform_dr: None,
@@ -759,7 +800,10 @@ impl DocumentEditor {
             modified_form_fields: HashMap::new(),
             deleted_form_fields: HashSet::new(),
             acroform_modified: false,
-            merged_pages: Vec::new(),
+            // ── pdf_manipulator patch: a merge keeps its source open and records ids only ──
+            merged_sources: Vec::new(),
+            merged_page_props: HashMap::new(),
+            // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
             merged_form_fields: Vec::new(),
             merged_acroform_dr: None,
@@ -810,7 +854,10 @@ impl DocumentEditor {
             modified_form_fields: HashMap::new(),
             deleted_form_fields: HashSet::new(),
             acroform_modified: false,
-            merged_pages: Vec::new(),
+            // ── pdf_manipulator patch: a merge keeps its source open and records ids only ──
+            merged_sources: Vec::new(),
+            merged_page_props: HashMap::new(),
+            // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: a merge carries the source's AcroForm ──
             merged_form_fields: Vec::new(),
             merged_acroform_dr: None,
@@ -1134,8 +1181,96 @@ impl DocumentEditor {
 
     /// Get the current page count (after modifications).
     pub fn current_page_count(&self) -> usize {
-        self.page_order.iter().filter(|&&i| i >= 0).count() + self.merged_pages.len()
+        self.page_order.iter().filter(|&&i| i >= 0).count() + self.merged_page_total()
     }
+
+    // ── pdf_manipulator patch: merged pages are addressed beside source pages ──
+    /// Pages imported by merges, over all merged documents.
+    fn merged_page_total(&self) -> usize {
+        self.merged_sources.iter().map(|s| s.pages.len()).sum()
+    }
+
+    /// Where the page at user-visible index `output` lives. Merged pages
+    /// follow the visible source pages, in import order.
+    fn page_key(&self, output: usize) -> PageKey {
+        let source_count = self.page_order.iter().filter(|&&i| i >= 0).count();
+        if output >= source_count && output - source_count < self.merged_page_total() {
+            PageKey::Merged(output - source_count)
+        } else {
+            PageKey::Source(self.output_to_source_index(output))
+        }
+    }
+
+    /// The source page index of `output`, or the refusal for a merged
+    /// page: its content is copied from the merged document at save and
+    /// cannot be edited.
+    fn source_page_for(&self, output: usize, op: &str) -> Result<usize> {
+        match self.page_key(output) {
+            PageKey::Source(index) => Ok(index),
+            PageKey::Merged(_) => Err(Error::Unsupported(format!(
+                "page {output} was merged in; {op} is not supported on merged pages"
+            ))),
+        }
+    }
+
+    /// The merged page at merged index `index` and the document it came from.
+    fn merged_page(&self, index: usize) -> Option<(&MergedSource, &MergedPageImport)> {
+        let mut rest = index;
+        for source in &self.merged_sources {
+            if rest < source.pages.len() {
+                return Some((source, &source.pages[rest]));
+            }
+            rest -= source.pages.len();
+        }
+        None
+    }
+
+    /// The editable page properties of the page at `output`, by source
+    /// index or by merged index.
+    fn page_props_mut(&mut self, output: usize) -> &mut ModifiedPageProps {
+        match self.page_key(output) {
+            PageKey::Source(index) => self.modified_page_props.entry(index).or_default(),
+            PageKey::Merged(index) => self.merged_page_props.entry(index).or_default(),
+        }
+    }
+
+    /// The page dictionary of merged page `index`, as the merged document has it.
+    fn merged_page_dict(&self, index: usize) -> Result<HashMap<String, Object>> {
+        let (source, page) = self
+            .merged_page(index)
+            .ok_or_else(|| Error::InvalidPdf(format!("Page index {} out of range", index)))?;
+        match Self::merged_page_object(source, page.page_ref)? {
+            Object::Dictionary(dict) => Ok(dict),
+            _ => Err(Error::InvalidPdf("Page is not a dictionary".to_string())),
+        }
+    }
+
+    /// A page box (`MediaBox`, `CropBox`) of a page dictionary.
+    fn box_of(dict: &HashMap<String, Object>, key: &str) -> Option<[f32; 4]> {
+        let array = dict.get(key)?.as_array()?;
+        if array.len() < 4 {
+            return None;
+        }
+        let at = |i: usize, default: f64| {
+            array[i]
+                .as_real()
+                .or_else(|| array[i].as_integer().map(|n| n as f64))
+                .unwrap_or(default) as f32
+        };
+        Some([at(0, 0.0), at(1, 0.0), at(2, 612.0), at(3, 792.0)])
+    }
+
+    /// Refuses a page-list edit once a merge has added pages.
+    fn refuse_if_merged(&self, op: &str) -> Result<()> {
+        if self.merged_sources.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(format!(
+                "{op} is not supported on a document with merged pages"
+            )))
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Translate a user-visible (output-order) page index to the internal source page index.
     ///
@@ -1207,7 +1342,7 @@ impl DocumentEditor {
         // Slow path for documents with appended pages from merge_from(): the
         // fast path swaps page_order, but merged pages live in a separate
         // vector and aren't represented there.
-        if !self.merged_pages.is_empty() {
+        if !self.merged_sources.is_empty() {
             let keep: std::collections::HashSet<usize> = pages.iter().copied().collect();
             let snapshot = self.save_to_bytes()?;
             let mut copy = DocumentEditor::from_bytes(snapshot)?;
@@ -1298,7 +1433,7 @@ impl DocumentEditor {
                 )));
             }
         }
-        if !self.merged_pages.is_empty() {
+        if !self.merged_sources.is_empty() {
             return Err(Error::InvalidPdf(
                 "select_pages does not yet support documents with pages added via merge_from"
                     .to_string(),
@@ -1378,15 +1513,15 @@ impl DocumentEditor {
     /// Number of pages merged from the source PDF.
     pub fn merge_from_bytes(&mut self, data: &[u8]) -> Result<usize> {
         // ── pdf_manipulator patch: shared core with merge_from_reader ──
-        let mut source_doc = PdfDocument::from_bytes(data.to_vec())?;
-        self.merge_from_document(&mut source_doc)
+        let source_doc = PdfDocument::from_bytes(data.to_vec())?;
+        self.merge_from_document(source_doc)
         // ── end pdf_manipulator patch ──
     }
 
     // ── pdf_manipulator patch: O(1)-memory merge via reader ──
     pub(crate) fn merge_from_reader(&mut self, reader: Box<dyn crate::document::ReadSeek>) -> Result<usize> {
-        let mut source_doc = PdfDocument::from_external_reader(reader)?;
-        self.merge_from_document(&mut source_doc)
+        let source_doc = PdfDocument::from_external_reader_bounded(reader, MERGED_CACHE_BYTES)?;
+        self.merge_from_document(source_doc)
     }
 
     /// Selective twin of `merge_from_reader`: imports only `pages`, in the
@@ -1396,11 +1531,11 @@ impl DocumentEditor {
         reader: Box<dyn crate::document::ReadSeek>,
         pages: &[usize],
     ) -> Result<usize> {
-        let mut source_doc = PdfDocument::from_external_reader(reader)?;
-        self.merge_pages_from_document(&mut source_doc, pages)
+        let source_doc = PdfDocument::from_external_reader_bounded(reader, MERGED_CACHE_BYTES)?;
+        self.merge_pages_from_document(source_doc, pages)
     }
 
-    fn merge_from_document(&mut self, source_doc: &mut PdfDocument) -> Result<usize> {
+    fn merge_from_document(&mut self, source_doc: PdfDocument) -> Result<usize> {
         let source_page_count = source_doc.page_count()?;
         let pages: Vec<usize> = (0..source_page_count).collect();
         self.merge_pages_from_document(source_doc, &pages)
@@ -1412,17 +1547,21 @@ impl DocumentEditor {
     /// share keeps one identity — which is also what lets the source's
     /// `/AcroForm /Fields` entries be renumbered onto the imported field
     /// objects (`carry_merged_acroform`).
+    ///
+    /// The merge records ids only: the document stays open in the editor
+    /// and the save streams each object from it.
     fn merge_pages_from_document(
         &mut self,
-        source_doc: &mut PdfDocument,
+        source_doc: PdfDocument,
         pages: &[usize],
     ) -> Result<usize> {
-        let source_page_count = source_doc.page_count()?;
+        let page_refs = source_doc.all_page_refs()?;
         for &page in pages {
-            if page >= source_page_count {
+            if page >= page_refs.len() {
                 return Err(Error::InvalidPdf(format!(
                     "Page index {} out of range (source has {} pages)",
-                    page, source_page_count
+                    page,
+                    page_refs.len()
                 )));
             }
         }
@@ -1430,13 +1569,33 @@ impl DocumentEditor {
             return Ok(0);
         }
 
-        let mut id_map: HashMap<u32, u32> = HashMap::new();
-        for &page_idx in pages {
-            let page_data =
-                self.import_page_from_document(source_doc, page_idx, &mut id_map)?;
-            self.merged_pages.push(page_data);
+        let mut merged = MergedSource {
+            doc: source_doc,
+            pages: Vec::with_capacity(pages.len()),
+            objects: Vec::new(),
+            id_map: HashMap::new(),
+            inherited: HashMap::new(),
+        };
+        let mut source_pages: Vec<u32> = page_refs.iter().map(|r| r.id).collect();
+        source_pages.sort_unstable();
+        // Every imported page gets its id first, so a destination or /P
+        // naming an imported page lands on the merged copy.
+        let page_ids: Vec<u32> = pages.iter().map(|_| self.allocate_object_id()).collect();
+        for (&page_idx, &page_id) in pages.iter().zip(&page_ids) {
+            merged.id_map.entry(page_refs[page_idx].id).or_insert(page_id);
         }
-        self.carry_merged_acroform(source_doc, &mut id_map)?;
+        for (&page_idx, &page_id) in pages.iter().zip(&page_ids) {
+            let page = self.import_page_from_document(
+                &mut merged,
+                page_refs[page_idx],
+                page_id,
+                &source_pages,
+            )?;
+            merged.pages.push(page);
+        }
+        self.carry_merged_acroform(&mut merged, &source_pages)?;
+        merged.doc.clear_object_cache();
+        self.merged_sources.push(merged);
         self.is_modified = true;
         Ok(pages.len())
     }
@@ -1448,11 +1607,8 @@ impl DocumentEditor {
     ///
     /// A field whose widgets all live on pages this merge did not import is
     /// skipped: its object was never renumbered, so it has no identity here.
-    fn carry_merged_acroform(
-        &mut self,
-        source_doc: &mut PdfDocument,
-        id_map: &mut HashMap<u32, u32>,
-    ) -> Result<()> {
+    fn carry_merged_acroform(&mut self, merged: &mut MergedSource, source_pages: &[u32]) -> Result<()> {
+        let source_doc = &merged.doc;
         let catalog = match source_doc.catalog() {
             Ok(c) => c,
             Err(_) => return Ok(()),
@@ -1475,165 +1631,199 @@ impl DocumentEditor {
             },
             _ => Vec::new(),
         };
+        // The /DR value stays in the merged document's numbering; the save
+        // remaps it. Its resource objects ride with the last imported
+        // page — the save writes every merged page's object list.
+        let mut dr = None;
+        if self.merged_acroform_dr.is_none() {
+            if let Some(value) = acroform.get("DR").cloned() {
+                self.walk_merge_ids(
+                    source_doc,
+                    &value,
+                    &mut merged.id_map,
+                    &mut merged.objects,
+                    source_pages,
+                )?;
+                dr = Some(value);
+            }
+        }
+
         for entry in &fields {
             if let Some(field_ref) = entry.as_reference() {
-                if let Some(&new_id) = id_map.get(&field_ref.id) {
+                if let Some(&new_id) = merged.id_map.get(&field_ref.id) {
                     self.merged_form_fields.push(ObjectRef::new(new_id, 0));
                 }
             }
         }
-
         if self.merged_acroform_da.is_none() {
             if let Some(da @ Object::String(_)) = acroform.get("DA") {
                 self.merged_acroform_da = Some(da.clone());
             }
         }
-        if self.merged_acroform_dr.is_none() {
-            if let Some(dr) = acroform.get("DR").cloned() {
-                let mut collected: Vec<(u32, Object)> = Vec::new();
-                let imported = self.deep_import_object(
-                    source_doc,
-                    &dr,
-                    id_map,
-                    &mut collected,
-                    &mut HashSet::new(),
-                )?;
-                // The resource objects ride with the pages they were
-                // imported beside — the save writer emits every merged
-                // page's dependent objects.
-                if let Some(last) = self.merged_pages.last_mut() {
-                    last.objects.extend(collected);
-                }
-                self.merged_acroform_dr = Some(imported);
+        if let Some(value) = dr {
+            let total = merged.objects.len();
+            if let Some(last) = merged.pages.last_mut() {
+                last.objects.end = total;
             }
+            self.merged_acroform_dr = Some((self.merged_sources.len(), value));
         }
         Ok(())
     }
     // ── end pdf_manipulator patch ──
 
-    /// Import a single page and all its dependent objects from a source document.
+    // ── pdf_manipulator patch: the merge walk records ids, never object bytes ──
+    /// Records the page at `page_ref` of a merged document: the new id of
+    /// every object it reaches that the merge has not met yet. The page
+    /// dictionary itself is not stored; the save reads it again.
     ///
-    /// Performs a deep copy of the page object graph, remapping all indirect
-    /// references to new object IDs allocated in this document.
+    /// `merged.id_map` spans every page of one merge, so shared objects are
+    /// imported once and the merge can look up a field's new id afterwards.
+    /// `source_pages` are the merged document's page ids, sorted: the walk
+    /// never follows a reference to one the merge did not import.
     fn import_page_from_document(
         &mut self,
-        source: &mut PdfDocument,
-        page_index: usize,
-        // ── pdf_manipulator patch: the caller owns the id map ──
-        // It spans every page of one merge, so shared objects are imported
-        // once and the merge can look up a field's new id afterwards.
-        id_map: &mut HashMap<u32, u32>,
-        // ── end pdf_manipulator patch ──
-    ) -> Result<MergedPageData> {
-        let page_ref = source.get_page_ref(page_index)?;
-        let page_obj = source.load_object(page_ref)?;
-
-        // Strip /Parent before deep import to avoid pulling in the entire
-        // source page tree (which causes cycles and imports unreachable objects)
-        let stripped_page = if let Object::Dictionary(mut dict) = page_obj {
-            dict.remove("Parent");
-            Object::Dictionary(dict)
-        } else {
-            page_obj
-        };
-
-        // Collected objects: new_id -> remapped object
-        let mut collected: Vec<(u32, Object)> = Vec::new();
-
-        // Deep-copy the page object, recursively importing all referenced objects
-        let final_page = self.deep_import_object(
-            source,
-            &stripped_page,
-            id_map,
-            &mut collected,
-            &mut HashSet::new(),
+        merged: &mut MergedSource,
+        page_ref: ObjectRef,
+        page_id: u32,
+        source_pages: &[u32],
+    ) -> Result<MergedPageImport> {
+        let mut page = Self::load_dict_only(&merged.doc, page_ref)?;
+        let first = merged.objects.len();
+        // The page tree is never followed: the save sets /Parent. What the
+        // page inherits from it is imported with the page instead.
+        if let Object::Dictionary(dict) = &mut page {
+            if let Some(Object::Reference(parent)) = dict.remove("Parent") {
+                self.resolve_inherited(merged, parent, source_pages)?;
+            }
+        }
+        self.walk_merge_ids(
+            &merged.doc,
+            &page,
+            &mut merged.id_map,
+            &mut merged.objects,
+            source_pages,
         )?;
-
-        Ok(MergedPageData {
-            page_object: final_page,
-            objects: collected,
-        })
+        Ok(MergedPageImport { page_ref, page_id, objects: first..merged.objects.len() })
     }
 
-    /// Recursively import a PDF object, remapping all indirect references.
-    ///
-    /// When an `Object::Reference` is encountered, the referenced object is
-    /// loaded from the source document, assigned a new ID, and recursively
-    /// imported. The reference is rewritten to point to the new ID.
-    fn deep_import_object(
+    /// Fills `merged.inherited` for the page-tree node `node` and every
+    /// ancestor not yet resolved: the inheritable attributes (§7.7.3.4) a
+    /// page below the node gets from its ancestors, nearest value winning.
+    /// The objects those values reference join the walk once, with the
+    /// node that first holds them.
+    fn resolve_inherited(
         &mut self,
-        source: &mut PdfDocument,
-        obj: &Object,
-        id_map: &mut HashMap<u32, u32>,
-        collected: &mut Vec<(u32, Object)>,
-        visiting: &mut HashSet<u32>,
-    ) -> Result<Object> {
-        match obj {
-            Object::Reference(obj_ref) => {
-                // Check if we already remapped this reference
-                if let Some(&new_id) = id_map.get(&obj_ref.id) {
-                    return Ok(Object::Reference(ObjectRef::new(new_id, 0)));
+        merged: &mut MergedSource,
+        node: ObjectRef,
+        source_pages: &[u32],
+    ) -> Result<()> {
+        let mut chain: Vec<(u32, HashMap<String, Object>)> = Vec::new();
+        let mut at = Some(node);
+        while let Some(r) = at {
+            if merged.inherited.contains_key(&r.id) || chain.iter().any(|(id, _)| *id == r.id) {
+                break;
+            }
+            let dict = match merged.doc.load_object(r)? {
+                Object::Dictionary(d) => d,
+                _ => HashMap::new(),
+            };
+            at = dict.get("Parent").and_then(|p| p.as_reference());
+            chain.push((r.id, dict));
+        }
+        let mut inherited: Vec<(String, Object)> = at
+            .and_then(|r| merged.inherited.get(&r.id).cloned())
+            .unwrap_or_default();
+        for (id, mut dict) in chain.into_iter().rev() {
+            for key in INHERITABLE {
+                if let Some(value) = dict.remove(key) {
+                    self.walk_merge_ids(
+                        &merged.doc,
+                        &value,
+                        &mut merged.id_map,
+                        &mut merged.objects,
+                        source_pages,
+                    )?;
+                    inherited.retain(|(k, _)| k != key);
+                    inherited.push((key.to_string(), value));
                 }
+            }
+            merged.inherited.insert(id, inherited.clone());
+        }
+        Ok(())
+    }
 
-                // Cycle detection
-                if !visiting.insert(obj_ref.id) {
-                    // Already visiting this object (cycle) - allocate an ID
-                    // and return a reference; the object will be filled later
-                    let new_id = self.allocate_object_id();
-                    id_map.insert(obj_ref.id, new_id);
-                    return Ok(Object::Reference(ObjectRef::new(new_id, 0)));
+    /// A merged page's dictionary as the save writes it before remapping:
+    /// the page's own entries plus the inheritable ones it lacks, with no
+    /// /Parent.
+    fn merged_page_object(source: &MergedSource, page_ref: ObjectRef) -> Result<Object> {
+        let mut page = Self::load_dict_only(&source.doc, page_ref)?;
+        if let Object::Dictionary(dict) = &mut page {
+            if let Some(Object::Reference(parent)) = dict.remove("Parent") {
+                for (key, value) in source.inherited.get(&parent.id).into_iter().flatten() {
+                    dict.entry(key.clone()).or_insert_with(|| value.clone());
                 }
+            }
+        }
+        Ok(page)
+    }
 
-                // Allocate a new ID for this object
-                let new_id = self.allocate_object_id();
-                id_map.insert(obj_ref.id, new_id);
-
-                // Load and recursively import the referenced object
-                let loaded = source.load_object(*obj_ref)?;
-                let remapped =
-                    self.deep_import_object(source, &loaded, id_map, collected, visiting)?;
-
-                visiting.remove(&obj_ref.id);
-
-                // Store the imported object
-                collected.push((new_id, remapped));
-
-                Ok(Object::Reference(ObjectRef::new(new_id, 0)))
-            },
-            Object::Dictionary(dict) => {
-                let mut new_dict = HashMap::with_capacity(dict.len());
-                for (key, value) in dict {
-                    let new_value =
-                        self.deep_import_object(source, value, id_map, collected, visiting)?;
-                    new_dict.insert(key.clone(), new_value);
-                }
-                Ok(Object::Dictionary(new_dict))
-            },
-            Object::Array(arr) => {
-                let mut new_arr = Vec::with_capacity(arr.len());
-                for item in arr {
-                    let new_item =
-                        self.deep_import_object(source, item, id_map, collected, visiting)?;
-                    new_arr.push(new_item);
-                }
-                Ok(Object::Array(new_arr))
-            },
-            Object::Stream { dict, data } => {
-                let mut new_dict = HashMap::with_capacity(dict.len());
-                for (key, value) in dict {
-                    let new_value =
-                        self.deep_import_object(source, value, id_map, collected, visiting)?;
-                    new_dict.insert(key.clone(), new_value);
-                }
-                Ok(Object::Stream {
-                    dict: new_dict,
-                    data: data.clone(),
-                })
-            },
-            // Primitive types need no remapping
-            _ => Ok(obj.clone()),
+    /// An object as the walk and the save read it: a stream is its
+    /// dictionary with no data, so nothing large is ever loaded.
+    fn load_dict_only(doc: &PdfDocument, r: ObjectRef) -> Result<Object> {
+        match doc.stream_head(r)? {
+            Some(head) => Ok(Object::Stream { dict: head.dict, data: bytes::Bytes::new() }),
+            None => doc.load_object(r),
         }
     }
+
+    /// Gives every object reachable from `root` a new id, once, pushing
+    /// `(new, source)` for each into `out`. A reference already in `id_map`
+    /// (met earlier, or an imported page) is not followed again, which also
+    /// ends cycles. An annotation's /P is not followed: the save points it
+    /// at the page the annotation lives on. Nor is a page of the merged
+    /// document that the merge did not import (`source_pages`, sorted):
+    /// it gets no id, so the save writes the reference as null.
+    fn walk_merge_ids(
+        &mut self,
+        doc: &PdfDocument,
+        root: &Object,
+        id_map: &mut HashMap<u32, u32>,
+        out: &mut Vec<(u32, u32)>,
+        source_pages: &[u32],
+    ) -> Result<()> {
+        fn push_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
+            match obj {
+                Object::Reference(r) => out.push(*r),
+                Object::Array(arr) => arr.iter().for_each(|o| push_refs(o, out)),
+                Object::Dictionary(d) => push_dict_refs(d, out),
+                Object::Stream { dict, .. } => push_dict_refs(dict, out),
+                _ => {},
+            }
+        }
+        fn push_dict_refs(dict: &HashMap<String, Object>, out: &mut Vec<ObjectRef>) {
+            let annotation = dict.contains_key("Subtype");
+            for (key, value) in dict {
+                if annotation && key == "P" && matches!(value, Object::Reference(_)) {
+                    continue;
+                }
+                push_refs(value, out);
+            }
+        }
+
+        let mut pending: Vec<ObjectRef> = Vec::new();
+        push_refs(root, &mut pending);
+        while let Some(r) = pending.pop() {
+            if id_map.contains_key(&r.id) || source_pages.binary_search(&r.id).is_ok() {
+                continue;
+            }
+            let new_id = self.allocate_object_id();
+            id_map.insert(r.id, new_id);
+            out.push((new_id, r.id));
+            push_refs(&Self::load_dict_only(doc, r)?, &mut pending);
+        }
+        Ok(())
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Merge specific pages from another PDF into this document.
     ///
@@ -1657,9 +1847,9 @@ impl DocumentEditor {
         source_path: impl AsRef<Path>,
         pages: &[usize],
     ) -> Result<usize> {
-        let mut source_doc = PdfDocument::open(source_path.as_ref())?;
+        let source_doc = PdfDocument::open(source_path.as_ref())?;
         // ── pdf_manipulator patch: shared core with merge_pages_from_reader ──
-        self.merge_pages_from_document(&mut source_doc, pages)
+        self.merge_pages_from_document(source_doc, pages)
         // ── end pdf_manipulator patch ──
     }
 
@@ -1837,7 +2027,7 @@ impl DocumentEditor {
             && self.page_order.iter().enumerate().all(|(i, &p)| p == i as i32);
         Some(if !identity {
             "pages were removed or reordered, and the original bytes would keep removed ones"
-        } else if !self.merged_pages.is_empty() || !self.merged_form_fields.is_empty() {
+        } else if !self.merged_sources.is_empty() || !self.merged_form_fields.is_empty() {
             "pages were merged in"
         } else if !self.apply_redactions_pages.is_empty()
             || !self.redaction_regions.is_empty()
@@ -2554,6 +2744,89 @@ impl DocumentEditor {
         compress: bool,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
+        Self::write_stream_copy(
+            source,
+            next_object_id,
+            r,
+            r.id,
+            None,
+            writer,
+            serializer,
+            encrypting_output,
+            compress,
+            xref_entries,
+        )
+    }
+
+    /// The twin of `write_source_stream` for an object of a merged
+    /// document: the object is written under `new_id` and its dictionary's
+    /// references go through `id_map` (an annotation's /P becomes `page_id`).
+    fn write_merged_stream(
+        source: &PdfDocument,
+        next_object_id: &mut u32,
+        (new_id, src_id): (u32, u32),
+        remap: (&HashMap<u32, u32>, u32),
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        encrypting_output: bool,
+        compress: bool,
+        xref_entries: &mut XrefEntries,
+    ) -> Result<bool> {
+        Self::write_stream_copy(
+            source,
+            next_object_id,
+            ObjectRef::new(src_id, 0),
+            new_id,
+            Some(remap),
+            writer,
+            serializer,
+            encrypting_output,
+            compress,
+            xref_entries,
+        )
+    }
+
+    /// Rewrites the references of `dict` through `id_map`. A reference the
+    /// merge never met becomes null rather than naming an unrelated object
+    /// of this document; an annotation's /P becomes `page_id`.
+    fn remap_dict_refs(dict: &mut HashMap<String, Object>, id_map: &HashMap<u32, u32>, page_id: u32) {
+        let annotation = dict.contains_key("Subtype");
+        for (key, value) in dict.iter_mut() {
+            if annotation && key == "P" && matches!(value, Object::Reference(_)) {
+                *value = Object::Reference(ObjectRef::new(page_id, 0));
+            } else {
+                Self::remap_refs(value, id_map, page_id);
+            }
+        }
+    }
+
+    fn remap_refs(obj: &mut Object, id_map: &HashMap<u32, u32>, page_id: u32) {
+        match obj {
+            Object::Reference(r) => {
+                *obj = match id_map.get(&r.id) {
+                    Some(&new_id) => Object::Reference(ObjectRef::new(new_id, 0)),
+                    None => Object::Null,
+                };
+            },
+            Object::Array(arr) => arr.iter_mut().for_each(|o| Self::remap_refs(o, id_map, page_id)),
+            Object::Dictionary(d) => Self::remap_dict_refs(d, id_map, page_id),
+            Object::Stream { dict, .. } => Self::remap_dict_refs(dict, id_map, page_id),
+            _ => {},
+        }
+    }
+
+    fn write_stream_copy(
+        source: &PdfDocument,
+        next_object_id: &mut u32,
+        r: ObjectRef,
+        out_id: u32,
+        remap: Option<(&HashMap<u32, u32>, u32)>,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        encrypting_output: bool,
+        compress: bool,
+        xref_entries: &mut XrefEntries,
+    ) -> Result<bool> {
         const CHUNK: usize = 64 * 1024;
         const EMPTY_TAIL: &[u8] = b"\nstream\n\nendstream\nendobj\n";
 
@@ -2572,6 +2845,9 @@ impl DocumentEditor {
 
         let deflate = compress && !head.dict.contains_key("Filter");
         let mut dict = head.dict;
+        if let Some((id_map, page_id)) = remap {
+            Self::remap_dict_refs(&mut dict, id_map, page_id);
+        }
         let length_id = if deflate {
             let id = *next_object_id;
             *next_object_id += 1;
@@ -2584,7 +2860,7 @@ impl DocumentEditor {
         };
 
         let framed = serializer.serialize_indirect(
-            r.id,
+            out_id,
             0,
             &Object::Stream { dict, data: bytes::Bytes::new() },
         );
@@ -2623,7 +2899,7 @@ impl DocumentEditor {
             None
         };
         writer.write_all(b"\nendstream\nendobj\n")?;
-        xref_entries.push((r.id, offset, 0, true));
+        xref_entries.push((out_id, offset, 0, true));
 
         if let (Some(id), Some(len)) = (length_id, compressed_len) {
             let offset = writer.position();
@@ -3046,7 +3322,11 @@ impl DocumentEditor {
         // `modify_form_field` cannot reach them.
         if !self.merged_form_fields.is_empty() && !self.remove_acroform {
             let merged_fields = self.merged_form_fields.clone();
-            let merged_dr = self.merged_acroform_dr.clone();
+            let merged_dr = self.merged_acroform_dr.as_ref().map(|(source, dr)| {
+                let mut dr = dr.clone();
+                Self::remap_refs(&mut dr, &self.merged_sources[*source].id_map, 0);
+                dr
+            });
             let merged_da = self.merged_acroform_da.clone();
             let acroform_entry =
                 catalog_obj.as_dict().and_then(|d| d.get("AcroForm")).cloned();
@@ -3173,12 +3453,13 @@ impl DocumentEditor {
         writer.write_all(&bytes)?;
         xref_entries.push((catalog_ref.id, offset, 0, true));
 
-        // Pre-allocate IDs for merged pages so we can include them in the Pages tree
-        let merged_page_count = self.merged_pages.len();
-        let mut merged_page_ids: Vec<u32> = Vec::with_capacity(merged_page_count);
-        for _ in 0..merged_page_count {
-            merged_page_ids.push(self.allocate_object_id());
-        }
+        // ── pdf_manipulator patch: merged page ids were allocated by the merge ──
+        let merged_page_ids: Vec<u32> = self
+            .merged_sources
+            .iter()
+            .flat_map(|s| s.pages.iter().map(|p| p.page_id))
+            .collect();
+        // ── end pdf_manipulator patch ──
 
         // Get and write pages tree
         if let Some(catalog_dict) = catalog_obj.as_dict() {
@@ -3188,6 +3469,7 @@ impl DocumentEditor {
                 // Rebuild Pages tree: filter by page_order, reorder, append merged pages
                 // ── pdf_manipulator patch: the kid list is refs (8 bytes a page); the Kids array object lives only until the Pages object is written ──
                 let mut kid_refs: Vec<ObjectRef> = Vec::new();
+                let mut source_kid_count = 0;
                 // ── end pdf_manipulator patch ──
                 let final_pages_obj = if let Some(pages_dict) = pages_obj.as_dict() {
                     let mut new_pages_dict = pages_dict.clone();
@@ -3209,6 +3491,9 @@ impl DocumentEditor {
                         }
                     }
 
+                    // ── pdf_manipulator patch: merged pages are written by their own block, not the page loop ──
+                    source_kid_count = kid_refs.len();
+                    // ── end pdf_manipulator patch ──
                     // Append merged page refs
                     for &page_id in &merged_page_ids {
                         kid_refs.push(ObjectRef::new(page_id, 0));
@@ -3238,8 +3523,11 @@ impl DocumentEditor {
                 xref_entries.push((pages_ref.id, offset, 0, true));
                 drop(final_pages_obj);
 
-                // Write individual pages (kid_refs includes merged pages)
-                let kids = kid_refs.iter().map(|&r| Object::Reference(r));
+                // Write individual pages (kid_refs includes merged pages, which the page loop skips)
+                let kids = kid_refs
+                    .iter()
+                    .take(source_kid_count)
+                    .map(|&r| Object::Reference(r));
                         // Build a mapping: output loop position → original source page index.
                         // After select_pages() the page_order may differ from 0..n, so all
                         // per-page HashMaps (modified_content, modified_annotations, …) must
@@ -5019,43 +5307,68 @@ impl DocumentEditor {
             }
         }
 
+        // ── pdf_manipulator patch: merged objects stream from the merged documents, one at a time ──
         // Write merged pages and their dependent objects
-        for (page_data, &page_id) in self.merged_pages.iter().zip(merged_page_ids.iter()) {
-            // Set /Parent on the merged page to point to the Pages tree root
-            let final_page_obj = if let Some(catalog_dict) = catalog_obj.as_dict() {
-                if let Some(pages_ref) = catalog_dict.get("Pages").and_then(|p| p.as_reference()) {
-                    if let Object::Dictionary(mut dict) = page_data.page_object.clone() {
-                        dict.insert("Parent".to_string(), Object::Reference(pages_ref));
-                        Object::Dictionary(dict)
-                    } else {
-                        page_data.page_object.clone()
-                    }
-                } else {
-                    page_data.page_object.clone()
+        let output_pages_ref = catalog_obj
+            .as_dict()
+            .and_then(|d| d.get("Pages"))
+            .and_then(|p| p.as_reference());
+        let mut merged_index = 0;
+        for source in &self.merged_sources {
+            for page in &source.pages {
+                // The page dictionary is read again here, so the merge kept
+                // no copy of it. Its /Parent was never imported.
+                let mut page_obj = Self::merged_page_object(source, page.page_ref)?;
+                if let Object::Dictionary(dict) = &mut page_obj {
+                    Self::remap_dict_refs(dict, &source.id_map, page.page_id);
                 }
-            } else {
-                page_data.page_object.clone()
-            };
-
-            // Write the page object
-            let offset = writer.position();
-            let bytes =
-                serialize_obj(&serializer, page_id, 0, &final_page_obj, &encryption_handler);
-            writer.write_all(&bytes)?;
-            xref_entries.push((page_id, offset, 0, true));
-
-            // Write all dependent objects for this page
-            for (obj_id, obj) in &page_data.objects {
-                // Skip if already written (dedup)
-                if xref_entries.contains_id(*obj_id) {
-                    continue;
+                if let Some(props) = self.merged_page_props.get(&merged_index) {
+                    page_obj = self.apply_page_props_to_object(&page_obj, props)?;
                 }
+                if let (Object::Dictionary(dict), Some(pages_ref)) = (&mut page_obj, output_pages_ref) {
+                    dict.insert("Parent".to_string(), Object::Reference(pages_ref));
+                }
+                merged_index += 1;
+
                 let offset = writer.position();
-                let bytes = serialize_obj(&serializer, *obj_id, 0, obj, &encryption_handler);
+                let bytes =
+                    serialize_obj(&serializer, page.page_id, 0, &page_obj, &encryption_handler);
                 writer.write_all(&bytes)?;
-                xref_entries.push((*obj_id, offset, 0, true));
+                xref_entries.push((page.page_id, offset, 0, true));
+                drop(page_obj);
+
+                for &(new_id, src_id) in &source.objects[page.objects.clone()] {
+                    if xref_entries.contains_id(new_id) {
+                        continue;
+                    }
+                    if Self::write_merged_stream(
+                        &source.doc,
+                        &mut self.next_object_id,
+                        (new_id, src_id),
+                        (&source.id_map, page.page_id),
+                        writer,
+                        &serializer,
+                        encryption_handler.is_some(),
+                        options.compress,
+                        &mut xref_entries,
+                    )? {
+                        continue;
+                    }
+                    let src_ref = ObjectRef::new(src_id, 0);
+                    let mut obj = source
+                        .doc
+                        .decrypt_stream_for_copy(source.doc.load_object(src_ref)?, src_ref)?;
+                    Self::remap_refs(&mut obj, &source.id_map, page.page_id);
+                    let offset = writer.position();
+                    let bytes = serialize_obj(&serializer, new_id, 0, &obj, &encryption_handler);
+                    writer.write_all(&bytes)?;
+                    xref_entries.push((new_id, offset, 0, true));
+                }
+                // Each object was read once; the cache would only sit full.
+                source.doc.clear_object_cache();
             }
         }
+        // ── end pdf_manipulator patch ──
 
         // Write parent-only form fields (non-terminal fields with no widget)
         // These don't belong to any specific page, so write them after page processing
@@ -5354,7 +5667,7 @@ impl DocumentEditor {
             )));
         }
 
-        let source_index = self.output_to_source_index(page_index);
+        let source_index = self.source_page_for(page_index, "setting page content")?;
         self.modified_content.insert(source_index, content);
         self.structure_modified = true;
         self.is_modified = true;
@@ -5409,6 +5722,9 @@ impl DocumentEditor {
     /// Returns a PdfPage that allows hierarchical navigation and querying
     /// of page content with a DOM-like API.
     pub fn get_page(&mut self, page_index: usize) -> Result<crate::editor::dom::PdfPage> {
+        // ── pdf_manipulator patch: a merged page is refused before anything reads it as a source page ──
+        self.source_page_for(page_index, "editing page content")?;
+        // ── end pdf_manipulator patch ──
         // Get the page info first
         let page_info = self.get_page_info(page_index)?;
 
@@ -5446,7 +5762,7 @@ impl DocumentEditor {
         // a stale set, and the eventual save_page would REPLACE the
         // pending entry with it, silently erasing earlier edits
         // (e.g. a stamp wiping out a watermark added before it).
-        let source_page = self.output_to_source_index(page_index);
+        let source_page = self.source_page_for(page_index, "editing page content")?;
         let annotations: Vec<crate::editor::dom::AnnotationWrapper> =
             if let Some(pending) = self.modified_annotations.get(&source_page) {
                 pending.clone()
@@ -5473,7 +5789,7 @@ impl DocumentEditor {
     ///
     /// This saves both the page content and any modified annotations.
     pub fn save_page(&mut self, page: crate::editor::dom::PdfPage) -> Result<()> {
-        let page_index = self.output_to_source_index(page.page_index);
+        let page_index = self.source_page_for(page.page_index, "saving page content")?;
         let annotations_modified = page.has_annotations_modified();
 
         // Extract annotations before moving root
@@ -5560,8 +5876,8 @@ impl DocumentEditor {
         &mut self,
         page_index: usize,
         annotation: A,
-    ) {
-        let source_page = self.output_to_source_index(page_index);
+    ) -> Result<()> {
+        let source_page = self.source_page_for(page_index, "adding an annotation")?;
         let wrapper = crate::editor::dom::AnnotationWrapper::from_write(annotation);
         self.modified_annotations
             .entry(source_page)
@@ -5574,6 +5890,7 @@ impl DocumentEditor {
             })
             .push(wrapper);
         self.is_modified = true;
+        Ok(())
     }
 
     /// Edit a page with a closure, automatically saving changes.
@@ -5630,7 +5947,22 @@ impl DocumentEditor {
     ///
     /// Returns the effective rotation, considering any modifications.
     pub fn get_page_rotation(&mut self, index: usize) -> Result<i32> {
-        let source_index = self.output_to_source_index(index);
+        // ── pdf_manipulator patch: merged pages read their own document ──
+        let source_index = match self.page_key(index) {
+            PageKey::Source(source_index) => source_index,
+            PageKey::Merged(merged) => {
+                if let Some(rotation) = self.merged_page_props.get(&merged).and_then(|p| p.rotation) {
+                    return Ok(rotation);
+                }
+                let dict = self.merged_page_dict(merged)?;
+                return Ok(dict
+                    .get("Rotate")
+                    .and_then(|r| r.as_integer())
+                    .map(|r| (r % 360 + 360) as i32 % 360)
+                    .unwrap_or(0));
+            },
+        };
+        // ── end pdf_manipulator patch ──
         // Check if we have a modified rotation
         if let Some(props) = self.modified_page_props.get(&source_index) {
             if let Some(rotation) = props.rotation {
@@ -5664,9 +5996,10 @@ impl DocumentEditor {
         }
 
         // Store the modified rotation keyed by source index so serialization can find it.
-        let source_index = self.output_to_source_index(index);
-        let props = self.modified_page_props.entry(source_index).or_default();
+        // ── pdf_manipulator patch: merged pages keep theirs by merged index ──
+        let props = self.page_props_mut(index);
         props.rotation = Some(degrees);
+        // ── end pdf_manipulator patch ──
 
         self.is_modified = true;
         Ok(())
@@ -5704,7 +6037,18 @@ impl DocumentEditor {
     ///
     /// Returns [llx, lly, urx, ury] (lower-left x, lower-left y, upper-right x, upper-right y).
     pub fn get_page_media_box(&mut self, index: usize) -> Result<[f32; 4]> {
-        let source_index = self.output_to_source_index(index);
+        // ── pdf_manipulator patch: merged pages read their own document ──
+        let source_index = match self.page_key(index) {
+            PageKey::Source(source_index) => source_index,
+            PageKey::Merged(merged) => {
+                if let Some(media_box) = self.merged_page_props.get(&merged).and_then(|p| p.media_box) {
+                    return Ok(media_box);
+                }
+                let dict = self.merged_page_dict(merged)?;
+                return Ok(Self::box_of(&dict, "MediaBox").unwrap_or([0.0, 0.0, 612.0, 792.0]));
+            },
+        };
+        // ── end pdf_manipulator patch ──
         // Check if we have a modified MediaBox
         if let Some(props) = self.modified_page_props.get(&source_index) {
             if let Some(media_box) = props.media_box {
@@ -5762,6 +6106,12 @@ impl DocumentEditor {
         let page_refs = self.get_page_refs().unwrap_or_default();
         let mut result = Vec::with_capacity(count);
         for i in 0..count {
+            // ── pdf_manipulator patch: merged pages read their own document ──
+            if i >= source_indices.len() && self.merged_page_total() > 0 {
+                result.push(self.get_page_media_box(i).unwrap_or([0.0, 0.0, 612.0, 792.0]));
+                continue;
+            }
+            // ── end pdf_manipulator patch ──
             let source_index = if i < source_indices.len() {
                 source_indices[i]
             } else {
@@ -5801,8 +6151,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", index)));
         }
 
-        let source_index = self.output_to_source_index(index);
-        let props = self.modified_page_props.entry(source_index).or_default();
+        let props = self.page_props_mut(index);
         props.media_box = Some(box_);
 
         self.is_modified = true;
@@ -5813,7 +6162,17 @@ impl DocumentEditor {
     ///
     /// Returns None if no CropBox is set (defaults to MediaBox).
     pub fn get_page_crop_box(&mut self, index: usize) -> Result<Option<[f32; 4]>> {
-        let source_index = self.output_to_source_index(index);
+        // ── pdf_manipulator patch: merged pages read their own document ──
+        let source_index = match self.page_key(index) {
+            PageKey::Source(source_index) => source_index,
+            PageKey::Merged(merged) => {
+                if let Some(crop_box) = self.merged_page_props.get(&merged).and_then(|p| p.crop_box) {
+                    return Ok(Some(crop_box));
+                }
+                return Ok(Self::box_of(&self.merged_page_dict(merged)?, "CropBox"));
+            },
+        };
+        // ── end pdf_manipulator patch ──
         // Check if we have a modified CropBox
         if let Some(props) = self.modified_page_props.get(&source_index) {
             if let Some(crop_box) = props.crop_box {
@@ -5864,8 +6223,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", index)));
         }
 
-        let source_index = self.output_to_source_index(index);
-        let props = self.modified_page_props.entry(source_index).or_default();
+        let props = self.page_props_mut(index);
         props.crop_box = Some(box_);
 
         self.is_modified = true;
@@ -5916,7 +6274,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "erasing a region")?;
         let regions = self.erase_regions.entry(source_page).or_default();
         regions.push(rect);
 
@@ -5930,7 +6288,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "erasing regions")?;
         let regions = self.erase_regions.entry(source_page).or_default();
         regions.extend_from_slice(rects);
 
@@ -5940,8 +6298,9 @@ impl DocumentEditor {
 
     /// Clear all pending erase operations for a page.
     pub fn clear_erase_regions(&mut self, page: usize) {
-        let source_page = self.output_to_source_index(page);
-        self.erase_regions.remove(&source_page);
+        if let PageKey::Source(source_page) = self.page_key(page) {
+            self.erase_regions.remove(&source_page);
+        }
     }
 
     /// Generate the content stream for erase overlays.
@@ -6004,7 +6363,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "flattening annotations")?;
         self.flatten_annotations_pages.insert(source_page);
         self.is_modified = true;
         Ok(())
@@ -6025,14 +6384,15 @@ impl DocumentEditor {
 
     /// Check if a page has annotations marked for flattening.
     pub fn is_page_marked_for_flatten(&self, page: usize) -> bool {
-        let source_page = self.output_to_source_index(page);
-        self.flatten_annotations_pages.contains(&source_page)
+        matches!(self.page_key(page), PageKey::Source(source_page)
+            if self.flatten_annotations_pages.contains(&source_page))
     }
 
     /// Clear the flatten annotation flag for a page.
     pub fn unmark_page_for_flatten(&mut self, page: usize) {
-        let source_page = self.output_to_source_index(page);
-        self.flatten_annotations_pages.remove(&source_page);
+        if let PageKey::Source(source_page) = self.page_key(page) {
+            self.flatten_annotations_pages.remove(&source_page);
+        }
     }
 
     // ========================================================================
@@ -6060,7 +6420,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "flattening forms")?;
         self.flatten_forms_pages.insert(source_page);
         self.is_modified = true;
         Ok(())
@@ -6089,8 +6449,8 @@ impl DocumentEditor {
 
     /// Check if a page has form fields marked for flattening.
     pub fn is_page_marked_for_form_flatten(&self, page: usize) -> bool {
-        let source_page = self.output_to_source_index(page);
-        self.flatten_forms_pages.contains(&source_page)
+        matches!(self.page_key(page), PageKey::Source(source_page)
+            if self.flatten_forms_pages.contains(&source_page))
     }
 
     /// Check if AcroForm will be removed on save.
@@ -8240,7 +8600,7 @@ impl DocumentEditor {
         if page >= self.current_page_count() {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "adding a redaction")?;
         self.redaction_regions.entry(source_page).or_default().push(
             crate::redaction::RedactionRegion::from_rect(rect[0], rect[1], rect[2], rect[3], fill),
         );
@@ -8261,7 +8621,7 @@ impl DocumentEditor {
         if page >= self.current_page_count() {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "counting redactions")?;
         let annots = self.get_redaction_data(source_page)?.len();
         let prog = self
             .redaction_regions
@@ -8511,7 +8871,7 @@ impl DocumentEditor {
         if page >= self.current_page_count() {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
-        let src = self.output_to_source_index(page);
+        let src = self.source_page_for(page, "erasing regions")?;
         let mut rs = RegionSet::new(src);
         for r in rects {
             rs.push(RedactionRegion::from_rect(r[0], r[1], r[2], r[3], None));
@@ -8672,7 +9032,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "applying redactions")?;
         self.apply_redactions_pages.insert(source_page);
         self.is_modified = true;
         Ok(())
@@ -8690,14 +9050,15 @@ impl DocumentEditor {
 
     /// Check if a page is marked for redaction application.
     pub fn is_page_marked_for_redaction(&self, page: usize) -> bool {
-        let source_page = self.output_to_source_index(page);
-        self.apply_redactions_pages.contains(&source_page)
+        matches!(self.page_key(page), PageKey::Source(source_page)
+            if self.apply_redactions_pages.contains(&source_page))
     }
 
     /// Clear the apply redactions flag for a page.
     pub fn unmark_page_for_redaction(&mut self, page: usize) {
-        let source_page = self.output_to_source_index(page);
-        self.apply_redactions_pages.remove(&source_page);
+        if let PageKey::Source(source_page) = self.page_key(page) {
+            self.apply_redactions_pages.remove(&source_page);
+        }
     }
 
     /// Get redaction annotation data for a page.
@@ -8943,7 +9304,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "editing an image")?;
         let page_mods = self.image_modifications.entry(source_page).or_default();
         let modification = page_mods
             .entry(image_name.to_string())
@@ -8985,7 +9346,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "editing an image")?;
         let page_mods = self.image_modifications.entry(source_page).or_default();
         let modification = page_mods
             .entry(image_name.to_string())
@@ -9024,7 +9385,7 @@ impl DocumentEditor {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
 
-        let source_page = self.output_to_source_index(page);
+        let source_page = self.source_page_for(page, "editing an image")?;
         let page_mods = self.image_modifications.entry(source_page).or_default();
         page_mods.insert(
             image_name.to_string(),
@@ -9277,6 +9638,23 @@ impl EditableDocument for DocumentEditor {
     }
 
     fn get_page_info(&mut self, index: usize) -> Result<PageInfo> {
+        // ── pdf_manipulator patch: a merged page reports its merged document's facts ──
+        if let PageKey::Merged(merged) = self.page_key(index) {
+            let [llx, lly, urx, ury] = self.get_page_media_box(index)?;
+            let rotation = self.get_page_rotation(index)?;
+            let page_id = self
+                .merged_page(merged)
+                .map(|(_, page)| page.page_id)
+                .ok_or_else(|| Error::InvalidPdf(format!("Page index {} out of range", index)))?;
+            return Ok(PageInfo {
+                index,
+                width: urx - llx,
+                height: ury - lly,
+                rotation,
+                object_ref: ObjectRef::new(page_id, 0),
+            });
+        }
+        // ── end pdf_manipulator patch ──
         let page_refs = self.get_page_refs()?;
 
         if index >= page_refs.len() {
@@ -9316,6 +9694,9 @@ impl EditableDocument for DocumentEditor {
     }
 
     fn remove_page(&mut self, index: usize) -> Result<()> {
+        // ── pdf_manipulator patch: merged pages cannot be reordered or dropped ──
+        self.refuse_if_merged("removing a page")?;
+        // ── end pdf_manipulator patch ──
         if index >= self.current_page_count() {
             return Err(Error::InvalidPdf(format!(
                 "Page index {} out of range (document has {} pages)",
@@ -9342,6 +9723,9 @@ impl EditableDocument for DocumentEditor {
     }
 
     fn move_page(&mut self, from: usize, to: usize) -> Result<()> {
+        // ── pdf_manipulator patch: merged pages cannot be reordered or dropped ──
+        self.refuse_if_merged("moving a page")?;
+        // ── end pdf_manipulator patch ──
         let count = self.current_page_count();
         if from >= count || to >= count {
             return Err(Error::InvalidPdf(format!(
@@ -9371,6 +9755,9 @@ impl EditableDocument for DocumentEditor {
     }
 
     fn duplicate_page(&mut self, index: usize) -> Result<usize> {
+        // ── pdf_manipulator patch: merged pages cannot be reordered or dropped ──
+        self.refuse_if_merged("duplicating a page")?;
+        // ── end pdf_manipulator patch ──
         if index >= self.current_page_count() {
             return Err(Error::InvalidPdf(format!(
                 "Page index {} out of range (document has {} pages)",
@@ -13300,5 +13687,334 @@ mod tests {
         for i in 0..3 {
             assert_eq!(reopened.get_page_rotation(i).unwrap(), 90, "page {i}");
         }
+    }
+
+    // ── a merge records ids and streams the merged document at save ──
+
+    const MERGE_CONTENT: &[u8] = b"BT\n/F1 12 Tf\n1 0 0 1 72 700 Tm\n(MERGEDTEXT) Tj\nET\n";
+    const MERGE_IMAGE: [u8; 48] = [
+        7, 200, 13, 91, 42, 250, 3, 118, 66, 29, 180, 5, 99, 141, 77, 230, 18, 61, 154, 9, 205,
+        88, 37, 172, 24, 111, 246, 53, 130, 2, 195, 70, 16, 223, 84, 149, 31, 167, 58, 240, 12,
+        104, 191, 45, 126, 8, 215, 93,
+    ];
+
+    /// Objects are numbered from 1 in the order given; offsets are computed.
+    fn pdf_from_objects(objs: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for o in objs {
+            offsets.push(out.len());
+            out.extend_from_slice(o);
+        }
+        let xref_at = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n", objs.len() + 1)
+                .as_bytes(),
+        );
+        out
+    }
+
+    fn stream_object(id: u32, dict: &str, data: &[u8]) -> Vec<u8> {
+        [
+            format!("{id} 0 obj\n<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes(),
+            data.to_vec(),
+            b"\nendstream\nendobj\n".to_vec(),
+        ]
+        .concat()
+    }
+
+    /// One page with a known content stream, an unfiltered image, a link
+    /// whose /P and /Dest name the page, a text field, outlines and an
+    /// AcroForm with /DR.
+    fn merge_source_pdf_bytes() -> Vec<u8> {
+        pdf_from_objects(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R \
+              /AcroForm << /Fields [10 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 8 0 R >> >> >> >>\nendobj\n"
+                .to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Contents 4 0 R \
+              /Resources << /Font << /F1 8 0 R >> /XObject << /Im1 5 0 R >> >> /Annots [6 0 R 10 0 R] >>\nendobj\n"
+                .to_vec(),
+            stream_object(4, "", MERGE_CONTENT),
+            stream_object(
+                5,
+                "/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                &MERGE_IMAGE,
+            ),
+            b"6 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 10 90 40] /P 3 0 R \
+              /Dest [3 0 R /Fit] /Border [0 0 0] >>\nendobj\n"
+                .to_vec(),
+            b"7 0 obj\n<< /Unused true >>\nendobj\n".to_vec(),
+            b"8 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+            b"9 0 obj\n<< /Type /Outlines /Count 0 >>\nendobj\n".to_vec(),
+            b"10 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (mergedfield) /Rect [10 100 90 120] \
+              /P 3 0 R /DA (/Helv 0 Tf 0 g) >>\nendobj\n"
+                .to_vec(),
+        ])
+    }
+
+    fn merge_base_pdf_bytes() -> Vec<u8> {
+        crate::api::Pdf::from_text("base page").unwrap().into_bytes()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn merged_editor() -> DocumentEditor {
+        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
+        assert_eq!(editor.merge_from_bytes(&merge_source_pdf_bytes()).unwrap(), 1);
+        editor
+    }
+
+    #[test]
+    fn merged_content_and_image_are_copied_byte_for_byte() {
+        let mut editor = merged_editor();
+        let bytes = editor
+            .save_to_bytes_with_options(SaveOptions { compress: false, ..SaveOptions::full_rewrite() })
+            .unwrap();
+
+        assert!(contains(&bytes, MERGE_CONTENT), "content stream bytes differ");
+        assert!(contains(&bytes, &MERGE_IMAGE), "image bytes differ");
+    }
+
+    #[test]
+    fn merged_save_writes_one_object_per_id() {
+        let mut editor = merged_editor();
+        let bytes = editor.save_to_bytes().unwrap();
+
+        let text = String::from_utf8_lossy(&bytes);
+        let mut ids = Vec::new();
+        for line in text.lines() {
+            if let Some(id) = line.strip_suffix(" 0 obj").and_then(|n| n.parse::<u32>().ok()) {
+                ids.push(id);
+            }
+        }
+        let unique: HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "an object id was written twice: {ids:?}");
+
+        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
+        for id in &ids {
+            assert!(!doc.is_free_entry(*id), "object {id} is missing from the xref");
+        }
+    }
+
+    #[test]
+    fn merged_save_with_compression_keeps_the_decoded_content() {
+        let mut editor = merged_editor();
+        let bytes = editor.save_to_bytes().unwrap();
+        assert!(!contains(&bytes, MERGE_CONTENT), "content stream was not deflated");
+
+        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
+        let page = doc.get_page_ref(1).unwrap();
+        let page_dict = doc.load_object(page).unwrap();
+        let contents = page_dict.as_dict().unwrap().get("Contents").unwrap().as_reference().unwrap();
+        let stream = doc.load_object(contents).unwrap();
+        let decoded = doc.decode_stream_with_encryption(&stream, contents).unwrap();
+        assert_eq!(decoded, MERGE_CONTENT);
+    }
+
+    #[test]
+    fn merged_link_keeps_its_destination_and_points_at_the_merged_page() {
+        let mut editor = merged_editor();
+        let bytes = editor.save_to_bytes().unwrap();
+        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
+
+        let page_ref = doc.get_page_ref(1).unwrap();
+        let page = doc.load_object(page_ref).unwrap();
+        let annots = page.as_dict().unwrap().get("Annots").unwrap().as_array().unwrap().clone();
+        let link = annots
+            .iter()
+            .filter_map(|a| a.as_reference())
+            .filter_map(|r| doc.load_object(r).ok())
+            .find(|o| o.as_dict().and_then(|d| d.get("Subtype")).and_then(|s| s.as_name()) == Some("Link"))
+            .expect("the merged page lost its link");
+        let link = link.as_dict().unwrap();
+        assert_eq!(link.get("P").and_then(|p| p.as_reference()), Some(page_ref));
+        let dest = link.get("Dest").and_then(|d| d.as_array()).expect("link lost its /Dest");
+        assert_eq!(dest[0].as_reference(), Some(page_ref), "a destination names the merged page");
+    }
+
+    #[test]
+    fn merge_does_not_import_outlines_and_lists_merged_fields() {
+        let mut editor = merged_editor();
+        let bytes = editor.save_to_bytes().unwrap();
+        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
+
+        let catalog = doc.catalog().unwrap();
+        let catalog = catalog.as_dict().unwrap();
+        assert!(!catalog.contains_key("Outlines"), "the first document's outline is kept, not the merged one");
+
+        let acroform = catalog.get("AcroForm").and_then(|a| a.as_dict()).expect("no AcroForm");
+        let fields = acroform.get("Fields").and_then(|f| f.as_array()).expect("no /Fields");
+        assert_eq!(fields.len(), 1);
+        let field = doc.load_object(fields[0].as_reference().unwrap()).unwrap();
+        assert_eq!(
+            field.as_dict().and_then(|d| d.get("T")).and_then(|t| t.as_string()),
+            Some(&b"mergedfield"[..])
+        );
+        assert!(acroform.contains_key("DR"), "the merged /DR is carried");
+    }
+
+    #[test]
+    fn rotating_a_merged_page_rotates_only_that_page() {
+        let mut editor = merged_editor();
+        assert_eq!(editor.current_page_count(), 2);
+        editor.set_page_rotation(1, 90).unwrap();
+        assert_eq!(editor.get_page_rotation(1).unwrap(), 90);
+        assert_eq!(editor.get_page_rotation(0).unwrap(), 0);
+        assert_eq!(editor.get_page_media_box(1).unwrap(), [0.0, 0.0, 300.0, 400.0]);
+        editor.set_page_media_box(1, [0.0, 0.0, 100.0, 200.0]).unwrap();
+
+        let bytes = editor.save_to_bytes().unwrap();
+        let mut reopened = open_editor_from_bytes(&bytes, "merged_rotate");
+        assert_eq!(reopened.get_page_rotation(1).unwrap(), 90);
+        assert_eq!(reopened.get_page_rotation(0).unwrap(), 0);
+        assert_eq!(reopened.get_page_media_box(1).unwrap(), [0.0, 0.0, 100.0, 200.0]);
+    }
+
+    #[test]
+    fn content_edits_on_a_merged_page_are_refused() {
+        let mut editor = merged_editor();
+        let err = editor.get_page(1).err().expect("editing merged content must fail");
+        assert!(matches!(err, Error::Unsupported(ref m) if m.contains("merged")), "{err}");
+        assert!(matches!(
+            editor.add_redaction(1, [0.0, 0.0, 10.0, 10.0], None),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(editor.erase_region(1, [0.0, 0.0, 10.0, 10.0]), Err(Error::Unsupported(_))));
+        assert!(matches!(editor.flatten_forms_on_page(1), Err(Error::Unsupported(_))));
+        // The source page is still editable.
+        editor.erase_region(0, [0.0, 0.0, 10.0, 10.0]).unwrap();
+    }
+
+    #[test]
+    fn page_list_edits_on_a_merged_document_are_refused_not_panics() {
+        use crate::editor::EditableDocument;
+        let mut editor = merged_editor();
+        assert!(matches!(editor.move_page(0, 1), Err(Error::Unsupported(_))));
+        assert!(matches!(editor.duplicate_page(0), Err(Error::Unsupported(_))));
+        assert!(matches!(editor.remove_page(1), Err(Error::Unsupported(_))));
+        assert!(editor.select_pages(&[0]).is_err());
+        assert_eq!(editor.current_page_count(), 2);
+    }
+
+    /// A page whose /MediaBox, /Rotate and /Resources live only on its
+    /// /Pages node.
+    fn inheriting_source_pdf_bytes() -> Vec<u8> {
+        let content: &[u8] = b"BT\n/F1 18 Tf\n1 0 0 1 20 200 Tm\n(INHERITEDTEXT) Tj\nET\n";
+        pdf_from_objects(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] /Rotate 90 \
+              /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n"
+                .to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n".to_vec(),
+            stream_object(4, "", content),
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        ])
+    }
+
+    /// Two pages: the first links to the second.
+    fn linked_pair_source_pdf_bytes() -> Vec<u8> {
+        pdf_from_objects(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 200 200] >>\nendobj\n"
+                .to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>\nendobj\n".to_vec(),
+            b"4 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 10 50 50] /P 3 0 R \
+              /Dest [5 0 R /Fit] >>\nendobj\n"
+                .to_vec(),
+            b"5 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n".to_vec(),
+        ])
+    }
+
+    /// Every object the saved file holds, once.
+    fn saved_objects(bytes: &[u8]) -> Vec<Object> {
+        let doc = crate::document::PdfDocument::from_bytes(bytes.to_vec()).unwrap();
+        doc.all_object_ids()
+            .into_iter()
+            .filter(|&id| id != 0 && !doc.is_free_entry(id))
+            .map(|id| doc.load_object(ObjectRef::new(id, 0)).unwrap())
+            .collect()
+    }
+
+    fn count_of_type(objects: &[Object], type_name: &str) -> usize {
+        objects
+            .iter()
+            .filter(|o| {
+                o.as_dict().and_then(|d| d.get("Type")).and_then(|t| t.as_name()) == Some(type_name)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_merged_page_keeps_what_it_inherited_from_its_page_tree() {
+        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
+        editor.merge_from_bytes(&inheriting_source_pdf_bytes()).unwrap();
+        let bytes = editor.save_to_bytes().unwrap();
+
+        let mut doc = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
+        assert!(
+            doc.extract_text(1).unwrap().contains("INHERITEDTEXT"),
+            "the inherited /Resources font is imported with the page"
+        );
+        let mut reopened = open_editor_from_bytes(&bytes, "merged_inherited");
+        assert_eq!(reopened.get_page_media_box(1).unwrap(), [0.0, 0.0, 300.0, 400.0]);
+        assert_eq!(reopened.get_page_rotation(1).unwrap(), 90);
+    }
+
+    #[test]
+    fn page_info_of_a_merged_page_reads_the_merged_page() {
+        use crate::editor::EditableDocument;
+        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
+        editor.merge_from_bytes(&inheriting_source_pdf_bytes()).unwrap();
+
+        let info = editor.get_page_info(1).unwrap();
+        assert_eq!((info.index, info.width, info.height, info.rotation), (1, 300.0, 400.0, 90));
+        editor.set_page_rotation(1, 180).unwrap();
+        editor.set_page_media_box(1, [0.0, 0.0, 100.0, 50.0]).unwrap();
+        let info = editor.get_page_info(1).unwrap();
+        assert_eq!((info.width, info.height, info.rotation), (100.0, 50.0, 180));
+        assert!(editor.get_page_info(2).is_err());
+    }
+
+    #[test]
+    fn a_link_to_a_page_that_was_not_merged_imports_no_page_tree() {
+        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
+        let source = crate::document::PdfDocument::from_bytes(linked_pair_source_pdf_bytes()).unwrap();
+        assert_eq!(editor.merge_pages_from_document(source, &[0]).unwrap(), 1);
+        let bytes = editor.save_to_bytes().unwrap();
+
+        let objects = saved_objects(&bytes);
+        assert_eq!(count_of_type(&objects, "Pages"), 1, "only the output's own page tree");
+        assert_eq!(count_of_type(&objects, "Page"), 2, "the unmerged source page is not imported");
+
+        let text = String::from_utf8_lossy(&bytes);
+        let ids: Vec<u32> = text
+            .lines()
+            .filter_map(|l| l.strip_suffix(" 0 obj").and_then(|n| n.parse().ok()))
+            .collect();
+        let unique: HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "an object id was written twice: {ids:?}");
+
+        let link = objects
+            .iter()
+            .find(|o| o.as_dict().and_then(|d| d.get("Subtype")).and_then(|s| s.as_name()) == Some("Link"))
+            .expect("the merged page lost its link");
+        let dest = link.as_dict().unwrap().get("Dest").and_then(|d| d.as_array()).expect("no /Dest");
+        assert!(matches!(dest[0], Object::Null), "a destination page that was left out is null");
+    }
+
+    #[test]
+    fn a_failed_merge_leaves_the_editor_unchanged() {
+        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
+        let source = crate::document::PdfDocument::from_bytes(merge_source_pdf_bytes()).unwrap();
+        assert!(editor.merge_pages_from_document(source, &[5]).is_err());
+        assert_eq!(editor.current_page_count(), 1);
+        assert!(editor.merged_sources.is_empty());
     }
 }
