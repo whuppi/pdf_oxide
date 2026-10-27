@@ -184,6 +184,14 @@ pub struct SaveOptions {
     pub garbage_collect: bool,
     /// Encryption configuration (None = no encryption)
     pub encryption: Option<EncryptionConfig>,
+    // ── pdf_manipulator patch: keep the source's own encryption ──
+    /// Write the output with the source's own encryption: its `/Encrypt`
+    /// dictionary, `/ID` and file key unchanged, so the owner and user
+    /// passwords and the permissions stay what the source set. Changes
+    /// nothing when the source is not encrypted. Mutually exclusive with
+    /// `encryption`.
+    pub keep_source_encryption: bool,
+    // ── end pdf_manipulator patch ──
 }
 
 impl SaveOptions {
@@ -2730,6 +2738,22 @@ impl DocumentEditor {
             }
         }
 
+        // ── pdf_manipulator patch: keep the source's own encryption ──
+        // Read before the first byte is written, so an unsupported source
+        // fails with nothing in the output.
+        if options.keep_source_encryption && options.encryption.is_some() {
+            return Err(Error::InvalidOperation(
+                "keep_source_encryption and an explicit encryption config are exclusive"
+                    .to_string(),
+            ));
+        }
+        let kept = if options.keep_source_encryption {
+            self.source.kept_encryption()?
+        } else {
+            None
+        };
+        // ── end pdf_manipulator patch ──
+
         // Write PDF header
         let (major, minor) = self.version();
         write!(writer, "%PDF-{}.{}\n", major, minor)?;
@@ -2785,7 +2809,16 @@ impl DocumentEditor {
                     )?,
                 };
 
-                (Some((id1, id2)), Some(encrypt_dict), Some(handler))
+                (Some((id1, id2)), Some(encrypt_dict.to_object()), Some(handler))
+            // ── pdf_manipulator patch: keep the source's own encryption ──
+            } else if let Some(kept) = kept {
+                let handler = EncryptionWriteHandler::with_file_key(
+                    kept.file_key,
+                    kept.algorithm,
+                    kept.encrypt_metadata,
+                );
+                (Some(kept.file_id), Some(kept.encrypt_dict), Some(handler))
+            // ── end pdf_manipulator patch ──
             } else {
                 (None, None, None)
             };
@@ -2823,9 +2856,8 @@ impl DocumentEditor {
         // Full implementation would do complete object traversal
 
         // Write encryption dictionary if encrypting (must not be encrypted itself)
-        let encrypt_obj_id = if let Some(ref enc_dict) = encrypt_dict {
+        let encrypt_obj_id = if let Some(ref enc_obj) = encrypt_dict {
             let enc_id = self.allocate_object_id();
-            let enc_obj = enc_dict.to_object();
             let offset = writer.position();
             // Encryption dict is NOT encrypted
             let bytes = serializer.serialize_indirect(enc_id, 0, &enc_obj);

@@ -3641,6 +3641,9 @@ impl WasmPdfDocument {
             linearize: linearize.unwrap_or(false),
             incremental: false,
             encryption: None,
+            // ── pdf_manipulator patch: keep the source's own encryption ──
+            keep_source_encryption: false,
+            // ── end pdf_manipulator patch ──
         };
         let editor_arc = self.ensure_editor()?;
         let mut editor = editor_arc

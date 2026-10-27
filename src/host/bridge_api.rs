@@ -299,7 +299,7 @@ pub(crate) fn handle_open(
             w.put_bool("requiresPassword", result.requires_password);
             w.put_bool("isTagged", result.is_tagged);
             w.put_i32("encryptionAlgorithm", result.encryption_algorithm as i32);
-            w.put_i32("permissionBits", result.permission_bits as i32);
+            w.put_i32("permissionBits", result.permission_bits);
             w.put_str("title", &result.title);
             w.put_str("author", &result.author);
             w.put_str("subject", &result.subject);
@@ -337,12 +337,6 @@ pub(crate) fn handle_editor_open(
     if let Some(resp) = authenticate_or_refuse(&doc, password) {
         return resp;
     }
-    // Encrypt-dict accessors return None on unencrypted documents —
-    // 0 / 0xFF are the wire's "not encrypted / all permitted" values,
-    // the same facts open_document reports.
-    let is_encrypted = doc.is_encrypted();
-    let enc_algo = doc.encryption_algorithm().unwrap_or(0) as i32;
-    let permission_bits = doc.permission_bits().map(|p| p as i32).unwrap_or(0xFF);
     let editor = match DocumentEditor::from_document(doc) {
         Ok(e) => e,
         Err(e) => return ResponseWriter::error_of(&e),
@@ -351,9 +345,6 @@ pub(crate) fn handle_editor_open(
     state.editors.insert(hid, editor);
     let mut w = ResponseWriter::ok();
     w.put_i32("handleId", hid as i32);
-    w.put_bool("isEncrypted", is_encrypted);
-    w.put_i32("encryptionAlgorithm", enc_algo);
-    w.put_i32("permissionBits", permission_bits);
     w.finish()
 }
 
@@ -1742,9 +1733,9 @@ pub(crate) fn handle_editor_save(
     let mode = req.get_i32("saveMode").unwrap_or(0);
     let encrypt_mode = req.get_i32("encryptMode").unwrap_or(0);
     let encryption = match encrypt_mode {
-        // 0 = keep (preserve source encryption — editor handles this internally)
+        // 0 = keep (the engine writes the source's own encryption)
         // 1 = remove (strip encryption)
-        1 => None,
+        0 | 1 => None,
         // 2 = apply new encryption config
         2 => {
             let algo = match req.get_i32("encryptAlgo").unwrap_or(4) {
@@ -1768,6 +1759,7 @@ pub(crate) fn handle_editor_save(
         compress,
         garbage_collect: gc,
         encryption,
+        keep_source_encryption: encrypt_mode == 0,
         ..Default::default()
     };
 

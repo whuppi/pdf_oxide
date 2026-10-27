@@ -1247,6 +1247,9 @@ impl PyPdfDocument {
                 linearize,
                 incremental: false,
                 encryption: None,
+                // ── pdf_manipulator patch: keep the source's own encryption ──
+                keep_source_encryption: false,
+                // ── end pdf_manipulator patch ──
             };
             editor
                 .save_with_options(path, options)
@@ -1282,6 +1285,9 @@ impl PyPdfDocument {
                 linearize,
                 incremental: false,
                 encryption: None,
+                // ── pdf_manipulator patch: keep the source's own encryption ──
+                keep_source_encryption: false,
+                // ── end pdf_manipulator patch ──
             };
             let bytes = editor.save_to_bytes_with_options(options).map_err(|e| {
                 PyRuntimeError::new_err(format!("Failed to save PDF to bytes: {}", e))

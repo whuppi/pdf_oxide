@@ -1135,6 +1135,21 @@ enum SoftHyphenSeam {
     Contiguous,
 }
 
+// ── pdf_manipulator patch: keep the source's own encryption ──
+/// An encrypted source's security parameters, as a save that keeps them
+/// writes them.
+pub(crate) struct KeptEncryption {
+    /// The source's `/Encrypt` dictionary, every key, indirect values resolved.
+    pub encrypt_dict: Object,
+    /// The source trailer's `/ID` halves, unchanged.
+    pub file_id: (Vec<u8>, Vec<u8>),
+    /// The file encryption key the source authenticated to.
+    pub file_key: Vec<u8>,
+    pub algorithm: crate::encryption::Algorithm,
+    pub encrypt_metadata: bool,
+}
+// ── end pdf_manipulator patch ──
+
 impl PdfDocument {
     /// Open a PDF document from in-memory bytes.
     ///
@@ -1744,6 +1759,133 @@ impl PdfDocument {
 
         result
     }
+
+    // ── pdf_manipulator patch: keep the source's own encryption ──
+    /// The security parameters of an authenticated encrypted source, or `None`
+    /// when the source is not encrypted. Fails with [`Error::Unsupported`]
+    /// when the write handler cannot reproduce the source's encryption.
+    pub(crate) fn kept_encryption(&self) -> Result<Option<KeptEncryption>> {
+        use crate::encryption::Algorithm;
+
+        fn refuse<T>(why: &str) -> Result<T> {
+            Err(Error::Unsupported(format!(
+                "keeping this source's encryption is not supported: {why}; \
+                 save it with explicit encryption"
+            )))
+        }
+
+        self.ensure_encryption_initialized()?;
+        let encrypt_entry = match self.trailer.as_dict().and_then(|d| d.get("Encrypt")) {
+            Some(entry) => entry.clone(),
+            None => return Ok(None),
+        };
+
+        let (file_key, algorithm) = {
+            let guard = self.encryption_handler.lock_or_recover();
+            match guard.as_ref().and_then(|h| h.encryption_key().map(|k| (k.to_vec(), h.algorithm())))
+            {
+                Some(pair) => pair,
+                None => return refuse("the source is not authenticated"),
+            }
+        };
+
+        let mut encrypt_dict = match &encrypt_entry {
+            Object::Reference(obj_ref) => self.load_object(*obj_ref)?,
+            direct => direct.clone(),
+        };
+        if let Object::Dictionary(dict) = &mut encrypt_dict {
+            for value in dict.values_mut() {
+                if let Object::Reference(obj_ref) = value {
+                    *value = self.load_object(*obj_ref)?;
+                }
+            }
+        }
+        let dict = match encrypt_dict.as_dict() {
+            Some(d) => d,
+            None => return refuse("its /Encrypt entry is not a dictionary"),
+        };
+
+        if dict.get("Filter").and_then(|o| o.as_name()) != Some("Standard") {
+            return refuse("it uses a public-key or non-standard security handler");
+        }
+        if dict.contains_key("SubFilter") {
+            return refuse("it names a /SubFilter security handler");
+        }
+        let version = match dict.get("V") {
+            Some(Object::Integer(v)) => *v,
+            _ => return refuse("its /V is missing"),
+        };
+
+        // The write handler encrypts every string and stream with one method.
+        // A V4/V5 source must name that same crypt filter for streams and
+        // strings, and for embedded files when it names one.
+        let crypt_method = |key: &str| -> Option<String> {
+            let name = dict.get(key).and_then(|o| o.as_name())?;
+            let cfm = dict
+                .get("CF")
+                .and_then(|cf| cf.as_dict())
+                .and_then(|cf| cf.get(name))
+                .and_then(|f| f.as_dict())
+                .and_then(|f| f.get("CFM"))
+                .and_then(|c| c.as_name())?;
+            Some(format!("{name}/{cfm}"))
+        };
+        match version {
+            1 | 2 => {}
+            4 | 5 => {
+                let stm = match crypt_method("StmF") {
+                    Some(m) => m,
+                    None => return refuse("its streams use /Identity or an unknown crypt filter"),
+                };
+                if crypt_method("StrF").as_deref() != Some(stm.as_str()) {
+                    return refuse("its strings and streams use different crypt filters");
+                }
+                if dict.contains_key("EFF") && crypt_method("EFF").as_deref() != Some(stm.as_str())
+                {
+                    return refuse("its embedded files use a different crypt filter");
+                }
+                let expected = if version == 4 {
+                    match stm.rsplit('/').next() {
+                        Some("AESV2") => Algorithm::Aes128,
+                        Some("V2") => Algorithm::Rc4_128,
+                        _ => return refuse("its crypt filter method is not V2 or AESV2"),
+                    }
+                } else if stm.ends_with("/AESV3") {
+                    Algorithm::Aes256
+                } else {
+                    return refuse("its crypt filter method is not AESV3");
+                };
+                if expected != algorithm {
+                    return refuse("its crypt filter method disagrees with the handler");
+                }
+            }
+            other => return refuse(&format!("its /V is {other}")),
+        }
+
+        let encrypt_metadata = match dict.get("EncryptMetadata") {
+            Some(Object::Boolean(b)) => *b,
+            _ => true,
+        };
+
+        let file_id = match self.trailer.as_dict().and_then(|d| d.get("ID")) {
+            Some(Object::Array(ids)) if ids.len() == 2 => {
+                match (ids[0].as_string(), ids[1].as_string()) {
+                    (Some(a), Some(b)) => (a.to_vec(), b.to_vec()),
+                    _ => return refuse("its trailer /ID is not two strings"),
+                }
+            },
+            _ => return refuse("its trailer has no two-string /ID"),
+        };
+
+        Ok(Some(KeptEncryption {
+            encrypt_dict,
+            file_id,
+            file_key,
+            algorithm,
+            encrypt_metadata,
+        }))
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Check if the PDF is encrypted.
     ///
@@ -35073,6 +35215,229 @@ mod stream_head_tests {
         let r = ObjectRef { id: 4, gen: 0 };
         assert!(doc.stream_head(r).unwrap().is_some());
         assert!(doc.object_cache.lock_or_recover().get(&r).is_none());
+    }
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: keep the source's own encryption ──
+#[cfg(test)]
+mod kept_encryption_tests {
+    use super::*;
+    use crate::editor::{DocumentEditor, EncryptionConfig, SaveOptions};
+    use crate::encryption::{Algorithm, EncryptDictBuilder};
+    use crate::writer::ObjectSerializer;
+
+    const FILE_ID: [u8; 16] = [0x11; 16];
+
+    type Entries = HashMap<String, Object>;
+
+    /// An AES-256 source whose /Encrypt dictionary is the engine writer's own
+    /// (`EncryptDictBuilder`) after `edit` changed it, since wrapping the file
+    /// key by hand is the engine's job. Every offset is computed here.
+    /// `id_entry` is the trailer's /ID text, empty for none.
+    fn source(user_password: &[u8], id_entry: &str, edit: impl FnOnce(&mut Entries)) -> Vec<u8> {
+        let (dict, _key) = EncryptDictBuilder::new(Algorithm::Aes256)
+            .user_password(user_password)
+            .owner_password(b"owner")
+            .permissions(-3900)
+            .encrypt_metadata(true)
+            .build_with_key(&FILE_ID)
+            .unwrap();
+        let mut encrypt = dict.to_object();
+        if let Object::Dictionary(entries) = &mut encrypt {
+            edit(entries);
+        }
+        let objects: Vec<Vec<u8>> = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n".to_vec(),
+            ObjectSerializer::compact().serialize_indirect(4, 0, &encrypt),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for o in &objects {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(o);
+        }
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 5 /Root 1 0 R /Encrypt 4 0 R {id_entry} >>\n\
+                 startxref\n{xref_at}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    const ID: &str = "/ID [<11111111111111111111111111111111> <22222222222222222222222222222222>]";
+
+    fn name(n: &str) -> Object {
+        Object::Name(n.to_string())
+    }
+
+    fn refusal(pdf: Vec<u8>, reason: &str) {
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        match doc.kept_encryption() {
+            Err(Error::Unsupported(msg)) => {
+                assert!(
+                    msg.starts_with("keeping this source's encryption is not supported: ")
+                        && msg.contains(reason)
+                        && msg.ends_with("save it with explicit encryption"),
+                    "unexpected message: {msg}"
+                );
+            },
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("expected Unsupported, got Ok"),
+        }
+    }
+
+    #[test]
+    fn a_plain_source_keeps_its_parameters() {
+        let doc = PdfDocument::from_bytes(source(b"", ID, |_| {})).unwrap();
+        let kept = doc.kept_encryption().unwrap().expect("an encrypted source");
+        assert_eq!(kept.file_id, (vec![0x11; 16], vec![0x22; 16]));
+        assert_eq!(kept.algorithm, Algorithm::Aes256);
+        assert_eq!(kept.file_key.len(), 32);
+        assert!(kept.encrypt_metadata);
+        let dict = kept.encrypt_dict.as_dict().unwrap();
+        for key in ["Filter", "V", "R", "O", "U", "OE", "UE", "P", "Perms", "CF", "StmF", "StrF"] {
+            assert!(dict.contains_key(key), "/{key} missing from the kept dictionary");
+        }
+    }
+
+    #[test]
+    fn an_unencrypted_source_has_nothing_to_keep() {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let objects: [&[u8]; 3] = [
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n",
+        ];
+        let mut offsets = Vec::new();
+        for o in objects {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(o);
+        }
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
+        );
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        assert!(doc.kept_encryption().unwrap().is_none());
+    }
+
+    #[test]
+    fn refuses_a_non_standard_filter() {
+        let pdf = source(b"", ID, |d| {
+            d.insert("Filter".into(), name("Adobe.PubSec"));
+        });
+        refusal(pdf, "public-key or non-standard security handler");
+    }
+
+    #[test]
+    fn refuses_a_sub_filter() {
+        let pdf = source(b"", ID, |d| {
+            d.insert("SubFilter".into(), name("adbe.pkcs7.s5"));
+        });
+        refusal(pdf, "/SubFilter");
+    }
+
+    #[test]
+    fn refuses_version_three() {
+        // The handler rejects V=3 while it initialises, before the keep checks.
+        let pdf = source(b"", ID, |d| {
+            d.insert("V".into(), Object::Integer(3));
+        });
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        match doc.kept_encryption() {
+            Err(Error::Unsupported(msg)) => assert!(msg.contains("V=3"), "{msg}"),
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("expected Unsupported, got Ok"),
+        }
+    }
+
+    #[test]
+    fn refuses_strings_and_streams_on_different_filters() {
+        let pdf = source(b"", ID, |d| {
+            d.insert("StrF".into(), name("Identity"));
+        });
+        refusal(pdf, "strings and streams use different crypt filters");
+    }
+
+    #[test]
+    fn refuses_identity_streams() {
+        let pdf = source(b"", ID, |d| {
+            d.insert("StmF".into(), name("Identity"));
+        });
+        refusal(pdf, "streams use /Identity");
+    }
+
+    #[test]
+    fn refuses_embedded_files_on_another_filter() {
+        let pdf = source(b"", ID, |d| {
+            d.insert("EFF".into(), name("Identity"));
+        });
+        refusal(pdf, "embedded files use a different crypt filter");
+    }
+
+    #[test]
+    fn refuses_a_crypt_method_that_is_not_the_versions() {
+        let pdf = source(b"", ID, |d| {
+            if let Some(Object::Dictionary(cf)) = d.get_mut("CF") {
+                if let Some(Object::Dictionary(std_cf)) = cf.get_mut("StdCF") {
+                    std_cf.insert("CFM".into(), name("AESV2"));
+                }
+            }
+        });
+        refusal(pdf, "crypt filter method is not AESV3");
+    }
+
+    #[test]
+    fn refuses_a_missing_id() {
+        refusal(source(b"", "", |_| {}), "no two-string /ID");
+    }
+
+    #[test]
+    fn refuses_a_one_element_id() {
+        refusal(
+            source(b"", "/ID [<11111111111111111111111111111111>]", |_| {}),
+            "no two-string /ID",
+        );
+    }
+
+    #[test]
+    fn refuses_an_id_that_is_not_strings() {
+        refusal(source(b"", "/ID [1 2]", |_| {}), "not two strings");
+    }
+
+    #[test]
+    fn refuses_an_unauthenticated_source() {
+        refusal(source(b"secret", ID, |_| {}), "the source is not authenticated");
+    }
+
+    #[test]
+    fn keep_and_an_explicit_config_exclude_each_other() {
+        let doc = PdfDocument::from_bytes(source(b"", ID, |_| {})).unwrap();
+        let mut editor = DocumentEditor::from_document(doc).unwrap();
+        let options = SaveOptions {
+            keep_source_encryption: true,
+            encryption: Some(EncryptionConfig::new("user", "owner")),
+            ..Default::default()
+        };
+        match editor.save_to_bytes_with_options(options) {
+            Err(Error::InvalidOperation(msg)) => assert!(msg.contains("exclusive"), "{msg}"),
+            Err(other) => panic!("expected InvalidOperation, got {other:?}"),
+            Ok(_) => panic!("expected InvalidOperation, got Ok"),
+        }
     }
 }
 // ── end pdf_manipulator patch ──

@@ -1612,6 +1612,9 @@ fn test_editor_save_with_compression() {
         garbage_collect: true,
         linearize: false,
         encryption: None,
+        // ── pdf_manipulator patch: keep the source's own encryption ──
+        keep_source_encryption: false,
+        // ── end pdf_manipulator patch ──
     };
     editor.save_with_options(&out_path, opts).unwrap();
 
@@ -1635,6 +1638,9 @@ fn test_editor_save_no_compress_no_gc() {
         garbage_collect: false,
         linearize: false,
         encryption: None,
+        // ── pdf_manipulator patch: keep the source's own encryption ──
+        keep_source_encryption: false,
+        // ── end pdf_manipulator patch ──
     };
     editor.save_with_options(&out_path, opts).unwrap();
 
@@ -1838,6 +1844,9 @@ fn test_save_to_bytes_with_compress_produces_valid_pdf() {
         linearize: false,
         incremental: false,
         encryption: None,
+        // ── pdf_manipulator patch: keep the source's own encryption ──
+        keep_source_encryption: false,
+        // ── end pdf_manipulator patch ──
     };
     let bytes = editor.save_to_bytes_with_options(opts).unwrap();
     assert!(!bytes.is_empty());
@@ -1861,6 +1870,9 @@ fn test_save_to_bytes_with_garbage_collect_produces_valid_pdf() {
         linearize: false,
         incremental: false,
         encryption: None,
+        // ── pdf_manipulator patch: keep the source's own encryption ──
+        keep_source_encryption: false,
+        // ── end pdf_manipulator patch ──
     };
     let bytes = editor.save_to_bytes_with_options(opts).unwrap();
     assert!(!bytes.is_empty());
@@ -1919,6 +1931,9 @@ fn test_gc_produces_smaller_or_equal_output_than_no_gc() {
             linearize: false,
             incremental: false,
             encryption: None,
+            // ── pdf_manipulator patch: keep the source's own encryption ──
+            keep_source_encryption: false,
+            // ── end pdf_manipulator patch ──
         })
         .unwrap();
 
@@ -1930,6 +1945,9 @@ fn test_gc_produces_smaller_or_equal_output_than_no_gc() {
             linearize: false,
             incremental: false,
             encryption: None,
+            // ── pdf_manipulator patch: keep the source's own encryption ──
+            keep_source_encryption: false,
+            // ── end pdf_manipulator patch ──
         })
         .unwrap();
 
@@ -1977,6 +1995,9 @@ fn test_compress_produces_smaller_or_equal_output_for_raw_streams() {
             linearize: false,
             incremental: false,
             encryption: None,
+            // ── pdf_manipulator patch: keep the source's own encryption ──
+            keep_source_encryption: false,
+            // ── end pdf_manipulator patch ──
         })
         .unwrap();
 
@@ -1988,6 +2009,9 @@ fn test_compress_produces_smaller_or_equal_output_for_raw_streams() {
             linearize: false,
             incremental: false,
             encryption: None,
+            // ── pdf_manipulator patch: keep the source's own encryption ──
+            keep_source_encryption: false,
+            // ── end pdf_manipulator patch ──
         })
         .unwrap();
 
@@ -2017,6 +2041,9 @@ fn test_linearize_true_does_not_panic() {
         linearize: true,
         incremental: false,
         encryption: None,
+        // ── pdf_manipulator patch: keep the source's own encryption ──
+        keep_source_encryption: false,
+        // ── end pdf_manipulator patch ──
     };
     let bytes = editor.save_to_bytes_with_options(opts).unwrap();
     assert!(bytes.starts_with(b"%PDF-"));
