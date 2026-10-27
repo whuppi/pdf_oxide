@@ -413,40 +413,12 @@ fn handle_builder_page_op(
             let cells = req.get_string_list("cells").unwrap_or_default();
             let row_spans = req.get_int_list("rowSpans").unwrap_or_default().to_vec();
             let column_count = req.get_i32("columnCount").unwrap_or(0);
-            if column_count <= 0 || row_spans.len() != cells.len() {
-                return ResponseWriter::error_kind(
-                    ErrorKind::InvalidArgument,
-                    "streamingTable cells and rowSpans must be parallel lists",
-                );
-            }
-            // Each row's spans must sum to columnCount: every column
-            // position is claimed exactly once, rowspan overruns refused.
-            let mut rows: Vec<Vec<(String, usize)>> = Vec::new();
-            let mut current: Vec<(String, usize)> = Vec::new();
-            let mut current_width: usize = 0;
-            for (text, span) in cells.into_iter().zip(row_spans) {
-                let span = span as usize;
-                if span == 0 || current_width + span > column_count as usize {
-                    return ResponseWriter::error_kind(
-                        ErrorKind::InvalidArgument,
-                        "streamingTable rowSpans must fill every row exactly: \
-                         each row's spans must sum to columnCount",
-                    );
+            let rows = match pack_streaming_rows(&cells, &row_spans, column_count) {
+                Ok(rows) => rows,
+                Err(msg) => {
+                    return ResponseWriter::error_kind(ErrorKind::InvalidArgument, msg);
                 }
-                current_width += span;
-                current.push((text.to_string(), span));
-                if current_width == column_count as usize {
-                    rows.push(std::mem::take(&mut current));
-                    current_width = 0;
-                }
-            }
-            if !current.is_empty() {
-                return ResponseWriter::error_kind(
-                    ErrorKind::InvalidArgument,
-                    "streamingTable rowSpans must fill every row exactly: \
-                     each row's spans must sum to columnCount",
-                );
-            }
+            };
             let config_columns: Vec<(String, f32, crate::writer::CellAlign)> = columns
                 .into_iter()
                 .map(|(header, width, align)| (header, width.unwrap_or(0.0), align))
@@ -474,9 +446,10 @@ fn handle_builder_page_op(
         return ResponseWriter::error_kind(ErrorKind::InvalidArgument, msg);
     }
 
-    dispatch::apply_page_op(builder, op);
-
-    ok_flag("applied")
+    match dispatch::apply_page_op(builder, op) {
+        Ok(()) => ok_flag("applied"),
+        Err(e) => ResponseWriter::error_of(&e),
+    }
 }
 
 fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
@@ -508,6 +481,35 @@ fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Op
             Err(e) => ResponseWriter::error_of(&e),
         }
     }
+}
+
+/// Pack a streaming table's flat cells into rows of `column_count` cells,
+/// each paired with the number of rows it spans downward. A spanned cell
+/// in a later row is still listed, as an empty placeholder.
+fn pack_streaming_rows(
+    cells: &[&str],
+    row_spans: &[i32],
+    column_count: i32,
+) -> Result<Vec<Vec<(String, usize)>>, &'static str> {
+    if column_count <= 0 || cells.len() % column_count as usize != 0 {
+        return Err("streamingTable cells length must be a nonzero multiple of columnCount");
+    }
+    if row_spans.len() != cells.len() {
+        return Err("streamingTable cells and rowSpans must be parallel lists");
+    }
+    if row_spans.iter().any(|span| *span < 1) {
+        return Err("streamingTable rowSpans must be at least 1");
+    }
+    Ok(cells
+        .chunks(column_count as usize)
+        .zip(row_spans.chunks(column_count as usize))
+        .map(|(row, spans)| {
+            row.iter()
+                .zip(spans)
+                .map(|(text, span)| (text.to_string(), *span as usize))
+                .collect()
+        })
+        .collect())
 }
 
 /// A string field of one `radioGroup` option map (empty when absent).
@@ -649,7 +651,7 @@ mod tests {
     fn refuse_unattached(queued: &[PageOp], op: &PageOp) -> Option<&'static str> {
         let mut builder = DocumentBuilder::new();
         for queued_op in queued {
-            apply_page_op(&mut builder, queued_op.clone());
+            apply_page_op(&mut builder, queued_op.clone()).unwrap();
         }
         super::refuse_unattached(&builder, op)
     }
@@ -844,9 +846,75 @@ mod tests {
     }
 
     #[test]
+    fn unusable_image_bytes_are_an_invalid_argument() {
+        let mut builder = DocumentBuilder::new();
+        for op in [
+            PageOp::Image { data: vec![1, 2, 3], x: 0.0, y: 0.0, w: 10.0, h: 10.0, alt: String::new() },
+            PageOp::ImageArtifact { data: vec![1, 2, 3], x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
+        ] {
+            let err = apply_page_op(&mut builder, op).unwrap_err();
+            assert_eq!(
+                crate::host::binary_codec::kind_of(&err),
+                crate::host::binary_codec::ErrorKind::InvalidArgument
+            );
+        }
+        apply_page_op(&mut builder, PageOp::Text("still usable".into())).unwrap();
+    }
+
+    #[test]
+    fn streaming_rows_pack_by_column_count_with_the_span_on_the_cell() {
+        let rows = super::pack_streaming_rows(&["Saw", "3", "", "4"], &[2, 1, 1, 1], 2).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![("Saw".to_string(), 2), ("3".to_string(), 1)],
+                vec![(String::new(), 1), ("4".to_string(), 1)],
+            ]
+        );
+        assert!(super::pack_streaming_rows(&["a", "b", "c"], &[1, 1, 1], 2).is_err());
+        assert!(super::pack_streaming_rows(&["a", "b"], &[1, 0], 2).is_err());
+        assert!(super::pack_streaming_rows(&["a", "b"], &[1], 2).is_err());
+    }
+
+    #[test]
+    fn spanned_streaming_rows_reach_the_engine() {
+        let mut builder = DocumentBuilder::new();
+        let op = PageOp::StreamingTableBlock {
+            config_columns: vec![
+                ("a".into(), 100.0, crate::writer::CellAlign::Left),
+                ("b".into(), 60.0, crate::writer::CellAlign::Left),
+            ],
+            repeat_header: true,
+            rows: super::pack_streaming_rows(&["Saw", "3", "", "4"], &[2, 1, 1, 1], 2).unwrap(),
+            mode: "fixed".into(),
+            sample_rows: 50,
+            min_col_width_pt: 20.0,
+            max_col_width_pt: 400.0,
+            max_rowspan: 2,
+        };
+        apply_page_op(&mut builder, op).unwrap();
+    }
+
+    #[test]
+    fn auto_all_streaming_table_row_is_refused() {
+        let mut builder = DocumentBuilder::new();
+        let op = PageOp::StreamingTableBlock {
+            config_columns: vec![("h".into(), 100.0, crate::writer::CellAlign::Left)],
+            repeat_header: true,
+            rows: vec![vec![("c".into(), 1)]],
+            mode: "auto_all".into(),
+            sample_rows: 50,
+            min_col_width_pt: 20.0,
+            max_col_width_pt: 400.0,
+            max_rowspan: 1,
+        };
+        assert!(apply_page_op(&mut builder, op).is_err());
+    }
+
+    #[test]
     fn script_after_ending_the_page_is_refused() {
         let mut builder = DocumentBuilder::new();
-        apply_page_op(&mut builder, text_field());
+        apply_page_op(&mut builder, text_field()).unwrap();
         builder.end_page();
         assert_eq!(
             super::refuse_unattached(&builder, &PageOp::FieldFormat("s".into())),
@@ -857,9 +925,9 @@ mod tests {
     #[test]
     fn a_page_op_after_ending_the_page_opens_a_new_page() {
         let mut builder = DocumentBuilder::new();
-        apply_page_op(&mut builder, PageOp::Text("one".into()));
+        apply_page_op(&mut builder, PageOp::Text("one".into())).unwrap();
         builder.end_page();
-        apply_page_op(&mut builder, PageOp::Text("two".into()));
+        apply_page_op(&mut builder, PageOp::Text("two".into())).unwrap();
         assert_eq!(builder.current_page_index(), Some(1));
     }
 
@@ -867,9 +935,9 @@ mod tests {
     fn new_page_same_size_keeps_the_size_and_clears_text_and_fields() {
         let mut builder = DocumentBuilder::new();
         builder.begin_page(crate::writer::PageSize::Custom(300.0, 400.0));
-        apply_page_op(&mut builder, text_field());
-        apply_page_op(&mut builder, PageOp::Text("hello".into()));
-        apply_page_op(&mut builder, PageOp::NewPageSameSize);
+        apply_page_op(&mut builder, text_field()).unwrap();
+        apply_page_op(&mut builder, PageOp::Text("hello".into())).unwrap();
+        apply_page_op(&mut builder, PageOp::NewPageSameSize).unwrap();
         assert_eq!(builder.current_page_index(), Some(1));
         assert_eq!(builder.page_mut(1).page_dimensions(), (300.0, 400.0));
         assert!(!builder.page_has_text(1));

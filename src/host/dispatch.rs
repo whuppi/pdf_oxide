@@ -2532,8 +2532,10 @@ pub enum PageOp {
 }
 
 /// Apply a page operation to the builder's current page at once. With no
-/// current page, a default A4 page is opened first.
-pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) {
+/// current page, a default A4 page is opened first. An engine error (bad
+/// image bytes, a streaming-table row the engine refuses) is returned; ops
+/// applied before it stay applied.
+pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) -> Result<()> {
     let index = match builder.current_page_index() {
         Some(index) => index,
         None => builder.begin_page(PageSize::A4),
@@ -2548,12 +2550,10 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) {
         PageOp::Space(pts) => page.space(pts),
         PageOp::HorizontalRule => page.horizontal_rule(),
         PageOp::Image { data, x, y, w, h, alt } => {
-            match crate::writer::ImageData::from_bytes(&data) {
-                // `Rect::new` takes (x, y, width, height): the far
-                // corner here scaled every image by its own origin.
-                Ok(img) => page.image_with_alt(img, crate::geometry::Rect::new(x, y, w, h), &alt),
-                Err(_) => &mut page, // skip — image data unparseable
-            }
+            let img = page_image(&data)?;
+            // `Rect::new` takes (x, y, width, height): the far
+            // corner here scaled every image by its own origin.
+            page.image_with_alt(img, crate::geometry::Rect::new(x, y, w, h), &alt)
         }
         PageOp::Watermark(text) => page.watermark(&text),
         PageOp::TextField { name, x, y, w, h, default_value } => page.text_field(name, x, y, w, h, default_value),
@@ -2632,11 +2632,8 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) {
         PageOp::OnOpen(ref script) => page.on_open(script),
         PageOp::OnClose(ref script) => page.on_close(script),
         PageOp::ImageArtifact { data, x, y, w, h } => {
-            match crate::writer::ImageData::from_bytes(&data) {
-                Ok(img) => page
-                    .image_with_artifact(img, crate::geometry::Rect::new(x, y, w, h)),
-                Err(_) => &mut page, // skip — image data unparseable
-            }
+            let img = page_image(&data)?;
+            page.image_with_artifact(img, crate::geometry::Rect::new(x, y, w, h))
         }
         PageOp::BufferedTable { ref columns, ref rows, has_header } => {
             // Same construction as the WASM binding's replay:
@@ -2703,7 +2700,7 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) {
             }
             let mut t = page.streaming_table(cfg);
             for row in rows {
-                let _ = t.push_row(|r| {
+                t.push_row(|r| {
                     for (text, span) in row {
                         if *span > 1 {
                             r.span_cell(text.as_str(), *span);
@@ -2711,16 +2708,24 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) {
                             r.cell(text.as_str());
                         }
                     }
-                });
+                })?;
             }
             // The page's state lives in the builder: the returned
             // page handle carries nothing to keep.
             let _ = t.finish();
-            return;
+            return Ok(());
         }
         PageOp::Newline => page.newline(),
         PageOp::NewPageSameSize => page.new_page_same_size(),
     };
+    Ok(())
+}
+
+/// Decode the image bytes of a page op. The caller passed the bytes, so a
+/// failure is an invalid argument, not an engine fault.
+fn page_image(data: &[u8]) -> Result<crate::writer::ImageData> {
+    crate::writer::ImageData::from_bytes(data)
+        .map_err(|e| Error::InvalidOperation(format!("image data is not a usable image: {e}")))
 }
 
 /// Create a new empty DocumentBuilder.
