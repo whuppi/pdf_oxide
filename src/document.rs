@@ -129,6 +129,15 @@ pub struct PageInfo {
     pub rotation: i32,
 }
 
+// ── pdf_manipulator patch: stream extent without loading the data ──
+/// A stream object's dictionary and where its data sits in the source.
+pub(crate) struct StreamHead {
+    pub dict: HashMap<String, Object>,
+    pub data_start: u64,
+    pub data_len: u64,
+}
+// ── end pdf_manipulator patch ──
+
 /// Default maximum size in bytes for the object cache (64 MB).
 ///
 /// This is a soft guardrail, not a hard ceiling. Real memory usage can be
@@ -2321,6 +2330,12 @@ impl PdfDocument {
                 return;
             }
         }
+        // A stream's references live in its dictionary: read only that, so
+        // the walk never loads (or caches) the stream data.
+        if let Ok(Some(head)) = self.stream_head(obj_ref) {
+            head.dict.values().for_each(|o| push_refs(o, out));
+            return;
+        }
         // Cold path: load into cache, then borrow.
         if self.load_object(obj_ref).is_ok() {
             let cache = self.object_cache.lock_or_recover();
@@ -2328,6 +2343,123 @@ impl PdfDocument {
                 push_refs(obj, out);
             }
         }
+    }
+    // ── end pdf_manipulator patch ──
+
+    // ── pdf_manipulator patch: stream extent without loading the data ──
+    /// Where the data of stream object `r` sits in the source, and its
+    /// dictionary, read without loading the data or touching the object
+    /// cache. `Ok(None)` when the object is not a plain uncompressed
+    /// stream whose /Length is trustworthy; the caller then loads it whole,
+    /// which also repairs a wrong /Length.
+    pub(crate) fn stream_head(&self, r: ObjectRef) -> Result<Option<StreamHead>> {
+        const CHUNK: usize = 64 * 1024;
+        const HEAD_MAX: usize = 1024 * 1024;
+
+        let entry = match self.xref.get(r.id) {
+            Some(e) if e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed => {
+                e.clone()
+            },
+            _ => return Ok(None),
+        };
+        let is_space = |b: u8| b.is_ascii_whitespace() || b == 0;
+
+        // Read until the buffer holds the header, a dictionary, `stream`
+        // and the end-of-line after it.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; CHUNK];
+        let (dict_start, stream_kw) = loop {
+            let n = self.read_source_at(entry.offset + buf.len() as u64, &mut chunk)?;
+            buf.extend_from_slice(&chunk[..n]);
+            let at_end = n < CHUNK;
+
+            let Some(obj_pos) = find_substring(&buf[..buf.len().min(64)], b"obj") else {
+                if at_end || buf.len() >= 64 {
+                    return Ok(None);
+                }
+                continue;
+            };
+            let found = (obj_pos + 3..buf.len().saturating_sub(5)).find(|&i| {
+                &buf[i..i + 6] == b"stream"
+                    && buf[..i]
+                        .iter()
+                        .rev()
+                        .find(|&&b| !is_space(b))
+                        .is_some_and(|&b| b == b'>')
+            });
+            if let Some(i) = found {
+                if buf.len() >= i + 8 || at_end {
+                    break (obj_pos + 3, i);
+                }
+            }
+            if at_end || buf.len() > HEAD_MAX {
+                return Ok(None);
+            }
+        };
+
+        // The header must name this object.
+        let header = String::from_utf8_lossy(&buf[..dict_start - 3]);
+        let mut parts = header.split_whitespace();
+        let id_ok = parts.next().and_then(|p| p.parse::<u32>().ok()) == Some(r.id);
+        let gen_ok = parts.next().and_then(|p| p.parse::<u16>().ok()).is_some();
+        if !id_ok || !gen_ok || parts.next().is_some() {
+            return Ok(None);
+        }
+
+        let mut dict = match parse_object(&buf[dict_start..stream_kw]) {
+            Ok((rest, Object::Dictionary(d))) if rest.iter().all(|&b| is_space(b)) => d,
+            _ => return Ok(None),
+        };
+
+        let after = stream_kw + 6;
+        let data_start = if buf[after..].starts_with(b"\r\n") {
+            after + 2
+        } else if buf[after..].starts_with(b"\n") {
+            after + 1
+        } else {
+            return Ok(None);
+        } as u64
+            + entry.offset;
+
+        let data_len = match dict.get("Length") {
+            Some(Object::Integer(n)) if *n >= 0 => *n as u64,
+            Some(Object::Reference(lr)) => match self.load_object(*lr)? {
+                Object::Integer(n) if n >= 0 => n as u64,
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        // The data must be followed by `endstream`, else /Length is wrong.
+        let mut tail = [0u8; 13];
+        let n = self.read_source_at(data_start + data_len, &mut tail)?;
+        let tail = &tail[..n];
+        let skip = tail.iter().take(4).take_while(|&&b| is_space(b)).count();
+        if !tail[skip..].starts_with(b"endstream") {
+            return Ok(None);
+        }
+
+        let is_encrypt_dict = *self.encrypt_dict_ref.lock_or_recover() == Some(r);
+        if !is_encrypt_dict {
+            let guard = self.encryption_handler.lock_or_recover();
+            if let Some(handler) = guard.as_ref() {
+                if handler.is_authenticated() {
+                    let mut wrapped = Object::Dictionary(dict);
+                    Self::decrypt_strings_in_object(
+                        handler,
+                        &mut wrapped,
+                        r.id,
+                        entry.generation as u32,
+                    );
+                    dict = match wrapped {
+                        Object::Dictionary(d) => d,
+                        _ => return Ok(None),
+                    };
+                }
+            }
+        }
+
+        Ok(Some(StreamHead { dict, data_start, data_len }))
     }
     // ── end pdf_manipulator patch ──
 
@@ -3774,14 +3906,14 @@ impl PdfDocument {
                 let mut chunk = Vec::new();
                 let bytes_read = reader.read_until(b'\n', &mut chunk)?;
 
+                // ── pdf_manipulator patch: an oversized object fails instead of truncating ──
                 if data.len() > MAX_BYTES {
-                    log::warn!(
-                        "Object {} exceeded maximum byte limit ({} bytes), truncating",
-                        obj_ref.id,
-                        MAX_BYTES
-                    );
-                    break;
+                    return Err(Error::InvalidPdf(format!(
+                        "object {} is larger than {} bytes; it cannot be loaded whole",
+                        obj_ref.id, MAX_BYTES
+                    )));
                 }
+                // ── end pdf_manipulator patch ──
 
                 if bytes_read == 0 {
                     let msg = format!(
@@ -34657,3 +34789,89 @@ mod soft_hyphen_seam_tests {
         assert_eq!(PdfDocument::soft_hyphen_seam(em, 0.0, 0.0), SoftHyphenSeam::Contiguous);
     }
 }
+
+// ── pdf_manipulator patch: stream extent without loading the data ──
+#[cfg(test)]
+mod stream_head_tests {
+    use super::*;
+
+    /// A sound PDF whose object 4 is `object_4` (a whole indirect object),
+    /// with the integer 11 as object 5.
+    fn pdf_with(object_4: &[u8]) -> Vec<u8> {
+        let objects: Vec<Vec<u8>> = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n".to_vec(),
+            object_4.to_vec(),
+            b"5 0 obj\n11\nendobj\n".to_vec(),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for o in &objects {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(o);
+        }
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    fn head_of(object_4: &[u8]) -> (Vec<u8>, Option<StreamHead>) {
+        let pdf = pdf_with(object_4);
+        let doc = PdfDocument::from_bytes(pdf.clone()).unwrap();
+        let head = doc.stream_head(ObjectRef { id: 4, gen: 0 }).unwrap();
+        (pdf, head)
+    }
+
+    #[test]
+    fn direct_length_gives_the_data_extent() {
+        let (pdf, head) = head_of(b"4 0 obj\n<< /Length 5 /Subtype /Image >>\nstream\nhello\nendstream\nendobj\n");
+        let head = head.expect("a plain stream");
+        assert_eq!(head.data_len, 5);
+        assert_eq!(&pdf[head.data_start as usize..][..5], b"hello");
+        assert_eq!(head.dict.get("Subtype").and_then(|o| o.as_name()), Some("Image"));
+    }
+
+    #[test]
+    fn indirect_length_is_resolved() {
+        let (pdf, head) = head_of(b"4 0 obj\n<< /Length 5 0 R >>\nstream\nabcdefghijk\nendstream\nendobj\n");
+        let head = head.expect("a stream with an indirect length");
+        assert_eq!(head.data_len, 11);
+        assert_eq!(&pdf[head.data_start as usize..][..11], b"abcdefghijk");
+    }
+
+    #[test]
+    fn crlf_after_stream_is_skipped() {
+        let (pdf, head) = head_of(b"4 0 obj\n<< /Length 3 >>\nstream\r\nxyz\r\nendstream\nendobj\n");
+        let head = head.expect("a stream with CRLF");
+        assert_eq!(&pdf[head.data_start as usize..][..3], b"xyz");
+    }
+
+    #[test]
+    fn wrong_length_gives_none() {
+        let (_, head) = head_of(b"4 0 obj\n<< /Length 2 >>\nstream\nhello\nendstream\nendobj\n");
+        assert!(head.is_none());
+    }
+
+    #[test]
+    fn non_stream_object_gives_none() {
+        let (_, head) = head_of(b"4 0 obj\n<< /Type /Font >>\nendobj\n");
+        assert!(head.is_none());
+    }
+
+    #[test]
+    fn a_stream_head_leaves_the_object_cache_alone() {
+        let pdf = pdf_with(b"4 0 obj\n<< /Length 5 >>\nstream\nhello\nendstream\nendobj\n");
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let r = ObjectRef { id: 4, gen: 0 };
+        assert!(doc.stream_head(r).unwrap().is_some());
+        assert!(doc.object_cache.lock_or_recover().get(&r).is_none());
+    }
+}
+// ── end pdf_manipulator patch ──

@@ -2490,6 +2490,107 @@ impl DocumentEditor {
     }
     // ── end pdf_manipulator patch ──
 
+    // ── pdf_manipulator patch: an unchanged source stream is copied, not loaded ──
+    /// Writes unstaged source object `r` as a chunked copy of its stream
+    /// data and returns `true`, or returns `false` having written nothing
+    /// when the object cannot be copied raw (not a plain stream, an
+    /// encrypted source or output, a container, a /Length that does not
+    /// hold); the caller then loads and serializes it. The caller checks
+    /// that no staged or overridden version of `r` exists. The dictionary
+    /// goes through `serializer`, so nulling and generation 0 apply. With
+    /// `compress` and no /Filter the data is deflated while streaming,
+    /// and /Length becomes a reference to a fresh object holding the
+    /// compressed size, written right after.
+    fn write_source_stream(
+        source: &PdfDocument,
+        next_object_id: &mut u32,
+        r: ObjectRef,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        encrypting_output: bool,
+        compress: bool,
+        xref_entries: &mut Vec<(u32, u64, u16, bool)>,
+    ) -> Result<bool> {
+        const CHUNK: usize = 64 * 1024;
+        const EMPTY_TAIL: &[u8] = b"\nstream\n\nendstream\nendobj\n";
+
+        if encrypting_output || source.is_encrypted() {
+            return Ok(false);
+        }
+        let Some(head) = source.stream_head(r)? else {
+            return Ok(false);
+        };
+        if matches!(
+            head.dict.get("Type").and_then(|t| t.as_name()),
+            Some("ObjStm") | Some("XRef")
+        ) {
+            return Ok(false);
+        }
+
+        let deflate = compress && !head.dict.contains_key("Filter");
+        let mut dict = head.dict;
+        let length_id = if deflate {
+            let id = *next_object_id;
+            *next_object_id += 1;
+            dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
+            dict.insert("Length".to_string(), Object::Reference(ObjectRef::new(id, 0)));
+            Some(id)
+        } else {
+            dict.insert("Length".to_string(), Object::Integer(head.data_len as i64));
+            None
+        };
+
+        let framed = serializer.serialize_indirect(
+            r.id,
+            0,
+            &Object::Stream { dict, data: bytes::Bytes::new() },
+        );
+        let Some(prefix) = framed.strip_suffix(EMPTY_TAIL) else {
+            return Ok(false);
+        };
+
+        let offset = writer.position();
+        writer.write_all(prefix)?;
+        writer.write_all(b"\nstream\n")?;
+
+        let mut buf = vec![0u8; CHUNK];
+        let mut copy = |out: &mut dyn Write| -> Result<()> {
+            let mut at = head.data_start;
+            let end = head.data_start + head.data_len;
+            while at < end {
+                let want = ((end - at) as usize).min(CHUNK);
+                let n = source.read_source_at(at, &mut buf[..want])?;
+                if n == 0 {
+                    return Err(Error::UnexpectedEof);
+                }
+                out.write_all(&buf[..n])?;
+                at += n as u64;
+            }
+            Ok(())
+        };
+
+        let compressed_len = if length_id.is_some() {
+            let start = writer.position();
+            let mut enc = flate2::write::ZlibEncoder::new(&mut *writer, flate2::Compression::default());
+            copy(&mut enc)?;
+            let w = enc.finish()?;
+            Some(w.position() - start)
+        } else {
+            copy(&mut *writer)?;
+            None
+        };
+        writer.write_all(b"\nendstream\nendobj\n")?;
+        xref_entries.push((r.id, offset, 0, true));
+
+        if let (Some(id), Some(len)) = (length_id, compressed_len) {
+            let offset = writer.position();
+            writer.write_all(&serializer.serialize_indirect(id, 0, &Object::Integer(len as i64)))?;
+            xref_entries.push((id, offset, 0, true));
+        }
+        Ok(true)
+    }
+    // ── end pdf_manipulator patch ──
+
     // ── end pdf_manipulator patch ──
 
     /// Write a full rewrite of the PDF to a generic writer.
@@ -4266,9 +4367,23 @@ impl DocumentEditor {
                                                             xobj_ref.as_reference()
                                                         {
                                                             if !written_ids.contains(&ref_obj.id) {
-                                                                if let Ok(xobj_obj) =
-                                                                    self.staged_or_source_object(ref_obj)
+                                                                // ── pdf_manipulator patch: unchanged streams copied; an unreadable object fails the save ──
+                                                                if !self.modified_objects.contains_key(&ref_obj.id)
+                                                                    && Self::write_source_stream(
+                                                                        &self.source,
+                                                                        &mut self.next_object_id,
+                                                                        ref_obj,
+                                                                        writer,
+                                                                        &serializer,
+                                                                        encryption_handler.is_some(),
+                                                                        options.compress,
+                                                                        &mut xref_entries,
+                                                                    )?
                                                                 {
+                                                                    written_ids.insert(ref_obj.id);
+                                                                } else {
+                                                                    let xobj_obj =
+                                                                        self.staged_or_source_object(ref_obj)?;
                                                                     let offset =
                                                                         writer.position();
                                                                     let bytes = serialize_obj(
@@ -4284,6 +4399,7 @@ impl DocumentEditor {
                                                                     ));
                                                                     written_ids.insert(ref_obj.id);
                                                                 }
+                                                                // ── end pdf_manipulator patch ──
                                                             }
                                                         }
                                                     }
@@ -4323,9 +4439,23 @@ impl DocumentEditor {
                                                         if let Some(ref_obj) = gs_ref.as_reference()
                                                         {
                                                             if !written_ids.contains(&ref_obj.id) {
-                                                                if let Ok(obj) =
-                                                                    self.staged_or_source_object(ref_obj)
+                                                                // ── pdf_manipulator patch: unchanged streams copied; an unreadable object fails the save ──
+                                                                if !self.modified_objects.contains_key(&ref_obj.id)
+                                                                    && Self::write_source_stream(
+                                                                        &self.source,
+                                                                        &mut self.next_object_id,
+                                                                        ref_obj,
+                                                                        writer,
+                                                                        &serializer,
+                                                                        encryption_handler.is_some(),
+                                                                        options.compress,
+                                                                        &mut xref_entries,
+                                                                    )?
                                                                 {
+                                                                    written_ids.insert(ref_obj.id);
+                                                                } else {
+                                                                    let obj =
+                                                                        self.staged_or_source_object(ref_obj)?;
                                                                     let offset =
                                                                         writer.position();
                                                                     let bytes = serialize_obj(
@@ -4341,6 +4471,7 @@ impl DocumentEditor {
                                                                     ));
                                                                     written_ids.insert(ref_obj.id);
                                                                 }
+                                                                // ── end pdf_manipulator patch ──
                                                             }
                                                         }
                                                     }
@@ -4979,6 +5110,24 @@ impl DocumentEditor {
                     continue;
                 }
             }
+            // ── pdf_manipulator patch: an unchanged source stream is copied, not loaded ──
+            if !prune.overrides.contains_key(&obj_id)
+                && !self.modified_objects.contains_key(&obj_id)
+                && Self::write_source_stream(
+                    &self.source,
+                    &mut self.next_object_id,
+                    ObjectRef { id: obj_id, gen: 0 },
+                    writer,
+                    &serializer,
+                    encryption_handler.is_some(),
+                    options.compress,
+                    &mut xref_entries,
+                )?
+            {
+                written_ids.insert(obj_id);
+                continue;
+            }
+            // ── end pdf_manipulator patch ──
             // Prefer a staged modification over the original source object.
             // ── pdf_manipulator patch: the prune plan's override wins (#261) ──
             let loaded = if let Some(o) = prune.overrides.get(&obj_id) {
