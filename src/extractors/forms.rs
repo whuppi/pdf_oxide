@@ -392,11 +392,29 @@ impl FormExtractor {
             return Ok(());
         }
 
+        // Extract field flags /Ff
+        let flags = field_dict
+            .get("Ff")
+            .and_then(|obj| Self::resolve_object(doc, obj).ok())
+            .and_then(|obj| match obj {
+                Object::Integer(i) => Some(i as u32),
+                _ => None,
+            });
+
+        // ── pdf_manipulator patch: a radio field's /V is the selected
+        // option's export name, whatever it is — "Yes"/"On"/"No"/"Off"
+        // must not collapse to a Boolean the way a checkbox's do. ──
+        let is_radio = field_type == FieldType::Button
+            && flags.is_some_and(|f| {
+                f & field_flags::RADIO != 0 && f & field_flags::PUSH_BUTTON == 0
+            });
+        // ── end pdf_manipulator patch ──
+
         // Extract field value
         let value = field_dict
             .get("V")
             .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .map(|obj| Self::parse_field_value(&obj, &field_type))
+            .map(|obj| Self::parse_field_value_of(&obj, &field_type, is_radio))
             .unwrap_or(FieldValue::None);
 
         // Extract tooltip
@@ -428,20 +446,11 @@ impl FormExtractor {
                 }
             });
 
-        // Extract field flags /Ff
-        let flags = field_dict
-            .get("Ff")
-            .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .and_then(|obj| match obj {
-                Object::Integer(i) => Some(i as u32),
-                _ => None,
-            });
-
         // Extract default value /DV
         let default_value = field_dict
             .get("DV")
             .and_then(|obj| Self::resolve_object(doc, obj).ok())
-            .map(|obj| Self::parse_field_value(&obj, &field_type));
+            .map(|obj| Self::parse_field_value_of(&obj, &field_type, is_radio));
 
         // Extract max length /MaxLen (text fields only)
         let max_length = field_dict
@@ -512,6 +521,17 @@ impl FormExtractor {
             _ => FieldType::Unknown(ft.to_string()),
         }
     }
+
+    // ── pdf_manipulator patch: radio names are kept verbatim ──
+    /// Like [`Self::parse_field_value`], but a radio field's name value is
+    /// returned as `FieldValue::Name` unchanged.
+    fn parse_field_value_of(obj: &Object, field_type: &FieldType, is_radio: bool) -> FieldValue {
+        match obj {
+            Object::Name(name) if is_radio => FieldValue::Name(name.clone()),
+            _ => Self::parse_field_value(obj, field_type),
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Parse field value from /V object.
     fn parse_field_value(obj: &Object, field_type: &FieldType) -> FieldValue {
