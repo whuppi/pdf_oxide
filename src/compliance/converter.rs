@@ -231,6 +231,9 @@ pub struct PdfAConverter {
     config: ConversionConfig,
     /// Validator for checking compliance.
     validator: PdfAValidator,
+    // ── pdf_manipulator patch: cancel polled once per page / error / rule batch ──
+    cancel: crate::cancel::CancelCheck,
+    // ── end pdf_manipulator patch ──
 }
 
 impl PdfAConverter {
@@ -240,8 +243,20 @@ impl PdfAConverter {
             level,
             config: ConversionConfig::default(),
             validator: PdfAValidator::new(),
+            // ── pdf_manipulator patch ──
+            cancel: crate::cancel::CancelCheck::none(),
+            // ── end pdf_manipulator patch ──
         }
     }
+
+    // ── pdf_manipulator patch: cancellable conversion ──
+    /// Stop the conversion with the cancelled error at the next page,
+    /// error or rule batch once `cancel` reports cancelled.
+    pub fn with_cancel(mut self, cancel: crate::cancel::CancelCheck) -> Self {
+        self.cancel = cancel;
+        self
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Set the conversion configuration.
     pub fn with_config(mut self, config: ConversionConfig) -> Self {
@@ -276,7 +291,10 @@ impl PdfAConverter {
         use std::collections::HashSet;
 
         let mut result = ConversionResult::new(self.level);
-        let initial_validation = self.validator.validate(editor.source_mut(), self.level)?;
+        // ── pdf_manipulator patch: cancellable validation ──
+        let initial_validation =
+            self.validator.validate_cancellable(editor.source_mut(), self.level, &self.cancel)?;
+        // ── end pdf_manipulator patch ──
 
         if initial_validation.is_compliant {
             result.success = true;
@@ -286,9 +304,11 @@ impl PdfAConverter {
 
         // Apply each fix once even if the same ErrorCode appears multiple times.
         let mut applied: HashSet<ErrorCode> = HashSet::new();
-        for error in &initial_validation.errors {
-            self.try_fix_error(editor, error, &mut result, &mut applied)?;
-        }
+        // ── pdf_manipulator patch: cancel between fixes ──
+        self.cancel.each(&initial_validation.errors, |error| {
+            self.try_fix_error(editor, error, &mut result, &mut applied)
+        })?;
+        // ── end pdf_manipulator patch ──
 
         // OutputIntents are required unconditionally for PDF/A-2/3.
         // The validator only reports DeviceColorWithoutIntent when it recognises
@@ -303,7 +323,10 @@ impl PdfAConverter {
 
         // Commit staged mutations so the validator reads the updated document.
         editor.commit_in_place()?;
-        let mut final_validation = self.validator.validate(editor.source_mut(), self.level)?;
+        // ── pdf_manipulator patch: cancellable validation ──
+        let mut final_validation =
+            self.validator.validate_cancellable(editor.source_mut(), self.level, &self.cancel)?;
+        // ── end pdf_manipulator patch ──
 
         // Issue #451: certain standard-14 PostScript fonts have no open-source
         // equivalent in URW Base35 / SYSTEM_FONTDB and therefore can't be
@@ -767,6 +790,9 @@ impl PdfAConverter {
         // Single tree walk; per-index get_page_ref in a loop is O(n²).
         let page_refs = editor.source().all_page_refs().unwrap_or_default();
         for page_ref in page_refs {
+            // ── pdf_manipulator patch ──
+            self.cancel.check()?;
+            // ── end pdf_manipulator patch ──
             let page_obj = match editor.source().load_object(page_ref) {
                 Ok(o) => o,
                 Err(_) => continue,
@@ -985,6 +1011,9 @@ impl PdfAConverter {
         let mut fixed = 0usize;
 
         for page_idx in 0..page_count {
+            // ── pdf_manipulator patch ──
+            self.cancel.check()?;
+            // ── end pdf_manipulator patch ──
             // Collect annotations that are missing an /AP /N entry.
             let page_ref = match editor.source().get_page_ref(page_idx) {
                 Ok(r) => r,

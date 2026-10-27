@@ -200,6 +200,7 @@ pub(crate) fn write(
     editor: &mut DocumentEditor,
     out: &mut impl PositionedWrite,
     options: &crate::editor::SaveOptions,
+    cancel: &crate::cancel::CancelCheck,
 ) -> std::result::Result<(), IncrementalError> {
     if options.encryption.is_some() {
         return Err(refused("an encryption change rewrites every object"));
@@ -222,6 +223,7 @@ pub(crate) fn write(
     let mut chunk = vec![0u8; READ_BUF_CAPACITY];
     let mut at = 0u64;
     while at < len {
+        cancel.check()?;
         let n = doc.read_source_at(at, &mut chunk)?;
         if n == 0 {
             return Err(Error::InvalidPdf("source ended before its length".into()).into());

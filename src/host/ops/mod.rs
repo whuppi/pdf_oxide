@@ -38,6 +38,8 @@ pub(crate) struct OpCtx<'a, 'req> {
     pub source_bytes: Option<&'req [u8]>,
     pub sources: &'a mut Vec<BoxedReader>,
     pub sinks: &'a mut Vec<BoxedWriter>,
+    /// Polled by the op's CPU loops, once per page / image / rule batch.
+    pub cancel: &'a crate::cancel::CancelCheck,
 }
 
 impl OpCtx<'_, '_> {

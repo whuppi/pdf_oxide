@@ -42,6 +42,11 @@ impl CancelToken {
         }
     }
 
+    /// The engine-loop probe over the same two flags.
+    pub fn check(&self) -> crate::cancel::CancelCheck {
+        crate::cancel::CancelCheck::from_flags(self.lane.clone(), self.job.clone())
+    }
+
     /// True once either the lane or the job has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.lane.load(Ordering::Relaxed) || self.job.load(Ordering::Relaxed)
@@ -93,6 +98,49 @@ mod tests {
         assert!(!token.is_cancelled());
         job.store(true, Ordering::SeqCst);
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn each_stops_after_the_item_that_cancelled() {
+        let job = Arc::new(AtomicBool::new(false));
+        let check = CancelToken::new(Arc::new(AtomicBool::new(false)), job.clone()).check();
+        let mut calls = 0;
+        let result = check.each(0..100, |i| {
+            calls += 1;
+            if i == 2 {
+                job.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        assert_eq!(calls, 3);
+        let err = result.expect_err("a cancelled loop returns the cancelled error");
+        assert!(err.to_string().contains("operation cancelled"));
+    }
+
+    #[test]
+    fn each_runs_every_item_without_a_cancel() {
+        let check = CancelToken::unconnected().check();
+        let mut seen = Vec::new();
+        check
+            .each(0..5, |i| {
+                seen.push(i);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn each_returns_the_bodys_own_error() {
+        let check = CancelToken::unconnected().check();
+        let result = check.each(0..5, |i| {
+            if i == 1 {
+                Err(crate::error::Error::InvalidPdf("body".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.unwrap_err().to_string().contains("body"));
     }
 
     #[test]

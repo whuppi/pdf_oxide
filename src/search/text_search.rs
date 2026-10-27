@@ -132,6 +132,18 @@ impl TextSearcher {
         pattern: &str,
         options: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
+        Self::search_cancellable(doc, pattern, options, &crate::cancel::CancelCheck::none())
+    }
+
+    // ── pdf_manipulator patch: cancel between pages ──
+    /// Like [`search`](Self::search), but stops with the cancelled error
+    /// before each page once `cancel` reports cancelled.
+    pub fn search_cancellable(
+        doc: &PdfDocument,
+        pattern: &str,
+        options: &SearchOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Vec<SearchResult>> {
         // Build the regex pattern
         let regex = Self::build_regex(pattern, options)?;
 
@@ -146,6 +158,7 @@ impl TextSearcher {
         let mut results = Vec::new();
 
         for page in start_page..=end_page {
+            cancel.check()?;
             let page_results = Self::search_page(doc, page, &regex, options)?;
             results.extend(page_results);
 
@@ -158,6 +171,7 @@ impl TextSearcher {
 
         Ok(results)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Search for text on a specific page.
     pub fn search_page(

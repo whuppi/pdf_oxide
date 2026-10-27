@@ -438,16 +438,36 @@ impl PdfUaValidator {
         document: &mut PdfDocument,
         level: PdfUaLevel,
     ) -> Result<UaValidationResult> {
+        self.validate_cancellable(document, level, &crate::cancel::CancelCheck::none())
+    }
+
+    // ── pdf_manipulator patch: cancel between rule batches ──
+    /// Like [`validate`](Self::validate), but stops with the cancelled
+    /// error before each rule batch once `cancel` reports cancelled.
+    pub fn validate_cancellable(
+        &self,
+        document: &mut PdfDocument,
+        level: PdfUaLevel,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<UaValidationResult> {
         let mut result = UaValidationResult::new(level);
 
         // Core PDF/UA validations
+        cancel.check()?;
         self.validate_tagged_pdf(document, &mut result)?;
+        cancel.check()?;
         self.validate_language(document, &mut result)?;
+        cancel.check()?;
         self.validate_title(document, &mut result)?;
+        cancel.check()?;
         self.validate_structure_tree(document, &mut result)?;
+        cancel.check()?;
         self.validate_figures(document, &mut result)?;
+        cancel.check()?;
         self.validate_tables(document, &mut result)?;
+        cancel.check()?;
         self.validate_form_fields(document, &mut result)?;
+        cancel.check()?;
         self.validate_annotations(document, &mut result)?;
 
         // Set compliance status
@@ -455,6 +475,7 @@ impl PdfUaValidator {
 
         Ok(result)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Check if document is a Tagged PDF.
     fn validate_tagged_pdf(

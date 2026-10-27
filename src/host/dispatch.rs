@@ -258,10 +258,15 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
 }
 
 /// Extract text from one page or all pages in the given format.
-pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) -> Result<ExtractTextResult> {
+pub fn extract_text(
+    doc: &mut PdfDocument,
+    page: Option<usize>,
+    format: &str,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<ExtractTextResult> {
     #[cfg(not(feature = "extract"))]
     {
-        let _ = (doc, page, format);
+        let _ = (doc, page, format, cancel);
         return Err(Error::Unsupported("extract support not enabled in this build".into()));
     }
     #[cfg(feature = "extract")]
@@ -270,7 +275,7 @@ pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) ->
             "markdown" => {
                 let opts = crate::converters::ConversionOptions::default();
                 match page {
-                    None => doc.to_markdown_all(&opts)?,
+                    None => doc.to_markdown_all_cancellable(&opts, cancel)?,
                     Some(i) => doc.to_markdown(i, &opts)?,
                 }
             }
@@ -280,10 +285,11 @@ pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) ->
                     None => {
                         let count = doc.page_count()?;
                         let mut all = String::new();
-                        for i in 0..count {
+                        cancel.each(0..count, |i| {
                             if i > 0 { all.push('\n'); }
                             all.push_str(&doc.to_html(i, &opts)?);
-                        }
+                            Ok(())
+                        })?;
                         all
                     }
                     Some(i) => doc.to_html(i, &opts)?,
@@ -294,10 +300,11 @@ pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) ->
                     None => {
                         let count = doc.page_count()?;
                         let mut all = String::new();
-                        for i in 0..count {
+                        cancel.each(0..count, |i| {
                             if i > 0 { all.push('\n'); }
                             all.push_str(&doc.extract_text(i)?);
-                        }
+                            Ok(())
+                        })?;
                         all
                     }
                     Some(i) => doc.extract_text(i)?,
@@ -309,17 +316,22 @@ pub fn extract_text(doc: &mut PdfDocument, page: Option<usize>, format: &str) ->
 }
 
 /// Search for text across the document, optionally filtered to one page.
-pub fn search_text(doc: &mut PdfDocument, query: &str, page: Option<usize>) -> Result<SearchResult> {
+pub fn search_text(
+    doc: &mut PdfDocument,
+    query: &str,
+    page: Option<usize>,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<SearchResult> {
     #[cfg(not(feature = "extract"))]
     {
-        let _ = (doc, query, page);
+        let _ = (doc, query, page, cancel);
         return Err(Error::Unsupported("extract support not enabled in this build".into()));
     }
     #[cfg(feature = "extract")]
     {
         use crate::search::{SearchOptions, TextSearcher};
         let opts = SearchOptions::default();
-        let all_hits = TextSearcher::search(doc, query, &opts)?;
+        let all_hits = TextSearcher::search_cancellable(doc, query, &opts, cancel)?;
         let hits: Vec<SearchHit> = all_hits
             .into_iter()
             .filter(|h| page.map_or(true, |p| h.page == p))
@@ -382,46 +394,52 @@ pub fn verify_signatures(doc: &mut PdfDocument) -> Result<bool> {
 }
 
 /// Validate PDF/A compliance at the given level (1=A1b, 2=A2b, 3=A3b).
-pub fn validate_pdf_a(doc: &mut PdfDocument, level: i32) -> Result<ValidationResult> {
+pub fn validate_pdf_a(
+    doc: &mut PdfDocument,
+    level: i32,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<ValidationResult> {
     #[cfg(not(feature = "pdfa"))]
     {
-        let _ = (doc, level);
+        let _ = (doc, level, cancel);
         return Err(Error::Unsupported("PDF/A support not enabled in this build".into()));
     }
     #[cfg(feature = "pdfa")]
     {
-    use crate::compliance::{validate_pdf_a as do_validate, PdfALevel};
+    use crate::compliance::{PdfALevel, PdfAValidator};
     let pdf_level = match level {
         1 => PdfALevel::A1b,
         3 => PdfALevel::A3b,
         _ => PdfALevel::A2b,
     };
-    match do_validate(doc, pdf_level) {
-        Ok(v) => Ok(ValidationResult {
-            compliant: v.is_compliant,
-            errors: v.errors.len() as i32,
-            warnings: v.warnings.len() as i32,
-        }),
-        Err(_) => Ok(ValidationResult { compliant: false, errors: -1, warnings: 0 }),
-    }
+    let v = PdfAValidator::new().validate_cancellable(doc, pdf_level, cancel)?;
+    Ok(ValidationResult {
+        compliant: v.is_compliant,
+        errors: v.errors.len() as i32,
+        warnings: v.warnings.len() as i32,
+    })
     }
 }
 
 /// Validate PDF/UA compliance at the given level (1=UA1, 2=UA2).
-pub fn validate_pdf_ua(doc: &mut PdfDocument, level: i32) -> Result<bool> {
+pub fn validate_pdf_ua(
+    doc: &mut PdfDocument,
+    level: i32,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<bool> {
     #[cfg(not(feature = "pdfa"))]
     {
-        let _ = (doc, level);
+        let _ = (doc, level, cancel);
         return Err(Error::Unsupported("PDF/A support not enabled in this build".into()));
     }
     #[cfg(feature = "pdfa")]
     {
-        use crate::compliance::pdf_ua::{validate_pdf_ua as do_validate, PdfUaLevel};
+        use crate::compliance::pdf_ua::{PdfUaLevel, PdfUaValidator};
         let ua_level = match level {
             2 => PdfUaLevel::Ua2,
             _ => PdfUaLevel::Ua1,
         };
-        Ok(do_validate(doc, ua_level).map(|r| r.is_compliant).unwrap_or(false))
+        Ok(PdfUaValidator::new().validate_cancellable(doc, ua_level, cancel)?.is_compliant)
     }
 }
 
@@ -689,11 +707,13 @@ pub fn extract_images_streamed<W: std::io::Write>(
     doc: &mut PdfDocument,
     page: usize,
     writer: &mut W,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Result<usize> {
     use crate::host::binary_codec::ResponseWriter;
+    cancel.check()?;
     let images = doc.extract_images(page)?;
     let count = images.len();
-    for img in images {
+    cancel.each(images, |img| {
         let (fmt, data) = match img.data() {
             crate::extractors::ImageData::Jpeg(bytes) => ("jpeg", bytes.to_vec()),
             crate::extractors::ImageData::Raw { pixels, .. } => ("raw", pixels.to_vec()),
@@ -710,7 +730,8 @@ pub fn extract_images_streamed<W: std::io::Write>(
         writer.write_all(&len_bytes).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         // image data dropped here — only one image in memory at a time
-    }
+        Ok(())
+    })?;
     // A zero-length frame terminates the stream.
     writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
     Ok(count)
@@ -730,10 +751,11 @@ pub fn render_pages_streamed<W: std::io::Write>(
     max_width: u32,
     max_height: u32,
     writer: &mut W,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Result<usize> {
     use crate::host::binary_codec::ResponseWriter;
     let count = pages.len();
-    for &page in pages {
+    cancel.each(pages.iter().copied(), |page| {
         let result = render_page(doc, page, max_width, max_height)?;
         let mut w = ResponseWriter::ok();
         w.put_i32("width", result.width as i32);
@@ -744,7 +766,8 @@ pub fn render_pages_streamed<W: std::io::Write>(
         writer.write_all(&len_bytes).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         // encoded page dropped here — only one page in memory at a time
-    }
+        Ok(())
+    })?;
     // A zero-length frame terminates the stream.
     writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
     Ok(count)
@@ -1026,6 +1049,7 @@ pub struct ImageOutcomeRow {
 pub fn edit_reduce_images(
     editor: &mut DocumentEditor,
     args: ImagePolicyArgs,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Result<Vec<ImageOutcomeRow>> {
     #[cfg(feature = "rendering")]
     {
@@ -1047,7 +1071,7 @@ pub fn edit_reduce_images(
             },
             recompress_jpeg: args.recompress_jpeg,
         };
-        let report = crate::host::images::execute::reduce_images(editor, &policy)?;
+        let report = crate::host::images::execute::reduce_images(editor, &policy, cancel)?;
         Ok(report
             .images
             .into_iter()
@@ -1073,7 +1097,7 @@ pub fn edit_reduce_images(
     }
     #[cfg(not(feature = "rendering"))]
     {
-        let _ = (editor, args);
+        let _ = (editor, args, cancel);
         Ok(Vec::new())
     }
 }
@@ -1361,10 +1385,14 @@ pub fn register_fallback_font(kind: &str, bytes: Vec<u8>) -> Result<()> {
 }
 
 /// Convert the editor's document to PDF/A at the given conformance level.
-pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<()> {
+pub fn edit_convert_to_pdf_a(
+    editor: &mut DocumentEditor,
+    level: i32,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<()> {
     #[cfg(not(feature = "pdfa"))]
     {
-        let _ = (editor, level);
+        let _ = (editor, level, cancel);
         return Err(Error::Unsupported("PDF/A support not enabled in this build".into()));
     }
     #[cfg(feature = "pdfa")]
@@ -1375,7 +1403,7 @@ pub fn edit_convert_to_pdf_a(editor: &mut DocumentEditor, level: i32) -> Result<
         3 => PdfALevel::A3b,
         _ => PdfALevel::A2b,
     };
-    let converter = crate::compliance::PdfAConverter::new(pdf_level);
+    let converter = crate::compliance::PdfAConverter::new(pdf_level).with_cancel(cancel.clone());
     converter.convert_with_editor(editor)?;
     Ok(())
     }
@@ -1466,11 +1494,12 @@ pub fn edit_save_with_options(
     editor: &mut DocumentEditor,
     writer: &mut impl crate::host::positioned_write::PositionedWrite,
     options: &crate::editor::SaveOptions,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Result<()> {
     if options.incremental {
-        return Ok(crate::host::incremental::write(editor, writer, options)?);
+        return Ok(crate::host::incremental::write(editor, writer, options, cancel)?);
     }
-    editor.write_full_to_writer(writer, options)
+    editor.write_full_to_writer(writer, options, cancel)
 }
 
 /// Save the editor's document with compression, GC, and save-mode flags.
@@ -1480,6 +1509,7 @@ pub fn edit_save(
     compress: bool,
     garbage_collect: bool,
     save_mode: i32,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Result<()> {
     use crate::editor::SaveOptions;
     let options = SaveOptions {
@@ -1488,7 +1518,7 @@ pub fn edit_save(
         garbage_collect,
         ..Default::default()
     };
-    edit_save_with_options(editor, writer, &options)
+    edit_save_with_options(editor, writer, &options, cancel)
 }
 
 /// Save with AES-256 encryption, returning the encrypted bytes.
@@ -2739,7 +2769,7 @@ mod extract_trim_probe_tests {
             Ok(doc) => doc,
             Err(e) => panic!("minimal doc must parse: {e}"),
         };
-        let err = match extract_text(&mut doc, None, "plainText") {
+        let err = match extract_text(&mut doc, None, "plainText", &crate::cancel::CancelCheck::none()) {
             Ok(_) => panic!("expected not-enabled error"),
             Err(e) => e,
         };
@@ -2756,7 +2786,7 @@ mod extract_trim_probe_tests {
             Ok(doc) => doc,
             Err(e) => panic!("minimal doc must parse: {e}"),
         };
-        let err = match search_text(&mut doc, "x", None) {
+        let err = match search_text(&mut doc, "x", None, &crate::cancel::CancelCheck::none()) {
             Ok(_) => panic!("expected not-enabled error"),
             Err(e) => e,
         };
@@ -2822,7 +2852,7 @@ mod trim_probe_tests {
             Ok(doc) => doc,
             Err(e) => panic!("minimal doc must parse: {e}"),
         };
-        let err = match validate_pdf_a(&mut doc, 2) {
+        let err = match validate_pdf_a(&mut doc, 2, &crate::cancel::CancelCheck::none()) {
             Ok(_) => panic!("expected not-enabled error"),
             Err(e) => e,
         };

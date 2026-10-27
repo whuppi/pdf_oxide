@@ -26,7 +26,7 @@ op_unit!(EXTRACT, "extract", pdf_op_extract_anchor, |ctx| {
             None => None,
         };
         let format = req.get_str("format").unwrap_or("plainText");
-        let result = dispatch::extract_text(doc, page, format)?;
+        let result = dispatch::extract_text(doc, page, format, ctx.cancel)?;
         let mut w = ResponseWriter::ok();
         w.put_str("text", &result.text);
         Ok(w.finish())
@@ -43,7 +43,7 @@ op_unit!(SEARCH, "search", pdf_op_search_anchor, |ctx| {
             },
             None => None,
         };
-        let result = dispatch::search_text(doc, query, page)?;
+        let result = dispatch::search_text(doc, query, page, ctx.cancel)?;
         let mut w = ResponseWriter::ok();
         w.put_map_list("hits", result.hits.len(), |i, item| {
             let h = &result.hits[i];

@@ -9,7 +9,7 @@ use crate::host::ops::op_unit;
 op_unit!(VALIDATE_PDF_A, "validatePdfA", pdf_op_validate_pdf_a_anchor, |ctx| {
     handle_with_doc(ctx.state, ctx.req, |doc, req| {
         let level = req.get_i32("level").unwrap_or(2);
-        let result = dispatch::validate_pdf_a(doc, level)?;
+        let result = dispatch::validate_pdf_a(doc, level, ctx.cancel)?;
         let mut w = ResponseWriter::ok();
         w.put_bool("compliant", result.compliant);
         w.put_i32("errors", result.errors);
@@ -25,7 +25,7 @@ op_unit!(
     |ctx| {
         handle_with_doc(ctx.state, ctx.req, |doc, req| {
             let level = req.get_i32("level").unwrap_or(1);
-            let result = dispatch::validate_pdf_ua(doc, level)?;
+            let result = dispatch::validate_pdf_ua(doc, level, ctx.cancel)?;
             let mut w = ResponseWriter::ok();
             w.put_bool("valid", result);
             Ok(w.finish())

@@ -153,7 +153,7 @@ op_unit!(
 
 op_unit!(MUTATE, "editorMutate", pdf_op_editor_mutate_anchor, |ctx| {
     let data = ctx.take_data_reader();
-    handle_editor_mutate(ctx.state, ctx.req, data)
+    handle_editor_mutate(ctx.state, ctx.req, data, ctx.cancel)
 });
 
 op_unit!(
@@ -168,7 +168,7 @@ op_unit!(
 
 op_unit!(SAVE, "editorSave", pdf_op_editor_save_anchor, |ctx| {
     let sink = ctx.take_sink(0);
-    handle_editor_save(ctx.state, ctx.req, sink)
+    handle_editor_save(ctx.state, ctx.req, sink, ctx.cancel)
 });
 
 op_unit!(
@@ -177,6 +177,6 @@ op_unit!(
     pdf_op_editor_extract_pages_anchor,
     |ctx| {
         let sink = ctx.take_sink(0);
-        handle_editor_extract_pages(ctx.state, ctx.req, sink)
+        handle_editor_extract_pages(ctx.state, ctx.req, sink, ctx.cancel)
     }
 );

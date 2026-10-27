@@ -308,7 +308,7 @@ fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) {
             }
         }
 
-        handle_request(state, &job.request, None, sources, sinks)
+        handle_request(state, &job.request, None, sources, sinks, &token.check())
     }));
 
     // Release BEFORE posting: the post triggers Dart's buffer free

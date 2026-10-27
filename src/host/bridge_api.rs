@@ -102,6 +102,7 @@ pub(crate) fn handle_request(
     source_bytes: Option<&[u8]>,
     mut sources: Vec<BoxedReader>,
     mut sinks: Vec<BoxedWriter>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     let req = match Request::parse(bytes) {
         Ok(r) => r,
@@ -114,6 +115,7 @@ pub(crate) fn handle_request(
         source_bytes,
         sources: &mut sources,
         sinks: &mut sinks,
+        cancel,
     };
     match crate::host::ops::registry::find(req.op()) {
         Some(entry) => (entry.handle)(&mut ctx),
@@ -380,6 +382,7 @@ pub(crate) fn handle_editor_mutate(
     state: &mut LaneState,
     req: &Request<'_>,
     data_reader: Option<BoxedReader>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     let edit_op = match req.get_str("editOp") {
         Some(op) => op,
@@ -392,7 +395,7 @@ pub(crate) fn handle_editor_mutate(
         None => return ResponseWriter::error("editor not found"),
     };
 
-    match do_editor_mutate(editor, edit_op, req, data_reader) {
+    match do_editor_mutate(editor, edit_op, req, data_reader, cancel) {
         Ok(bytes) => bytes,
         Err(e) => ResponseWriter::error_of(&e),
     }
@@ -403,6 +406,7 @@ fn do_editor_mutate(
     edit_op: &str,
     req: &Request<'_>,
     mut data_reader: Option<BoxedReader>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> crate::error::Result<Vec<u8>> {
     use crate::error::Error;
 
@@ -533,7 +537,7 @@ fn do_editor_mutate(
                 chroma: req.get_str("chroma").unwrap_or("auto").to_string(),
                 recompress_jpeg: req.get_bool("recompressJpeg").unwrap_or(false),
             };
-            let rows = dispatch::edit_reduce_images(editor, policy)?;
+            let rows = dispatch::edit_reduce_images(editor, policy, cancel)?;
             let mut w = ResponseWriter::ok();
             w.put_map_list("images", rows.len(), |i, item| {
                 let r = &rows[i];
@@ -704,7 +708,7 @@ fn do_editor_mutate(
             ok_response()
         }
         "convertToPdfA" => {
-            dispatch::edit_convert_to_pdf_a(editor, req.get_i32("level").unwrap_or(2))?;
+            dispatch::edit_convert_to_pdf_a(editor, req.get_i32("level").unwrap_or(2), cancel)?;
             ok_response()
         }
         "resizeImage" => {
@@ -1549,7 +1553,12 @@ pub(crate) fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink
     }
 }
 
-pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+pub(crate) fn handle_render_streamed(
+    state: &mut LaneState,
+    req: &Request<'_>,
+    sink_writer: Option<BoxedWriter>,
+    cancel: &crate::cancel::CancelCheck,
+) -> Vec<u8> {
     let hid = req_handle(req);
     let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
@@ -1575,7 +1584,7 @@ pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, s
     let max_h = req.get_i32("maxHeight").unwrap_or(0) as u32;
 
     if let Some(mut writer) = sink_writer {
-        match dispatch::render_pages_streamed(doc, &pages, max_w, max_h, &mut writer) {
+        match dispatch::render_pages_streamed(doc, &pages, max_w, max_h, &mut writer, cancel) {
             Ok(count) => {
                 let mut w = ResponseWriter::ok();
                 w.put_bool("streamed", true);
@@ -1602,7 +1611,12 @@ pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, s
     }
 }
 
-pub(crate) fn handle_extract_images_streamed(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+pub(crate) fn handle_extract_images_streamed(
+    state: &mut LaneState,
+    req: &Request<'_>,
+    sink_writer: Option<BoxedWriter>,
+    cancel: &crate::cancel::CancelCheck,
+) -> Vec<u8> {
     let hid = req_handle(req);
     let docs = &mut state.documents;
     let doc = match docs.get_mut(&hid) {
@@ -1620,7 +1634,7 @@ pub(crate) fn handle_extract_images_streamed(state: &mut LaneState, req: &Reques
     };
 
     if let Some(mut writer) = sink_writer {
-        match dispatch::extract_images_streamed(doc, page, &mut writer) {
+        match dispatch::extract_images_streamed(doc, page, &mut writer, cancel) {
             Ok(count) => {
                 let mut w = ResponseWriter::ok();
                 w.put_bool("streamed", true);
@@ -1655,6 +1669,7 @@ pub(crate) fn handle_sign(
     source_reader: Option<BoxedReader>,
     source_bytes: Option<&[u8]>,
     sink_writer: Option<BoxedWriter>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     use crate::signatures::{SignOptions, SigningCredentials};
 
@@ -1686,7 +1701,7 @@ pub(crate) fn handle_sign(
         let Some(signed_at) = req.get_i64("signedAt").and_then(|s| u64::try_from(s).ok()) else {
             return ResponseWriter::error_kind(ErrorKind::InvalidArgument, "sign: missing signedAt");
         };
-        match crate::host::sign::sign_pdf(reader, &mut writer, &credentials, opts, signed_at) {
+        match crate::host::sign::sign_pdf(reader, &mut writer, &credentials, opts, signed_at, cancel) {
             Ok(()) => {
                 ok_flag("signed")
             }
@@ -1712,6 +1727,7 @@ pub(crate) fn handle_sign(
     _source_reader: Option<BoxedReader>,
     _source_bytes: Option<&[u8]>,
     _sink_writer: Option<BoxedWriter>,
+    _cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     ResponseWriter::error_kind(ErrorKind::Unsupported, "signatures feature not enabled")
 }
@@ -1720,6 +1736,7 @@ pub(crate) fn handle_editor_save(
     state: &mut LaneState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     let hid = req_handle(req);
     let editors = &mut state.editors;
@@ -1766,7 +1783,7 @@ pub(crate) fn handle_editor_save(
     match (options.incremental, sink_writer) {
         (true, Some(mut writer)) => {
             use crate::host::incremental::{write, IncrementalError};
-            match write(editor, &mut writer, &options) {
+            match write(editor, &mut writer, &options, cancel) {
                 Ok(()) => ok_flag("streamed"),
                 Err(IncrementalError::Refused(why)) => {
                     ResponseWriter::error_kind(ErrorKind::IncrementalRefused, &why)
@@ -1775,7 +1792,7 @@ pub(crate) fn handle_editor_save(
             }
         },
         (false, Some(mut writer)) => {
-            match dispatch::edit_save_with_options(editor, &mut writer, &options) {
+            match dispatch::edit_save_with_options(editor, &mut writer, &options, cancel) {
                 Ok(()) => ok_flag("streamed"),
                 Err(e) => ResponseWriter::error_of(&e),
             }
@@ -1798,6 +1815,7 @@ pub(crate) fn handle_editor_extract_pages(
     state: &mut LaneState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     let hid = req_handle(req);
     let editors = &mut state.editors;
@@ -1832,7 +1850,7 @@ pub(crate) fn handle_editor_extract_pages(
 
     let result = if let Some(mut writer) = sink_writer {
         dispatch::edit_save_with_options(
-            editor, &mut writer, &crate::editor::SaveOptions::full_rewrite(),
+            editor, &mut writer, &crate::editor::SaveOptions::full_rewrite(), cancel,
         )
     } else {
         Err(crate::error::Error::InvalidPdf(
@@ -1974,7 +1992,7 @@ mod wasm_entry {
             sinks.push(BoxedWriter::new(JsCallbackWriter::new(i)));
         }
 
-        handle_request(state, request_bytes, None, sources, sinks)
+        handle_request(state, request_bytes, None, sources, sinks, &crate::cancel::CancelCheck::from_host())
     }
 
     /// Drop this lane's state, freeing every handle it owns.

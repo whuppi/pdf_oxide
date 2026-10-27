@@ -23470,6 +23470,17 @@ impl PdfDocument {
         &self,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        self.to_markdown_all_cancellable(options, &crate::cancel::CancelCheck::none())
+    }
+
+    // ── pdf_manipulator patch: cancel between pages ──
+    /// Like [`to_markdown_all`](Self::to_markdown_all), but stops with the
+    /// cancelled error before each page once `cancel` reports cancelled.
+    pub fn to_markdown_all_cancellable(
+        &self,
+        options: &crate::converters::ConversionOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<String> {
         // Diagnostics raised by the producers that hold no document land
         // in a thread-local sink; scope them to this call so a document
         // read earlier on this thread cannot claim them.
@@ -23482,16 +23493,18 @@ impl PdfDocument {
         // Pre-reserve ~4 KB/page to avoid repeated reallocation.
         let mut result = String::with_capacity(page_count.saturating_mul(4096));
 
-        for i in 0..page_count {
+        cancel.each(0..page_count, |i| {
             if i > 0 {
                 result.push_str("\n---\n\n");
             }
             let page_markdown = self.to_markdown(i, options)?;
             result.push_str(&page_markdown);
-        }
+            Ok(())
+        })?;
 
         Ok(result)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Convert all pages to plain text format.
     ///

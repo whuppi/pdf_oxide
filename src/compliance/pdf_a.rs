@@ -74,11 +74,24 @@ impl PdfAValidator {
         document: &mut PdfDocument,
         level: PdfALevel,
     ) -> Result<ValidationResult> {
+        self.validate_cancellable(document, level, &crate::cancel::CancelCheck::none())
+    }
+
+    // ── pdf_manipulator patch: cancel between rule batches ──
+    /// Like [`validate`](Self::validate), but stops with the cancelled
+    /// error before each rule batch once `cancel` reports cancelled.
+    pub fn validate_cancellable(
+        &self,
+        document: &mut PdfDocument,
+        level: PdfALevel,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<ValidationResult> {
         let mut result = ValidationResult::new(level);
 
         // Macro to run a validator and check for early return
         macro_rules! run_validator {
             ($validator:expr) => {
+                cancel.check()?;
                 $validator(document, level, &mut result)?;
                 if self.should_stop(&result) {
                     return Ok(self.finalize_result(result));
@@ -97,10 +110,12 @@ impl PdfAValidator {
         run_validator!(validators::validate_embedded_files);
 
         // Last validator doesn't need early return check
+        cancel.check()?;
         validators::validate_annotations(document, level, &mut result)?;
 
         Ok(self.finalize_result(result))
     }
+    // ── end pdf_manipulator patch ──
 
     /// Check a specific aspect of PDF/A compliance.
     ///

@@ -6,7 +6,7 @@ use crate::host::ops::op_unit;
 
 op_unit!(RENDER, "render", pdf_op_render_anchor, |ctx| {
     let sink = ctx.take_sink(0);
-    handle_render_streamed(ctx.state, ctx.req, sink)
+    handle_render_streamed(ctx.state, ctx.req, sink, ctx.cancel)
 });
 
 op_unit!(
@@ -15,6 +15,6 @@ op_unit!(
     pdf_op_extract_images_anchor,
     |ctx| {
         let sink = ctx.take_sink(0);
-        handle_extract_images_streamed(ctx.state, ctx.req, sink)
+        handle_extract_images_streamed(ctx.state, ctx.req, sink, ctx.cancel)
     }
 );

@@ -894,7 +894,7 @@ impl DocumentEditor {
             ));
         }
         let mut writer = CountingWriter::new(std::io::Cursor::new(Vec::new()));
-        self.write_full_to_writer(&mut writer, &options)?;
+        self.write_full_to_writer(&mut writer, &options, &crate::cancel::CancelCheck::none())?;
         Ok(writer.into_inner().into_inner())
         // ── end pdf_manipulator patch ──
     }
@@ -2576,7 +2576,7 @@ impl DocumentEditor {
         use crate::host::positioned_write::CountingWriter;
         let file = File::create(path.as_ref())?;
         let mut writer = CountingWriter::new(BufWriter::new(file));
-        self.write_full_to_writer(&mut writer, options)
+        self.write_full_to_writer(&mut writer, options, &crate::cancel::CancelCheck::none())
         // ── end pdf_manipulator patch ──
     }
 
@@ -2917,12 +2917,13 @@ impl DocumentEditor {
     // Visibility (pub(crate) for dispatch) AND the output type: the
     // writer is any PositionedWrite, and every byte offset below comes
     // from writer.position() — all such calls in this function are
-    // part of this patch.
+    // part of this patch. `cancel` is polled once per page.
     // ── end pdf_manipulator patch ──
     pub(crate) fn write_full_to_writer(
         &mut self,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         options: &SaveOptions,
+        cancel: &crate::cancel::CancelCheck,
     ) -> Result<()> {
         use crate::encryption::{
             generate_file_id, Algorithm, EncryptDictBuilder, EncryptionWriteHandler,
@@ -3545,6 +3546,9 @@ impl DocumentEditor {
                         let cached_page_refs = self.get_page_refs().unwrap_or_default();
                         // ── end pdf_manipulator patch ──
                         for kid in kids {
+                            // ── pdf_manipulator patch: stop within one page of a cancel ──
+                            cancel.check()?;
+                            // ── end pdf_manipulator patch ──
                             if let Some(page_ref) = kid.as_reference() {
                                 // ── pdf_manipulator patch: staged page dict wins over source ──
                                 // Edits that rewrite the page dictionary

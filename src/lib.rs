@@ -328,6 +328,10 @@ pub mod wasm;
 pub mod host;
 // ── end pdf_manipulator patch ──
 
+// ── pdf_manipulator patch: cancellation probe for engine loops ──
+pub mod cancel;
+// ── end pdf_manipulator patch ──
+
 // Re-exports
 pub use annotation_types::{
     AnnotationBorderStyle, AnnotationColor, AnnotationFlags, AnnotationSubtype, BorderEffectStyle,

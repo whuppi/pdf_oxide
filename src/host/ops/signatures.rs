@@ -9,7 +9,7 @@ use crate::host::ops::op_unit;
 op_unit!(SIGN, "sign", pdf_op_sign_anchor, |ctx| {
     let source = ctx.take_source(0);
     let sink = ctx.take_sink(0);
-    handle_sign(ctx.req, source, ctx.source_bytes, sink)
+    handle_sign(ctx.req, source, ctx.source_bytes, sink, ctx.cancel)
 });
 
 op_unit!(

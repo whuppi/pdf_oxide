@@ -23,6 +23,7 @@ pub(crate) fn sign_pdf(
     credentials: &SigningCredentials,
     opts: SignOptions,
     signed_at_unix_secs: u64,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Result<()> {
     use crate::document::PdfDocument;
     use crate::host::constants::READ_BUF_CAPACITY;
@@ -217,6 +218,7 @@ pub(crate) fn sign_pdf(
     let mut chunk = vec![0u8; READ_BUF_CAPACITY];
     let mut at = 0u64;
     while at < len {
+        cancel.check()?;
         let n = doc.read_source_at(at, &mut chunk)?;
         if n == 0 {
             return Err(Error::InvalidPdf("sign: source ended before its length".into()));
@@ -248,6 +250,7 @@ pub(crate) fn sign_pdf(
     // Write output: the source, then the section.
     let mut at = 0u64;
     while at < len {
+        cancel.check()?;
         let n = (len - at).min(chunk.len() as u64) as usize;
         doc.read_source_at(at, &mut chunk[..n])?;
         writer.write_all(&chunk[..n])?;

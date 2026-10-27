@@ -25,7 +25,11 @@ use super::resample::{resample_bilevel, resample_continuous};
 
 /// Run the pipeline over every image drawn on the editor's visible pages
 /// and stage each replacement for the next save.
-pub fn reduce_images(editor: &mut DocumentEditor, policy: &Policy) -> Result<Report> {
+pub fn reduce_images(
+    editor: &mut DocumentEditor,
+    policy: &Policy,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<Report> {
     let pages: Vec<usize> = editor
         .page_order_visible()
         .iter()
@@ -33,10 +37,10 @@ pub fn reduce_images(editor: &mut DocumentEditor, policy: &Policy) -> Result<Rep
         .collect();
     let entries = document_images(editor.source(), &pages)?;
     let mut report = Report::default();
-    for entry in entries {
+    cancel.each(entries, |entry| {
         let object = staged_or_source(editor, entry.object)?;
         let Object::Stream { dict, data } = &object else {
-            continue;
+            return Ok(());
         };
         let kind = classify(editor.source(), dict, data);
         let uses: Vec<Use> = entry.placements.iter().map(|&ctm| Use { ctm }).collect();
@@ -93,7 +97,8 @@ pub fn reduce_images(editor: &mut DocumentEditor, policy: &Policy) -> Result<Rep
             },
         }
         report.images.push(outcome);
-    }
+        Ok(())
+    })?;
     Ok(report)
 }
 

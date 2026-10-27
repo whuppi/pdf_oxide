@@ -15,5 +15,5 @@ pub fn run(
 ) -> Vec<u8> {
     let sources = sources.into_iter().map(|f| BoxedReader(Box::new(f))).collect();
     let sinks = sinks.into_iter().map(BoxedWriter::new).collect();
-    bridge_api::handle_request(state, request, None, sources, sinks)
+    bridge_api::handle_request(state, request, None, sources, sinks, &crate::cancel::CancelCheck::none())
 }
