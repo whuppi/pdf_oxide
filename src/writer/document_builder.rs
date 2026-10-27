@@ -420,10 +420,12 @@ fn italic_font_name(base: &str) -> String {
     }
 }
 
-/// Page builder for adding content to a page with fluent API.
-pub struct FluentPageBuilder<'a> {
-    builder: &'a mut DocumentBuilder,
-    page_index: usize,
+// ── pdf_manipulator patch ── the per-page building state lives on the page
+// (`PageData::state`) so a host can hold a `DocumentBuilder` across calls and
+// apply each operation through a short-lived `PageBuilder`.
+/// Per-page building state: cursor, text settings and the work not yet
+/// committed to the page.
+pub(crate) struct PageState {
     cursor_x: f32,
     cursor_y: f32,
     text_config: TextConfig,
@@ -433,91 +435,119 @@ pub struct FluentPageBuilder<'a> {
     /// Pending annotations for this page
     pending_annotations: Vec<Annotation>,
     /// Active 2D affine transform (PDF row order: `[a b c d e f]`).
-    /// `None` = identity. Populated by [`Self::with_transform`] /
-    /// [`Self::rotated`] / [`Self::scaled`] / [`Self::translated`] and
-    /// applied to `TextContent.matrix` on emission. v0.3.39 scope:
-    /// text only — see inline comment in the transforms section for
-    /// the Path / Image / Table follow-up.
+    /// `None` = identity. Populated by [`PageBuilder::with_transform`] /
+    /// [`PageBuilder::rotated`] / [`PageBuilder::scaled`] /
+    /// [`PageBuilder::translated`] and applied to `TextContent.matrix` on
+    /// emission. v0.3.39 scope: text only — see inline comment in the
+    /// transforms section for the Path / Image / Table follow-up.
     current_matrix: Option<[f32; 6]>,
     /// Deferred `/Tabs` value for the current page, set by
-    /// [`Self::tab_order`] and applied in [`Self::done`]. #393 D-4.
+    /// [`PageBuilder::tab_order`] and applied when the page is committed.
+    /// #393 D-4.
     pending_tab_order: Option<TabOrder>,
 }
 
-impl<'a> FluentPageBuilder<'a> {
-    /// Set the text configuration for subsequent text operations.
-    pub fn text_config(mut self, config: TextConfig) -> Self {
-        self.text_config = config;
+impl PageState {
+    /// State of a fresh page of the given height: 1 inch margin, cursor at
+    /// the top left.
+    fn new(height: f32) -> Self {
+        Self {
+            cursor_x: 72.0,
+            cursor_y: height - 72.0,
+            text_config: TextConfig::default(),
+            text_layout: TextLayout::new(),
+            last_text_rect: None,
+            pending_annotations: Vec::new(),
+            current_matrix: None,
+            pending_tab_order: None,
+        }
+    }
+}
+
+/// Builds one page of a [`DocumentBuilder`] in place. Every method applies
+/// at once and returns `&mut Self`; the page's state lives in the document
+/// builder, so a `PageBuilder` can be dropped and recreated with
+/// [`DocumentBuilder::page_mut`] between calls.
+pub struct PageBuilder<'a> {
+    builder: &'a mut DocumentBuilder,
+    page_index: usize,
+}
+// ── end pdf_manipulator patch ──
+
+/// Page builder for adding content to a page with fluent API.
+pub struct FluentPageBuilder<'a> {
+    inner: PageBuilder<'a>,
+}
+
+impl<'a> PageBuilder<'a> {
+    fn state(&self) -> &PageState {
+        &self.builder.pages[self.page_index].state
+    }
+
+    fn state_mut(&mut self) -> &mut PageState {
+        &mut self.builder.pages[self.page_index].state
+    }
+
+    /// Same as [`FluentPageBuilder::text_config`], applied in place.
+    pub fn text_config(&mut self, config: TextConfig) -> &mut Self {
+        self.state_mut().text_config = config;
         self
     }
 
-    /// Set font for subsequent text operations.
-    pub fn font(mut self, name: &str, size: f32) -> Self {
-        self.text_config.font = name.to_string();
-        self.text_config.size = size;
+    /// Same as [`FluentPageBuilder::font`], applied in place.
+    pub fn font(&mut self, name: &str, size: f32) -> &mut Self {
+        self.state_mut().text_config.font = name.to_string();
+        self.state_mut().text_config.size = size;
         self
     }
 
-    /// Set cursor position for text placement.
-    pub fn at(mut self, x: f32, y: f32) -> Self {
-        self.cursor_x = x;
-        self.cursor_y = y;
+    /// Same as [`FluentPageBuilder::at`], applied in place.
+    pub fn at(&mut self, x: f32, y: f32) -> &mut Self {
+        self.state_mut().cursor_x = x;
+        self.state_mut().cursor_y = y;
         self
     }
 
-    /// Vertical points remaining on the current page from the cursor down to
-    /// the bottom margin (conventionally 72 pt / 1 inch from the bottom of
-    /// the page). Pure query — no mutation, no emission.
-    ///
-    /// The streaming `Table` surface (research #393) uses this to decide
-    /// whether the next row fits or whether to trigger a page break:
-    ///
-    /// ```no_run
-    /// # use pdf_oxide::writer::DocumentBuilder;
-    /// # let mut doc = DocumentBuilder::new();
-    /// # let page = doc.letter_page();
-    /// if page.remaining_space() < 40.0 {
-    ///     // ... trigger new_page_same_size() and redraw header
-    /// }
-    /// ```
-    ///
-    /// Returns 0.0 (not negative) when the cursor has already passed the
-    /// bottom margin. A return of > 0.0 does not *guarantee* the next row
-    /// fits — that depends on the row's own measured height.
+    /// Same as [`FluentPageBuilder::remaining_space`].
     pub fn remaining_space(&self) -> f32 {
         const BOTTOM_MARGIN: f32 = 72.0;
-        (self.cursor_y - BOTTOM_MARGIN).max(0.0)
+        (self.state().cursor_y - BOTTOM_MARGIN).max(0.0)
     }
 
-    /// Finish the current page and start a new one with the **same page
-    /// size**. The builder's `text_config` (font, size, alignment,
-    /// line-height multiplier) carries over; cursor resets to the same
-    /// top-left origin the current page started at.
-    ///
-    /// Pending annotations and form fields on the current page are
-    /// committed before the new page is opened. Does not re-draw any
-    /// header / footer — callers that want header-repeat-on-break (tables,
-    /// long documents) must redraw explicitly.
-    pub fn new_page_same_size(mut self) -> FluentPageBuilder<'a> {
+    /// Same as [`FluentPageBuilder::new_page_same_size`], applied in place.
+    pub fn new_page_same_size(&mut self) -> &mut Self {
         self.new_page_same_size_inplace();
         self
     }
 
-    /// In-place page break: same semantics as `new_page_same_size` but
-    /// mutates `self` rather than consuming it. Used by `StreamingTable`
-    /// (which borrows its `FluentPageBuilder` and can't consume).
+    /// In-place page break: same semantics as `new_page_same_size`.
+    /// Used by `StreamingTable` (which borrows its `FluentPageBuilder`
+    /// and can't consume).
     pub(crate) fn new_page_same_size_inplace(&mut self) {
         let current = &self.builder.pages[self.page_index];
         let width = current.width;
         let height = current.height;
 
         // Commit pending annotations to the current page before switching.
-        let annotations = std::mem::take(&mut self.pending_annotations);
+        let annotations = std::mem::take(&mut self.state_mut().pending_annotations);
         self.builder.pages[self.page_index]
             .annotations
             .extend(annotations);
 
+        // The new page carries the text settings, transform and deferred
+        // tab order over; the cursor resets to the top-left (mirrors
+        // DocumentBuilder::page) and the last text rect is cleared.
+        let old = self.state_mut();
+        let carried = PageState {
+            text_config: old.text_config.clone(),
+            text_layout: std::mem::take(&mut old.text_layout),
+            current_matrix: old.current_matrix,
+            pending_tab_order: old.pending_tab_order.take(),
+            ..PageState::new(height)
+        };
+
         // Append a fresh PageData with matching dimensions.
+        let old_index = self.page_index;
         self.page_index = self.builder.pages.len();
         self.builder.pages.push(PageData {
             width,
@@ -530,20 +560,14 @@ impl<'a> FluentPageBuilder<'a> {
             page_open_script: None,
             page_close_script: None,
             pending_footnotes: Vec::new(),
+            state: carried,
         });
-
-        // Reset cursor to top-left (mirrors DocumentBuilder::page).
-        self.cursor_x = 72.0;
-        self.cursor_y = height - 72.0;
-        self.last_text_rect = None;
-        // text_config, text_layout, pending_annotations (now empty)
-        // carry over automatically.
+        if self.builder.current_page == Some(old_index) {
+            self.builder.current_page = Some(self.page_index);
+        }
     }
 
-    /// Width and height of the current page in points. Useful when the
-    /// caller needs to size content to the actual page (e.g. table column
-    /// caps that must reflect a landscape orientation chosen at section
-    /// time, not the document's default size).
+    /// Same as [`FluentPageBuilder::page_dimensions`].
     pub fn page_dimensions(&self) -> (f32, f32) {
         let p = &self.builder.pages[self.page_index];
         (p.width, p.height)
@@ -552,16 +576,16 @@ impl<'a> FluentPageBuilder<'a> {
     /// Current cursor X (points from left edge). Used by
     /// `StreamingTable` to anchor column offsets.
     pub(crate) fn cursor_x(&self) -> f32 {
-        self.cursor_x
+        self.state().cursor_x
     }
     /// Current cursor Y (points from bottom edge, PDF convention).
     pub(crate) fn cursor_y(&self) -> f32 {
-        self.cursor_y
+        self.state().cursor_y
     }
     /// Move the cursor down to `y`. Internal use — public callers should
     /// use `at()` which takes (x, y).
     pub(crate) fn set_cursor_y(&mut self, y: f32) {
-        self.cursor_y = y;
+        self.state_mut().cursor_y = y;
     }
     /// Width of the current page in points. Useful for callers
     /// computing alignment rectangles relative to the page edge.
@@ -573,22 +597,22 @@ impl<'a> FluentPageBuilder<'a> {
     }
     /// Font name from the builder's current text_config.
     pub(crate) fn text_config_font_name(&self) -> &str {
-        &self.text_config.font
+        &self.state().text_config.font
     }
     /// Font size in points.
     pub(crate) fn text_config_font_size(&self) -> f32 {
-        self.text_config.size
+        self.state().text_config.size
     }
     /// Line-height multiplier (multiplied with font size to get baseline
     /// step).
     pub(crate) fn text_config_line_height(&self) -> f32 {
-        self.text_config.line_height
+        self.state().text_config.line_height
     }
     /// Wrap `text` to `max_width` using the builder's TextLayout engine.
     /// Returns one `(line, measured_width)` per visual line.
     pub(crate) fn wrap_cell_text(&self, text: &str, max_width: f32) -> Vec<(String, f32)> {
-        self.text_layout
-            .wrap_text(text, &self.text_config.font, self.text_config.size, max_width)
+        self.state().text_layout
+            .wrap_text(text, &self.state().text_config.font, self.state().text_config.size, max_width)
     }
     /// Push a `ContentElement` into the current page's element list.
     pub(crate) fn push_element(&mut self, element: ContentElement) {
@@ -600,93 +624,66 @@ impl<'a> FluentPageBuilder<'a> {
         self.builder.pages[self.page_index].elements.len()
     }
 
-    /// Open a streaming table that consumes this page builder. See
-    /// [`super::streaming_table::StreamingTable`] for the full API and
-    /// [issue #393](https://github.com/yfedoseev/pdf_oxide/issues/393)
-    /// for design rationale.
+    /// Open a streaming table on this page. The page's state lives in the
+    /// document builder, so the table's `finish()` result may be dropped.
     pub fn streaming_table(
         self,
         config: super::streaming_table::StreamingTableConfig,
     ) -> super::streaming_table::StreamingTable<'a> {
-        super::streaming_table::StreamingTable::open(self, config)
+        FluentPageBuilder { inner: self }.streaming_table(config)
     }
 
-    /// Measure the rendered width of `text` in the builder's current font
-    /// and size, in PDF points. Pure query — does not advance the cursor or
-    /// emit any content.
-    ///
-    /// Use this to pick explicit column widths before calling
-    /// `streaming_table` (see #393) or to right-align custom labels. For
-    /// embedded fonts, the measure honours the face's horizontal advances
-    /// (HMTX). For base-14 fonts, it uses the AFM width tables.
+    /// Same as [`FluentPageBuilder::measure`].
     pub fn measure(&self, text: &str) -> f32 {
-        self.text_layout.font_manager().text_width(
+        self.state().text_layout.font_manager().text_width(
             text,
-            &self.text_config.font,
-            self.text_config.size,
+            &self.state().text_config.font,
+            self.state().text_config.size,
         )
     }
 
-    /// Add text at the current cursor position.
-    pub fn text(mut self, text: &str) -> Self {
-        let text_width = self.text_layout.font_manager().text_width(
+    /// Same as [`FluentPageBuilder::text`], applied in place.
+    pub fn text(&mut self, text: &str) -> &mut Self {
+        let text_width = self.state().text_layout.font_manager().text_width(
             text,
-            &self.text_config.font,
-            self.text_config.size,
+            &self.state().text_config.font,
+            self.state().text_config.size,
         );
 
         // Create the bounding box and track it for potential markup annotations
-        let text_rect = Rect::new(self.cursor_x, self.cursor_y, text_width, self.text_config.size);
-        self.last_text_rect = Some(text_rect);
+        let text_rect = Rect::new(self.state().cursor_x, self.state().cursor_y, text_width, self.state().text_config.size);
+        self.state_mut().last_text_rect = Some(text_rect);
 
         let page = &mut self.builder.pages[self.page_index];
         page.elements.push(ContentElement::Text(TextContent {
             text: text.to_string(),
             bbox: text_rect,
             font: crate::elements::FontSpec {
-                name: self.text_config.font.clone(),
-                size: self.text_config.size,
+                name: page.state.text_config.font.clone(),
+                size: page.state.text_config.size,
             },
             style: Default::default(),
             reading_order: Some(page.elements.len()),
             artifact_type: None,
             origin: None,
             rotation_degrees: None,
-            matrix: self.current_matrix,
+            matrix: page.state.current_matrix,
         }));
         // Move cursor down for next line
-        self.cursor_y -= self.text_config.size * self.text_config.line_height;
+        page.state.cursor_y -= page.state.text_config.size * page.state.text_config.line_height;
         self
     }
 
-    /// Place wrapped text inside a rectangle with horizontal alignment.
-    ///
-    /// Wraps `text` to `rect.width` using the builder's current font and
-    /// size, emits one content-stream line per wrapped line, and positions
-    /// each line within the rect per `align`:
-    ///
-    /// - `Left`:   line left edge at `rect.x`
-    /// - `Center`: line centered within `rect.x .. rect.x + rect.width`
-    /// - `Right`:  line right edge at `rect.x + rect.width`
-    ///
-    /// Vertical layout is top-anchored: the first line's top sits at
-    /// `rect.y`, subsequent lines drop by `size * line_height`. The cursor
-    /// is **not** advanced — the rect has its own geometry and the caller
-    /// owns the cursor. Use `measure()` or `text_layout.text_bounds()` to
-    /// pre-compute rect dimensions if needed.
-    ///
-    /// This is the cell-text primitive the buffered `Table` surface
-    /// (research #393) consumes. It is also usable standalone for
-    /// box-constrained captions, labels, and pull-quotes.
-    pub fn text_in_rect(mut self, rect: Rect, text: &str, align: TextAlign) -> Self {
-        let lines = self.text_layout.wrap_text(
+    /// Same as [`FluentPageBuilder::text_in_rect`], applied in place.
+    pub fn text_in_rect(&mut self, rect: Rect, text: &str, align: TextAlign) -> &mut Self {
+        let lines = self.state().text_layout.wrap_text(
             text,
-            &self.text_config.font,
-            self.text_config.size,
+            &self.state().text_config.font,
+            self.state().text_config.size,
             rect.width,
         );
 
-        let line_height = self.text_config.size * self.text_config.line_height;
+        let line_height = self.state().text_config.size * self.state().text_config.line_height;
         let mut line_top = rect.y;
 
         for (line_text, line_width) in lines {
@@ -701,14 +698,14 @@ impl<'a> FluentPageBuilder<'a> {
                 TextAlign::Right => rect.x + rect.width - line_width,
             };
 
-            let bbox = Rect::new(line_x, line_top, line_width, self.text_config.size);
+            let bbox = Rect::new(line_x, line_top, line_width, self.state().text_config.size);
             let page = &mut self.builder.pages[self.page_index];
             page.elements.push(ContentElement::Text(TextContent {
                 text: line_text,
                 bbox,
                 font: crate::elements::FontSpec {
-                    name: self.text_config.font.clone(),
-                    size: self.text_config.size,
+                    name: page.state.text_config.font.clone(),
+                    size: page.state.text_config.size,
                 },
                 style: Default::default(),
                 reading_order: Some(page.elements.len()),
@@ -724,12 +721,12 @@ impl<'a> FluentPageBuilder<'a> {
         // Track only the last emitted line for potential markup annotations.
         // Table callers typically set markup at the whole-cell level, not
         // per-line; the default matches the behaviour of `.text()`.
-        self.last_text_rect = Some(rect);
+        self.state_mut().last_text_rect = Some(rect);
         self
     }
 
-    /// Add a heading (larger, bold text).
-    pub fn heading(self, level: u8, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::heading`], applied in place.
+    pub fn heading(&mut self, level: u8, text: &str) -> &mut Self {
         let size = match level {
             1 => 24.0,
             2 => 20.0,
@@ -743,45 +740,33 @@ impl<'a> FluentPageBuilder<'a> {
         self.font(font, size).text(text)
     }
 
-    /// Render an unordered list of items at the current cursor
-    /// position. Each item gets an indented bullet + wrapped text;
-    /// the cursor advances past the last item with a small bottom
-    /// padding.
-    ///
-    /// Bullet glyph is `•` (U+2022) — renders in Helvetica / Times /
-    /// Courier without font embedding. For custom bullets (e.g. `★`
-    /// with an embedded CJK / symbol font) call `bullet_list_styled`
-    /// (not yet in v0.3.39 — filed as a v0.3.40 enhancement).
-    ///
-    /// #393 Bundle E-2.
-    pub fn bullet_list<S: AsRef<str>>(self, items: &[S]) -> Self {
+    /// Same as [`FluentPageBuilder::bullet_list`], applied in place.
+    pub fn bullet_list<S: AsRef<str>>(&mut self, items: &[S]) -> &mut Self {
         self.list_inner(items, ListMarker::Bullet)
     }
 
-    /// Render an ordered/numbered list. `style` controls the marker
-    /// format (decimal `1. 2. 3.`, lowercase Roman, or lowercase
-    /// alphabetic). #393 Bundle E-2.
-    pub fn numbered_list<S: AsRef<str>>(self, items: &[S], style: ListStyle) -> Self {
+    /// Same as [`FluentPageBuilder::numbered_list`], applied in place.
+    pub fn numbered_list<S: AsRef<str>>(&mut self, items: &[S], style: ListStyle) -> &mut Self {
         self.list_inner(items, ListMarker::Numbered(style))
     }
 
-    fn list_inner<S: AsRef<str>>(mut self, items: &[S], marker: ListMarker) -> Self {
+    fn list_inner<S: AsRef<str>>(&mut self, items: &[S], marker: ListMarker) -> &mut Self {
         if items.is_empty() {
             return self;
         }
         let indent = 18.0_f32;
         let marker_cell_w = 22.0_f32;
-        let line_height = self.text_config.size * self.text_config.line_height;
-        let font = self.text_config.font.clone();
-        let size = self.text_config.size;
+        let line_height = self.state().text_config.size * self.state().text_config.line_height;
+        let font = self.state().text_config.font.clone();
+        let size = self.state().text_config.size;
         let page_w = self.builder.pages[self.page_index].width;
         let right_margin = 72.0;
-        let text_x = self.cursor_x + indent + marker_cell_w;
+        let text_x = self.state().cursor_x + indent + marker_cell_w;
         let content_w = page_w - text_x - right_margin;
 
         for (idx, item) in items.iter().enumerate() {
             let item_text = item.as_ref();
-            let line_y = self.cursor_y;
+            let line_y = self.state().cursor_y;
             // Marker (bullet glyph or number) at indent.
             let marker_str = match &marker {
                 ListMarker::Bullet => "\u{2022}".to_string(),
@@ -791,65 +776,43 @@ impl<'a> FluentPageBuilder<'a> {
                     ListStyle::AlphaLower => format!("{}.", to_alpha_lower(idx + 1)),
                 },
             };
-            let marker_x = self.cursor_x + indent;
-            self = self
-                .at(marker_x, line_y)
+            let marker_x = self.state().cursor_x + indent;
+            self.at(marker_x, line_y)
                 .font(&font, size)
                 .text(&marker_str);
             // Undo the cursor-y advance `.text()` applied so we can
             // place the wrapped content lines at the correct ys below.
-            self.cursor_y += line_height;
+            self.state_mut().cursor_y += line_height;
 
             // Body: wrap the item text across multiple lines.
             let wrapped = self
+                .state()
                 .text_layout
                 .wrap_text(item_text, &font, size, content_w);
             if wrapped.is_empty() {
                 // Empty item — just drop one blank line.
-                self.cursor_y -= line_height;
+                self.state_mut().cursor_y -= line_height;
                 continue;
             }
             for (n, (ln, _)) in wrapped.iter().enumerate() {
                 let ly = line_y - (n as f32) * line_height;
-                self = self.at(text_x, ly).text(ln);
-                self.cursor_y += line_height;
+                self.at(text_x, ly).text(ln);
+                self.state_mut().cursor_y += line_height;
             }
             // Net advance for this item: one line_height per wrapped
             // line.
-            self.cursor_y -= (wrapped.len() as f32) * line_height;
+            self.state_mut().cursor_y -= (wrapped.len() as f32) * line_height;
         }
         // Small trailing breather after the whole list.
-        self.cursor_y -= 6.0;
+        self.state_mut().cursor_y -= 6.0;
         self
     }
 
-    /// Render a code block at the current cursor position. The block
-    /// is rendered as a single filled-background rectangle spanning
-    /// the page content width, with monospace (Courier) text laid out
-    /// line-by-line inside it. Lines wrap at the content width with a
-    /// configurable left/right padding.
-    ///
-    /// `source` is the code string (preserves `\n` line breaks);
-    /// `language` is cosmetic — it doesn't syntax-highlight in v0.3.39
-    /// (syntax highlighting is deferred to v0.3.40) but is recorded
-    /// for future accessibility tagging (Bundle F).
-    ///
-    /// After this call the cursor advances past the block. #393
-    /// Bundle E-3.
-    ///
-    /// ```no_run
-    /// # use pdf_oxide::writer::DocumentBuilder;
-    /// # let mut doc = DocumentBuilder::new();
-    /// doc.letter_page()
-    ///    .at(72.0, 720.0)
-    ///    .heading(1, "Example")
-    ///    .code_block("rust", "fn main() {\n    println!(\"hi\");\n}")
-    ///    .done();
-    /// ```
-    pub fn code_block(mut self, language: &str, source: &str) -> Self {
+    /// Same as [`FluentPageBuilder::code_block`], applied in place.
+    pub fn code_block(&mut self, language: &str, source: &str) -> &mut Self {
         let _ = language; // reserved for Bundle F accessibility tagging
         let page_width = self.builder.pages[self.page_index].width;
-        let left_margin = self.cursor_x.max(72.0);
+        let left_margin = self.state().cursor_x.max(72.0);
         let right_margin = 72.0;
         let rect_x = left_margin - 4.0;
         let rect_w = page_width - left_margin - right_margin + 8.0;
@@ -857,23 +820,23 @@ impl<'a> FluentPageBuilder<'a> {
 
         // Switch to monospace for this block; remember the outer font
         // so we can restore it on exit.
-        let outer_font = self.text_config.font.clone();
-        let outer_size = self.text_config.size;
-        self = self.font("Courier", 9.0);
+        let outer_font = self.state().text_config.font.clone();
+        let outer_size = self.state().text_config.size;
+        self.font("Courier", 9.0);
 
         // Compute total block height by pre-wrapping each source line.
         // 9pt Courier × 1.2 line-height = 10.8 pt per line; 4pt top +
         // 4pt bottom padding.
-        let line_height = self.text_config.size * self.text_config.line_height;
+        let line_height = self.state().text_config.size * self.state().text_config.line_height;
         let top_pad = 4.0_f32;
         let bot_pad = 4.0_f32;
         let all_lines: Vec<(String, f32)> = source
             .split('\n')
             .flat_map(|ln| {
-                let wrapped = self.text_layout.wrap_text(
+                let wrapped = self.state().text_layout.wrap_text(
                     ln,
-                    &self.text_config.font,
-                    self.text_config.size,
+                    &self.state().text_config.font,
+                    self.state().text_config.size,
                     inner_w,
                 );
                 if wrapped.is_empty() {
@@ -886,58 +849,57 @@ impl<'a> FluentPageBuilder<'a> {
         let block_h = top_pad + bot_pad + (all_lines.len() as f32) * line_height;
 
         // Background fill (light grey).
-        let bg_y = self.cursor_y - block_h;
-        self = self.filled_rect(rect_x, bg_y, rect_w, block_h, 0.96, 0.96, 0.96);
+        let bg_y = self.state().cursor_y - block_h;
+        self.filled_rect(rect_x, bg_y, rect_w, block_h, 0.96, 0.96, 0.96);
 
         // Emit each wrapped line as its own text element. Start from
         // the top-padding offset inside the block and step down by
         // line_height.
-        let start_y = self.cursor_y - top_pad;
+        let start_y = self.state().cursor_y - top_pad;
         let text_x = left_margin;
         for (line_idx, (line, _)) in all_lines.iter().enumerate() {
             let line_y = start_y - (line_idx as f32) * line_height;
-            self = self.at(text_x, line_y).text(line);
+            self.at(text_x, line_y).text(line);
             // `.text()` advances cursor_y; undo that advance so every
             // line lands at the pre-computed y, not line_height below
             // the prior one (double-advance).
-            self.cursor_y += line_height;
+            self.state_mut().cursor_y += line_height;
         }
 
         // Final cursor: just below the block with a small breathing
         // space.
-        self.cursor_y = bg_y - 6.0;
-        self = self.font(&outer_font, outer_size);
-        self
+        self.state_mut().cursor_y = bg_y - 6.0;
+        self.font(&outer_font, outer_size)
     }
 
-    /// Add a paragraph of text with automatic word wrapping.
-    pub fn paragraph(mut self, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::paragraph`], applied in place.
+    pub fn paragraph(&mut self, text: &str) -> &mut Self {
         // Use FontManager-based word wrapping for accurate metrics
-        let page = &mut self.builder.pages[self.page_index];
-        let max_width = page.width - self.cursor_x - 72.0; // 72pt right margin
+        let page = &self.builder.pages[self.page_index];
+        let max_width = page.width - page.state.cursor_x - 72.0; // 72pt right margin
 
-        let lines = self.text_layout.wrap_text(
+        let lines = page.state.text_layout.wrap_text(
             text,
-            &self.text_config.font,
-            self.text_config.size,
+            &page.state.text_config.font,
+            page.state.text_config.size,
             max_width,
         );
 
-        let line_height = self.text_config.size * self.text_config.line_height;
+        let line_height = page.state.text_config.size * page.state.text_config.line_height;
         const BOTTOM_MARGIN: f32 = 72.0;
         for (line_text, line_width) in lines {
             // Break to a new page when the next line would land below the bottom
             // margin; otherwise content silently writes off the page (invisible).
-            if self.cursor_y - line_height < BOTTOM_MARGIN {
+            if self.state().cursor_y - line_height < BOTTOM_MARGIN {
                 self.new_page_same_size_inplace();
             }
             let page = &mut self.builder.pages[self.page_index];
             page.elements.push(ContentElement::Text(TextContent {
                 text: line_text,
-                bbox: Rect::new(self.cursor_x, self.cursor_y, line_width, self.text_config.size),
+                bbox: Rect::new(page.state.cursor_x, page.state.cursor_y, line_width, page.state.text_config.size),
                 font: crate::elements::FontSpec {
-                    name: self.text_config.font.clone(),
-                    size: self.text_config.size,
+                    name: page.state.text_config.font.clone(),
+                    size: page.state.text_config.size,
                 },
                 style: Default::default(),
                 reading_order: Some(page.elements.len()),
@@ -946,30 +908,31 @@ impl<'a> FluentPageBuilder<'a> {
                 rotation_degrees: None,
                 matrix: None,
             }));
-            self.cursor_y -= line_height;
+            page.state.cursor_y -= line_height;
         }
         // Add extra space after paragraph
-        self.cursor_y -= self.text_config.size * 0.5;
+        let gap = self.state().text_config.size * 0.5;
+        self.state_mut().cursor_y -= gap;
         self
     }
 
-    /// Add vertical space.
-    pub fn space(mut self, points: f32) -> Self {
-        self.cursor_y -= points;
+    /// Same as [`FluentPageBuilder::space`], applied in place.
+    pub fn space(&mut self, points: f32) -> &mut Self {
+        self.state_mut().cursor_y -= points;
         self
     }
 
-    /// Add a horizontal line.
-    pub fn horizontal_rule(mut self) -> Self {
+    /// Same as [`FluentPageBuilder::horizontal_rule`], applied in place.
+    pub fn horizontal_rule(&mut self) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
-        let line_y = self.cursor_y + self.text_config.size * 0.5;
+        let line_y = page.state.cursor_y + page.state.text_config.size * 0.5;
         page.elements
             .push(ContentElement::Path(crate::elements::PathContent {
                 operations: vec![
-                    crate::elements::PathOperation::MoveTo(self.cursor_x, line_y),
+                    crate::elements::PathOperation::MoveTo(page.state.cursor_x, line_y),
                     crate::elements::PathOperation::LineTo(page.width - 72.0, line_y),
                 ],
-                bbox: Rect::new(self.cursor_x, line_y, page.width - 72.0 - self.cursor_x, 1.0),
+                bbox: Rect::new(page.state.cursor_x, line_y, page.width - 72.0 - page.state.cursor_x, 1.0),
                 stroke_color: Some(crate::layout::Color {
                     r: 0.5,
                     g: 0.5,
@@ -985,58 +948,41 @@ impl<'a> FluentPageBuilder<'a> {
                 artifact_type: None,
                 layer: None,
             }));
-        self.cursor_y -= self.text_config.size;
+        page.state.cursor_y -= page.state.text_config.size;
         self
     }
 
-    /// Add a content element directly.
-    pub fn element(self, element: ContentElement) -> Self {
+    /// Same as [`FluentPageBuilder::element`], applied in place.
+    pub fn element(&mut self, element: ContentElement) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.elements.push(element);
         self
     }
 
-    /// Add multiple content elements.
-    pub fn elements(self, elements: Vec<ContentElement>) -> Self {
+    /// Same as [`FluentPageBuilder::elements`], applied in place.
+    pub fn elements(&mut self, elements: Vec<ContentElement>) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.elements.extend(elements);
         self
     }
 
-    /// Add a footnote reference mark at the current cursor position and
-    /// record the corresponding footnote body for page-end placement.
-    ///
-    /// The `ref_mark` (e.g. `"¹"` or `"[1]"`) is emitted inline at 65 %
-    /// of the current font size. The `note_text` body is collected and
-    /// rendered below a separator line near the page bottom when the page
-    /// is finalised in `DocumentBuilder::build`. In tagged PDF/UA mode the
-    /// body is automatically wrapped in a `<Note>` structure element.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// page.at(72.0, 700.0)
-    ///     .text("Important claim")
-    ///     .footnote("¹", "Source: Annual report 2025.")
-    ///     .text(" continued here.")
-    ///     .done()
-    /// ```
-    pub fn footnote(mut self, ref_mark: &str, note_text: &str) -> Self {
-        let base_size = self.text_config.size;
+    /// Same as [`FluentPageBuilder::footnote`], applied in place.
+    pub fn footnote(&mut self, ref_mark: &str, note_text: &str) -> &mut Self {
+        let base_size = self.state().text_config.size;
         let ref_size = (base_size * 0.65).max(6.0);
 
         let ref_w =
-            self.text_layout
+            self.state().text_layout
                 .font_manager()
-                .text_width(ref_mark, &self.text_config.font, ref_size);
+                .text_width(ref_mark, &self.state().text_config.font, ref_size);
 
         let page = &mut self.builder.pages[self.page_index];
         let reading_order = page.elements.len();
         page.elements.push(ContentElement::Text(TextContent {
             text: ref_mark.to_string(),
-            bbox: Rect::new(self.cursor_x, self.cursor_y, ref_w, ref_size),
+            bbox: Rect::new(page.state.cursor_x, page.state.cursor_y, ref_w, ref_size),
             font: crate::elements::FontSpec {
-                name: self.text_config.font.clone(),
+                name: page.state.text_config.font.clone(),
                 size: ref_size,
             },
             style: Default::default(),
@@ -1044,36 +990,18 @@ impl<'a> FluentPageBuilder<'a> {
             artifact_type: None,
             origin: None,
             rotation_degrees: None,
-            matrix: self.current_matrix,
+            matrix: page.state.current_matrix,
         }));
         page.pending_footnotes
             .push((ref_mark.to_string(), note_text.to_string()));
 
         // Advance cursor_x past the ref mark; don't advance cursor_y (inline).
-        self.cursor_x += ref_w;
+        page.state.cursor_x += ref_w;
         self
     }
 
-    /// Lay out `text` as wrapped lines distributed across `column_count`
-    /// balanced columns starting at the current cursor position.
-    ///
-    /// Internally uses
-    /// [`crate::html_css::layout::multicol::distribute_lines_into_columns`]
-    /// to balance the line distribution. The columns span the full available
-    /// width (page width minus the left cursor margin and a 72 pt right
-    /// margin), separated by `gap_pt` points of inter-column space.
-    ///
-    /// The cursor advances past the tallest column so subsequent content
-    /// continues below the column block.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// page.at(72.0, 700.0)
-    ///     .columns(2, 12.0, "First paragraph.\nSecond paragraph runs long enough to wrap across both columns.")
-    ///     .done()
-    /// ```
-    pub fn columns(mut self, column_count: u32, gap_pt: f32, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::columns`], applied in place.
+    pub fn columns(&mut self, column_count: u32, gap_pt: f32, text: &str) -> &mut Self {
         use crate::html_css::layout::multicol::distribute_lines_into_columns;
 
         let n = column_count.max(1);
@@ -1081,14 +1009,14 @@ impl<'a> FluentPageBuilder<'a> {
 
         // Geometry
         let page_width = self.builder.pages[self.page_index].width;
-        let left_x = self.cursor_x;
+        let left_x = self.state().cursor_x;
         let right_margin = 72.0_f32;
         let available = (page_width - left_x - right_margin).max(0.0);
         let total_gap = gap * (n - 1) as f32;
         let col_width = ((available - total_gap) / n as f32).max(1.0);
 
-        let font_size = self.text_config.size;
-        let line_h = font_size * self.text_config.line_height;
+        let font_size = self.state().text_config.size;
+        let line_h = font_size * self.state().text_config.line_height;
 
         // Collect all wrapped lines from the text (split on "\n\n" for paragraphs)
         let mut all_lines: Vec<(String, f32)> = Vec::new(); // (text, measured_width)
@@ -1100,8 +1028,8 @@ impl<'a> FluentPageBuilder<'a> {
                 line_heights.push(font_size * 0.5);
             }
             let wrapped =
-                self.text_layout
-                    .wrap_text(para, &self.text_config.font, font_size, col_width);
+                self.state().text_layout
+                    .wrap_text(para, &self.state().text_config.font, font_size, col_width);
             for (line_text, line_width) in wrapped {
                 all_lines.push((line_text, line_width));
                 line_heights.push(line_h);
@@ -1119,7 +1047,7 @@ impl<'a> FluentPageBuilder<'a> {
         let dist = distribute_lines_into_columns(&line_heights, n, col_h_cap);
 
         // Emit elements — borrow pages mutably only during push
-        let start_y = self.cursor_y;
+        let start_y = self.state().cursor_y;
         let mut max_drop = 0.0_f32;
 
         for (col_idx, line_indices) in dist.iter().enumerate() {
@@ -1130,11 +1058,9 @@ impl<'a> FluentPageBuilder<'a> {
                 let lh = line_heights[li];
                 if !line_text.is_empty() {
                     let y = start_y - drop;
-                    let font_name = self.text_config.font.clone();
+                    let font_name = self.state().text_config.font.clone();
                     let reading_order = self.builder.pages[self.page_index].elements.len();
-                    self.builder.pages[self.page_index]
-                        .elements
-                        .push(ContentElement::Text(TextContent {
+                    self.push_element(ContentElement::Text(TextContent {
                             text: line_text.clone(),
                             bbox: Rect::new(col_x, y, line_width, font_size),
                             font: crate::elements::FontSpec {
@@ -1146,7 +1072,7 @@ impl<'a> FluentPageBuilder<'a> {
                             artifact_type: None,
                             origin: None,
                             rotation_degrees: None,
-                            matrix: self.current_matrix,
+                            matrix: self.state().current_matrix,
                         }));
                 }
                 drop += lh;
@@ -1154,7 +1080,7 @@ impl<'a> FluentPageBuilder<'a> {
             max_drop = max_drop.max(drop);
         }
 
-        self.cursor_y = start_y - max_drop - font_size * 0.5;
+        self.state_mut().cursor_y = start_y - max_drop - font_size * 0.5;
         self
     }
 
@@ -1162,59 +1088,51 @@ impl<'a> FluentPageBuilder<'a> {
     // Rich text (inline runs)
     // ==========================================================================
 
-    /// Emit `text` inline at the current cursor — advances `cursor_x` by the
-    /// measured text width but does **not** advance `cursor_y`.  Call
-    /// [`Self::newline`] after a sequence of inline calls to move to the next
-    /// line, or use [`Self::rich_paragraph`] for an all-in-one API.
-    pub fn inline(mut self, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::inline`], applied in place.
+    pub fn inline(&mut self, text: &str) -> &mut Self {
         self.emit_inline_run(text, None, None);
         self
     }
 
-    /// Inline bold run (Helvetica-Bold / embedded font "-Bold" suffix).
-    pub fn inline_bold(mut self, text: &str) -> Self {
-        let bold_font = bold_font_name(&self.text_config.font);
+    /// Same as [`FluentPageBuilder::inline_bold`], applied in place.
+    pub fn inline_bold(&mut self, text: &str) -> &mut Self {
+        let bold_font = bold_font_name(&self.state().text_config.font);
         self.emit_inline_run(text, Some(bold_font), None);
         self
     }
 
-    /// Inline italic run (Helvetica-Oblique / embedded font "-Oblique" suffix).
-    pub fn inline_italic(mut self, text: &str) -> Self {
-        let italic_font = italic_font_name(&self.text_config.font);
+    /// Same as [`FluentPageBuilder::inline_italic`], applied in place.
+    pub fn inline_italic(&mut self, text: &str) -> &mut Self {
+        let italic_font = italic_font_name(&self.state().text_config.font);
         self.emit_inline_run(text, Some(italic_font), None);
         self
     }
 
-    /// Inline run with a custom RGB color (values 0.0–1.0).
-    pub fn inline_color(mut self, r: f32, g: f32, b: f32, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::inline_color`], applied in place.
+    pub fn inline_color(&mut self, r: f32, g: f32, b: f32, text: &str) -> &mut Self {
         self.emit_inline_run(text, None, Some(crate::layout::Color { r, g, b }));
         self
     }
 
-    /// Advance cursor_y by one line-height and reset cursor_x to the left
-    /// margin (72 pt). Used after a run of [`Self::inline`] calls.
-    pub fn newline(mut self) -> Self {
-        self.cursor_y -= self.text_config.size * self.text_config.line_height;
-        self.cursor_x = 72.0;
+    /// Same as [`FluentPageBuilder::newline`], applied in place.
+    pub fn newline(&mut self) -> &mut Self {
+        self.state_mut().cursor_y -= self.state().text_config.size * self.state().text_config.line_height;
+        self.state_mut().cursor_x = 72.0;
         self
     }
 
-    /// A single text run for [`Self::rich_paragraph`].
-    ///
-    /// Construct with the associated helper functions:
-    /// [`TextRun::normal`], [`TextRun::bold`], [`TextRun::italic`],
-    /// [`TextRun::color`].
-    pub fn rich_paragraph(mut self, runs: &[TextRun]) -> Self {
-        let left_margin = self.cursor_x;
+    /// Same as [`FluentPageBuilder::rich_paragraph`], applied in place.
+    pub fn rich_paragraph(&mut self, runs: &[TextRun]) -> &mut Self {
+        let left_margin = self.state().cursor_x;
         let right_margin = 72.0_f32;
         let page_width = self.builder.pages[self.page_index].width;
         let max_right = page_width - right_margin;
 
         for (run_idx, run) in runs.iter().enumerate() {
             let font_name = match run.style {
-                TextRunStyle::Bold => bold_font_name(&self.text_config.font),
-                TextRunStyle::Italic => italic_font_name(&self.text_config.font),
-                TextRunStyle::Normal | TextRunStyle::Color { .. } => self.text_config.font.clone(),
+                TextRunStyle::Bold => bold_font_name(&self.state().text_config.font),
+                TextRunStyle::Italic => italic_font_name(&self.state().text_config.font),
+                TextRunStyle::Normal | TextRunStyle::Color { .. } => self.state().text_config.font.clone(),
             };
             let color = match run.style {
                 TextRunStyle::Color { r, g, b } => Some(crate::layout::Color { r, g, b }),
@@ -1235,21 +1153,21 @@ impl<'a> FluentPageBuilder<'a> {
             // the run's own text is still discarded by `split_whitespace`
             // below (unchanged) — spacing between runs is guaranteed here
             // instead of relying on the caller to pad it correctly.
-            if run_idx > 0 && (self.cursor_x - left_margin).abs() > 0.01 {
-                let space_w = self.text_layout.font_manager().text_width(
+            if run_idx > 0 && (self.state().cursor_x - left_margin).abs() > 0.01 {
+                let space_w = self.state().text_layout.font_manager().text_width(
                     " ",
                     &font_name,
-                    self.text_config.size,
+                    self.state().text_config.size,
                 );
-                if self.cursor_x + space_w <= max_right {
-                    self.cursor_x += space_w;
+                if self.state().cursor_x + space_w <= max_right {
+                    self.state_mut().cursor_x += space_w;
                 } else {
-                    let line_height = self.text_config.size * self.text_config.line_height;
-                    if self.cursor_y - line_height < 72.0 {
+                    let line_height = self.state().text_config.size * self.state().text_config.line_height;
+                    if self.state().cursor_y - line_height < 72.0 {
                         self.new_page_same_size_inplace();
                     }
-                    self.cursor_y -= line_height;
-                    self.cursor_x = left_margin;
+                    self.state_mut().cursor_y -= line_height;
+                    self.state_mut().cursor_x = left_margin;
                 }
             }
 
@@ -1262,37 +1180,35 @@ impl<'a> FluentPageBuilder<'a> {
                 } else {
                     format!("{} {}", buf, word)
                 };
-                let cw = self.text_layout.font_manager().text_width(
+                let cw = self.state().text_layout.font_manager().text_width(
                     &candidate,
                     &font_name,
-                    self.text_config.size,
+                    self.state().text_config.size,
                 );
-                if self.cursor_x + cw > max_right && !buf.is_empty() {
+                if self.state().cursor_x + cw > max_right && !buf.is_empty() {
                     // Auto-paginate when next line would land below bottom margin.
-                    let line_height = self.text_config.size * self.text_config.line_height;
-                    if self.cursor_y - line_height < 72.0 {
+                    let line_height = self.state().text_config.size * self.state().text_config.line_height;
+                    if self.state().cursor_y - line_height < 72.0 {
                         self.new_page_same_size_inplace();
                     }
                     // Emit buf as a line
-                    let bw = self.text_layout.font_manager().text_width(
+                    let bw = self.state().text_layout.font_manager().text_width(
                         &buf,
                         &font_name,
-                        self.text_config.size,
+                        self.state().text_config.size,
                     );
                     let reading_order = self.builder.pages[self.page_index].elements.len();
-                    self.builder.pages[self.page_index]
-                        .elements
-                        .push(ContentElement::Text(TextContent {
+                    self.push_element(ContentElement::Text(TextContent {
                             text: buf.clone(),
                             bbox: Rect::new(
-                                self.cursor_x,
-                                self.cursor_y,
+                                self.state().cursor_x,
+                                self.state().cursor_y,
                                 bw,
-                                self.text_config.size,
+                                self.state().text_config.size,
                             ),
                             font: crate::elements::FontSpec {
                                 name: font_name.clone(),
-                                size: self.text_config.size,
+                                size: self.state().text_config.size,
                             },
                             style: crate::elements::TextStyle {
                                 color: color.unwrap_or(crate::layout::Color {
@@ -1306,10 +1222,10 @@ impl<'a> FluentPageBuilder<'a> {
                             artifact_type: None,
                             origin: None,
                             rotation_degrees: None,
-                            matrix: self.current_matrix,
+                            matrix: self.state().current_matrix,
                         }));
-                    self.cursor_y -= line_height;
-                    self.cursor_x = left_margin;
+                    self.state_mut().cursor_y -= line_height;
+                    self.state_mut().cursor_x = left_margin;
                     buf = word.to_string();
                 } else {
                     buf = candidate;
@@ -1317,20 +1233,18 @@ impl<'a> FluentPageBuilder<'a> {
             }
             // Emit any remaining words
             if !buf.is_empty() {
-                let bw = self.text_layout.font_manager().text_width(
+                let bw = self.state().text_layout.font_manager().text_width(
                     &buf,
                     &font_name,
-                    self.text_config.size,
+                    self.state().text_config.size,
                 );
                 let reading_order = self.builder.pages[self.page_index].elements.len();
-                self.builder.pages[self.page_index]
-                    .elements
-                    .push(ContentElement::Text(TextContent {
+                self.push_element(ContentElement::Text(TextContent {
                         text: buf,
-                        bbox: Rect::new(self.cursor_x, self.cursor_y, bw, self.text_config.size),
+                        bbox: Rect::new(self.state().cursor_x, self.state().cursor_y, bw, self.state().text_config.size),
                         font: crate::elements::FontSpec {
                             name: font_name.clone(),
-                            size: self.text_config.size,
+                            size: self.state().text_config.size,
                         },
                         style: crate::elements::TextStyle {
                             color: color.unwrap_or(crate::layout::Color {
@@ -1344,39 +1258,37 @@ impl<'a> FluentPageBuilder<'a> {
                         artifact_type: None,
                         origin: None,
                         rotation_degrees: None,
-                        matrix: self.current_matrix,
+                        matrix: self.state().current_matrix,
                     }));
-                self.cursor_x += bw;
+                self.state_mut().cursor_x += bw;
             }
         }
         // Finish the paragraph
-        self.cursor_y -= self.text_config.size * self.text_config.line_height;
-        self.cursor_x = left_margin;
-        self.cursor_y -= self.text_config.size * 0.5; // trailing gap
+        self.state_mut().cursor_y -= self.state().text_config.size * self.state().text_config.line_height;
+        self.state_mut().cursor_x = left_margin;
+        self.state_mut().cursor_y -= self.state().text_config.size * 0.5; // trailing gap
         self
     }
 
-    /// Internal: emit one inline text run advancing cursor_x only.
     fn emit_inline_run(
         &mut self,
         text: &str,
         font_override: Option<String>,
         color: Option<crate::layout::Color>,
     ) {
-        let font_name = font_override.unwrap_or_else(|| self.text_config.font.clone());
+        let font_name = font_override.unwrap_or_else(|| self.state().text_config.font.clone());
         let w = self
+            .state()
             .text_layout
             .font_manager()
-            .text_width(text, &font_name, self.text_config.size);
+            .text_width(text, &font_name, self.state().text_config.size);
         let reading_order = self.builder.pages[self.page_index].elements.len();
-        self.builder.pages[self.page_index]
-            .elements
-            .push(ContentElement::Text(TextContent {
+        self.push_element(ContentElement::Text(TextContent {
                 text: text.to_string(),
-                bbox: Rect::new(self.cursor_x, self.cursor_y, w, self.text_config.size),
+                bbox: Rect::new(self.state().cursor_x, self.state().cursor_y, w, self.state().text_config.size),
                 font: crate::elements::FontSpec {
                     name: font_name,
-                    size: self.text_config.size,
+                    size: self.state().text_config.size,
                 },
                 style: crate::elements::TextStyle {
                     color: color.unwrap_or(crate::layout::Color {
@@ -1390,80 +1302,48 @@ impl<'a> FluentPageBuilder<'a> {
                 artifact_type: None,
                 origin: None,
                 rotation_degrees: None,
-                matrix: self.current_matrix,
+                matrix: self.state().current_matrix,
             }));
-        self.cursor_x += w;
-        self.last_text_rect =
-            Some(Rect::new(self.cursor_x - w, self.cursor_y, w, self.text_config.size));
+        self.state_mut().cursor_x += w;
+        self.state_mut().last_text_rect =
+            Some(Rect::new(self.state().cursor_x - w, self.state().cursor_y, w, self.state().text_config.size));
     }
 
     // ==========================================================================
     // Annotation Methods
     // ==========================================================================
 
-    /// Add a URL link annotation to the last text element.
-    ///
-    /// The link will cover the bounding box of the most recently added text.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// builder.page(PageSize::Letter)
-    ///     .at(72.0, 720.0)
-    ///     .text("Visit our website")
-    ///     .link_url("https://example.com")
-    ///     .done();
-    /// ```
-    pub fn link_url(mut self, url: &str) -> Self {
-        if let Some(rect) = self.last_text_rect {
+    /// Same as [`FluentPageBuilder::link_url`], applied in place.
+    pub fn link_url(&mut self, url: &str) -> &mut Self {
+        if let Some(rect) = self.state().last_text_rect {
             let link = LinkAnnotation::uri(rect, url);
-            self.pending_annotations.push(link.into());
+            self.state_mut().pending_annotations.push(link.into());
         }
         self
     }
 
-    /// Add an internal page link annotation to the last text element.
-    ///
-    /// # Arguments
-    ///
-    /// * `page` - The target page index (0-based)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// builder.page(PageSize::Letter)
-    ///     .at(72.0, 720.0)
-    ///     .text("Go to page 5")
-    ///     .link_page(4)  // 0-indexed
-    ///     .done();
-    /// ```
-    pub fn link_page(mut self, page: usize) -> Self {
-        if let Some(rect) = self.last_text_rect {
+    /// Same as [`FluentPageBuilder::link_page`], applied in place.
+    pub fn link_page(&mut self, page: usize) -> &mut Self {
+        if let Some(rect) = self.state().last_text_rect {
             let link = LinkAnnotation::goto_page(rect, page);
-            self.pending_annotations.push(link.into());
+            self.state_mut().pending_annotations.push(link.into());
         }
         self
     }
 
-    /// Add a named destination link to the last text element.
-    ///
-    /// # Arguments
-    ///
-    /// * `destination` - The named destination string
-    pub fn link_named(mut self, destination: &str) -> Self {
-        if let Some(rect) = self.last_text_rect {
+    /// Same as [`FluentPageBuilder::link_named`], applied in place.
+    pub fn link_named(&mut self, destination: &str) -> &mut Self {
+        if let Some(rect) = self.state().last_text_rect {
             let link = LinkAnnotation::goto_named(rect, destination);
-            self.pending_annotations.push(link.into());
+            self.state_mut().pending_annotations.push(link.into());
         }
         self
     }
 
-    /// Add a JavaScript action link to the last text element.
-    ///
-    /// When clicked the viewer executes the provided JavaScript string.
-    pub fn link_javascript(mut self, script: &str) -> Self {
+    /// Same as [`FluentPageBuilder::link_javascript`], applied in place.
+    pub fn link_javascript(&mut self, script: &str) -> &mut Self {
         use super::annotation_builder::{BorderStyle, HighlightMode, LinkAction};
-        if let Some(rect) = self.last_text_rect {
+        if let Some(rect) = self.state().last_text_rect {
             let link = LinkAnnotation {
                 rect,
                 action: LinkAction::JavaScript(script.into()),
@@ -1472,214 +1352,120 @@ impl<'a> FluentPageBuilder<'a> {
                 color: None,
                 quad_points: None,
             };
-            self.pending_annotations.push(link.into());
+            self.state_mut().pending_annotations.push(link.into());
         }
         self
     }
 
-    /// Run a JavaScript script when this page is opened (`/AA /O`).
-    pub fn on_open(self, script: &str) -> Self {
+    /// Same as [`FluentPageBuilder::on_open`], applied in place.
+    pub fn on_open(&mut self, script: &str) -> &mut Self {
         self.builder.pages[self.page_index].page_open_script = Some(script.into());
         self
     }
 
-    /// Run a JavaScript script when this page is closed (`/AA /C`).
-    pub fn on_close(self, script: &str) -> Self {
+    /// Same as [`FluentPageBuilder::on_close`], applied in place.
+    pub fn on_close(&mut self, script: &str) -> &mut Self {
         self.builder.pages[self.page_index].page_close_script = Some(script.into());
         self
     }
 
-    /// Add a highlight annotation to the last text element.
-    ///
-    /// # Arguments
-    ///
-    /// * `color` - RGB color tuple (0.0-1.0 for each component)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// builder.page(PageSize::Letter)
-    ///     .at(72.0, 720.0)
-    ///     .text("Important text")
-    ///     .highlight((1.0, 1.0, 0.0))  // Yellow highlight
-    ///     .done();
-    /// ```
-    pub fn highlight(mut self, color: (f32, f32, f32)) -> Self {
-        if let Some(rect) = self.last_text_rect {
+    /// Same as [`FluentPageBuilder::highlight`], applied in place.
+    pub fn highlight(&mut self, color: (f32, f32, f32)) -> &mut Self {
+        if let Some(rect) = self.state().last_text_rect {
             let markup = TextMarkupAnnotation::from_rect(TextMarkupType::Highlight, rect)
                 .with_color(color.0, color.1, color.2);
-            self.pending_annotations.push(markup.into());
+            self.state_mut().pending_annotations.push(markup.into());
         }
         self
     }
 
-    /// Add an underline annotation to the last text element.
-    ///
-    /// # Arguments
-    ///
-    /// * `color` - RGB color tuple (0.0-1.0 for each component)
-    pub fn underline(mut self, color: (f32, f32, f32)) -> Self {
-        if let Some(rect) = self.last_text_rect {
+    /// Same as [`FluentPageBuilder::underline`], applied in place.
+    pub fn underline(&mut self, color: (f32, f32, f32)) -> &mut Self {
+        if let Some(rect) = self.state().last_text_rect {
             let markup = TextMarkupAnnotation::from_rect(TextMarkupType::Underline, rect)
                 .with_color(color.0, color.1, color.2);
-            self.pending_annotations.push(markup.into());
+            self.state_mut().pending_annotations.push(markup.into());
         }
         self
     }
 
-    /// Add a strikeout annotation to the last text element.
-    ///
-    /// # Arguments
-    ///
-    /// * `color` - RGB color tuple (0.0-1.0 for each component)
-    pub fn strikeout(mut self, color: (f32, f32, f32)) -> Self {
-        if let Some(rect) = self.last_text_rect {
+    /// Same as [`FluentPageBuilder::strikeout`], applied in place.
+    pub fn strikeout(&mut self, color: (f32, f32, f32)) -> &mut Self {
+        if let Some(rect) = self.state().last_text_rect {
             let markup = TextMarkupAnnotation::from_rect(TextMarkupType::StrikeOut, rect)
                 .with_color(color.0, color.1, color.2);
-            self.pending_annotations.push(markup.into());
+            self.state_mut().pending_annotations.push(markup.into());
         }
         self
     }
 
-    /// Add a squiggly underline annotation to the last text element.
-    ///
-    /// # Arguments
-    ///
-    /// * `color` - RGB color tuple (0.0-1.0 for each component)
-    pub fn squiggly(mut self, color: (f32, f32, f32)) -> Self {
-        if let Some(rect) = self.last_text_rect {
+    /// Same as [`FluentPageBuilder::squiggly`], applied in place.
+    pub fn squiggly(&mut self, color: (f32, f32, f32)) -> &mut Self {
+        if let Some(rect) = self.state().last_text_rect {
             let markup = TextMarkupAnnotation::from_rect(TextMarkupType::Squiggly, rect)
                 .with_color(color.0, color.1, color.2);
-            self.pending_annotations.push(markup.into());
+            self.state_mut().pending_annotations.push(markup.into());
         }
         self
     }
 
-    /// Add a sticky note annotation at the current cursor position.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The note content
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// builder.page(PageSize::Letter)
-    ///     .at(72.0, 720.0)
-    ///     .sticky_note("Please review this section")
-    ///     .done();
-    /// ```
-    pub fn sticky_note(mut self, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::sticky_note`], applied in place.
+    pub fn sticky_note(&mut self, text: &str) -> &mut Self {
         // Place sticky note at current cursor position (small 24x24 icon)
-        let rect = Rect::new(self.cursor_x, self.cursor_y, 24.0, 24.0);
+        let rect = Rect::new(self.state().cursor_x, self.state().cursor_y, 24.0, 24.0);
         let note = TextAnnotation::new(rect, text);
-        self.pending_annotations.push(note.into());
+        self.state_mut().pending_annotations.push(note.into());
         self
     }
 
-    /// Add a sticky note annotation with a specific icon at the current cursor position.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The note content
-    /// * `icon` - The icon to display
-    pub fn sticky_note_with_icon(mut self, text: &str, icon: TextAnnotationIcon) -> Self {
-        let rect = Rect::new(self.cursor_x, self.cursor_y, 24.0, 24.0);
+    /// Same as [`FluentPageBuilder::sticky_note_with_icon`], applied in place.
+    pub fn sticky_note_with_icon(&mut self, text: &str, icon: TextAnnotationIcon) -> &mut Self {
+        let rect = Rect::new(self.state().cursor_x, self.state().cursor_y, 24.0, 24.0);
         let note = TextAnnotation::new(rect, text).with_icon(icon);
-        self.pending_annotations.push(note.into());
+        self.state_mut().pending_annotations.push(note.into());
         self
     }
 
-    /// Add a sticky note annotation at a specific position.
-    ///
-    /// # Arguments
-    ///
-    /// * `x` - X coordinate
-    /// * `y` - Y coordinate
-    /// * `text` - The note content
-    pub fn sticky_note_at(mut self, x: f32, y: f32, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::sticky_note_at`], applied in place.
+    pub fn sticky_note_at(&mut self, x: f32, y: f32, text: &str) -> &mut Self {
         let rect = Rect::new(x, y, 24.0, 24.0);
         let note = TextAnnotation::new(rect, text);
-        self.pending_annotations.push(note.into());
+        self.state_mut().pending_annotations.push(note.into());
         self
     }
 
-    /// Add a stamp annotation at the current cursor position.
-    ///
-    /// # Arguments
-    ///
-    /// * `stamp_type` - The type of stamp (Approved, Draft, Confidential, etc.)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use pdf_oxide::writer::StampType;
-    ///
-    /// builder.page(PageSize::Letter)
-    ///     .at(72.0, 720.0)
-    ///     .stamp(StampType::Approved)
-    ///     .done();
-    /// ```
-    pub fn stamp(mut self, stamp_type: StampType) -> Self {
+    /// Same as [`FluentPageBuilder::stamp`], applied in place.
+    pub fn stamp(&mut self, stamp_type: StampType) -> &mut Self {
         // Default stamp size: 150x50 points
-        let rect = Rect::new(self.cursor_x, self.cursor_y, 150.0, 50.0);
+        let rect = Rect::new(self.state().cursor_x, self.state().cursor_y, 150.0, 50.0);
         let stamp = StampAnnotation::new(rect, stamp_type);
-        self.pending_annotations.push(stamp.into());
+        self.state_mut().pending_annotations.push(stamp.into());
         self
     }
 
-    /// Add a stamp annotation at a specific position with custom size.
-    ///
-    /// # Arguments
-    ///
-    /// * `rect` - The bounding rectangle for the stamp
-    /// * `stamp_type` - The type of stamp
-    pub fn stamp_at(mut self, rect: Rect, stamp_type: StampType) -> Self {
+    /// Same as [`FluentPageBuilder::stamp_at`], applied in place.
+    pub fn stamp_at(&mut self, rect: Rect, stamp_type: StampType) -> &mut Self {
         let stamp = StampAnnotation::new(rect, stamp_type);
-        self.pending_annotations.push(stamp.into());
+        self.state_mut().pending_annotations.push(stamp.into());
         self
     }
 
-    /// Add a FreeText annotation (text displayed directly on page).
-    ///
-    /// # Arguments
-    ///
-    /// * `rect` - The bounding rectangle for the text box
-    /// * `text` - The text content
-    pub fn freetext(mut self, rect: Rect, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::freetext`], applied in place.
+    pub fn freetext(&mut self, rect: Rect, text: &str) -> &mut Self {
         let freetext = FreeTextAnnotation::new(rect, text);
-        self.pending_annotations.push(freetext.into());
+        self.state_mut().pending_annotations.push(freetext.into());
         self
     }
 
-    /// Add a FreeText annotation with custom font settings.
-    ///
-    /// # Arguments
-    ///
-    /// * `rect` - The bounding rectangle for the text box
-    /// * `text` - The text content
-    /// * `font` - Font name
-    /// * `size` - Font size in points
-    pub fn freetext_styled(mut self, rect: Rect, text: &str, font: &str, size: f32) -> Self {
+    /// Same as [`FluentPageBuilder::freetext_styled`], applied in place.
+    pub fn freetext_styled(&mut self, rect: Rect, text: &str, font: &str, size: f32) -> &mut Self {
         let freetext = FreeTextAnnotation::new(rect, text).with_font(font, size);
-        self.pending_annotations.push(freetext.into());
+        self.state_mut().pending_annotations.push(freetext.into());
         self
     }
 
-    /// Add a watermark annotation (appears behind content, optionally print-only).
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The watermark text
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// builder.page(PageSize::Letter)
-    ///     .watermark("DRAFT")
-    ///     .done();
-    /// ```
-    pub fn watermark(mut self, text: &str) -> Self {
+    /// Same as [`FluentPageBuilder::watermark`], applied in place.
+    pub fn watermark(&mut self, text: &str) -> &mut Self {
         let page = &self.builder.pages[self.page_index];
         // Center the watermark on the page with diagonal orientation
         let rect =
@@ -1689,73 +1475,52 @@ impl<'a> FluentPageBuilder<'a> {
             .with_rotation(45.0)
             .with_opacity(0.3)
             .with_font("Helvetica", 72.0);
-        self.pending_annotations.push(watermark.into());
+        self.state_mut().pending_annotations.push(watermark.into());
         self
     }
 
-    /// Add a "CONFIDENTIAL" watermark with preset styling.
-    pub fn watermark_confidential(mut self) -> Self {
+    /// Same as [`FluentPageBuilder::watermark_confidential`], applied in place.
+    pub fn watermark_confidential(&mut self) -> &mut Self {
         let page = &self.builder.pages[self.page_index];
         let rect =
             Rect::new(page.width * 0.1, page.height * 0.3, page.width * 0.8, page.height * 0.4);
         let watermark = WatermarkAnnotation::confidential().with_rect(rect);
-        self.pending_annotations.push(watermark.into());
+        self.state_mut().pending_annotations.push(watermark.into());
         self
     }
 
-    /// Add a "DRAFT" watermark with preset styling.
-    pub fn watermark_draft(mut self) -> Self {
+    /// Same as [`FluentPageBuilder::watermark_draft`], applied in place.
+    pub fn watermark_draft(&mut self) -> &mut Self {
         let page = &self.builder.pages[self.page_index];
         let rect =
             Rect::new(page.width * 0.1, page.height * 0.3, page.width * 0.8, page.height * 0.4);
         let watermark = WatermarkAnnotation::draft().with_rect(rect);
-        self.pending_annotations.push(watermark.into());
+        self.state_mut().pending_annotations.push(watermark.into());
         self
     }
 
-    /// Add a custom watermark with full control over positioning and styling.
-    pub fn watermark_custom(mut self, watermark: WatermarkAnnotation) -> Self {
-        self.pending_annotations.push(watermark.into());
+    /// Same as [`FluentPageBuilder::watermark_custom`], applied in place.
+    pub fn watermark_custom(&mut self, watermark: WatermarkAnnotation) -> &mut Self {
+        self.state_mut().pending_annotations.push(watermark.into());
         self
     }
 
-    /// Add a generic annotation.
-    ///
-    /// This is a low-level method that allows adding any annotation type.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use pdf_oxide::writer::{LinkAnnotation, Annotation};
-    /// use pdf_oxide::geometry::Rect;
-    ///
-    /// let link = LinkAnnotation::uri(
-    ///     Rect::new(72.0, 720.0, 100.0, 12.0),
-    ///     "https://example.com",
-    /// );
-    ///
-    /// builder.page(PageSize::Letter)
-    ///     .add_annotation(link)
-    ///     .done();
-    /// ```
-    pub fn add_annotation<A: Into<Annotation>>(mut self, annotation: A) -> Self {
-        self.pending_annotations.push(annotation.into());
+    /// Same as [`FluentPageBuilder::add_annotation`], applied in place.
+    pub fn add_annotation<A: Into<Annotation>>(&mut self, annotation: A) -> &mut Self {
+        self.state_mut().pending_annotations.push(annotation.into());
         self
     }
 
-    /// Add a single-line text form field to the page. `name` is the
-    /// unique field identifier used for form submission;
-    /// `default_value` is the initial text shown in the field (pass
-    /// `None` or an empty string for a blank field).
+    /// Same as [`FluentPageBuilder::text_field`], applied in place.
     pub fn text_field(
-        self,
+        &mut self,
         name: impl Into<String>,
         x: f32,
         y: f32,
         w: f32,
         h: f32,
         default_value: Option<String>,
-    ) -> Self {
+    ) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.form_fields.push(PendingFormField::TextField {
             name: name.into(),
@@ -1766,17 +1531,16 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Add a checkbox form field to the page. `checked` sets whether
-    /// the box is initially ticked.
+    /// Same as [`FluentPageBuilder::checkbox`], applied in place.
     pub fn checkbox(
-        self,
+        &mut self,
         name: impl Into<String>,
         x: f32,
         y: f32,
         w: f32,
         h: f32,
         checked: bool,
-    ) -> Self {
+    ) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.form_fields.push(PendingFormField::Checkbox {
             name: name.into(),
@@ -1787,12 +1551,9 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Add a dropdown combo-box form field. Each entry of `options` is
-    /// a user-visible string that also serves as the submitted value.
-    /// `selected` picks the initial choice by value; pass `None` to
-    /// leave the field blank.
+    /// Same as [`FluentPageBuilder::combo_box`], applied in place.
     pub fn combo_box(
-        self,
+        &mut self,
         name: impl Into<String>,
         x: f32,
         y: f32,
@@ -1800,7 +1561,7 @@ impl<'a> FluentPageBuilder<'a> {
         h: f32,
         options: Vec<String>,
         selected: Option<String>,
-    ) -> Self {
+    ) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.form_fields.push(PendingFormField::ComboBox {
             name: name.into(),
@@ -1812,17 +1573,9 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Add a scrollable list-box form field — same options shape as
-    /// [`Self::combo_box`] but the user sees a scrollable list rather
-    /// than a dropdown. `multi_select` toggles whether multiple
-    /// entries can be selected simultaneously. `selected` is the
-    /// initial value (or values; a comma-separated list is treated as
-    /// multiple selections when `multi_select` is true).
-    ///
-    /// #393 Bundle D-1 — wires the existing `ListBoxWidget` through
-    /// the fluent surface.
+    /// Same as [`FluentPageBuilder::list_box`], applied in place.
     pub fn list_box(
-        self,
+        &mut self,
         name: impl Into<String>,
         x: f32,
         y: f32,
@@ -1831,7 +1584,7 @@ impl<'a> FluentPageBuilder<'a> {
         options: Vec<String>,
         selected: Option<String>,
         multi_select: bool,
-    ) -> Self {
+    ) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.form_fields.push(PendingFormField::ListBox {
             name: name.into(),
@@ -1844,16 +1597,13 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Add a radio-button group. Each entry of `buttons` is an
-    /// `(export_value, x, y, w, h)` tuple describing one option's
-    /// submitted value and its visible bounding rectangle. `selected`
-    /// picks the initial choice by export value.
+    /// Same as [`FluentPageBuilder::radio_group`], applied in place.
     pub fn radio_group(
-        self,
+        &mut self,
         name: impl Into<String>,
         buttons: Vec<(String, f32, f32, f32, f32)>,
         selected: Option<String>,
-    ) -> Self {
+    ) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         let buttons = buttons
             .into_iter()
@@ -1868,16 +1618,16 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Add a clickable push button with a visible caption.
+    /// Same as [`FluentPageBuilder::push_button`], applied in place.
     pub fn push_button(
-        self,
+        &mut self,
         name: impl Into<String>,
         x: f32,
         y: f32,
         w: f32,
         h: f32,
         caption: impl Into<String>,
-    ) -> Self {
+    ) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.form_fields.push(PendingFormField::PushButton {
             name: name.into(),
@@ -1888,11 +1638,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Add an unsigned signature placeholder field to the page.
-    ///
-    /// The field is created with `/FT /Sig` and `/V null` (unsigned).
-    /// A signing application can fill it in via incremental update.
-    pub fn signature_field(self, name: impl Into<String>, x: f32, y: f32, w: f32, h: f32) -> Self {
+    /// Same as [`FluentPageBuilder::signature_field`], applied in place.
+    pub fn signature_field(&mut self, name: impl Into<String>, x: f32, y: f32, w: f32, h: f32) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         page.form_fields.push(PendingFormField::SignatureField {
             name: name.into(),
@@ -1902,12 +1649,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Mark the most-recently-added form field on this page as
-    /// **required**. Chainable after any `text_field` / `checkbox` /
-    /// `combo_box` / `list_box` / `radio_group` / `push_button` /
-    /// `signature_field` call. No-op if no field has been
-    /// added yet. #393 Bundle D-3.
-    pub fn required(self) -> Self {
+    /// Same as [`FluentPageBuilder::required`], applied in place.
+    pub fn required(&mut self) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         if let Some(meta) = page.form_field_meta.last_mut() {
             meta.required = true;
@@ -1915,9 +1658,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Mark the most-recently-added form field as **read-only**
-    /// (displayed but not editable in the reader).
-    pub fn read_only(self) -> Self {
+    /// Same as [`FluentPageBuilder::read_only`], applied in place.
+    pub fn read_only(&mut self) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         if let Some(meta) = page.form_field_meta.last_mut() {
             meta.read_only = true;
@@ -1925,9 +1667,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Attach a **tooltip** (hover text, `/TU` in the field dict) to
-    /// the most-recently-added form field.
-    pub fn tooltip(self, text: impl Into<String>) -> Self {
+    /// Same as [`FluentPageBuilder::tooltip`], applied in place.
+    pub fn tooltip(&mut self, text: impl Into<String>) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         if let Some(meta) = page.form_field_meta.last_mut() {
             meta.tooltip = Some(text.into());
@@ -1935,9 +1676,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Attach a JavaScript keystroke action (`/AA /K`) to the most-recently-added
-    /// form field. Called on every keystroke while the field has focus.
-    pub fn field_keystroke(self, script: impl Into<String>) -> Self {
+    /// Same as [`FluentPageBuilder::field_keystroke`], applied in place.
+    pub fn field_keystroke(&mut self, script: impl Into<String>) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         if let Some(meta) = page.form_field_meta.last_mut() {
             meta.keystroke = Some(script.into());
@@ -1945,9 +1685,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Attach a JavaScript format action (`/AA /F`) to the most-recently-added
-    /// form field. Called when the field value is formatted for display.
-    pub fn field_format(self, script: impl Into<String>) -> Self {
+    /// Same as [`FluentPageBuilder::field_format`], applied in place.
+    pub fn field_format(&mut self, script: impl Into<String>) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         if let Some(meta) = page.form_field_meta.last_mut() {
             meta.format = Some(script.into());
@@ -1955,9 +1694,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Attach a JavaScript validate action (`/AA /V`) to the most-recently-added
-    /// form field. Called when the user commits the field value.
-    pub fn field_validate(self, script: impl Into<String>) -> Self {
+    /// Same as [`FluentPageBuilder::field_validate`], applied in place.
+    pub fn field_validate(&mut self, script: impl Into<String>) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         if let Some(meta) = page.form_field_meta.last_mut() {
             meta.validate = Some(script.into());
@@ -1965,9 +1703,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Attach a JavaScript calculate action (`/AA /C`) to the most-recently-added
-    /// form field. Called when any field in the form changes.
-    pub fn field_calculate(self, script: impl Into<String>) -> Self {
+    /// Same as [`FluentPageBuilder::field_calculate`], applied in place.
+    pub fn field_calculate(&mut self, script: impl Into<String>) -> &mut Self {
         let page = &mut self.builder.pages[self.page_index];
         if let Some(meta) = page.form_field_meta.last_mut() {
             meta.calculate = Some(script.into());
@@ -1975,13 +1712,9 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Declare the page's tab-navigation order. `TabOrder::Row`
-    /// (default in modern readers), `TabOrder::Column`, or
-    /// `TabOrder::Structure` (requires tagged PDF — Bundle F).
-    /// Deferred until `done()` — the `/Tabs` key is emitted on the
-    /// page dict at build time. #393 Bundle D-4.
-    pub fn tab_order(mut self, order: TabOrder) -> Self {
-        self.pending_tab_order = Some(order);
+    /// Same as [`FluentPageBuilder::tab_order`], applied in place.
+    pub fn tab_order(&mut self, order: TabOrder) -> &mut Self {
+        self.state_mut().pending_tab_order = Some(order);
         self
     }
 
@@ -1996,37 +1729,18 @@ impl<'a> FluentPageBuilder<'a> {
     // bindings.
     // ───────────────────────────────────────────────────────────────────
 
-    /// Place a buffered `Table` at the current cursor position.
-    ///
-    /// This is the v0.3.39 buffered table surface — see research #393.
-    /// The table layout (column widths, row heights, cell positions, wrapped
-    /// cell text) is solved against the page's content width
-    /// (`page.width - 2 × 72pt`), the result is emitted as a sequence of
-    /// `ContentElement::Text` and `ContentElement::Path` via
-    /// `Table::to_content_elements`, and the cursor is advanced by the
-    /// table's total height.
-    ///
-    /// **Scope:** in-memory tables. Supports colspan / rowspan / rich cell
-    /// styling. Does **not** page-break — if the layout overflows the
-    /// current page the overflow is drawn past the bottom margin. For
-    /// 1000+ rows that cross page boundaries, use `streaming_table`
-    /// (lands in step 5/9).
-    ///
-    /// Font measurement uses the page-default font (`text_config.font`).
-    /// Per-cell font overrides honour the font name string in the cell but
-    /// are measured against the table default — good enough for v0.3.39.
-    /// Track: #400 v0.3.40 (mixed-font precise metrics).
-    pub fn table(mut self, table: Table) -> Self {
+    /// Same as [`FluentPageBuilder::table`], applied in place.
+    pub fn table(&mut self, table: Table) -> &mut Self {
         let page_width = self.builder.pages[self.page_index].width;
         let content_width = page_width - 2.0 * 72.0; // match margin convention
 
         let metrics = FluentFontMetrics {
-            manager: self.text_layout.font_manager(),
-            font_name: self.text_config.font.clone(),
+            manager: self.state().text_layout.font_manager(),
+            font_name: self.state().text_config.font.clone(),
         };
         let layout = table.calculate_layout(content_width, &metrics);
 
-        let elements = table.to_content_elements(self.cursor_x, self.cursor_y, &layout);
+        let elements = table.to_content_elements(self.state().cursor_x, self.state().cursor_y, &layout);
         let n = elements.len();
 
         let page = &mut self.builder.pages[self.page_index];
@@ -2043,15 +1757,12 @@ impl<'a> FluentPageBuilder<'a> {
         }
         let _ = n; // retained for future logging / subsetter-registration path
 
-        self.cursor_y -= layout.total_height;
+        page.state.cursor_y -= layout.total_height;
         self
     }
 
-    /// Draw a stroked rectangle with a caller-supplied `LineStyle`.
-    /// Unlike [`Self::rect`] (1pt black default), this exposes width and
-    /// colour. Used by the upcoming buffered `Table` surface for per-side
-    /// coloured / variable-thickness cell borders (#393 D-P1.3).
-    pub fn stroke_rect(self, x: f32, y: f32, w: f32, h: f32, style: LineStyle) -> Self {
+    /// Same as [`FluentPageBuilder::stroke_rect`], applied in place.
+    pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, style: LineStyle) -> &mut Self {
         use crate::elements::PathContent;
         use crate::elements::PathOperation;
         let mut path = PathContent::new(Rect::new(x, y, w, h));
@@ -2064,15 +1775,14 @@ impl<'a> FluentPageBuilder<'a> {
         path.fill_color = None;
         path.stroke_width = style.width;
         path.dash_pattern = style.dash;
-        path.matrix = self.current_matrix;
+        path.matrix = self.state().current_matrix;
         let page = &mut self.builder.pages[self.page_index];
         page.elements.push(ContentElement::Path(path));
         self
     }
 
-    /// Draw a straight line with a caller-supplied `LineStyle`. Variable-
-    /// thickness / coloured rules — e.g. a 0.5pt grey rule between rows.
-    pub fn stroke_line(self, x1: f32, y1: f32, x2: f32, y2: f32, style: LineStyle) -> Self {
+    /// Same as [`FluentPageBuilder::stroke_line`], applied in place.
+    pub fn stroke_line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, style: LineStyle) -> &mut Self {
         use crate::elements::PathContent;
         use crate::elements::PathOperation;
         let min_x = x1.min(x2);
@@ -2090,7 +1800,7 @@ impl<'a> FluentPageBuilder<'a> {
         path.fill_color = None;
         path.stroke_width = style.width;
         path.dash_pattern = style.dash;
-        path.matrix = self.current_matrix;
+        path.matrix = self.state().current_matrix;
         let page = &mut self.builder.pages[self.page_index];
         page.elements.push(ContentElement::Path(path));
         self
@@ -2108,41 +1818,29 @@ impl<'a> FluentPageBuilder<'a> {
     // text-only to cover paths + images in #393 Bundle A-2 follow-up.
     // ───────────────────────────────────────────────────────────────────
 
-    /// Evaluate `f` inside a scope where every text element is drawn
-    /// under the 2D affine transform `matrix` (PDF convention:
-    /// `[a b c d e f]`, applied as `(x' y') = (x y) · M`). The transform
-    /// composes with any outer transform; on exit, the outer transform
-    /// is restored.
-    ///
-    /// ```no_run
-    /// # use pdf_oxide::writer::DocumentBuilder;
-    /// # let mut doc = DocumentBuilder::new();
-    /// # let page = doc.letter_page();
-    /// let page = page.with_transform([1.0, 0.0, 0.0, 1.0, 50.0, 50.0], |p| {
-    ///     p.at(0.0, 0.0).text("drawn at page (50, 50)")
-    /// });
-    /// ```
-    pub fn with_transform<F>(self, matrix: [f32; 6], f: F) -> Self
+    /// Same as [`FluentPageBuilder::with_transform`], applied in place.
+    pub fn with_transform<F>(&mut self, matrix: [f32; 6], f: F) -> &mut Self
     where
-        F: FnOnce(Self) -> Self,
+        F: FnOnce(&mut Self) -> &mut Self,
     {
-        let outer = self.current_matrix;
-        let composed = compose_affine(outer.unwrap_or(IDENTITY), matrix);
-        let mut page = Self {
-            current_matrix: Some(composed),
-            ..self
-        };
-        page = f(page);
-        page.current_matrix = outer;
-        page
+        let outer = self.push_transform(matrix);
+        f(self);
+        self.state_mut().current_matrix = outer;
+        self
     }
 
-    /// Evaluate `f` in a scope where text is rotated by `degrees` about
-    /// the origin. To rotate about a point `(cx, cy)`, compose with
-    /// `.translated(cx, cy, |p| p.rotated(deg, |p| p.translated(-cx, -cy, f)))`.
-    pub fn rotated<F>(self, degrees: f32, f: F) -> Self
+    /// Compose `matrix` onto the active transform; returns the previous
+    /// transform, to be restored by the caller on scope exit.
+    fn push_transform(&mut self, matrix: [f32; 6]) -> Option<[f32; 6]> {
+        let outer = self.state().current_matrix;
+        self.state_mut().current_matrix = Some(compose_affine(outer.unwrap_or(IDENTITY), matrix));
+        outer
+    }
+
+    /// Same as [`FluentPageBuilder::rotated`], applied in place.
+    pub fn rotated<F>(&mut self, degrees: f32, f: F) -> &mut Self
     where
-        F: FnOnce(Self) -> Self,
+        F: FnOnce(&mut Self) -> &mut Self,
     {
         let r = degrees.to_radians();
         let (c, s) = (r.cos(), r.sin());
@@ -2150,18 +1848,18 @@ impl<'a> FluentPageBuilder<'a> {
         self.with_transform([c, s, -s, c, 0.0, 0.0], f)
     }
 
-    /// Evaluate `f` scaled by `(sx, sy)` about the origin.
-    pub fn scaled<F>(self, sx: f32, sy: f32, f: F) -> Self
+    /// Same as [`FluentPageBuilder::scaled`], applied in place.
+    pub fn scaled<F>(&mut self, sx: f32, sy: f32, f: F) -> &mut Self
     where
-        F: FnOnce(Self) -> Self,
+        F: FnOnce(&mut Self) -> &mut Self,
     {
         self.with_transform([sx, 0.0, 0.0, sy, 0.0, 0.0], f)
     }
 
-    /// Evaluate `f` translated by `(tx, ty)`.
-    pub fn translated<F>(self, tx: f32, ty: f32, f: F) -> Self
+    /// Same as [`FluentPageBuilder::translated`], applied in place.
+    pub fn translated<F>(&mut self, tx: f32, ty: f32, f: F) -> &mut Self
     where
-        F: FnOnce(Self) -> Self,
+        F: FnOnce(&mut Self) -> &mut Self,
     {
         self.with_transform([1.0, 0.0, 0.0, 1.0, tx, ty], f)
     }
@@ -2170,92 +1868,75 @@ impl<'a> FluentPageBuilder<'a> {
     // Image placement
     // ───────────────────────────────────────────────────────────────────
 
-    /// Embed an image at `rect` from a filesystem path. Supports JPEG
-    /// and PNG; format is detected from the bytes (not the extension).
-    /// PNG alpha channels become `/SMask` XObjects so transparent
-    /// images composite correctly.
-    ///
-    /// `rect.x` / `rect.y` use PDF's bottom-up coordinates (same
-    /// convention as the rest of the builder). `rect.width` /
-    /// `rect.height` are the on-page size in points — the image is
-    /// scaled to fit the rect without preserving aspect ratio; use
-    /// [`crate::writer::ImageData::fit_to_box`] before calling this
-    /// method if you need letterboxing.
-    pub fn image_from_file(self, path: impl AsRef<Path>, rect: Rect) -> Result<Self> {
+    /// Same as [`FluentPageBuilder::image_from_file`], applied in place.
+    pub fn image_from_file(&mut self, path: impl AsRef<Path>, rect: Rect) -> Result<&mut Self> {
         use crate::writer::image_handler::ImageData;
         let data =
             ImageData::from_file(path).map_err(|e| crate::error::Error::Image(e.to_string()))?;
         Ok(self.image_with(data, rect))
     }
 
-    /// Embed an image at `rect` from in-memory bytes. Auto-detects
-    /// JPEG / PNG by magic number.
-    pub fn image_from_bytes(self, bytes: &[u8], rect: Rect) -> Result<Self> {
+    /// Same as [`FluentPageBuilder::image_from_bytes`], applied in place.
+    pub fn image_from_bytes(&mut self, bytes: &[u8], rect: Rect) -> Result<&mut Self> {
         use crate::writer::image_handler::ImageData;
         let data =
             ImageData::from_bytes(bytes).map_err(|e| crate::error::Error::Image(e.to_string()))?;
         Ok(self.image_with(data, rect))
     }
 
-    /// Embed an image with alternative text for accessibility (PDF/UA-1 §7.1).
-    /// The image is wrapped in a `/Figure` structure element carrying `/Alt`
-    /// so assistive technology can describe it. Requires `tagged_pdf_ua1()` on
-    /// the `DocumentBuilder` for the alt text to be wired into the StructTree.
+    /// Same as [`FluentPageBuilder::image_from_bytes_with_alt`], applied in place.
     pub fn image_from_bytes_with_alt(
-        self,
+        &mut self,
         bytes: &[u8],
         rect: Rect,
         alt_text: impl Into<String>,
-    ) -> Result<Self> {
+    ) -> Result<&mut Self> {
         use crate::writer::image_handler::ImageData;
         let data =
             ImageData::from_bytes(bytes).map_err(|e| crate::error::Error::Image(e.to_string()))?;
         Ok(self.image_with_alt(data, rect, alt_text))
     }
 
-    /// Embed a decorative image marked as an `/Artifact` (PDF/UA-1 §7.1).
-    /// Assistive technology ignores artifact images; do not attach alt text.
-    pub fn image_from_bytes_as_artifact(self, bytes: &[u8], rect: Rect) -> Result<Self> {
+    /// Same as [`FluentPageBuilder::image_from_bytes_as_artifact`], applied in place.
+    pub fn image_from_bytes_as_artifact(&mut self, bytes: &[u8], rect: Rect) -> Result<&mut Self> {
         use crate::writer::image_handler::ImageData;
         let data =
             ImageData::from_bytes(bytes).map_err(|e| crate::error::Error::Image(e.to_string()))?;
         Ok(self.image_with_artifact(data, rect))
     }
 
-    /// Embed a pre-decoded image with alternative text (PDF/UA-1 §7.1).
+    /// Same as [`FluentPageBuilder::image_with_alt`], applied in place.
     pub fn image_with_alt(
-        self,
+        &mut self,
         data: crate::writer::image_handler::ImageData,
         rect: Rect,
         alt_text: impl Into<String>,
-    ) -> Self {
+    ) -> &mut Self {
         let alt = alt_text.into();
         self.image_with_options(data, rect, Some(alt), false)
     }
 
-    /// Embed a pre-decoded decorative image as an `/Artifact` (PDF/UA-1 §7.1).
+    /// Same as [`FluentPageBuilder::image_with_artifact`], applied in place.
     pub fn image_with_artifact(
-        self,
+        &mut self,
         data: crate::writer::image_handler::ImageData,
         rect: Rect,
-    ) -> Self {
+    ) -> &mut Self {
         self.image_with_options(data, rect, None, true)
     }
 
-    /// Embed a pre-decoded [`crate::writer::ImageData`] at `rect`. Useful
-    /// when a caller has already loaded the image (e.g. for reuse across
-    /// multiple placements) and doesn't need the IO / parse step again.
-    pub fn image_with(self, data: crate::writer::image_handler::ImageData, rect: Rect) -> Self {
+    /// Same as [`FluentPageBuilder::image_with`], applied in place.
+    pub fn image_with(&mut self, data: crate::writer::image_handler::ImageData, rect: Rect) -> &mut Self {
         self.image_with_options(data, rect, None, false)
     }
 
     fn image_with_options(
-        self,
+        &mut self,
         data: crate::writer::image_handler::ImageData,
         rect: Rect,
         alt_text: Option<String>,
         is_artifact: bool,
-    ) -> Self {
+    ) -> &mut Self {
         use crate::elements::{
             ColorSpace as EColorSpace, ImageContent, ImageFormat as EImageFormat,
         };
@@ -2287,7 +1968,7 @@ impl<'a> FluentPageBuilder<'a> {
 
         // Propagate the active transform so images inside `.rotated()`
         // etc. scopes render under that matrix. #393 Bundle A-2 follow-up.
-        content.matrix = self.current_matrix;
+        content.matrix = self.state().current_matrix;
 
         let page = &mut self.builder.pages[self.page_index];
         content.reading_order = Some(page.elements.len());
@@ -2295,19 +1976,16 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Place a 1-D barcode (Code 128, EAN-13, QR, …) at `(x, y, w, h)`.
-    /// The barcode is rendered to PNG at the given pixel dimensions and
-    /// embedded as an image. `barcode_type` selects the symbology;
-    /// `data` is the content to encode.
+    /// Same as [`FluentPageBuilder::barcode_1d`], applied in place.
     pub fn barcode_1d(
-        self,
+        &mut self,
         barcode_type: crate::writer::BarcodeType,
         data: &str,
         x: f32,
         y: f32,
         w: f32,
         h: f32,
-    ) -> Result<Self> {
+    ) -> Result<&mut Self> {
         let opts = crate::writer::BarcodeOptions::new()
             .width(w as u32)
             .height(h as u32);
@@ -2315,9 +1993,8 @@ impl<'a> FluentPageBuilder<'a> {
         self.image_from_bytes(&png, crate::geometry::Rect::new(x, y, w, h))
     }
 
-    /// Place a QR code at `(x, y, size, size)` (square).
-    /// `data` is the content to encode (URL, text, etc.).
-    pub fn barcode_qr(self, data: &str, x: f32, y: f32, size: f32) -> Result<Self> {
+    /// Same as [`FluentPageBuilder::barcode_qr`], applied in place.
+    pub fn barcode_qr(&mut self, data: &str, x: f32, y: f32, size: f32) -> Result<&mut Self> {
         let opts = crate::writer::QrCodeOptions::new().size(size as u32);
         let png = crate::writer::BarcodeGenerator::generate_qr(data, &opts)?;
         self.image_from_bytes(&png, crate::geometry::Rect::new(x, y, size, size))
@@ -2331,33 +2008,29 @@ impl<'a> FluentPageBuilder<'a> {
     // undrawn (e.g. fill-only vs stroke-only). Shared helper
     // `push_stroked_fill` applies both to a `PathContent`.
 
-    /// Draw a circle centred at `(cx, cy)` with `radius`. Pass
-    /// `stroke = Some(...)` for outlined, `fill = Some((r, g, b))` for
-    /// filled. Both together draw a stroked + filled disc.
+    /// Same as [`FluentPageBuilder::circle`], applied in place.
     pub fn circle(
-        self,
+        &mut self,
         cx: f32,
         cy: f32,
         radius: f32,
         stroke: Option<LineStyle>,
         fill: Option<(f32, f32, f32)>,
-    ) -> Self {
+    ) -> &mut Self {
         let path = crate::elements::PathContent::circle(cx, cy, radius);
         self.push_shaped_path(path, stroke, fill)
     }
 
-    /// Draw an ellipse centred at `(cx, cy)` with horizontal radius
-    /// `rx` and vertical radius `ry`. Same stroke/fill semantics as
-    /// [`Self::circle`].
+    /// Same as [`FluentPageBuilder::ellipse`], applied in place.
     pub fn ellipse(
-        self,
+        &mut self,
         cx: f32,
         cy: f32,
         rx: f32,
         ry: f32,
         stroke: Option<LineStyle>,
         fill: Option<(f32, f32, f32)>,
-    ) -> Self {
+    ) -> &mut Self {
         // Magic constant for approximating a quarter-ellipse with a cubic
         // Bezier: k = 4 * (sqrt(2) - 1) / 3.
         use crate::elements::{PathContent, PathOperation};
@@ -2375,15 +2048,13 @@ impl<'a> FluentPageBuilder<'a> {
         self.push_shaped_path(PathContent::from_operations(ops), stroke, fill)
     }
 
-    /// Draw a closed polygon through `points`. Requires at least 2
-    /// points — fewer is a no-op. Same stroke/fill semantics as
-    /// [`Self::circle`].
+    /// Same as [`FluentPageBuilder::polygon`], applied in place.
     pub fn polygon(
-        self,
+        &mut self,
         points: &[(f32, f32)],
         stroke: Option<LineStyle>,
         fill: Option<(f32, f32, f32)>,
-    ) -> Self {
+    ) -> &mut Self {
         if points.len() < 2 {
             return self;
         }
@@ -2398,20 +2069,16 @@ impl<'a> FluentPageBuilder<'a> {
         self.push_shaped_path(PathContent::from_operations(ops), stroke, fill)
     }
 
-    /// Draw a circular arc centred at `(cx, cy)` with `radius`, from
-    /// `start_angle` to `end_angle` (radians, anticlockwise). Only
-    /// stroke; arcs are not filled. Approximated by up to 4 cubic
-    /// Beziers (one per quadrant), matching the accuracy of the
-    /// [`Self::circle`] primitive.
+    /// Same as [`FluentPageBuilder::arc`], applied in place.
     pub fn arc(
-        self,
+        &mut self,
         cx: f32,
         cy: f32,
         radius: f32,
         start_angle: f32,
         end_angle: f32,
         stroke: LineStyle,
-    ) -> Self {
+    ) -> &mut Self {
         use crate::elements::{PathContent, PathOperation};
         // Subdivide into arcs of <= π/2 each so a single cubic Bezier
         // stays accurate. Magic ratio for quarter-arcs.
@@ -2447,11 +2114,9 @@ impl<'a> FluentPageBuilder<'a> {
         self.push_shaped_path(PathContent::from_operations(ops), Some(stroke), None)
     }
 
-    /// Draw a single cubic Bezier curve from `(x0, y0)` to `(x3, y3)`
-    /// with control points `(c1x, c1y)` and `(c2x, c2y)`. Stroke only
-    /// by default; pass `Some((r, g, b))` for fill.
+    /// Same as [`FluentPageBuilder::bezier_curve`], applied in place.
     pub fn bezier_curve(
-        self,
+        &mut self,
         x0: f32,
         y0: f32,
         c1x: f32,
@@ -2462,7 +2127,7 @@ impl<'a> FluentPageBuilder<'a> {
         y3: f32,
         stroke: LineStyle,
         fill: Option<(f32, f32, f32)>,
-    ) -> Self {
+    ) -> &mut Self {
         use crate::elements::{PathContent, PathOperation};
         let ops = vec![
             PathOperation::MoveTo(x0, y0),
@@ -2471,17 +2136,12 @@ impl<'a> FluentPageBuilder<'a> {
         self.push_shaped_path(PathContent::from_operations(ops), Some(stroke), fill)
     }
 
-    /// Internal helper: apply optional stroke + fill to a `PathContent`
-    /// and push it as a `ContentElement::Path` on the current page.
-    /// Shared by all shape primitives so stroke/fill semantics — and
-    /// dash patterns — stay consistent across `circle` / `ellipse` /
-    /// `polygon` / `arc` / `bezier_curve`.
     fn push_shaped_path(
-        self,
+        &mut self,
         mut path: crate::elements::PathContent,
         stroke: Option<LineStyle>,
         fill: Option<(f32, f32, f32)>,
-    ) -> Self {
+    ) -> &mut Self {
         if let Some(style) = stroke {
             path.stroke_color = Some(crate::layout::Color {
                 r: style.color.0,
@@ -2501,16 +2161,14 @@ impl<'a> FluentPageBuilder<'a> {
         // Propagate the active transform so paths inside `.rotated()` /
         // `.scaled()` / `.translated()` scopes render under that matrix.
         // #393 Bundle A-2 follow-up.
-        path.matrix = self.current_matrix;
+        path.matrix = self.state().current_matrix;
         let page = &mut self.builder.pages[self.page_index];
         page.elements.push(ContentElement::Path(path));
         self
     }
 
-    /// Draw a stroked rectangle outline at `(x, y)` with size `w × h`
-    /// using the default 1pt black stroke. For a filled rectangle with
-    /// a custom colour, see [`Self::filled_rect`].
-    pub fn rect(self, x: f32, y: f32, w: f32, h: f32) -> Self {
+    /// Same as [`FluentPageBuilder::rect`], applied in place.
+    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) -> &mut Self {
         use crate::elements::PathContent;
         use crate::elements::PathOperation;
         let mut path = PathContent::new(Rect::new(x, y, w, h));
@@ -2526,9 +2184,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Draw a filled rectangle at `(x, y)` with size `w × h` in the
-    /// given RGB colour (channels in `0.0..=1.0`). No outline.
-    pub fn filled_rect(self, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32) -> Self {
+    /// Same as [`FluentPageBuilder::filled_rect`], applied in place.
+    pub fn filled_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32) -> &mut Self {
         use crate::elements::PathContent;
         use crate::elements::PathOperation;
         let mut path = PathContent::new(Rect::new(x, y, w, h));
@@ -2540,9 +2197,8 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
-    /// Draw a straight line from `(x1, y1)` to `(x2, y2)` with the
-    /// default 1pt black stroke.
-    pub fn line(self, x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+    /// Same as [`FluentPageBuilder::line`], applied in place.
+    pub fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) -> &mut Self {
         use crate::elements::PathContent;
         use crate::elements::PathOperation;
         let min_x = x1.min(x2);
@@ -2563,15 +2219,1163 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
+}
+
+impl<'a> FluentPageBuilder<'a> {
+    /// Set the text configuration for subsequent text operations.
+    pub fn text_config(mut self, config: TextConfig) -> Self {
+        self.inner.text_config(config);
+        self
+    }
+
+    /// Set font for subsequent text operations.
+    pub fn font(mut self, name: &str, size: f32) -> Self {
+        self.inner.font(name, size);
+        self
+    }
+
+    /// Set cursor position for text placement.
+    pub fn at(mut self, x: f32, y: f32) -> Self {
+        self.inner.at(x, y);
+        self
+    }
+
+    /// Vertical points remaining on the current page from the cursor down to
+    /// the bottom margin (conventionally 72 pt / 1 inch from the bottom of
+    /// the page). Pure query — no mutation, no emission.
+    ///
+    /// The streaming `Table` surface (research #393) uses this to decide
+    /// whether the next row fits or whether to trigger a page break:
+    ///
+    /// ```no_run
+    /// # use pdf_oxide::writer::DocumentBuilder;
+    /// # let mut doc = DocumentBuilder::new();
+    /// # let page = doc.letter_page();
+    /// if page.remaining_space() < 40.0 {
+    ///     // ... trigger new_page_same_size() and redraw header
+    /// }
+    /// ```
+    ///
+    /// Returns 0.0 (not negative) when the cursor has already passed the
+    /// bottom margin. A return of > 0.0 does not *guarantee* the next row
+    /// fits — that depends on the row's own measured height.
+    pub fn remaining_space(&self) -> f32 {
+        self.inner.remaining_space()
+    }
+
+
+
+    /// Width and height of the current page in points. Useful when the
+    /// caller needs to size content to the actual page (e.g. table column
+    /// caps that must reflect a landscape orientation chosen at section
+    /// time, not the document's default size).
+    pub fn page_dimensions(&self) -> (f32, f32) {
+        self.inner.page_dimensions()
+    }
+
+    /// Current cursor X (points from left edge). Used by
+    /// `StreamingTable` to anchor column offsets.
+    pub(crate) fn cursor_x(&self) -> f32 {
+        self.inner.cursor_x()
+    }
+    /// Current cursor Y (points from bottom edge, PDF convention).
+    pub(crate) fn cursor_y(&self) -> f32 {
+        self.inner.cursor_y()
+    }
+    /// Move the cursor down to `y`. Internal use — public callers should
+    /// use `at()` which takes (x, y).
+    pub(crate) fn set_cursor_y(&mut self, y: f32) {
+        self.inner.set_cursor_y(y)
+    }
+    /// Width of the current page in points. Useful for callers
+    /// computing alignment rectangles relative to the page edge.
+    // ── pdf_manipulator patch ── only the office converter calls this.
+    #[cfg(feature = "office")]
+    // ── end pdf_manipulator patch ──
+    pub(crate) fn page_width(&self) -> f32 {
+        self.inner.page_width()
+    }
+    /// Font name from the builder's current text_config.
+    pub(crate) fn text_config_font_name(&self) -> &str {
+        self.inner.text_config_font_name()
+    }
+    /// Font size in points.
+    pub(crate) fn text_config_font_size(&self) -> f32 {
+        self.inner.text_config_font_size()
+    }
+    /// Line-height multiplier (multiplied with font size to get baseline
+    /// step).
+    pub(crate) fn text_config_line_height(&self) -> f32 {
+        self.inner.text_config_line_height()
+    }
+    /// Wrap `text` to `max_width` using the builder's TextLayout engine.
+    /// Returns one `(line, measured_width)` per visual line.
+    pub(crate) fn wrap_cell_text(&self, text: &str, max_width: f32) -> Vec<(String, f32)> {
+        self.inner.wrap_cell_text(text, max_width)
+    }
+    /// Push a `ContentElement` into the current page's element list.
+    pub(crate) fn push_element(&mut self, element: ContentElement) {
+        self.inner.push_element(element)
+    }
+    /// Number of elements already on the current page — used to seed
+    /// monotone reading_order values.
+    pub(crate) fn page_element_count(&self) -> usize {
+        self.inner.page_element_count()
+    }
+
+
+    /// Measure the rendered width of `text` in the builder's current font
+    /// and size, in PDF points. Pure query — does not advance the cursor or
+    /// emit any content.
+    ///
+    /// Use this to pick explicit column widths before calling
+    /// `streaming_table` (see #393) or to right-align custom labels. For
+    /// embedded fonts, the measure honours the face's horizontal advances
+    /// (HMTX). For base-14 fonts, it uses the AFM width tables.
+    pub fn measure(&self, text: &str) -> f32 {
+        self.inner.measure(text)
+    }
+
+    /// Add text at the current cursor position.
+    pub fn text(mut self, text: &str) -> Self {
+        self.inner.text(text);
+        self
+    }
+
+    /// Place wrapped text inside a rectangle with horizontal alignment.
+    ///
+    /// Wraps `text` to `rect.width` using the builder's current font and
+    /// size, emits one content-stream line per wrapped line, and positions
+    /// each line within the rect per `align`:
+    ///
+    /// - `Left`:   line left edge at `rect.x`
+    /// - `Center`: line centered within `rect.x .. rect.x + rect.width`
+    /// - `Right`:  line right edge at `rect.x + rect.width`
+    ///
+    /// Vertical layout is top-anchored: the first line's top sits at
+    /// `rect.y`, subsequent lines drop by `size * line_height`. The cursor
+    /// is **not** advanced — the rect has its own geometry and the caller
+    /// owns the cursor. Use `measure()` or `text_layout.text_bounds()` to
+    /// pre-compute rect dimensions if needed.
+    ///
+    /// This is the cell-text primitive the buffered `Table` surface
+    /// (research #393) consumes. It is also usable standalone for
+    /// box-constrained captions, labels, and pull-quotes.
+    pub fn text_in_rect(mut self, rect: Rect, text: &str, align: TextAlign) -> Self {
+        self.inner.text_in_rect(rect, text, align);
+        self
+    }
+
+    /// Add a heading (larger, bold text).
+    pub fn heading(mut self, level: u8, text: &str) -> Self {
+        self.inner.heading(level, text);
+        self
+    }
+
+    /// Render an unordered list of items at the current cursor
+    /// position. Each item gets an indented bullet + wrapped text;
+    /// the cursor advances past the last item with a small bottom
+    /// padding.
+    ///
+    /// Bullet glyph is `•` (U+2022) — renders in Helvetica / Times /
+    /// Courier without font embedding. For custom bullets (e.g. `★`
+    /// with an embedded CJK / symbol font) call `bullet_list_styled`
+    /// (not yet in v0.3.39 — filed as a v0.3.40 enhancement).
+    ///
+    /// #393 Bundle E-2.
+    pub fn bullet_list<S: AsRef<str>>(mut self, items: &[S]) -> Self {
+        self.inner.bullet_list(items);
+        self
+    }
+
+    /// Render an ordered/numbered list. `style` controls the marker
+    /// format (decimal `1. 2. 3.`, lowercase Roman, or lowercase
+    /// alphabetic). #393 Bundle E-2.
+    pub fn numbered_list<S: AsRef<str>>(mut self, items: &[S], style: ListStyle) -> Self {
+        self.inner.numbered_list(items, style);
+        self
+    }
+
+
+    /// Render a code block at the current cursor position. The block
+    /// is rendered as a single filled-background rectangle spanning
+    /// the page content width, with monospace (Courier) text laid out
+    /// line-by-line inside it. Lines wrap at the content width with a
+    /// configurable left/right padding.
+    ///
+    /// `source` is the code string (preserves `\n` line breaks);
+    /// `language` is cosmetic — it doesn't syntax-highlight in v0.3.39
+    /// (syntax highlighting is deferred to v0.3.40) but is recorded
+    /// for future accessibility tagging (Bundle F).
+    ///
+    /// After this call the cursor advances past the block. #393
+    /// Bundle E-3.
+    ///
+    /// ```no_run
+    /// # use pdf_oxide::writer::DocumentBuilder;
+    /// # let mut doc = DocumentBuilder::new();
+    /// doc.letter_page()
+    ///    .at(72.0, 720.0)
+    ///    .heading(1, "Example")
+    ///    .code_block("rust", "fn main() {\n    println!(\"hi\");\n}")
+    ///    .done();
+    /// ```
+    pub fn code_block(mut self, language: &str, source: &str) -> Self {
+        self.inner.code_block(language, source);
+        self
+    }
+
+    /// Add a paragraph of text with automatic word wrapping.
+    pub fn paragraph(mut self, text: &str) -> Self {
+        self.inner.paragraph(text);
+        self
+    }
+
+    /// Add vertical space.
+    pub fn space(mut self, points: f32) -> Self {
+        self.inner.space(points);
+        self
+    }
+
+    /// Add a horizontal line.
+    pub fn horizontal_rule(mut self) -> Self {
+        self.inner.horizontal_rule();
+        self
+    }
+
+    /// Add a content element directly.
+    pub fn element(mut self, element: ContentElement) -> Self {
+        self.inner.element(element);
+        self
+    }
+
+    /// Add multiple content elements.
+    pub fn elements(mut self, elements: Vec<ContentElement>) -> Self {
+        self.inner.elements(elements);
+        self
+    }
+
+    /// Add a footnote reference mark at the current cursor position and
+    /// record the corresponding footnote body for page-end placement.
+    ///
+    /// The `ref_mark` (e.g. `"¹"` or `"[1]"`) is emitted inline at 65 %
+    /// of the current font size. The `note_text` body is collected and
+    /// rendered below a separator line near the page bottom when the page
+    /// is finalised in `DocumentBuilder::build`. In tagged PDF/UA mode the
+    /// body is automatically wrapped in a `<Note>` structure element.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// page.at(72.0, 700.0)
+    ///     .text("Important claim")
+    ///     .footnote("¹", "Source: Annual report 2025.")
+    ///     .text(" continued here.")
+    ///     .done()
+    /// ```
+    pub fn footnote(mut self, ref_mark: &str, note_text: &str) -> Self {
+        self.inner.footnote(ref_mark, note_text);
+        self
+    }
+
+    /// Lay out `text` as wrapped lines distributed across `column_count`
+    /// balanced columns starting at the current cursor position.
+    ///
+    /// Internally uses
+    /// [`crate::html_css::layout::multicol::distribute_lines_into_columns`]
+    /// to balance the line distribution. The columns span the full available
+    /// width (page width minus the left cursor margin and a 72 pt right
+    /// margin), separated by `gap_pt` points of inter-column space.
+    ///
+    /// The cursor advances past the tallest column so subsequent content
+    /// continues below the column block.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// page.at(72.0, 700.0)
+    ///     .columns(2, 12.0, "First paragraph.\nSecond paragraph runs long enough to wrap across both columns.")
+    ///     .done()
+    /// ```
+    pub fn columns(mut self, column_count: u32, gap_pt: f32, text: &str) -> Self {
+        self.inner.columns(column_count, gap_pt, text);
+        self
+    }
+
+    // ==========================================================================
+    // Rich text (inline runs)
+    // ==========================================================================
+
+    /// Emit `text` inline at the current cursor — advances `cursor_x` by the
+    /// measured text width but does **not** advance `cursor_y`.  Call
+    /// [`Self::newline`] after a sequence of inline calls to move to the next
+    /// line, or use [`Self::rich_paragraph`] for an all-in-one API.
+    pub fn inline(mut self, text: &str) -> Self {
+        self.inner.inline(text);
+        self
+    }
+
+    /// Inline bold run (Helvetica-Bold / embedded font "-Bold" suffix).
+    pub fn inline_bold(mut self, text: &str) -> Self {
+        self.inner.inline_bold(text);
+        self
+    }
+
+    /// Inline italic run (Helvetica-Oblique / embedded font "-Oblique" suffix).
+    pub fn inline_italic(mut self, text: &str) -> Self {
+        self.inner.inline_italic(text);
+        self
+    }
+
+    /// Inline run with a custom RGB color (values 0.0–1.0).
+    pub fn inline_color(mut self, r: f32, g: f32, b: f32, text: &str) -> Self {
+        self.inner.inline_color(r, g, b, text);
+        self
+    }
+
+    /// Advance cursor_y by one line-height and reset cursor_x to the left
+    /// margin (72 pt). Used after a run of [`Self::inline`] calls.
+    pub fn newline(mut self) -> Self {
+        self.inner.newline();
+        self
+    }
+
+    /// A single text run for [`Self::rich_paragraph`].
+    ///
+    /// Construct with the associated helper functions:
+    /// [`TextRun::normal`], [`TextRun::bold`], [`TextRun::italic`],
+    /// [`TextRun::color`].
+    pub fn rich_paragraph(mut self, runs: &[TextRun]) -> Self {
+        self.inner.rich_paragraph(runs);
+        self
+    }
+
+
+    // ==========================================================================
+    // Annotation Methods
+    // ==========================================================================
+
+    /// Add a URL link annotation to the last text element.
+    ///
+    /// The link will cover the bounding box of the most recently added text.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// builder.page(PageSize::Letter)
+    ///     .at(72.0, 720.0)
+    ///     .text("Visit our website")
+    ///     .link_url("https://example.com")
+    ///     .done();
+    /// ```
+    pub fn link_url(mut self, url: &str) -> Self {
+        self.inner.link_url(url);
+        self
+    }
+
+    /// Add an internal page link annotation to the last text element.
+    ///
+    /// # Arguments
+    ///
+    /// * `page` - The target page index (0-based)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// builder.page(PageSize::Letter)
+    ///     .at(72.0, 720.0)
+    ///     .text("Go to page 5")
+    ///     .link_page(4)  // 0-indexed
+    ///     .done();
+    /// ```
+    pub fn link_page(mut self, page: usize) -> Self {
+        self.inner.link_page(page);
+        self
+    }
+
+    /// Add a named destination link to the last text element.
+    ///
+    /// # Arguments
+    ///
+    /// * `destination` - The named destination string
+    pub fn link_named(mut self, destination: &str) -> Self {
+        self.inner.link_named(destination);
+        self
+    }
+
+    /// Add a JavaScript action link to the last text element.
+    ///
+    /// When clicked the viewer executes the provided JavaScript string.
+    pub fn link_javascript(mut self, script: &str) -> Self {
+        self.inner.link_javascript(script);
+        self
+    }
+
+    /// Run a JavaScript script when this page is opened (`/AA /O`).
+    pub fn on_open(mut self, script: &str) -> Self {
+        self.inner.on_open(script);
+        self
+    }
+
+    /// Run a JavaScript script when this page is closed (`/AA /C`).
+    pub fn on_close(mut self, script: &str) -> Self {
+        self.inner.on_close(script);
+        self
+    }
+
+    /// Add a highlight annotation to the last text element.
+    ///
+    /// # Arguments
+    ///
+    /// * `color` - RGB color tuple (0.0-1.0 for each component)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// builder.page(PageSize::Letter)
+    ///     .at(72.0, 720.0)
+    ///     .text("Important text")
+    ///     .highlight((1.0, 1.0, 0.0))  // Yellow highlight
+    ///     .done();
+    /// ```
+    pub fn highlight(mut self, color: (f32, f32, f32)) -> Self {
+        self.inner.highlight(color);
+        self
+    }
+
+    /// Add an underline annotation to the last text element.
+    ///
+    /// # Arguments
+    ///
+    /// * `color` - RGB color tuple (0.0-1.0 for each component)
+    pub fn underline(mut self, color: (f32, f32, f32)) -> Self {
+        self.inner.underline(color);
+        self
+    }
+
+    /// Add a strikeout annotation to the last text element.
+    ///
+    /// # Arguments
+    ///
+    /// * `color` - RGB color tuple (0.0-1.0 for each component)
+    pub fn strikeout(mut self, color: (f32, f32, f32)) -> Self {
+        self.inner.strikeout(color);
+        self
+    }
+
+    /// Add a squiggly underline annotation to the last text element.
+    ///
+    /// # Arguments
+    ///
+    /// * `color` - RGB color tuple (0.0-1.0 for each component)
+    pub fn squiggly(mut self, color: (f32, f32, f32)) -> Self {
+        self.inner.squiggly(color);
+        self
+    }
+
+    /// Add a sticky note annotation at the current cursor position.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The note content
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// builder.page(PageSize::Letter)
+    ///     .at(72.0, 720.0)
+    ///     .sticky_note("Please review this section")
+    ///     .done();
+    /// ```
+    pub fn sticky_note(mut self, text: &str) -> Self {
+        self.inner.sticky_note(text);
+        self
+    }
+
+    /// Add a sticky note annotation with a specific icon at the current cursor position.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The note content
+    /// * `icon` - The icon to display
+    pub fn sticky_note_with_icon(mut self, text: &str, icon: TextAnnotationIcon) -> Self {
+        self.inner.sticky_note_with_icon(text, icon);
+        self
+    }
+
+    /// Add a sticky note annotation at a specific position.
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - X coordinate
+    /// * `y` - Y coordinate
+    /// * `text` - The note content
+    pub fn sticky_note_at(mut self, x: f32, y: f32, text: &str) -> Self {
+        self.inner.sticky_note_at(x, y, text);
+        self
+    }
+
+    /// Add a stamp annotation at the current cursor position.
+    ///
+    /// # Arguments
+    ///
+    /// * `stamp_type` - The type of stamp (Approved, Draft, Confidential, etc.)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use pdf_oxide::writer::StampType;
+    ///
+    /// builder.page(PageSize::Letter)
+    ///     .at(72.0, 720.0)
+    ///     .stamp(StampType::Approved)
+    ///     .done();
+    /// ```
+    pub fn stamp(mut self, stamp_type: StampType) -> Self {
+        self.inner.stamp(stamp_type);
+        self
+    }
+
+    /// Add a stamp annotation at a specific position with custom size.
+    ///
+    /// # Arguments
+    ///
+    /// * `rect` - The bounding rectangle for the stamp
+    /// * `stamp_type` - The type of stamp
+    pub fn stamp_at(mut self, rect: Rect, stamp_type: StampType) -> Self {
+        self.inner.stamp_at(rect, stamp_type);
+        self
+    }
+
+    /// Add a FreeText annotation (text displayed directly on page).
+    ///
+    /// # Arguments
+    ///
+    /// * `rect` - The bounding rectangle for the text box
+    /// * `text` - The text content
+    pub fn freetext(mut self, rect: Rect, text: &str) -> Self {
+        self.inner.freetext(rect, text);
+        self
+    }
+
+    /// Add a FreeText annotation with custom font settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `rect` - The bounding rectangle for the text box
+    /// * `text` - The text content
+    /// * `font` - Font name
+    /// * `size` - Font size in points
+    pub fn freetext_styled(mut self, rect: Rect, text: &str, font: &str, size: f32) -> Self {
+        self.inner.freetext_styled(rect, text, font, size);
+        self
+    }
+
+    /// Add a watermark annotation (appears behind content, optionally print-only).
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The watermark text
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// builder.page(PageSize::Letter)
+    ///     .watermark("DRAFT")
+    ///     .done();
+    /// ```
+    pub fn watermark(mut self, text: &str) -> Self {
+        self.inner.watermark(text);
+        self
+    }
+
+    /// Add a "CONFIDENTIAL" watermark with preset styling.
+    pub fn watermark_confidential(mut self) -> Self {
+        self.inner.watermark_confidential();
+        self
+    }
+
+    /// Add a "DRAFT" watermark with preset styling.
+    pub fn watermark_draft(mut self) -> Self {
+        self.inner.watermark_draft();
+        self
+    }
+
+    /// Add a custom watermark with full control over positioning and styling.
+    pub fn watermark_custom(mut self, watermark: WatermarkAnnotation) -> Self {
+        self.inner.watermark_custom(watermark);
+        self
+    }
+
+    /// Add a generic annotation.
+    ///
+    /// This is a low-level method that allows adding any annotation type.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use pdf_oxide::writer::{LinkAnnotation, Annotation};
+    /// use pdf_oxide::geometry::Rect;
+    ///
+    /// let link = LinkAnnotation::uri(
+    ///     Rect::new(72.0, 720.0, 100.0, 12.0),
+    ///     "https://example.com",
+    /// );
+    ///
+    /// builder.page(PageSize::Letter)
+    ///     .add_annotation(link)
+    ///     .done();
+    /// ```
+    pub fn add_annotation<A: Into<Annotation>>(mut self, annotation: A) -> Self {
+        self.inner.add_annotation(annotation);
+        self
+    }
+
+    /// Add a single-line text form field to the page. `name` is the
+    /// unique field identifier used for form submission;
+    /// `default_value` is the initial text shown in the field (pass
+    /// `None` or an empty string for a blank field).
+    pub fn text_field(
+        mut self,
+        name: impl Into<String>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        default_value: Option<String>,
+    ) -> Self {
+        self.inner.text_field(name, x, y, w, h, default_value);
+        self
+    }
+
+    /// Add a checkbox form field to the page. `checked` sets whether
+    /// the box is initially ticked.
+    pub fn checkbox(
+        mut self,
+        name: impl Into<String>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        checked: bool,
+    ) -> Self {
+        self.inner.checkbox(name, x, y, w, h, checked);
+        self
+    }
+
+    /// Add a dropdown combo-box form field. Each entry of `options` is
+    /// a user-visible string that also serves as the submitted value.
+    /// `selected` picks the initial choice by value; pass `None` to
+    /// leave the field blank.
+    pub fn combo_box(
+        mut self,
+        name: impl Into<String>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        options: Vec<String>,
+        selected: Option<String>,
+    ) -> Self {
+        self.inner.combo_box(name, x, y, w, h, options, selected);
+        self
+    }
+
+    /// Add a scrollable list-box form field — same options shape as
+    /// [`Self::combo_box`] but the user sees a scrollable list rather
+    /// than a dropdown. `multi_select` toggles whether multiple
+    /// entries can be selected simultaneously. `selected` is the
+    /// initial value (or values; a comma-separated list is treated as
+    /// multiple selections when `multi_select` is true).
+    ///
+    /// #393 Bundle D-1 — wires the existing `ListBoxWidget` through
+    /// the fluent surface.
+    pub fn list_box(
+        mut self,
+        name: impl Into<String>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        options: Vec<String>,
+        selected: Option<String>,
+        multi_select: bool,
+    ) -> Self {
+        self.inner.list_box(name, x, y, w, h, options, selected, multi_select);
+        self
+    }
+
+    /// Add a radio-button group. Each entry of `buttons` is an
+    /// `(export_value, x, y, w, h)` tuple describing one option's
+    /// submitted value and its visible bounding rectangle. `selected`
+    /// picks the initial choice by export value.
+    pub fn radio_group(
+        mut self,
+        name: impl Into<String>,
+        buttons: Vec<(String, f32, f32, f32, f32)>,
+        selected: Option<String>,
+    ) -> Self {
+        self.inner.radio_group(name, buttons, selected);
+        self
+    }
+
+    /// Add a clickable push button with a visible caption.
+    pub fn push_button(
+        mut self,
+        name: impl Into<String>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        caption: impl Into<String>,
+    ) -> Self {
+        self.inner.push_button(name, x, y, w, h, caption);
+        self
+    }
+
+    /// Add an unsigned signature placeholder field to the page.
+    ///
+    /// The field is created with `/FT /Sig` and `/V null` (unsigned).
+    /// A signing application can fill it in via incremental update.
+    pub fn signature_field(mut self, name: impl Into<String>, x: f32, y: f32, w: f32, h: f32) -> Self {
+        self.inner.signature_field(name, x, y, w, h);
+        self
+    }
+
+    /// Mark the most-recently-added form field on this page as
+    /// **required**. Chainable after any `text_field` / `checkbox` /
+    /// `combo_box` / `list_box` / `radio_group` / `push_button` /
+    /// `signature_field` call. No-op if no field has been
+    /// added yet. #393 Bundle D-3.
+    pub fn required(mut self) -> Self {
+        self.inner.required();
+        self
+    }
+
+    /// Mark the most-recently-added form field as **read-only**
+    /// (displayed but not editable in the reader).
+    pub fn read_only(mut self) -> Self {
+        self.inner.read_only();
+        self
+    }
+
+    /// Attach a **tooltip** (hover text, `/TU` in the field dict) to
+    /// the most-recently-added form field.
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.inner.tooltip(text);
+        self
+    }
+
+    /// Attach a JavaScript keystroke action (`/AA /K`) to the most-recently-added
+    /// form field. Called on every keystroke while the field has focus.
+    pub fn field_keystroke(mut self, script: impl Into<String>) -> Self {
+        self.inner.field_keystroke(script);
+        self
+    }
+
+    /// Attach a JavaScript format action (`/AA /F`) to the most-recently-added
+    /// form field. Called when the field value is formatted for display.
+    pub fn field_format(mut self, script: impl Into<String>) -> Self {
+        self.inner.field_format(script);
+        self
+    }
+
+    /// Attach a JavaScript validate action (`/AA /V`) to the most-recently-added
+    /// form field. Called when the user commits the field value.
+    pub fn field_validate(mut self, script: impl Into<String>) -> Self {
+        self.inner.field_validate(script);
+        self
+    }
+
+    /// Attach a JavaScript calculate action (`/AA /C`) to the most-recently-added
+    /// form field. Called when any field in the form changes.
+    pub fn field_calculate(mut self, script: impl Into<String>) -> Self {
+        self.inner.field_calculate(script);
+        self
+    }
+
+    /// Declare the page's tab-navigation order. `TabOrder::Row`
+    /// (default in modern readers), `TabOrder::Column`, or
+    /// `TabOrder::Structure` (requires tagged PDF — Bundle F).
+    /// Deferred until `done()` — the `/Tabs` key is emitted on the
+    /// page dict at build time. #393 Bundle D-4.
+    pub fn tab_order(mut self, order: TabOrder) -> Self {
+        self.inner.tab_order(order);
+        self
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Low-level graphics primitives (PdfWriter exposure)
+    //
+    // These emit `ContentElement::Path` directly, the same backing
+    // primitive DocumentBuilder already supports via `element()`. Kept
+    // as first-class fluent methods because "I want a rectangle" is
+    // common enough that forcing users through the lower-level
+    // `ContentElement::Path` builder is ergonomically bad across 6
+    // bindings.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Place a buffered `Table` at the current cursor position.
+    ///
+    /// This is the v0.3.39 buffered table surface — see research #393.
+    /// The table layout (column widths, row heights, cell positions, wrapped
+    /// cell text) is solved against the page's content width
+    /// (`page.width - 2 × 72pt`), the result is emitted as a sequence of
+    /// `ContentElement::Text` and `ContentElement::Path` via
+    /// `Table::to_content_elements`, and the cursor is advanced by the
+    /// table's total height.
+    ///
+    /// **Scope:** in-memory tables. Supports colspan / rowspan / rich cell
+    /// styling. Does **not** page-break — if the layout overflows the
+    /// current page the overflow is drawn past the bottom margin. For
+    /// 1000+ rows that cross page boundaries, use `streaming_table`
+    /// (lands in step 5/9).
+    ///
+    /// Font measurement uses the page-default font (`text_config.font`).
+    /// Per-cell font overrides honour the font name string in the cell but
+    /// are measured against the table default — good enough for v0.3.39.
+    /// Track: #400 v0.3.40 (mixed-font precise metrics).
+    pub fn table(mut self, table: Table) -> Self {
+        self.inner.table(table);
+        self
+    }
+
+    /// Draw a stroked rectangle with a caller-supplied `LineStyle`.
+    /// Unlike [`Self::rect`] (1pt black default), this exposes width and
+    /// colour. Used by the upcoming buffered `Table` surface for per-side
+    /// coloured / variable-thickness cell borders (#393 D-P1.3).
+    pub fn stroke_rect(mut self, x: f32, y: f32, w: f32, h: f32, style: LineStyle) -> Self {
+        self.inner.stroke_rect(x, y, w, h, style);
+        self
+    }
+
+    /// Draw a straight line with a caller-supplied `LineStyle`. Variable-
+    /// thickness / coloured rules — e.g. a 0.5pt grey rule between rows.
+    pub fn stroke_line(mut self, x1: f32, y1: f32, x2: f32, y2: f32, style: LineStyle) -> Self {
+        self.inner.stroke_line(x1, y1, x2, y2, style);
+        self
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Transforms (rotate / scale / translate + arbitrary 2D matrix)
+    //
+    // Applies to TextContent, PathContent (shapes + stroke primitives),
+    // and ImageContent elements emitted inside the closure. `TableContent`
+    // is **not yet** transformed — it's rendered via
+    // `Table::to_content_elements` whose inner elements already carry
+    // their own matrix field and compose naturally, but the
+    // Table-as-a-whole matrix remains a v0.3.40 item. Extended from
+    // text-only to cover paths + images in #393 Bundle A-2 follow-up.
+    // ───────────────────────────────────────────────────────────────────
+
+
+
+
+
+    // ───────────────────────────────────────────────────────────────────
+    // Image placement
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Embed an image at `rect` from a filesystem path. Supports JPEG
+    /// and PNG; format is detected from the bytes (not the extension).
+    /// PNG alpha channels become `/SMask` XObjects so transparent
+    /// images composite correctly.
+    ///
+    /// `rect.x` / `rect.y` use PDF's bottom-up coordinates (same
+    /// convention as the rest of the builder). `rect.width` /
+    /// `rect.height` are the on-page size in points — the image is
+    /// scaled to fit the rect without preserving aspect ratio; use
+    /// [`crate::writer::ImageData::fit_to_box`] before calling this
+    /// method if you need letterboxing.
+    pub fn image_from_file(mut self, path: impl AsRef<Path>, rect: Rect) -> Result<Self> {
+        self.inner.image_from_file(path, rect)?;
+        Ok(self)
+    }
+
+    /// Embed an image at `rect` from in-memory bytes. Auto-detects
+    /// JPEG / PNG by magic number.
+    pub fn image_from_bytes(mut self, bytes: &[u8], rect: Rect) -> Result<Self> {
+        self.inner.image_from_bytes(bytes, rect)?;
+        Ok(self)
+    }
+
+    /// Embed an image with alternative text for accessibility (PDF/UA-1 §7.1).
+    /// The image is wrapped in a `/Figure` structure element carrying `/Alt`
+    /// so assistive technology can describe it. Requires `tagged_pdf_ua1()` on
+    /// the `DocumentBuilder` for the alt text to be wired into the StructTree.
+    pub fn image_from_bytes_with_alt(
+        mut self,
+        bytes: &[u8],
+        rect: Rect,
+        alt_text: impl Into<String>,
+    ) -> Result<Self> {
+        self.inner.image_from_bytes_with_alt(bytes, rect, alt_text)?;
+        Ok(self)
+    }
+
+    /// Embed a decorative image marked as an `/Artifact` (PDF/UA-1 §7.1).
+    /// Assistive technology ignores artifact images; do not attach alt text.
+    pub fn image_from_bytes_as_artifact(mut self, bytes: &[u8], rect: Rect) -> Result<Self> {
+        self.inner.image_from_bytes_as_artifact(bytes, rect)?;
+        Ok(self)
+    }
+
+    /// Embed a pre-decoded image with alternative text (PDF/UA-1 §7.1).
+    pub fn image_with_alt(
+        mut self,
+        data: crate::writer::image_handler::ImageData,
+        rect: Rect,
+        alt_text: impl Into<String>,
+    ) -> Self {
+        self.inner.image_with_alt(data, rect, alt_text);
+        self
+    }
+
+    /// Embed a pre-decoded decorative image as an `/Artifact` (PDF/UA-1 §7.1).
+    pub fn image_with_artifact(
+        mut self,
+        data: crate::writer::image_handler::ImageData,
+        rect: Rect,
+    ) -> Self {
+        self.inner.image_with_artifact(data, rect);
+        self
+    }
+
+    /// Embed a pre-decoded [`crate::writer::ImageData`] at `rect`. Useful
+    /// when a caller has already loaded the image (e.g. for reuse across
+    /// multiple placements) and doesn't need the IO / parse step again.
+    pub fn image_with(mut self, data: crate::writer::image_handler::ImageData, rect: Rect) -> Self {
+        self.inner.image_with(data, rect);
+        self
+    }
+
+
+    /// Place a 1-D barcode (Code 128, EAN-13, QR, …) at `(x, y, w, h)`.
+    /// The barcode is rendered to PNG at the given pixel dimensions and
+    /// embedded as an image. `barcode_type` selects the symbology;
+    /// `data` is the content to encode.
+    pub fn barcode_1d(
+        mut self,
+        barcode_type: crate::writer::BarcodeType,
+        data: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> Result<Self> {
+        self.inner.barcode_1d(barcode_type, data, x, y, w, h)?;
+        Ok(self)
+    }
+
+    /// Place a QR code at `(x, y, size, size)` (square).
+    /// `data` is the content to encode (URL, text, etc.).
+    pub fn barcode_qr(mut self, data: &str, x: f32, y: f32, size: f32) -> Result<Self> {
+        self.inner.barcode_qr(data, x, y, size)?;
+        Ok(self)
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Shape primitives (circle / ellipse / polygon / arc / bezier_curve)
+    // ───────────────────────────────────────────────────────────────────
+    // Each primitive accepts an optional LineStyle (stroke) and optional
+    // fill colour. `None` for a style leaves that side of the paint
+    // undrawn (e.g. fill-only vs stroke-only). Shared helper
+    // `push_stroked_fill` applies both to a `PathContent`.
+
+    /// Draw a circle centred at `(cx, cy)` with `radius`. Pass
+    /// `stroke = Some(...)` for outlined, `fill = Some((r, g, b))` for
+    /// filled. Both together draw a stroked + filled disc.
+    pub fn circle(
+        mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        stroke: Option<LineStyle>,
+        fill: Option<(f32, f32, f32)>,
+    ) -> Self {
+        self.inner.circle(cx, cy, radius, stroke, fill);
+        self
+    }
+
+    /// Draw an ellipse centred at `(cx, cy)` with horizontal radius
+    /// `rx` and vertical radius `ry`. Same stroke/fill semantics as
+    /// [`Self::circle`].
+    pub fn ellipse(
+        mut self,
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        stroke: Option<LineStyle>,
+        fill: Option<(f32, f32, f32)>,
+    ) -> Self {
+        self.inner.ellipse(cx, cy, rx, ry, stroke, fill);
+        self
+    }
+
+    /// Draw a closed polygon through `points`. Requires at least 2
+    /// points — fewer is a no-op. Same stroke/fill semantics as
+    /// [`Self::circle`].
+    pub fn polygon(
+        mut self,
+        points: &[(f32, f32)],
+        stroke: Option<LineStyle>,
+        fill: Option<(f32, f32, f32)>,
+    ) -> Self {
+        self.inner.polygon(points, stroke, fill);
+        self
+    }
+
+    /// Draw a circular arc centred at `(cx, cy)` with `radius`, from
+    /// `start_angle` to `end_angle` (radians, anticlockwise). Only
+    /// stroke; arcs are not filled. Approximated by up to 4 cubic
+    /// Beziers (one per quadrant), matching the accuracy of the
+    /// [`Self::circle`] primitive.
+    pub fn arc(
+        mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        stroke: LineStyle,
+    ) -> Self {
+        self.inner.arc(cx, cy, radius, start_angle, end_angle, stroke);
+        self
+    }
+
+    /// Draw a single cubic Bezier curve from `(x0, y0)` to `(x3, y3)`
+    /// with control points `(c1x, c1y)` and `(c2x, c2y)`. Stroke only
+    /// by default; pass `Some((r, g, b))` for fill.
+    pub fn bezier_curve(
+        mut self,
+        x0: f32,
+        y0: f32,
+        c1x: f32,
+        c1y: f32,
+        c2x: f32,
+        c2y: f32,
+        x3: f32,
+        y3: f32,
+        stroke: LineStyle,
+        fill: Option<(f32, f32, f32)>,
+    ) -> Self {
+        self.inner.bezier_curve(x0, y0, c1x, c1y, c2x, c2y, x3, y3, stroke, fill);
+        self
+    }
+
+
+    /// Draw a stroked rectangle outline at `(x, y)` with size `w × h`
+    /// using the default 1pt black stroke. For a filled rectangle with
+    /// a custom colour, see [`Self::filled_rect`].
+    pub fn rect(mut self, x: f32, y: f32, w: f32, h: f32) -> Self {
+        self.inner.rect(x, y, w, h);
+        self
+    }
+
+    /// Draw a filled rectangle at `(x, y)` with size `w × h` in the
+    /// given RGB colour (channels in `0.0..=1.0`). No outline.
+    pub fn filled_rect(mut self, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32) -> Self {
+        self.inner.filled_rect(x, y, w, h, r, g, b);
+        self
+    }
+
+    /// Draw a straight line from `(x1, y1)` to `(x2, y2)` with the
+    /// default 1pt black stroke.
+    pub fn line(mut self, x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        self.inner.line(x1, y1, x2, y2);
+        self
+    }
+
+    /// Finish the current page and start a new one with the **same page
+    /// size**. The builder's `text_config` (font, size, alignment,
+    /// line-height multiplier) carries over; cursor resets to the same
+    /// top-left origin the current page started at.
+    ///
+    /// Pending annotations and form fields on the current page are
+    /// committed before the new page is opened. Does not re-draw any
+    /// header / footer — callers that want header-repeat-on-break (tables,
+    /// long documents) must redraw explicitly.
+    pub fn new_page_same_size(mut self) -> FluentPageBuilder<'a> {
+        self.inner.new_page_same_size();
+        self
+    }
+
+    /// In-place page break: same semantics as `new_page_same_size` but
+    /// mutates `self` rather than consuming it. Used by `StreamingTable`
+    /// (which borrows its `FluentPageBuilder` and can't consume).
+    pub(crate) fn new_page_same_size_inplace(&mut self) {
+        self.inner.new_page_same_size_inplace();
+    }
+
+    /// Open a streaming table that consumes this page builder. See
+    /// [`super::streaming_table::StreamingTable`] for the full API and
+    /// [issue #393](https://github.com/yfedoseev/pdf_oxide/issues/393)
+    /// for design rationale.
+    pub fn streaming_table(
+        self,
+        config: super::streaming_table::StreamingTableConfig,
+    ) -> super::streaming_table::StreamingTable<'a> {
+        super::streaming_table::StreamingTable::open(self, config)
+    }
+
+    /// Evaluate `f` inside a scope where every text element is drawn
+    /// under the 2D affine transform `matrix` (PDF convention:
+    /// `[a b c d e f]`, applied as `(x' y') = (x y) · M`). The transform
+    /// composes with any outer transform; on exit, the outer transform
+    /// is restored.
+    ///
+    /// ```no_run
+    /// # use pdf_oxide::writer::DocumentBuilder;
+    /// # let mut doc = DocumentBuilder::new();
+    /// # let page = doc.letter_page();
+    /// let page = page.with_transform([1.0, 0.0, 0.0, 1.0, 50.0, 50.0], |p| {
+    ///     p.at(0.0, 0.0).text("drawn at page (50, 50)")
+    /// });
+    /// ```
+    pub fn with_transform<F>(mut self, matrix: [f32; 6], f: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        let outer = self.inner.push_transform(matrix);
+        let mut page = f(self);
+        page.inner.state_mut().current_matrix = outer;
+        page
+    }
+
+    /// Evaluate `f` in a scope where text is rotated by `degrees` about
+    /// the origin. To rotate about a point `(cx, cy)`, compose with
+    /// `.translated(cx, cy, |p| p.rotated(deg, |p| p.translated(-cx, -cy, f)))`.
+    pub fn rotated<F>(self, degrees: f32, f: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        let r = degrees.to_radians();
+        let (c, s) = (r.cos(), r.sin());
+        // PDF matrix row order: [a b c d e f] = [cos sin -sin cos 0 0]
+        self.with_transform([c, s, -s, c, 0.0, 0.0], f)
+    }
+
+    /// Evaluate `f` scaled by `(sx, sy)` about the origin.
+    pub fn scaled<F>(self, sx: f32, sy: f32, f: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        self.with_transform([sx, 0.0, 0.0, sy, 0.0, 0.0], f)
+    }
+
+    /// Evaluate `f` translated by `(tx, ty)`.
+    pub fn translated<F>(self, tx: f32, ty: f32, f: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        self.with_transform([1.0, 0.0, 0.0, 1.0, tx, ty], f)
+    }
+
     /// Finish building this page and return to the document builder.
-    pub fn done(mut self) -> &'a mut DocumentBuilder {
-        // Move pending annotations to page data
-        let page = &mut self.builder.pages[self.page_index];
-        page.annotations.append(&mut self.pending_annotations);
-        if let Some(order) = self.pending_tab_order {
-            page.tab_order = Some(order);
-        }
-        self.builder
+    pub fn done(self) -> &'a mut DocumentBuilder {
+        self.inner.builder.pages[self.inner.page_index].commit_pending();
+        self.inner.builder
     }
 }
 
@@ -2666,6 +3470,34 @@ struct PageData {
     /// `(ref_mark, note_text)`. Emitted as a separator + Note elements
     /// at the bottom of the page in `DocumentBuilder::build`.
     pending_footnotes: Vec<(String, String)>,
+    state: PageState,
+}
+
+impl PageData {
+    fn new(width: f32, height: f32) -> Self {
+        Self {
+            width,
+            height,
+            elements: Vec::new(),
+            annotations: Vec::new(),
+            form_fields: Vec::new(),
+            form_field_meta: Vec::new(),
+            tab_order: None,
+            page_open_script: None,
+            page_close_script: None,
+            pending_footnotes: Vec::new(),
+            state: PageState::new(height),
+        }
+    }
+
+    /// Move the annotations and the tab order the page builder deferred
+    /// onto the page.
+    fn commit_pending(&mut self) {
+        self.annotations.append(&mut self.state.pending_annotations);
+        if let Some(order) = self.state.pending_tab_order {
+            self.tab_order = Some(order);
+        }
+    }
 }
 
 /// High-level document builder with fluent API.
@@ -2710,6 +3542,10 @@ pub struct DocumentBuilder {
     /// FlateDecode-compress emitted page content streams. Default: false.
     /// Enable for size-sensitive output (long documents → 5-10× smaller PDFs).
     compress_streams: bool,
+    // ── pdf_manipulator patch ──
+    /// Page opened by [`DocumentBuilder::begin_page`] and not yet ended.
+    current_page: Option<usize>,
+    // ── end pdf_manipulator patch ──
 }
 
 impl DocumentBuilder {
@@ -2717,6 +3553,7 @@ impl DocumentBuilder {
     pub fn new() -> Self {
         Self {
             metadata: DocumentMetadata::default(),
+            current_page: None,
             pages: Vec::new(),
             template: None,
             embedded_fonts: Vec::new(),
@@ -2795,60 +3632,44 @@ impl DocumentBuilder {
         // Clamp insert position to current page count — beyond that,
         // append at the end (no panic).
         let insert_pos = insert_at.min(builder.pages.len());
-        builder.pages.insert(
-            insert_pos,
-            PageData {
-                width,
-                height,
-                elements: Vec::new(),
-                annotations: Vec::new(),
-                form_fields: Vec::new(),
-                form_field_meta: Vec::new(),
-                tab_order: None,
-                page_open_script: None,
-                page_close_script: None,
-                pending_footnotes: Vec::new(),
-            },
-        );
+        builder
+            .pages
+            .insert(insert_pos, PageData::new(width, height));
+        if let Some(current) = builder.current_page.as_mut() {
+            if *current >= insert_pos {
+                *current += 1;
+            }
+        }
 
         // Now render directly into that page via a scratch
         // FluentPageBuilder. We can't use `page()` because it appends;
         // instead borrow a fresh builder pointing at `insert_pos`.
         {
-            let mut page = FluentPageBuilder {
+            let mut page = PageBuilder {
                 builder: &mut builder,
                 page_index: insert_pos,
-                cursor_x: 72.0,
-                cursor_y: height - 72.0,
-                text_config: TextConfig::default(),
-                text_layout: TextLayout::new(),
-                last_text_rect: None,
-                pending_annotations: Vec::new(),
-                current_matrix: None,
-                pending_tab_order: None,
             };
 
             // Title: bold + larger.
-            page = page.font("Helvetica-Bold", 18.0).text(&title_str);
-            page = page.space(12.0);
-            page = page.font("Helvetica", 11.0);
+            page.font("Helvetica-Bold", 18.0).text(&title_str);
+            page.space(12.0);
+            page.font("Helvetica", 11.0);
 
             let page_w = width - 144.0; // 1-inch margins each side
             for (depth, t, target_page) in entries {
                 let indent = 72.0 + (depth as f32) * 16.0;
                 // Title
-                let line_y = page.cursor_y;
-                page = page.at(indent, line_y).text(&t);
+                let line_y = page.cursor_y();
+                page.at(indent, line_y).text(&t);
                 // Right-aligned page number (1-based for user display).
                 let num = (target_page + 1).to_string();
                 let num_w = page.measure(&num);
                 let num_x = (width - 72.0) - num_w;
-                page = page.at(num_x, line_y).text(&num);
+                page.at(num_x, line_y).text(&num);
             }
             let _ = page_w;
-
-            page.done();
         }
+        builder.pages[insert_pos].commit_pending();
 
         builder
     }
@@ -3029,31 +3850,61 @@ impl DocumentBuilder {
     pub fn page(&mut self, size: PageSize) -> FluentPageBuilder<'_> {
         let (width, height) = size.dimensions();
         let page_index = self.pages.len();
-        self.pages.push(PageData {
-            width,
-            height,
-            elements: Vec::new(),
-            annotations: Vec::new(),
-            form_fields: Vec::new(),
-            form_field_meta: Vec::new(),
-            tab_order: None,
-            page_open_script: None,
-            page_close_script: None,
-            pending_footnotes: Vec::new(),
-        });
+        self.pages.push(PageData::new(width, height));
         FluentPageBuilder {
-            builder: self,
-            page_index,
-            cursor_x: 72.0,          // 1 inch margin
-            cursor_y: height - 72.0, // Start from top with 1 inch margin
-            text_config: TextConfig::default(),
-            text_layout: TextLayout::new(),
-            last_text_rect: None,
-            pending_annotations: Vec::new(),
-            current_matrix: None,
-            pending_tab_order: None,
+            inner: PageBuilder {
+                builder: self,
+                page_index,
+            },
         }
     }
+
+    // ── pdf_manipulator patch ── immediate page building for a host that
+    // holds the builder across calls: pages are begun, built through
+    // `page_mut` and ended without a borrow outliving the call.
+    /// Append a page of `size` and make it the current page. The previous
+    /// current page is ended first.
+    pub fn begin_page(&mut self, size: PageSize) -> usize {
+        self.end_page();
+        let (width, height) = size.dimensions();
+        self.pages.push(PageData::new(width, height));
+        let index = self.pages.len() - 1;
+        self.current_page = Some(index);
+        index
+    }
+
+    /// Commit the current page's pending annotations and tab order and
+    /// clear the current page.
+    pub fn end_page(&mut self) {
+        if let Some(index) = self.current_page.take() {
+            self.pages[index].commit_pending();
+        }
+    }
+
+    /// Index of the page `begin_page` opened and `end_page` has not closed.
+    pub fn current_page_index(&self) -> Option<usize> {
+        self.current_page
+    }
+
+    /// Build page `index` in place. Panics when `index` is out of range.
+    pub fn page_mut(&mut self, index: usize) -> PageBuilder<'_> {
+        assert!(index < self.pages.len(), "page index {index} out of range");
+        PageBuilder {
+            builder: self,
+            page_index: index,
+        }
+    }
+
+    /// Whether page `index` holds a form field a field script can attach to.
+    pub fn page_has_form_field(&self, index: usize) -> bool {
+        !self.pages[index].form_field_meta.is_empty()
+    }
+
+    /// Whether page `index` holds text a link or text markup can attach to.
+    pub fn page_has_text(&self, index: usize) -> bool {
+        self.pages[index].state.last_text_rect.is_some()
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Add a Letter-sized page.
     pub fn letter_page(&mut self) -> FluentPageBuilder<'_> {
@@ -3887,7 +4738,9 @@ mod tests {
 
         let mut doc = DocumentBuilder::new();
         let page = doc.letter_page().font("Helvetica", 12.0);
-        let cursor_before = page.cursor_y;
+        // ── pdf_manipulator patch ── the cursor is behind an accessor now.
+        let cursor_before = page.cursor_y();
+        // ── end pdf_manipulator patch ──
 
         let table = RenderTable::new(vec![
             vec![
@@ -3901,7 +4754,9 @@ mod tests {
         .with_column_widths(vec![ColumnWidth::Fixed(200.0), ColumnWidth::Fixed(200.0)]);
 
         let page = page.table(table);
-        let cursor_after = page.cursor_y;
+        // ── pdf_manipulator patch ── the cursor is behind an accessor now.
+        let cursor_after = page.cursor_y();
+        // ── end pdf_manipulator patch ──
         page.done();
 
         // Cursor advanced downward by at least one row's worth of height.
@@ -4250,7 +5105,9 @@ mod tests {
         let mut doc = DocumentBuilder::new();
         let before_y = {
             let p = doc.letter_page().at(72.0, 720.0);
-            let y = p.cursor_y;
+            // ── pdf_manipulator patch ── the cursor is behind an accessor now.
+            let y = p.cursor_y();
+            // ── end pdf_manipulator patch ──
             p.code_block("rust", "fn main() {\n    println!(\"hi\");\n}\n")
                 .done();
             y

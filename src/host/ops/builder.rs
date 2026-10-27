@@ -7,7 +7,7 @@ use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{ok_flag, read_all_from_reader, req_handle};
 
-use crate::writer::PageSize;
+use crate::writer::{DocumentBuilder, PageSize};
 
 op_unit!(CREATE, "builderCreate", pdf_op_builder_create_anchor, |ctx| {
     handle_builder_create(ctx.state)
@@ -16,7 +16,6 @@ op_unit!(CREATE, "builderCreate", pdf_op_builder_create_anchor, |ctx| {
 op_unit!(DISPOSE, "builderDispose", pdf_op_builder_dispose_anchor, |ctx| {
     let hid = req_handle(ctx.req);
     ctx.state.builders.remove(&hid);
-    ctx.state.page_ops.remove(&hid);
     ok_flag("disposed")
 });
 
@@ -44,11 +43,10 @@ op_unit!(
     "builderPageDone",
     pdf_op_builder_page_done_anchor,
     |ctx| {
-        ctx.state
-            .page_ops
-            .entry(req_handle(ctx.req))
-            .or_default()
-            .push(dispatch::PageOp::Done);
+        let Some(builder) = ctx.state.builders.get_mut(&req_handle(ctx.req)) else {
+            return ResponseWriter::error("builder not found");
+        };
+        builder.end_page();
         ok_flag("done")
     }
 );
@@ -97,12 +95,10 @@ fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> 
             req.get_f64("height").unwrap_or(842.0) as f32,
         ),
     };
-    let (pw, ph) = size.dimensions();
-    state
-        .page_ops
-        .entry(req_handle(req))
-        .or_default()
-        .push(dispatch::PageOp::NewPage { width: pw, height: ph });
+    let Some(builder) = state.builders.get_mut(&req_handle(req)) else {
+        return ResponseWriter::error("builder not found");
+    };
+    builder.begin_page(size);
     ok_flag("added")
 }
 
@@ -471,19 +467,16 @@ fn handle_builder_page_op(
         }
     };
 
-    if let Some(msg) = refuse_unattached(
-        state.page_ops.get(&hid).map(Vec::as_slice).unwrap_or(&[]),
-        &op,
-    ) {
+    let Some(builder) = state.builders.get_mut(&hid) else {
+        return ResponseWriter::error("builder not found");
+    };
+    if let Some(msg) = refuse_unattached(builder, &op) {
         return ResponseWriter::error_kind(ErrorKind::InvalidArgument, msg);
     }
 
-    state.page_ops
-        .entry(hid)
-        .or_default()
-        .push(op);
+    dispatch::apply_page_op(builder, op);
 
-    ok_flag("buffered")
+    ok_flag("applied")
 }
 
 fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
@@ -495,11 +488,8 @@ fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Op
     };
 
     let compress = req.get_bool("compress").unwrap_or(true);
-    let ops = state.page_ops.remove(&hid).unwrap_or_default();
     let mut builder = builder.compress_streams(compress);
-    if !ops.is_empty() {
-        dispatch::replay_page_ops(&mut builder, PageSize::A4, ops);
-    }
+    builder.end_page();
 
     if let Some(mut writer) = sink_writer {
         match dispatch::builder_save_to_writer(builder, &mut writer) {
@@ -607,18 +597,12 @@ fn parse_stamp_name(name: &str) -> crate::writer::StampType {
     }
 }
 
-/// Refuse a field-script or link op queued with nothing on its page to
-/// attach to. The engine drops such calls silently — a field script needs
-/// a `form_field_meta` entry, a link a `last_text_rect` — so the host
-/// refuses at queue time instead of reporting success over an op that
-/// never lands. `queued` is this handle's ops already buffered; the scan
-/// walks back to the most recent page start (`NewPage`, `NewPageSameSize`,
-/// `Done`), which resets both the page's form fields and its last text
-/// rect.
-fn refuse_unattached(
-    queued: &[dispatch::PageOp],
-    op: &dispatch::PageOp,
-) -> Option<&'static str> {
+/// Refuse a field-script or link op with nothing on the builder's current
+/// page to attach to. The engine drops such calls silently — a field script
+/// needs a `form_field_meta` entry, a link a `last_text_rect` — so the host
+/// refuses instead of reporting success over an op that never lands. With
+/// no current page there is nothing to attach to either.
+fn refuse_unattached(builder: &DocumentBuilder, op: &dispatch::PageOp) -> Option<&'static str> {
     use dispatch::PageOp;
     let unattached = match op {
         PageOp::FieldKeystroke(_) => "fieldKeystroke needs a form field on this page first",
@@ -642,26 +626,14 @@ fn refuse_unattached(
             | PageOp::FieldValidate(_)
             | PageOp::FieldCalculate(_)
     );
-    let mut has_field = false;
-    let mut has_text = false;
-    for queued_op in queued.iter().rev() {
-        match queued_op {
-            PageOp::NewPage { .. } | PageOp::NewPageSameSize | PageOp::Done => break,
-            PageOp::TextField { .. }
-            | PageOp::Checkbox { .. }
-            | PageOp::ComboBox { .. }
-            | PageOp::PushButton { .. }
-            | PageOp::SignatureField { .. }
-            | PageOp::RadioGroup { .. } => has_field = true,
-            PageOp::Text(_) | PageOp::Heading(_, _) => has_text = true,
-            // Inline runs and rect-wrapped text set the same
-            // `last_text_rect` as `.text()` does in the engine.
-            PageOp::Inline(_) | PageOp::InlineBold(_) | PageOp::InlineItalic(_) => has_text = true,
-            PageOp::InlineColor { .. } | PageOp::TextInRect { .. } => has_text = true,
-            _ => {}
+    let attached = builder.current_page_index().is_some_and(|page| {
+        if wants_field {
+            builder.page_has_form_field(page)
+        } else {
+            builder.page_has_text(page)
         }
-    }
-    if (wants_field && !has_field) || (!wants_field && !has_text) {
+    });
+    if !attached {
         Some(unattached)
     } else {
         None
@@ -670,8 +642,17 @@ fn refuse_unattached(
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_unattached;
-    use crate::host::dispatch::PageOp;
+    use crate::host::dispatch::{apply_page_op, PageOp};
+    use crate::writer::DocumentBuilder;
+
+    /// `op`'s refusal on a real builder after `queued` was applied to it.
+    fn refuse_unattached(queued: &[PageOp], op: &PageOp) -> Option<&'static str> {
+        let mut builder = DocumentBuilder::new();
+        for queued_op in queued {
+            apply_page_op(&mut builder, queued_op.clone());
+        }
+        super::refuse_unattached(&builder, op)
+    }
 
     fn text_field() -> PageOp {
         PageOp::TextField {
@@ -842,5 +823,145 @@ mod tests {
             refuse_unattached(&queued, &PageOp::LinkUrl("https://example.com".into())),
             Some("linkUrl needs text on this page first")
         );
+    }
+
+    #[test]
+    fn script_on_a_page_with_text_but_no_field_is_refused() {
+        let queued = vec![PageOp::Text("hello".into())];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::FieldKeystroke("s".into())),
+            Some("fieldKeystroke needs a form field on this page first")
+        );
+    }
+
+    #[test]
+    fn link_on_a_page_with_a_field_but_no_text_is_refused() {
+        let queued = vec![text_field()];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::LinkUrl("https://example.com".into())),
+            Some("linkUrl needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn script_after_ending_the_page_is_refused() {
+        let mut builder = DocumentBuilder::new();
+        apply_page_op(&mut builder, text_field());
+        builder.end_page();
+        assert_eq!(
+            super::refuse_unattached(&builder, &PageOp::FieldFormat("s".into())),
+            Some("fieldFormat needs a form field on this page first")
+        );
+    }
+
+    #[test]
+    fn a_page_op_after_ending_the_page_opens_a_new_page() {
+        let mut builder = DocumentBuilder::new();
+        apply_page_op(&mut builder, PageOp::Text("one".into()));
+        builder.end_page();
+        apply_page_op(&mut builder, PageOp::Text("two".into()));
+        assert_eq!(builder.current_page_index(), Some(1));
+    }
+
+    #[test]
+    fn new_page_same_size_keeps_the_size_and_clears_text_and_fields() {
+        let mut builder = DocumentBuilder::new();
+        builder.begin_page(crate::writer::PageSize::Custom(300.0, 400.0));
+        apply_page_op(&mut builder, text_field());
+        apply_page_op(&mut builder, PageOp::Text("hello".into()));
+        apply_page_op(&mut builder, PageOp::NewPageSameSize);
+        assert_eq!(builder.current_page_index(), Some(1));
+        assert_eq!(builder.page_mut(1).page_dimensions(), (300.0, 400.0));
+        assert!(!builder.page_has_text(1));
+        assert!(!builder.page_has_form_field(1));
+        assert_eq!(
+            super::refuse_unattached(&builder, &PageOp::LinkUrl("https://example.com".into())),
+            Some("linkUrl needs text on this page first")
+        );
+    }
+
+    /// A document's objects with their numbers and references masked, in
+    /// sorted order: the writer numbers objects in hash-map order, so two
+    /// builds of one document differ in numbering and order alone.
+    fn canonical(pdf: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(pdf);
+        let mut objects: Vec<&str> = text.split("endobj").collect();
+        objects.pop(); // the trailer after the last object
+        let mut masked: Vec<String> = objects
+            .into_iter()
+            .map(|object| {
+                let body = object.split_once("obj").map_or(object, |(_, rest)| rest);
+                let tokens: Vec<&str> = body.split_whitespace().collect();
+                let mut out = Vec::with_capacity(tokens.len());
+                let mut i = 0;
+                while i < tokens.len() {
+                    let is_ref = i + 2 < tokens.len()
+                        && tokens[i].parse::<u32>().is_ok()
+                        && tokens[i + 1] == "0"
+                        && tokens[i + 2].starts_with('R');
+                    if is_ref {
+                        out.push(format!("R{}", &tokens[i + 2][1..]));
+                        i += 3;
+                    } else {
+                        out.push(tokens[i].to_string());
+                        i += 1;
+                    }
+                }
+                out.join(" ")
+            })
+            .collect();
+        masked.sort();
+        masked
+    }
+
+    /// One page built through the wrapper chain and through in-place calls
+    /// is the same document.
+    #[test]
+    fn page_builder_matches_the_fluent_chain() {
+        use crate::geometry::Rect;
+        use crate::writer::{PageSize, TextAlign};
+        let rect = Rect::new(72.0, 560.0, 200.0, 40.0);
+        let long = "Words that wrap across the page and run past its bottom margin. ".repeat(40);
+
+        let mut chained = DocumentBuilder::new().title("golden");
+        chained
+            .page(PageSize::Letter)
+            .font("Helvetica", 12.0)
+            .at(72.0, 700.0)
+            .heading(1, "Title")
+            .text("see")
+            .link_url("https://example.com")
+            .paragraph(&long)
+            .text_field("name", 72.0, 500.0, 150.0, 20.0, None)
+            .required()
+            .field_keystroke("AFNumber_Keystroke(2)")
+            .text_in_rect(rect, "boxed", TextAlign::Center)
+            .highlight((1.0, 1.0, 0.0))
+            .sticky_note("note")
+            .new_page_same_size()
+            .text("second")
+            .done();
+
+        let mut placed = DocumentBuilder::new().title("golden");
+        let index = placed.begin_page(PageSize::Letter);
+        placed
+            .page_mut(index)
+            .font("Helvetica", 12.0)
+            .at(72.0, 700.0)
+            .heading(1, "Title")
+            .text("see")
+            .link_url("https://example.com")
+            .paragraph(&long)
+            .text_field("name", 72.0, 500.0, 150.0, 20.0, None)
+            .required()
+            .field_keystroke("AFNumber_Keystroke(2)")
+            .text_in_rect(rect, "boxed", TextAlign::Center)
+            .highlight((1.0, 1.0, 0.0))
+            .sticky_note("note")
+            .new_page_same_size()
+            .text("second");
+        placed.end_page();
+
+        assert_eq!(canonical(&chained.build().unwrap()), canonical(&placed.build().unwrap()));
     }
 }

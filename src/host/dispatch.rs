@@ -2167,7 +2167,8 @@ fn stamp_type_from_int(i: i32) -> crate::writer::StampType {
 
 use crate::writer::{DocumentBuilder, FluentPageBuilder, PageSize};
 
-/// A buffered page-building operation replayed by [`replay_page_ops`].
+/// A parsed page-building operation, applied by [`apply_page_op`].
+#[derive(Clone)]
 pub enum PageOp {
     /// Set the current font by name and size.
     Font(String, f32),
@@ -2528,219 +2529,198 @@ pub enum PageOp {
     },
     /// Start a new page with the same dimensions as the current one.
     NewPageSameSize,
-    /// Start a new page with custom dimensions.
-    NewPage {
-        /// Page width in points.
-        width: f32,
-        /// Page height in points.
-        height: f32,
-    },
-    /// Finalize the current page.
-    Done,
 }
 
-/// Replay a sequence of buffered page operations onto a builder.
-pub fn replay_page_ops(builder: &mut DocumentBuilder, default_size: PageSize, ops: Vec<PageOp>) {
-    let mut current_page: Option<FluentPageBuilder<'_>> = None;
-
-    for op in ops {
-        match op {
-            PageOp::NewPage { width, height } => {
-                if let Some(p) = current_page.take() { p.done(); }
-                current_page = Some(builder.page(PageSize::Custom(width, height)));
-            }
-            PageOp::Done => {
-                if let Some(p) = current_page.take() { p.done(); }
-            }
-            other => {
-                let page = match current_page.take() {
-                    Some(p) => p,
-                    None => builder.page(default_size),
-                };
-                current_page = Some(match other {
-                    PageOp::Font(ref name, sz) => page.font(name, sz),
-                    PageOp::At(x, y) => page.at(x, y),
-                    PageOp::Text(ref text) => page.text(text),
-                    PageOp::Heading(level, ref text) => page.heading(level, text),
-                    PageOp::Paragraph(ref text) => page.paragraph(text),
-                    PageOp::Space(pts) => page.space(pts),
-                    PageOp::HorizontalRule => page.horizontal_rule(),
-                    PageOp::Image { data, x, y, w, h, alt } => {
-                        match crate::writer::ImageData::from_bytes(&data) {
-                            // `Rect::new` takes (x, y, width, height): the far
-                            // corner here scaled every image by its own origin.
-                            Ok(img) => page.image_with_alt(img, crate::geometry::Rect::new(x, y, w, h), &alt),
-                            Err(_) => page, // skip — image data unparseable
-                        }
-                    }
-                    PageOp::Watermark(text) => page.watermark(&text),
-                    PageOp::TextField { name, x, y, w, h, default_value } => page.text_field(name, x, y, w, h, default_value),
-                    PageOp::Checkbox { name, x, y, w, h, checked } => page.checkbox(&name, x, y, w, h, checked),
-                    PageOp::ComboBox { name, x, y, w, h, options, selected } => page.combo_box(name, x, y, w, h, options, selected),
-                    PageOp::PushButton { name, x, y, w, h, caption } => page.push_button(&name, x, y, w, h, &caption),
-                    PageOp::SignatureField { name, x, y, w, h } => page.signature_field(&name, x, y, w, h),
-                    PageOp::RadioGroup { name, values, xs, ys, ws, hs, selected } => {
-                        let buttons: Vec<(String, f32, f32, f32, f32)> = values.into_iter()
-                            .zip(xs).zip(ys).zip(ws).zip(hs)
-                            .map(|((((v, x), y), w), h)| (v, x, y, w, h))
-                            .collect();
-                        page.radio_group(name, buttons, selected)
-                    }
-                    PageOp::FieldKeystroke(script) => page.field_keystroke(script),
-                    PageOp::FieldFormat(script) => page.field_format(script),
-                    PageOp::FieldValidate(script) => page.field_validate(script),
-                    PageOp::FieldCalculate(script) => page.field_calculate(script),
-                    PageOp::LinkUrl(url) => page.link_url(&url),
-                    PageOp::LinkPage(target) => page.link_page(target),
-                    PageOp::Footnote { ref_mark, note_text } => page.footnote(&ref_mark, &note_text),
-                    PageOp::Columns { column_count, gap_pt, text } => page.columns(column_count, gap_pt, &text),
-                    PageOp::Inline(ref text) => page.inline(text),
-                    PageOp::InlineBold(ref text) => page.inline_bold(text),
-                    PageOp::InlineItalic(ref text) => page.inline_italic(text),
-                    PageOp::InlineColor { r, g, b, ref text } => page.inline_color(r, g, b, text),
-                    PageOp::TextInRect { x, y, w, h, ref text, align } => page.text_in_rect(
-                        crate::geometry::Rect::new(x, y, w, h),
-                        text,
-                        align,
-                    ),
-                    PageOp::Rect(x, y, w, h) => page.rect(x, y, w, h),
-                    PageOp::FilledRect(x, y, w, h, r, g, b) => page.filled_rect(x, y, w, h, r, g, b),
-                    PageOp::Line(x1, y1, x2, y2) => page.line(x1, y1, x2, y2),
-                    PageOp::StrokeRect { x, y, w, h, width, r, g, b } => {
-                        page.stroke_rect(x, y, w, h, crate::writer::LineStyle::new(width, r, g, b))
-                    }
-                    PageOp::StrokeRectDashed { x, y, w, h, width, r, g, b, dash, phase } => page
-                        .stroke_rect(
-                            x,
-                            y,
-                            w,
-                            h,
-                            crate::writer::LineStyle::new(width, r, g, b).with_dash(&dash, phase),
-                        ),
-                    PageOp::StrokeLine { x1, y1, x2, y2, width, r, g, b } => page.stroke_line(
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        crate::writer::LineStyle::new(width, r, g, b),
-                    ),
-                    PageOp::StrokeLineDashed { x1, y1, x2, y2, width, r, g, b, dash, phase } => page
-                        .stroke_line(
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                            crate::writer::LineStyle::new(width, r, g, b).with_dash(&dash, phase),
-                        ),
-                    PageOp::Highlight(r, g, b) => page.highlight((r, g, b)),
-                    PageOp::Underline(r, g, b) => page.underline((r, g, b)),
-                    PageOp::Strikeout(r, g, b) => page.strikeout((r, g, b)),
-                    PageOp::Squiggly(r, g, b) => page.squiggly((r, g, b)),
-                    PageOp::StickyNote(ref text) => page.sticky_note(text),
-                    PageOp::StickyNoteAt(x, y, ref text) => page.sticky_note_at(x, y, text),
-                    PageOp::Stamp(stamp_type) => page.stamp(stamp_type),
-                    PageOp::FreeText { x, y, w, h, ref text } => page.freetext(
-                        crate::geometry::Rect::new(x, y, w, h),
-                        text,
-                    ),
-                    PageOp::WatermarkConfidential => page.watermark_confidential(),
-                    PageOp::WatermarkDraft => page.watermark_draft(),
-                    PageOp::LinkNamed(ref dest) => page.link_named(dest),
-                    PageOp::LinkJavaScript(ref script) => page.link_javascript(script),
-                    PageOp::OnOpen(ref script) => page.on_open(script),
-                    PageOp::OnClose(ref script) => page.on_close(script),
-                    PageOp::ImageArtifact { data, x, y, w, h } => {
-                        match crate::writer::ImageData::from_bytes(&data) {
-                            Ok(img) => page
-                                .image_with_artifact(img, crate::geometry::Rect::new(x, y, w, h)),
-                            Err(_) => page, // skip — image data unparseable
-                        }
-                    }
-                    PageOp::BufferedTable { ref columns, ref rows, has_header } => {
-                        // Same construction as the WASM binding's replay:
-                        // text cells, a bold header row when hasHeader, and
-                        // per-column widths and alignments.
-                        let cell_rows: Vec<Vec<crate::writer::TableCell>> = rows
-                            .iter()
-                            .map(|r| r.iter().map(|c| crate::writer::TableCell::text(c.clone())).collect())
-                            .collect();
-                        let cell_rows = if has_header {
-                            let header: Vec<crate::writer::TableCell> = columns
-                                .iter()
-                                .map(|(h, _, _)| crate::writer::TableCell::text(h.clone()).bold())
-                                .collect();
-                            let mut out = Vec::with_capacity(cell_rows.len() + 1);
-                            out.push(header);
-                            out.extend(cell_rows);
-                            out
-                        } else {
-                            cell_rows
-                        };
-                        let mut table = crate::writer::Table::new(cell_rows);
-                        if has_header {
-                            table = table.with_header_row();
-                        }
-                        let widths: Vec<crate::writer::ColumnWidth> = columns
-                            .iter()
-                            .map(|(_, w, _)| match w {
-                                Some(pt) => crate::writer::ColumnWidth::Fixed(*pt),
-                                None => crate::writer::ColumnWidth::Auto,
-                            })
-                            .collect();
-                        let aligns: Vec<crate::writer::CellAlign> =
-                            columns.iter().map(|(_, _, a)| *a).collect();
-                        table = table.with_column_widths(widths).with_column_aligns(aligns);
-                        page.table(table)
-                    }
-                    PageOp::StreamingTableBlock {
-                        ref config_columns,
-                        repeat_header,
-                        ref rows,
-                        ref mode,
-                        sample_rows,
-                        min_col_width_pt,
-                        max_col_width_pt,
-                        max_rowspan,
-                    } => {
-                        let mut cfg = crate::writer::StreamingTableConfig::new()
-                            .repeat_header(repeat_header)
-                            .max_rowspan(max_rowspan);
-                        cfg = match mode.as_str() {
-                            "sample" => {
-                                cfg.mode_sample(sample_rows, min_col_width_pt, max_col_width_pt)
-                            },
-                            "auto_all" => cfg.mode_auto_all(),
-                            _ => cfg.mode_fixed(),
-                        };
-                        for (header, width, align) in config_columns {
-                            cfg = cfg.column(
-                                crate::writer::StreamingColumn::new(header.clone())
-                                    .width_pt(*width)
-                                    .align(*align),
-                            );
-                        }
-                        let mut t = page.streaming_table(cfg);
-                        for row in rows {
-                            let _ = t.push_row(|r| {
-                                for (text, span) in row {
-                                    if *span > 1 {
-                                        r.span_cell(text.as_str(), *span);
-                                    } else {
-                                        r.cell(text.as_str());
-                                    }
-                                }
-                            });
-                        }
-                        t.finish()
-                    }
-                    PageOp::Newline => page.newline(),
-                    PageOp::NewPageSameSize => page.new_page_same_size(),
-                    PageOp::NewPage { .. } | PageOp::Done => unreachable!(),
-                });
+/// Apply a page operation to the builder's current page at once. With no
+/// current page, a default A4 page is opened first.
+pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) {
+    let index = match builder.current_page_index() {
+        Some(index) => index,
+        None => builder.begin_page(PageSize::A4),
+    };
+    let mut page = builder.page_mut(index);
+    match op {
+        PageOp::Font(ref name, sz) => page.font(name, sz),
+        PageOp::At(x, y) => page.at(x, y),
+        PageOp::Text(ref text) => page.text(text),
+        PageOp::Heading(level, ref text) => page.heading(level, text),
+        PageOp::Paragraph(ref text) => page.paragraph(text),
+        PageOp::Space(pts) => page.space(pts),
+        PageOp::HorizontalRule => page.horizontal_rule(),
+        PageOp::Image { data, x, y, w, h, alt } => {
+            match crate::writer::ImageData::from_bytes(&data) {
+                // `Rect::new` takes (x, y, width, height): the far
+                // corner here scaled every image by its own origin.
+                Ok(img) => page.image_with_alt(img, crate::geometry::Rect::new(x, y, w, h), &alt),
+                Err(_) => &mut page, // skip — image data unparseable
             }
         }
-    }
-    if let Some(p) = current_page { p.done(); }
+        PageOp::Watermark(text) => page.watermark(&text),
+        PageOp::TextField { name, x, y, w, h, default_value } => page.text_field(name, x, y, w, h, default_value),
+        PageOp::Checkbox { name, x, y, w, h, checked } => page.checkbox(&name, x, y, w, h, checked),
+        PageOp::ComboBox { name, x, y, w, h, options, selected } => page.combo_box(name, x, y, w, h, options, selected),
+        PageOp::PushButton { name, x, y, w, h, caption } => page.push_button(&name, x, y, w, h, &caption),
+        PageOp::SignatureField { name, x, y, w, h } => page.signature_field(&name, x, y, w, h),
+        PageOp::RadioGroup { name, values, xs, ys, ws, hs, selected } => {
+            let buttons: Vec<(String, f32, f32, f32, f32)> = values.into_iter()
+                .zip(xs).zip(ys).zip(ws).zip(hs)
+                .map(|((((v, x), y), w), h)| (v, x, y, w, h))
+                .collect();
+            page.radio_group(name, buttons, selected)
+        }
+        PageOp::FieldKeystroke(script) => page.field_keystroke(script),
+        PageOp::FieldFormat(script) => page.field_format(script),
+        PageOp::FieldValidate(script) => page.field_validate(script),
+        PageOp::FieldCalculate(script) => page.field_calculate(script),
+        PageOp::LinkUrl(url) => page.link_url(&url),
+        PageOp::LinkPage(target) => page.link_page(target),
+        PageOp::Footnote { ref_mark, note_text } => page.footnote(&ref_mark, &note_text),
+        PageOp::Columns { column_count, gap_pt, text } => page.columns(column_count, gap_pt, &text),
+        PageOp::Inline(ref text) => page.inline(text),
+        PageOp::InlineBold(ref text) => page.inline_bold(text),
+        PageOp::InlineItalic(ref text) => page.inline_italic(text),
+        PageOp::InlineColor { r, g, b, ref text } => page.inline_color(r, g, b, text),
+        PageOp::TextInRect { x, y, w, h, ref text, align } => page.text_in_rect(
+            crate::geometry::Rect::new(x, y, w, h),
+            text,
+            align,
+        ),
+        PageOp::Rect(x, y, w, h) => page.rect(x, y, w, h),
+        PageOp::FilledRect(x, y, w, h, r, g, b) => page.filled_rect(x, y, w, h, r, g, b),
+        PageOp::Line(x1, y1, x2, y2) => page.line(x1, y1, x2, y2),
+        PageOp::StrokeRect { x, y, w, h, width, r, g, b } => {
+            page.stroke_rect(x, y, w, h, crate::writer::LineStyle::new(width, r, g, b))
+        }
+        PageOp::StrokeRectDashed { x, y, w, h, width, r, g, b, dash, phase } => page
+            .stroke_rect(
+                x,
+                y,
+                w,
+                h,
+                crate::writer::LineStyle::new(width, r, g, b).with_dash(&dash, phase),
+            ),
+        PageOp::StrokeLine { x1, y1, x2, y2, width, r, g, b } => page.stroke_line(
+            x1,
+            y1,
+            x2,
+            y2,
+            crate::writer::LineStyle::new(width, r, g, b),
+        ),
+        PageOp::StrokeLineDashed { x1, y1, x2, y2, width, r, g, b, dash, phase } => page
+            .stroke_line(
+                x1,
+                y1,
+                x2,
+                y2,
+                crate::writer::LineStyle::new(width, r, g, b).with_dash(&dash, phase),
+            ),
+        PageOp::Highlight(r, g, b) => page.highlight((r, g, b)),
+        PageOp::Underline(r, g, b) => page.underline((r, g, b)),
+        PageOp::Strikeout(r, g, b) => page.strikeout((r, g, b)),
+        PageOp::Squiggly(r, g, b) => page.squiggly((r, g, b)),
+        PageOp::StickyNote(ref text) => page.sticky_note(text),
+        PageOp::StickyNoteAt(x, y, ref text) => page.sticky_note_at(x, y, text),
+        PageOp::Stamp(stamp_type) => page.stamp(stamp_type),
+        PageOp::FreeText { x, y, w, h, ref text } => page.freetext(
+            crate::geometry::Rect::new(x, y, w, h),
+            text,
+        ),
+        PageOp::WatermarkConfidential => page.watermark_confidential(),
+        PageOp::WatermarkDraft => page.watermark_draft(),
+        PageOp::LinkNamed(ref dest) => page.link_named(dest),
+        PageOp::LinkJavaScript(ref script) => page.link_javascript(script),
+        PageOp::OnOpen(ref script) => page.on_open(script),
+        PageOp::OnClose(ref script) => page.on_close(script),
+        PageOp::ImageArtifact { data, x, y, w, h } => {
+            match crate::writer::ImageData::from_bytes(&data) {
+                Ok(img) => page
+                    .image_with_artifact(img, crate::geometry::Rect::new(x, y, w, h)),
+                Err(_) => &mut page, // skip — image data unparseable
+            }
+        }
+        PageOp::BufferedTable { ref columns, ref rows, has_header } => {
+            // Same construction as the WASM binding's replay:
+            // text cells, a bold header row when hasHeader, and
+            // per-column widths and alignments.
+            let cell_rows: Vec<Vec<crate::writer::TableCell>> = rows
+                .iter()
+                .map(|r| r.iter().map(|c| crate::writer::TableCell::text(c.clone())).collect())
+                .collect();
+            let cell_rows = if has_header {
+                let header: Vec<crate::writer::TableCell> = columns
+                    .iter()
+                    .map(|(h, _, _)| crate::writer::TableCell::text(h.clone()).bold())
+                    .collect();
+                let mut out = Vec::with_capacity(cell_rows.len() + 1);
+                out.push(header);
+                out.extend(cell_rows);
+                out
+            } else {
+                cell_rows
+            };
+            let mut table = crate::writer::Table::new(cell_rows);
+            if has_header {
+                table = table.with_header_row();
+            }
+            let widths: Vec<crate::writer::ColumnWidth> = columns
+                .iter()
+                .map(|(_, w, _)| match w {
+                    Some(pt) => crate::writer::ColumnWidth::Fixed(*pt),
+                    None => crate::writer::ColumnWidth::Auto,
+                })
+                .collect();
+            let aligns: Vec<crate::writer::CellAlign> =
+                columns.iter().map(|(_, _, a)| *a).collect();
+            table = table.with_column_widths(widths).with_column_aligns(aligns);
+            page.table(table)
+        }
+        PageOp::StreamingTableBlock {
+            ref config_columns,
+            repeat_header,
+            ref rows,
+            ref mode,
+            sample_rows,
+            min_col_width_pt,
+            max_col_width_pt,
+            max_rowspan,
+        } => {
+            let mut cfg = crate::writer::StreamingTableConfig::new()
+                .repeat_header(repeat_header)
+                .max_rowspan(max_rowspan);
+            cfg = match mode.as_str() {
+                "sample" => {
+                    cfg.mode_sample(sample_rows, min_col_width_pt, max_col_width_pt)
+                },
+                "auto_all" => cfg.mode_auto_all(),
+                _ => cfg.mode_fixed(),
+            };
+            for (header, width, align) in config_columns {
+                cfg = cfg.column(
+                    crate::writer::StreamingColumn::new(header.clone())
+                        .width_pt(*width)
+                        .align(*align),
+                );
+            }
+            let mut t = page.streaming_table(cfg);
+            for row in rows {
+                let _ = t.push_row(|r| {
+                    for (text, span) in row {
+                        if *span > 1 {
+                            r.span_cell(text.as_str(), *span);
+                        } else {
+                            r.cell(text.as_str());
+                        }
+                    }
+                });
+            }
+            // The page's state lives in the builder: the returned
+            // page handle carries nothing to keep.
+            let _ = t.finish();
+            return;
+        }
+        PageOp::Newline => page.newline(),
+        PageOp::NewPageSameSize => page.new_page_same_size(),
+    };
 }
 
 /// Create a new empty DocumentBuilder.

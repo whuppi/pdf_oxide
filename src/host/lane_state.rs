@@ -14,7 +14,6 @@
 
 use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;
-use crate::host::dispatch;
 use crate::writer::DocumentBuilder;
 use std::collections::HashMap;
 
@@ -27,8 +26,6 @@ pub struct LaneState {
     pub editors: HashMap<u32, DocumentEditor>,
     /// In-progress builders, by handle id.
     pub builders: HashMap<u32, DocumentBuilder>,
-    /// Staged page operations per editor handle.
-    pub page_ops: HashMap<u32, Vec<dispatch::PageOp>>,
     /// Next handle id. Plain u32 — single-threaded owner, no atomics.
     next_handle: u32,
 }
@@ -41,7 +38,6 @@ impl LaneState {
             documents: HashMap::new(),
             editors: HashMap::new(),
             builders: HashMap::new(),
-            page_ops: HashMap::new(),
             next_handle: 1,
         }
     }
@@ -78,6 +74,5 @@ mod tests {
         assert!(state.documents.is_empty());
         assert!(state.editors.is_empty());
         assert!(state.builders.is_empty());
-        assert!(state.page_ops.is_empty());
     }
 }
