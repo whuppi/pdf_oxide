@@ -2,7 +2,7 @@
 // document via handleId. Core — always built.
 
 use crate::host::binary_codec::{ErrorKind, ResponseWriter};
-use crate::host::bridge_api::{handle_open, handle_with_doc, ok_flag, req_handle};
+use crate::host::bridge_api::{handle_open, handle_with_doc, ok_flag, page_of, req_handle};
 use crate::host::dispatch;
 use crate::host::ops::op_unit;
 
@@ -18,7 +18,13 @@ op_unit!(DISPOSE, "docDispose", pdf_op_doc_dispose_anchor, |ctx| {
 
 op_unit!(EXTRACT, "extract", pdf_op_extract_anchor, |ctx| {
     handle_with_doc(ctx.state, ctx.req, |doc, req| {
-        let page = req.get_i32("page").map(|p| p as usize);
+        let page = match req.get_i32("page") {
+            Some(p) => match page_of(p, doc.page_count()?) {
+                Ok(i) => Some(i),
+                Err(resp) => return Ok(resp),
+            },
+            None => None,
+        };
         let format = req.get_str("format").unwrap_or("plainText");
         let result = dispatch::extract_text(doc, page, format)?;
         let mut w = ResponseWriter::ok();
@@ -30,7 +36,13 @@ op_unit!(EXTRACT, "extract", pdf_op_extract_anchor, |ctx| {
 op_unit!(SEARCH, "search", pdf_op_search_anchor, |ctx| {
     handle_with_doc(ctx.state, ctx.req, |doc, req| {
         let query = req.get_str("query").unwrap_or("");
-        let page = req.get_i32("page").map(|p| p as usize);
+        let page = match req.get_i32("page") {
+            Some(p) => match page_of(p, doc.page_count()?) {
+                Ok(i) => Some(i),
+                Err(resp) => return Ok(resp),
+            },
+            None => None,
+        };
         let result = dispatch::search_text(doc, query, page)?;
         let mut w = ResponseWriter::ok();
         w.put_map_list("hits", result.hits.len(), |i, item| {
@@ -67,7 +79,10 @@ op_unit!(
 
 op_unit!(CLASSIFY_PAGE, "classifyPage", pdf_op_classify_page_anchor, |ctx| {
     handle_with_doc(ctx.state, ctx.req, |doc, req| {
-        let page = req.get_i32("page").unwrap_or(0) as usize;
+        let page = match page_of(req.get_i32("page").unwrap_or(0), doc.page_count()?) {
+            Ok(i) => i,
+            Err(resp) => return Ok(resp),
+        };
         let result = dispatch::classify_page(doc, page)?;
         let mut w = ResponseWriter::ok();
         w.put_str("type", &result.type_name);
@@ -156,11 +171,11 @@ op_unit!(ANNOTATIONS, "annotations", pdf_op_annotations_anchor, |ctx| {
                 ))
             }
         };
-        let count = doc.page_count()?;
-        if page < 0 || page as usize >= count {
-            return Ok(ResponseWriter::page_range(page, count as i32));
-        }
-        let rows = dispatch::doc_annotations(doc, page as usize)?;
+        let page = match page_of(page, doc.page_count()?) {
+            Ok(i) => i,
+            Err(resp) => return Ok(resp),
+        };
+        let rows = dispatch::doc_annotations(doc, page)?;
         let mut w = ResponseWriter::ok();
         w.put_map_list("annotations", rows.len(), |i, item| {
             let a = &rows[i];

@@ -4,7 +4,7 @@
 use crate::host::binary_codec::ResponseWriter;
 use crate::host::bridge_api::{
     handle_editor_extract_pages, handle_editor_merge_from, handle_editor_mutate,
-    handle_editor_open, handle_editor_save, handle_with_editor, ok_flag, req_handle,
+    handle_editor_open, handle_editor_save, handle_with_editor, ok_flag, page_of, req_handle,
 };
 use crate::host::dispatch;
 use crate::host::ops::op_unit;
@@ -60,7 +60,10 @@ op_unit!(
     pdf_op_editor_page_media_box_anchor,
     |ctx| {
         handle_with_editor(ctx.state, ctx.req, |editor, req| {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = match page_of(req.get_i32("page").unwrap_or(0), editor.current_page_count()) {
+                Ok(i) => i,
+                Err(resp) => return Ok(resp),
+            };
             let (x, y, w2, h) = dispatch::edit_page_media_box(editor, page)?;
             let mut w = ResponseWriter::ok();
             w.put_f64("x", x as f64);
@@ -78,7 +81,10 @@ op_unit!(
     pdf_op_editor_page_crop_box_anchor,
     |ctx| {
         handle_with_editor(ctx.state, ctx.req, |editor, req| {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = match page_of(req.get_i32("page").unwrap_or(0), editor.current_page_count()) {
+                Ok(i) => i,
+                Err(resp) => return Ok(resp),
+            };
             let cropped = dispatch::edit_page_crop_box(editor, page)?;
             let mut w = ResponseWriter::ok();
             match cropped {
@@ -102,7 +108,10 @@ op_unit!(
     pdf_op_editor_page_images_anchor,
     |ctx| {
         handle_with_editor(ctx.state, ctx.req, |editor, req| {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = match page_of(req.get_i32("page").unwrap_or(0), editor.current_page_count()) {
+                Ok(i) => i,
+                Err(resp) => return Ok(resp),
+            };
             let images = dispatch::edit_page_images(editor, page)?;
             let mut w = ResponseWriter::ok();
             w.put_map_list("images", images.len(), |i, item| {
@@ -130,7 +139,10 @@ op_unit!(
     pdf_op_editor_redaction_count_anchor,
     |ctx| {
         handle_with_editor(ctx.state, ctx.req, |editor, req| {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = match page_of(req.get_i32("page").unwrap_or(0), editor.current_page_count()) {
+                Ok(i) => i,
+                Err(resp) => return Ok(resp),
+            };
             let count = dispatch::edit_redaction_count(editor, page)?;
             let mut w = ResponseWriter::ok();
             w.put_i32("count", count as i32);

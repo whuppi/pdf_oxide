@@ -130,6 +130,22 @@ pub(crate) fn req_handle(req: &Request<'_>) -> u32 {
     req.get_i32("handleId").unwrap_or(0) as u32
 }
 
+/// The request's page index when it names a page of a document with
+/// `count` pages, or the page-range error response to send instead.
+pub(crate) fn page_of(page: i32, count: usize) -> Result<usize, Vec<u8>> {
+    if page < 0 || page as usize >= count {
+        Err(ResponseWriter::page_range(page, count as i32))
+    } else {
+        Ok(page as usize)
+    }
+}
+
+/// Every index of `pages` checked like [`page_of`]; the first bad entry
+/// is the one answered.
+pub(crate) fn pages_of(pages: &[i32], count: usize) -> Result<Vec<usize>, Vec<u8>> {
+    pages.iter().map(|&p| page_of(p, count)).collect()
+}
+
 /// A success response carrying a single `true` flag.
 pub(crate) fn ok_flag(key: &str) -> Vec<u8> {
     let mut w = ResponseWriter::ok();
@@ -390,20 +406,34 @@ fn do_editor_mutate(
 ) -> crate::error::Result<Vec<u8>> {
     use crate::error::Error;
 
+    // The pages the editor has now, after deletes and merges.
+    let count = editor.current_page_count();
+    // The checked `page` field (0 when absent), or the page-range response.
+    macro_rules! page {
+        () => {
+            match page_of(req.get_i32("page").unwrap_or(0), count) {
+                Ok(i) => i,
+                Err(resp) => return Ok(resp),
+            }
+        };
+    }
+
     match edit_op {
         "selectPages" => {
-            let pages: Vec<usize> = req.get_int_list("pages").unwrap_or(&[])
-                .iter().map(|&p| p as usize).collect();
+            let pages = match pages_of(req.get_int_list("pages").unwrap_or(&[]), count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
             dispatch::edit_select_pages(editor, &pages)?;
             ok_response()
         }
         "deletePage" => {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = page!();
             dispatch::edit_delete_pages(editor, &[page])?;
             ok_response()
         }
         "rotatePage" => {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = page!();
             let degrees = req.get_i32("degrees").unwrap_or(0);
             dispatch::edit_rotate_pages(editor, &[(page, degrees)])?;
             ok_response()
@@ -413,23 +443,35 @@ fn do_editor_mutate(
             ok_response()
         }
         "movePage" => {
-            let from = req.get_i32("from").unwrap_or(0) as usize;
-            let to = req.get_i32("to").unwrap_or(0) as usize;
+            let from = match page_of(req.get_i32("from").unwrap_or(0), count) {
+                Ok(i) => i,
+                Err(resp) => return Ok(resp),
+            };
+            let to = match page_of(req.get_i32("to").unwrap_or(0), count) {
+                Ok(i) => i,
+                Err(resp) => return Ok(resp),
+            };
             dispatch::edit_move_page(editor, from, to)?;
             ok_response()
         }
         "flattenForms" => {
-            let page = req.get_i32("page").map(|p| p as usize);
+            let page = match req.get_i32("page").map(|p| page_of(p, count)).transpose() {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
             dispatch::edit_flatten_forms(editor, page)?;
             ok_response()
         }
         "flattenAnnotations" => {
-            let page = req.get_i32("page").map(|p| p as usize);
+            let page = match req.get_i32("page").map(|p| page_of(p, count)).transpose() {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
             dispatch::edit_flatten_annotations(editor, page)?;
             ok_response()
         }
         "clearEraseRegions" => {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = page!();
             dispatch::edit_clear_erase_regions(editor, page);
             ok_response()
         }
@@ -454,7 +496,7 @@ fn do_editor_mutate(
             ok_response()
         }
         "setPageMediaBox" => {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = page!();
             let x = req.get_f64("x").unwrap_or(0.0) as f32;
             let y = req.get_f64("y").unwrap_or(0.0) as f32;
             let width = req.get_f64("width").unwrap_or(0.0) as f32;
@@ -463,7 +505,7 @@ fn do_editor_mutate(
             ok_response()
         }
         "setPageCropBox" => {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = page!();
             let x = req.get_f64("x").unwrap_or(0.0) as f32;
             let y = req.get_f64("y").unwrap_or(0.0) as f32;
             let width = req.get_f64("width").unwrap_or(0.0) as f32;
@@ -472,7 +514,7 @@ fn do_editor_mutate(
             ok_response()
         }
         "setPageRotation" => {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = page!();
             let degrees = req.get_i32("degrees").unwrap_or(0);
             dispatch::edit_set_page_rotation(editor, page, degrees)?;
             ok_response()
@@ -533,7 +575,7 @@ fn do_editor_mutate(
             ok_response()
         }
         "eraseRegions" => {
-            let page = req.get_i32("page").unwrap_or(0) as usize;
+            let page = page!();
             let coords = req.get_f64_list("regions").unwrap_or(&[]);
             // The wire carries origin + size per region; the engine's
             // region set takes two corners (`RedactionRegion::from_rect`).
@@ -550,9 +592,16 @@ fn do_editor_mutate(
         "watermark" => {
             let pos_fields: Vec<f32> = req.get_f64_list("posFields")
                 .unwrap_or(&[]).iter().map(|&f| f as f32).collect();
+            // A negative page means every page; only a named page is checked.
+            let page = req.get_i32("page").unwrap_or(-1);
+            if page >= 0 {
+                if let Err(resp) = page_of(page, count) {
+                    return Ok(resp);
+                }
+            }
             dispatch::edit_watermark(
                 editor,
-                req.get_i32("page").unwrap_or(-1),
+                page,
                 req.get_str("text").unwrap_or("WATERMARK"),
                 req.get_f64("fontSize").unwrap_or(48.0) as f32,
                 req.get_f64("rotation").unwrap_or(45.0) as f32,
@@ -569,7 +618,7 @@ fn do_editor_mutate(
         "addStamp" => {
             dispatch::edit_add_stamp(
                 editor,
-                req.get_i32("page").unwrap_or(0) as usize,
+                page!(),
                 req.get_i32("stampType").unwrap_or(12),
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
@@ -588,7 +637,7 @@ fn do_editor_mutate(
             };
             dispatch::edit_add_image_stamp(
                 editor,
-                req.get_i32("page").unwrap_or(0) as usize,
+                page!(),
                 image_bytes,
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
@@ -661,7 +710,7 @@ fn do_editor_mutate(
         "resizeImage" => {
             dispatch::edit_resize_image(
                 editor,
-                req.get_i32("page").unwrap_or(0) as usize,
+                page!(),
                 req.get_str("imageName").unwrap_or(""),
                 req.get_f64("width").unwrap_or(100.0) as f32,
                 req.get_f64("height").unwrap_or(100.0) as f32,
@@ -671,7 +720,7 @@ fn do_editor_mutate(
         "repositionImage" => {
             dispatch::edit_reposition_image(
                 editor,
-                req.get_i32("page").unwrap_or(0) as usize,
+                page!(),
                 req.get_str("imageName").unwrap_or(""),
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
@@ -681,7 +730,7 @@ fn do_editor_mutate(
         "setImageBounds" => {
             dispatch::edit_set_image_bounds(
                 editor,
-                req.get_i32("page").unwrap_or(0) as usize,
+                page!(),
                 req.get_str("imageName").unwrap_or(""),
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
@@ -699,7 +748,7 @@ fn do_editor_mutate(
             let height = req.get_f64("height").unwrap_or(50.0) as f32;
             dispatch::edit_add_redaction(
                 editor,
-                req.get_i32("page").unwrap_or(0) as usize,
+                page!(),
                 [x, y, x + width, y + height],
             )?;
             ok_response()
@@ -1510,10 +1559,17 @@ pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, s
 
     let page_indices = req.get_int_list("pageIndices").unwrap_or(&[]);
     // Empty list = all pages (Dart convention: PdfPages.all() sends []).
+    let count = match doc.page_count() {
+        Ok(c) => c,
+        Err(e) => return ResponseWriter::error_of(&e),
+    };
     let pages: Vec<usize> = if page_indices.is_empty() {
-        (0..doc.page_count().unwrap_or(0)).collect()
+        (0..count).collect()
     } else {
-        page_indices.iter().map(|&p| p as usize).collect()
+        match pages_of(page_indices, count) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        }
     };
     let max_w = req.get_i32("maxWidth").unwrap_or(0) as u32;
     let max_h = req.get_i32("maxHeight").unwrap_or(0) as u32;
@@ -1529,7 +1585,10 @@ pub(crate) fn handle_render_streamed(state: &mut LaneState, req: &Request<'_>, s
             Err(e) => ResponseWriter::error_of(&e),
         }
     } else {
-        let page = req.get_i32("page").unwrap_or(0) as usize;
+        let page = match page_of(req.get_i32("page").unwrap_or(0), count) {
+            Ok(i) => i,
+            Err(resp) => return resp,
+        };
         match dispatch::render_page(doc, page, max_w, max_h) {
             Ok(result) => {
                 let mut w = ResponseWriter::ok();
@@ -1551,7 +1610,14 @@ pub(crate) fn handle_extract_images_streamed(state: &mut LaneState, req: &Reques
         None => return ResponseWriter::error("document not found"),
     };
 
-    let page = req.get_i32("page").unwrap_or(0) as usize;
+    let count = match doc.page_count() {
+        Ok(c) => c,
+        Err(e) => return ResponseWriter::error_of(&e),
+    };
+    let page = match page_of(req.get_i32("page").unwrap_or(0), count) {
+        Ok(i) => i,
+        Err(resp) => return resp,
+    };
 
     if let Some(mut writer) = sink_writer {
         match dispatch::extract_images_streamed(doc, page, &mut writer) {
@@ -1747,18 +1813,16 @@ pub(crate) fn handle_editor_extract_pages(
         );
     }
 
-    let page_count = editor.current_page_count();
-    for &p in pages {
-        if (p as usize) >= page_count {
-            return ResponseWriter::page_range(p, page_count as i32);
-        }
-    }
-    if let Err(e) = dispatch::refuse_repeated_pages(pages.iter().map(|&p| p as usize)) {
+    let pages = match pages_of(pages, editor.current_page_count()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = dispatch::refuse_repeated_pages(pages.iter().copied()) {
         return ResponseWriter::error_of(&e);
     }
 
     let visible: Vec<i32> = editor.page_order_visible();
-    let new_order: Vec<i32> = pages.iter().map(|&i| visible[i as usize]).collect();
+    let new_order: Vec<i32> = pages.iter().map(|&i| visible[i]).collect();
 
     // Save + restore state — editor unchanged after this call.
     let saved_order = std::mem::replace(editor.page_order_mut(), new_order);
@@ -1925,7 +1989,8 @@ mod wasm_entry {
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_unattached;
+    use super::{page_of, pages_of, refuse_unattached};
+    use crate::host::binary_codec::ResponseWriter;
     use crate::host::dispatch::PageOp;
 
     fn text_field() -> PageOp {
@@ -2097,5 +2162,22 @@ mod tests {
             refuse_unattached(&queued, &PageOp::LinkUrl("https://example.com".into())),
             Some("linkUrl needs text on this page first")
         );
+    }
+
+    #[test]
+    fn page_of_accepts_in_range_and_refuses_outside() {
+        assert_eq!(page_of(0, 2), Ok(0));
+        assert_eq!(page_of(1, 2), Ok(1));
+        assert_eq!(page_of(-1, 2), Err(ResponseWriter::page_range(-1, 2)));
+        assert_eq!(page_of(2, 2), Err(ResponseWriter::page_range(2, 2)));
+        assert_eq!(page_of(0, 0), Err(ResponseWriter::page_range(0, 0)));
+    }
+
+    #[test]
+    fn pages_of_answers_the_first_bad_entry() {
+        assert_eq!(pages_of(&[1, 0], 2), Ok(vec![1, 0]));
+        assert_eq!(pages_of(&[], 2), Ok(vec![]));
+        assert_eq!(pages_of(&[0, 2, -1], 2), Err(ResponseWriter::page_range(2, 2)));
+        assert_eq!(pages_of(&[-1], 2), Err(ResponseWriter::page_range(-1, 2)));
     }
 }
