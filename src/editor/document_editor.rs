@@ -10316,7 +10316,25 @@ mod tests {
     }
 
     /// Generates bytes for a minimal valid PDF with one page.
+    #[test]
+    // ── pdf_manipulator patch ──
+    fn test_minimal_pdf_source_opens_without_xref_repair() {
+        // minimal_pdf_bytes' startxref must point at the xref keyword: if
+        // it drifts, every helper test below silently opens through xref
+        // reconstruction instead of the table the file declares.
+        let doc = PdfDocument::from_bytes(minimal_pdf_bytes()).unwrap();
+        assert!(
+            !doc.xref_repaired(),
+            "minimal_pdf_bytes' startxref does not point at the xref keyword, \
+             so every open goes through reconstruction"
+        );
+    }
+    // ── end pdf_manipulator patch ──
+
     fn minimal_pdf_bytes() -> Vec<u8> {
+        // ── pdf_manipulator patch: startxref recomputed to the true xref
+        // offset — the upstream constant pointed a byte-count past the
+        // xref keyword, so every open went through reconstruction ──
         let pdf = b"%PDF-1.4\n\
             1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
             2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
@@ -10328,7 +10346,7 @@ mod tests {
             0000000058 00000 n \n\
             0000000115 00000 n \n\
             trailer\n<< /Size 4 /Root 1 0 R >>\n\
-            startxref\n197\n%%EOF\n";
+            startxref\n186\n%%EOF\n";
         pdf.to_vec()
     }
 
