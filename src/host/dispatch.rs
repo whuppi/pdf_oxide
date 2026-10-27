@@ -3,7 +3,7 @@
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
 //! RULE: Every operation the Flutter bridge can perform is a function here.
-//! bridge_api.rs is the only caller. No other file calls the engine directly.
+//! The op units under `ops/` are the only callers. No other file calls the engine directly.
 //!
 //! INVARIANTS:
 //! - No FFI types (pointers, ports, extern "C").
@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 
 // ═══════════════════════════════════════════════════════════════════
 // Result types — typed structs returned by dispatch functions.
-// bridge_api.rs encodes these to binary via ResponseWriter.
+// The op units under `ops/` encode these to binary via ResponseWriter.
 // ═══════════════════════════════════════════════════════════════════
 
 /// Result of opening and inspecting a PDF document.
@@ -595,6 +595,15 @@ pub fn doc_form_fields(doc: &mut PdfDocument) -> Result<Vec<FormFieldRow>> {
             let (value_kind, text, checked, choices): (&'static str, String, bool, Vec<String>) =
                 match (&f.field_type, &f.value) {
                     (_, FieldValue::Text(s)) => ("text", s.clone(), false, Vec::new()),
+                    // A radio group's /V is the selected option's export
+                    // name; "Off" means none, like an unset choice field.
+                    (FieldType::Button, FieldValue::Name(n)) if field_type == "radioGroup" => {
+                        if n == "Off" {
+                            ("none", String::new(), false, Vec::new())
+                        } else {
+                            ("choice", n.clone(), false, Vec::new())
+                        }
+                    }
                     (_, FieldValue::Boolean(b)) => ("checked", String::new(), *b, Vec::new()),
                     (FieldType::Button, FieldValue::Name(n)) => {
                         ("checked", String::new(), n != "Off", Vec::new())

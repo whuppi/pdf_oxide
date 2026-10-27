@@ -29,6 +29,7 @@ pub(crate) mod pdfa;
 pub(crate) mod registry;
 pub(crate) mod render;
 pub(crate) mod signatures;
+pub(crate) mod support;
 
 /// Everything a handler may need, bundled so every op shares one calling
 /// convention (uniform middleware, uniform registry signature).

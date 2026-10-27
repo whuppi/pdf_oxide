@@ -166,6 +166,13 @@ impl<'a> Request<'a> {
             if *k == key { if let FieldValue::StringList(l) = v { Some(l.clone()) } else { None } } else { None }
         })
     }
+
+    /// Get a list-of-maps field by key.
+    pub fn get_map_list(&self, key: &str) -> Option<&[Vec<(&'a str, FieldValue<'a>)>]> {
+        self.fields.iter().find_map(|(k, v)| {
+            if *k == key { if let FieldValue::MapList(l) = v { Some(l.as_slice()) } else { None } } else { None }
+        })
+    }
 }
 
 fn read_value<'a>(r: &mut Reader<'a>) -> Result<FieldValue<'a>, &'static str> {

@@ -1,10 +1,14 @@
 // Document-handle ops: open/dispose plus read ops that reuse the parsed
 // document via handleId. Core — always built.
 
-use crate::host::binary_codec::{ErrorKind, ResponseWriter};
-use crate::host::bridge_api::{handle_open, handle_with_doc, ok_flag, page_of, req_handle};
+use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
+use crate::host::bridge_api::BoxedReader;
 use crate::host::dispatch;
+use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
+use crate::host::ops::support::{
+    authenticate_or_refuse, handle_with_doc, ok_flag, open_source, page_of, req_handle,
+};
 
 op_unit!(OPEN, "open", pdf_op_open_anchor, |ctx| {
     let source = ctx.take_source(0);
@@ -240,3 +244,53 @@ op_unit!(
         }
     }
 );
+
+fn handle_open(
+    state: &mut LaneState,
+    req: &Request<'_>,
+    source_bytes: Option<&[u8]>,
+    source_reader: Option<BoxedReader>,
+) -> Vec<u8> {
+    let password = req.get_str("password");
+    let mut doc = match open_source(source_bytes, source_reader, "open") {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = authenticate_or_refuse(&doc, password) {
+        return resp;
+    }
+    match dispatch::open_document(&mut doc) {
+        Ok(result) => {
+            let hid = state.next_handle_id();
+            state.documents.insert(hid, doc);
+            let mut w = ResponseWriter::ok();
+            w.put_i32("handleId", hid as i32);
+            w.put_i32("pageCount", result.page_count as i32);
+            w.put_str("version", &format!("{}.{}", result.version_major, result.version_minor));
+            w.put_bool("isEncrypted", result.is_encrypted);
+            w.put_bool("requiresPassword", result.requires_password);
+            w.put_bool("isTagged", result.is_tagged);
+            w.put_i32("encryptionAlgorithm", result.encryption_algorithm as i32);
+            w.put_i32("permissionBits", result.permission_bits);
+            w.put_str("title", &result.title);
+            w.put_str("author", &result.author);
+            w.put_str("subject", &result.subject);
+            w.put_str("keywords", &result.keywords);
+            w.put_str("producer", &result.producer);
+            w.put_str("creator", &result.creator);
+            w.put_str("creationDate", &result.creation_date);
+            w.put_map_list("pages", result.pages.len(), |i, item| {
+                let p = &result.pages[i];
+                item.put_i32("index", i as i32);
+                item.put_f64("width", p.width);
+                item.put_f64("height", p.height);
+                item.put_i32("rotation", p.rotation);
+                if let Some(label) = &p.label {
+                    item.put_str("label", label);
+                }
+            });
+            w.finish()
+        }
+        Err(e) => ResponseWriter::error_of(&e),
+    }
+}

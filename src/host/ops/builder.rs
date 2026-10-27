@@ -1,11 +1,13 @@
 // Builder-handle ops: create pages from scratch. Core — always built.
 
-use crate::host::bridge_api::{
-    handle_builder_add_page, handle_builder_create, handle_builder_page_op,
-    handle_builder_save, handle_builder_set_metadata, ok_flag, req_handle,
-};
+use crate::host::binary_codec::{ErrorKind, FieldValue, Request, ResponseWriter};
+use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
+use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
+use crate::host::ops::support::{ok_flag, read_all_from_reader, req_handle};
+
+use crate::writer::PageSize;
 
 op_unit!(CREATE, "builderCreate", pdf_op_builder_create_anchor, |ctx| {
     handle_builder_create(ctx.state)
@@ -55,3 +57,790 @@ op_unit!(SAVE, "builderSave", pdf_op_builder_save_anchor, |ctx| {
     let sink = ctx.take_sink(0);
     handle_builder_save(ctx.state, ctx.req, sink)
 });
+
+fn handle_builder_create(state: &mut LaneState) -> Vec<u8> {
+    let builder = dispatch::builder_new();
+    let hid = state.next_handle_id();
+    state.builders.insert(hid, builder);
+    let mut w = ResponseWriter::ok();
+    w.put_i32("handleId", hid as i32);
+    w.finish()
+}
+
+fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+    let hid = req_handle(req);
+    let Some(mut b) = state.builders.remove(&hid) else {
+        return ResponseWriter::error("builder not found");
+    };
+    if let Some(v) = req.get_str("title") {
+        b = dispatch::builder_set_title(b, v);
+    }
+    if let Some(v) = req.get_str("author") {
+        b = dispatch::builder_set_author(b, v);
+    }
+    if let Some(v) = req.get_str("subject") {
+        b = dispatch::builder_set_subject(b, v);
+    }
+    if let Some(v) = req.get_str("keywords") {
+        b = dispatch::builder_set_keywords(b, v);
+    }
+    state.builders.insert(hid, b);
+    ok_flag("set")
+}
+
+fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+    let size = match req.get_str("pageType") {
+        Some("a4") => PageSize::A4,
+        Some("letter") => PageSize::Letter,
+        _ => PageSize::Custom(
+            req.get_f64("width").unwrap_or(595.0) as f32,
+            req.get_f64("height").unwrap_or(842.0) as f32,
+        ),
+    };
+    let (pw, ph) = size.dimensions();
+    state
+        .page_ops
+        .entry(req_handle(req))
+        .or_default()
+        .push(dispatch::PageOp::NewPage { width: pw, height: ph });
+    ok_flag("added")
+}
+
+fn handle_builder_page_op(
+    state: &mut LaneState,
+    req: &Request<'_>,
+    mut data_reader: Option<BoxedReader>,
+) -> Vec<u8> {
+    let hid = req_handle(req);
+    let page_op = match req.get_str("pageOp") {
+        Some(op) => op,
+        None => return ResponseWriter::error("missing pageOp"),
+    };
+
+    let op = match page_op {
+        "font" => dispatch::PageOp::Font(
+            req.get_str("name").unwrap_or("Helvetica").to_string(),
+            req.get_f64("size").unwrap_or(12.0) as f32,
+        ),
+        "at" => dispatch::PageOp::At(
+            req.get_f64("x").unwrap_or(0.0) as f32,
+            req.get_f64("y").unwrap_or(0.0) as f32,
+        ),
+        "text" => dispatch::PageOp::Text(req.get_str("text").unwrap_or("").to_string()),
+        "heading" => dispatch::PageOp::Heading(
+            req.get_i32("level").unwrap_or(1) as u8,
+            req.get_str("text").unwrap_or("").to_string(),
+        ),
+        "paragraph" => dispatch::PageOp::Paragraph(req.get_str("text").unwrap_or("").to_string()),
+        "space" => dispatch::PageOp::Space(req.get_f64("points").unwrap_or(12.0) as f32),
+        "horizontalRule" => dispatch::PageOp::HorizontalRule,
+        "watermark" => dispatch::PageOp::Watermark(req.get_str("text").unwrap_or("").to_string()),
+        "image" => {
+            let image_data = if let Some(ref mut reader) = data_reader {
+                read_all_from_reader(reader).unwrap_or_default()
+            } else {
+                req.get_bytes("data").unwrap_or(&[]).to_vec()
+            };
+            dispatch::PageOp::Image {
+                data: image_data,
+                x: req.get_f64("x").unwrap_or(0.0) as f32,
+                y: req.get_f64("y").unwrap_or(0.0) as f32,
+                w: req.get_f64("width").unwrap_or(0.0) as f32,
+                h: req.get_f64("height").unwrap_or(0.0) as f32,
+                alt: req.get_str("altText").unwrap_or("").to_string(),
+            }
+        }
+        "textField" => dispatch::PageOp::TextField {
+            name: req.get_str("name").unwrap_or("").to_string(),
+            x: req.get_f64("x").unwrap_or(0.0) as f32,
+            y: req.get_f64("y").unwrap_or(0.0) as f32,
+            w: req.get_f64("width").unwrap_or(0.0) as f32,
+            h: req.get_f64("height").unwrap_or(0.0) as f32,
+            default_value: req.get_str("defaultValue").map(|s| s.to_string()),
+        },
+        "checkbox" => dispatch::PageOp::Checkbox {
+            name: req.get_str("name").unwrap_or("").to_string(),
+            x: req.get_f64("x").unwrap_or(0.0) as f32,
+            y: req.get_f64("y").unwrap_or(0.0) as f32,
+            w: req.get_f64("width").unwrap_or(0.0) as f32,
+            h: req.get_f64("height").unwrap_or(0.0) as f32,
+            checked: req.get_bool("checked").unwrap_or(false),
+        },
+        "comboBox" => dispatch::PageOp::ComboBox {
+            name: req.get_str("name").unwrap_or("").to_string(),
+            x: req.get_f64("x").unwrap_or(0.0) as f32,
+            y: req.get_f64("y").unwrap_or(0.0) as f32,
+            w: req.get_f64("width").unwrap_or(0.0) as f32,
+            h: req.get_f64("height").unwrap_or(0.0) as f32,
+            options: req.get_string_list("options").unwrap_or_default().into_iter().map(|s| s.to_string()).collect(),
+            selected: req.get_str("selected").map(|s| s.to_string()),
+        },
+        "pushButton" => dispatch::PageOp::PushButton {
+            name: req.get_str("name").unwrap_or("").to_string(),
+            x: req.get_f64("x").unwrap_or(0.0) as f32,
+            y: req.get_f64("y").unwrap_or(0.0) as f32,
+            w: req.get_f64("width").unwrap_or(0.0) as f32,
+            h: req.get_f64("height").unwrap_or(0.0) as f32,
+            caption: req.get_str("caption").unwrap_or("").to_string(),
+        },
+        "signatureField" => dispatch::PageOp::SignatureField {
+            name: req.get_str("name").unwrap_or("").to_string(),
+            x: req.get_f64("x").unwrap_or(0.0) as f32,
+            y: req.get_f64("y").unwrap_or(0.0) as f32,
+            w: req.get_f64("width").unwrap_or(0.0) as f32,
+            h: req.get_f64("height").unwrap_or(0.0) as f32,
+        },
+        "radioGroup" => {
+            let options = req.get_map_list("options").unwrap_or(&[]);
+            dispatch::PageOp::RadioGroup {
+                name: req.get_str("name").unwrap_or("").to_string(),
+                values: options.iter().map(|o| option_str(o, "value")).collect(),
+                xs: options.iter().map(|o| option_f32(o, "x")).collect(),
+                ys: options.iter().map(|o| option_f32(o, "y")).collect(),
+                ws: options.iter().map(|o| option_f32(o, "width")).collect(),
+                hs: options.iter().map(|o| option_f32(o, "height")).collect(),
+                selected: req.get_str("selected").map(|s| s.to_string()),
+            }
+        }
+        "fieldKeystroke" => dispatch::PageOp::FieldKeystroke(req.get_str("script").unwrap_or("").to_string()),
+        "fieldFormat" => dispatch::PageOp::FieldFormat(req.get_str("script").unwrap_or("").to_string()),
+        "fieldValidate" => dispatch::PageOp::FieldValidate(req.get_str("script").unwrap_or("").to_string()),
+        "fieldCalculate" => dispatch::PageOp::FieldCalculate(req.get_str("script").unwrap_or("").to_string()),
+        "linkUrl" => dispatch::PageOp::LinkUrl(req.get_str("url").unwrap_or("").to_string()),
+        "linkPage" => dispatch::PageOp::LinkPage(req.get_i32("targetPage").unwrap_or(0) as usize),
+        "footnote" => dispatch::PageOp::Footnote {
+            ref_mark: req.get_str("refMark").unwrap_or("").to_string(),
+            note_text: req.get_str("noteText").unwrap_or("").to_string(),
+        },
+        "columns" => dispatch::PageOp::Columns {
+            column_count: req.get_i32("columnCount").unwrap_or(2) as u32,
+            gap_pt: req.get_f64("gapPt").unwrap_or(12.0) as f32,
+            text: req.get_str("text").unwrap_or("").to_string(),
+        },
+        "newline" => dispatch::PageOp::Newline,
+        "newPageSameSize" => dispatch::PageOp::NewPageSameSize,
+        "inline" => dispatch::PageOp::Inline(req.get_str("text").unwrap_or("").to_string()),
+        "inlineBold" => dispatch::PageOp::InlineBold(req.get_str("text").unwrap_or("").to_string()),
+        "inlineItalic" => dispatch::PageOp::InlineItalic(req.get_str("text").unwrap_or("").to_string()),
+        "inlineColor" => dispatch::PageOp::InlineColor {
+            r: req.get_f64("r").unwrap_or(0.0) as f32,
+            g: req.get_f64("g").unwrap_or(0.0) as f32,
+            b: req.get_f64("b").unwrap_or(0.0) as f32,
+            text: req.get_str("text").unwrap_or("").to_string(),
+        },
+        "textInRect" => dispatch::PageOp::TextInRect {
+            x: req.get_f64("x").unwrap_or(0.0) as f32,
+            y: req.get_f64("y").unwrap_or(0.0) as f32,
+            w: req.get_f64("width").unwrap_or(0.0) as f32,
+            h: req.get_f64("height").unwrap_or(0.0) as f32,
+            text: req.get_str("text").unwrap_or("").to_string(),
+            align: align_from_int(req.get_i32("align").unwrap_or(0)),
+        },
+        "rect" => dispatch::PageOp::Rect(
+            req.get_f64("x").unwrap_or(0.0) as f32,
+            req.get_f64("y").unwrap_or(0.0) as f32,
+            req.get_f64("width").unwrap_or(0.0) as f32,
+            req.get_f64("height").unwrap_or(0.0) as f32,
+        ),
+        "filledRect" => dispatch::PageOp::FilledRect(
+            req.get_f64("x").unwrap_or(0.0) as f32,
+            req.get_f64("y").unwrap_or(0.0) as f32,
+            req.get_f64("width").unwrap_or(0.0) as f32,
+            req.get_f64("height").unwrap_or(0.0) as f32,
+            req.get_f64("r").unwrap_or(0.0) as f32,
+            req.get_f64("g").unwrap_or(0.0) as f32,
+            req.get_f64("b").unwrap_or(0.0) as f32,
+        ),
+        "line" => dispatch::PageOp::Line(
+            req.get_f64("x1").unwrap_or(0.0) as f32,
+            req.get_f64("y1").unwrap_or(0.0) as f32,
+            req.get_f64("x2").unwrap_or(0.0) as f32,
+            req.get_f64("y2").unwrap_or(0.0) as f32,
+        ),
+        "strokeRect" => {
+            let dash: Vec<f32> = req
+                .get_f64_list("dash")
+                .unwrap_or(&[])
+                .iter()
+                .map(|d| *d as f32)
+                .collect();
+            if dash.is_empty() {
+                dispatch::PageOp::StrokeRect {
+                    x: req.get_f64("x").unwrap_or(0.0) as f32,
+                    y: req.get_f64("y").unwrap_or(0.0) as f32,
+                    w: req.get_f64("width").unwrap_or(0.0) as f32,
+                    h: req.get_f64("height").unwrap_or(0.0) as f32,
+                    width: req.get_f64("lineWidth").unwrap_or(1.0) as f32,
+                    r: req.get_f64("r").unwrap_or(0.0) as f32,
+                    g: req.get_f64("g").unwrap_or(0.0) as f32,
+                    b: req.get_f64("b").unwrap_or(0.0) as f32,
+                }
+            } else {
+                dispatch::PageOp::StrokeRectDashed {
+                    x: req.get_f64("x").unwrap_or(0.0) as f32,
+                    y: req.get_f64("y").unwrap_or(0.0) as f32,
+                    w: req.get_f64("width").unwrap_or(0.0) as f32,
+                    h: req.get_f64("height").unwrap_or(0.0) as f32,
+                    width: req.get_f64("lineWidth").unwrap_or(1.0) as f32,
+                    r: req.get_f64("r").unwrap_or(0.0) as f32,
+                    g: req.get_f64("g").unwrap_or(0.0) as f32,
+                    b: req.get_f64("b").unwrap_or(0.0) as f32,
+                    dash,
+                    phase: req.get_f64("dashPhase").unwrap_or(0.0) as f32,
+                }
+            }
+        }
+        "strokeLine" => {
+            let dash: Vec<f32> = req
+                .get_f64_list("dash")
+                .unwrap_or(&[])
+                .iter()
+                .map(|d| *d as f32)
+                .collect();
+            if dash.is_empty() {
+                dispatch::PageOp::StrokeLine {
+                    x1: req.get_f64("x1").unwrap_or(0.0) as f32,
+                    y1: req.get_f64("y1").unwrap_or(0.0) as f32,
+                    x2: req.get_f64("x2").unwrap_or(0.0) as f32,
+                    y2: req.get_f64("y2").unwrap_or(0.0) as f32,
+                    width: req.get_f64("lineWidth").unwrap_or(1.0) as f32,
+                    r: req.get_f64("r").unwrap_or(0.0) as f32,
+                    g: req.get_f64("g").unwrap_or(0.0) as f32,
+                    b: req.get_f64("b").unwrap_or(0.0) as f32,
+                }
+            } else {
+                dispatch::PageOp::StrokeLineDashed {
+                    x1: req.get_f64("x1").unwrap_or(0.0) as f32,
+                    y1: req.get_f64("y1").unwrap_or(0.0) as f32,
+                    x2: req.get_f64("x2").unwrap_or(0.0) as f32,
+                    y2: req.get_f64("y2").unwrap_or(0.0) as f32,
+                    width: req.get_f64("lineWidth").unwrap_or(1.0) as f32,
+                    r: req.get_f64("r").unwrap_or(0.0) as f32,
+                    g: req.get_f64("g").unwrap_or(0.0) as f32,
+                    b: req.get_f64("b").unwrap_or(0.0) as f32,
+                    dash,
+                    phase: req.get_f64("dashPhase").unwrap_or(0.0) as f32,
+                }
+            }
+        }
+        "highlight" => dispatch::PageOp::Highlight(
+            req.get_f64("r").unwrap_or(1.0) as f32,
+            req.get_f64("g").unwrap_or(1.0) as f32,
+            req.get_f64("b").unwrap_or(0.0) as f32,
+        ),
+        "underline" => dispatch::PageOp::Underline(
+            req.get_f64("r").unwrap_or(0.0) as f32,
+            req.get_f64("g").unwrap_or(0.0) as f32,
+            req.get_f64("b").unwrap_or(0.0) as f32,
+        ),
+        "strikeout" => dispatch::PageOp::Strikeout(
+            req.get_f64("r").unwrap_or(0.0) as f32,
+            req.get_f64("g").unwrap_or(0.0) as f32,
+            req.get_f64("b").unwrap_or(0.0) as f32,
+        ),
+        "squiggly" => dispatch::PageOp::Squiggly(
+            req.get_f64("r").unwrap_or(0.0) as f32,
+            req.get_f64("g").unwrap_or(0.0) as f32,
+            req.get_f64("b").unwrap_or(0.0) as f32,
+        ),
+        "stickyNote" => {
+            let text = req.get_str("text").unwrap_or("").to_string();
+            match (req.get_f64("x"), req.get_f64("y")) {
+                (Some(x), Some(y)) => {
+                    dispatch::PageOp::StickyNoteAt(x as f32, y as f32, text)
+                }
+                (None, None) => dispatch::PageOp::StickyNote(text),
+                _ => {
+                    return ResponseWriter::error_kind(
+                        ErrorKind::InvalidArgument,
+                        "stickyNote takes x and y together or neither",
+                    )
+                }
+            }
+        }
+        "stamp" => dispatch::PageOp::Stamp(parse_stamp_name(req.get_str("stampType").unwrap_or(""))),
+        "freeText" => dispatch::PageOp::FreeText {
+            x: req.get_f64("x").unwrap_or(0.0) as f32,
+            y: req.get_f64("y").unwrap_or(0.0) as f32,
+            w: req.get_f64("width").unwrap_or(0.0) as f32,
+            h: req.get_f64("height").unwrap_or(0.0) as f32,
+            text: req.get_str("text").unwrap_or("").to_string(),
+        },
+        "watermarkConfidential" => dispatch::PageOp::WatermarkConfidential,
+        "watermarkDraft" => dispatch::PageOp::WatermarkDraft,
+        "linkNamed" => dispatch::PageOp::LinkNamed(req.get_str("destination").unwrap_or("").to_string()),
+        "linkJavaScript" => dispatch::PageOp::LinkJavaScript(req.get_str("script").unwrap_or("").to_string()),
+        "onOpen" => dispatch::PageOp::OnOpen(req.get_str("script").unwrap_or("").to_string()),
+        "onClose" => dispatch::PageOp::OnClose(req.get_str("script").unwrap_or("").to_string()),
+        "imageArtifact" => {
+            let image_data = if let Some(ref mut reader) = data_reader {
+                read_all_from_reader(reader).unwrap_or_default()
+            } else {
+                req.get_bytes("data").unwrap_or(&[]).to_vec()
+            };
+            dispatch::PageOp::ImageArtifact {
+                data: image_data,
+                x: req.get_f64("x").unwrap_or(0.0) as f32,
+                y: req.get_f64("y").unwrap_or(0.0) as f32,
+                w: req.get_f64("width").unwrap_or(0.0) as f32,
+                h: req.get_f64("height").unwrap_or(0.0) as f32,
+            }
+        }
+        "table" => {
+            let columns = table_columns_from_request(req);
+            let cells = req.get_string_list("cells").unwrap_or_default();
+            let column_count = req.get_i32("columnCount").unwrap_or(0);
+            if column_count <= 0 || cells.len() % column_count as usize != 0 {
+                return ResponseWriter::error_kind(
+                    ErrorKind::InvalidArgument,
+                    "table cells length must be a nonzero multiple of columnCount",
+                );
+            }
+            let rows: Vec<Vec<String>> = cells
+                .chunks(column_count as usize)
+                .map(|row| row.iter().map(|s| s.to_string()).collect())
+                .collect();
+            dispatch::PageOp::BufferedTable {
+                columns,
+                rows,
+                has_header: req.get_bool("hasHeader").unwrap_or(true),
+            }
+        }
+        "streamingTable" => {
+            let columns = table_columns_from_request(req);
+            if columns.iter().any(|(_, width, _)| width.is_none()) {
+                return ResponseWriter::error_kind(
+                    ErrorKind::InvalidArgument,
+                    "streamingTable requires an explicit width for every column",
+                );
+            }
+            let cells = req.get_string_list("cells").unwrap_or_default();
+            let row_spans = req.get_int_list("rowSpans").unwrap_or_default().to_vec();
+            let column_count = req.get_i32("columnCount").unwrap_or(0);
+            if column_count <= 0 || row_spans.len() != cells.len() {
+                return ResponseWriter::error_kind(
+                    ErrorKind::InvalidArgument,
+                    "streamingTable cells and rowSpans must be parallel lists",
+                );
+            }
+            // Each row's spans must sum to columnCount: every column
+            // position is claimed exactly once, rowspan overruns refused.
+            let mut rows: Vec<Vec<(String, usize)>> = Vec::new();
+            let mut current: Vec<(String, usize)> = Vec::new();
+            let mut current_width: usize = 0;
+            for (text, span) in cells.into_iter().zip(row_spans) {
+                let span = span as usize;
+                if span == 0 || current_width + span > column_count as usize {
+                    return ResponseWriter::error_kind(
+                        ErrorKind::InvalidArgument,
+                        "streamingTable rowSpans must fill every row exactly: \
+                         each row's spans must sum to columnCount",
+                    );
+                }
+                current_width += span;
+                current.push((text.to_string(), span));
+                if current_width == column_count as usize {
+                    rows.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+            }
+            if !current.is_empty() {
+                return ResponseWriter::error_kind(
+                    ErrorKind::InvalidArgument,
+                    "streamingTable rowSpans must fill every row exactly: \
+                     each row's spans must sum to columnCount",
+                );
+            }
+            let config_columns: Vec<(String, f32, crate::writer::CellAlign)> = columns
+                .into_iter()
+                .map(|(header, width, align)| (header, width.unwrap_or(0.0), align))
+                .collect();
+            dispatch::PageOp::StreamingTableBlock {
+                config_columns,
+                repeat_header: req.get_bool("repeatHeader").unwrap_or(true),
+                rows,
+                mode: req.get_str("mode").unwrap_or("fixed").to_string(),
+                sample_rows: req.get_i32("sampleRows").unwrap_or(50) as usize,
+                min_col_width_pt: req.get_f64("minColWidth").unwrap_or(20.0) as f32,
+                max_col_width_pt: req.get_f64("maxColWidth").unwrap_or(400.0) as f32,
+                max_rowspan: req.get_i32("maxRowSpan").unwrap_or(1) as usize,
+            }
+        }
+        _ => {
+            return ResponseWriter::error(&format!("unknown pageOp: {page_op}"));
+        }
+    };
+
+    if let Some(msg) = refuse_unattached(
+        state.page_ops.get(&hid).map(Vec::as_slice).unwrap_or(&[]),
+        &op,
+    ) {
+        return ResponseWriter::error_kind(ErrorKind::InvalidArgument, msg);
+    }
+
+    state.page_ops
+        .entry(hid)
+        .or_default()
+        .push(op);
+
+    ok_flag("buffered")
+}
+
+fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+    let hid = req_handle(req);
+    let builders_map = &mut state.builders;
+    let builder = match builders_map.remove(&hid) {
+        Some(b) => b,
+        None => return ResponseWriter::error("builder not found"),
+    };
+
+    let compress = req.get_bool("compress").unwrap_or(true);
+    let ops = state.page_ops.remove(&hid).unwrap_or_default();
+    let mut builder = builder.compress_streams(compress);
+    if !ops.is_empty() {
+        dispatch::replay_page_ops(&mut builder, PageSize::A4, ops);
+    }
+
+    if let Some(mut writer) = sink_writer {
+        match dispatch::builder_save_to_writer(builder, &mut writer) {
+            Ok(()) => {
+                ok_flag("streamed")
+            }
+            Err(e) => ResponseWriter::error_of(&e),
+        }
+    } else {
+        match dispatch::builder_save(builder) {
+            Ok(bytes) => {
+                let mut w = ResponseWriter::ok();
+                w.put_bytes("data", &bytes);
+                w.finish()
+            }
+            Err(e) => ResponseWriter::error_of(&e),
+        }
+    }
+}
+
+/// A string field of one `radioGroup` option map (empty when absent).
+fn option_str(option: &[(&str, FieldValue<'_>)], key: &str) -> String {
+    option
+        .iter()
+        .find_map(|(k, v)| match v {
+            FieldValue::Str(s) if *k == key => Some(s.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A number field of one `radioGroup` option map (0 when absent); whole
+/// numbers may arrive as integers, as in `Request::get_f64`.
+fn option_f32(option: &[(&str, FieldValue<'_>)], key: &str) -> f32 {
+    option
+        .iter()
+        .find_map(|(k, v)| match v {
+            FieldValue::F64(n) if *k == key => Some(*n as f32),
+            FieldValue::I32(n) if *k == key => Some(*n as f32),
+            FieldValue::I64(n) if *k == key => Some(*n as f32),
+            _ => None,
+        })
+        .unwrap_or(0.0)
+}
+
+/// Map the wire alignment index (0 left / 1 center / 2 right) — the same
+/// encoding as the WASM binding's `Align` — onto the writer's `TextAlign`.
+fn align_from_int(v: i32) -> crate::writer::TextAlign {
+    match v {
+        1 => crate::writer::TextAlign::Center,
+        2 => crate::writer::TextAlign::Right,
+        _ => crate::writer::TextAlign::Left,
+    }
+}
+
+fn align_from_index(v: i32) -> crate::writer::CellAlign {
+    match v {
+        1 => crate::writer::CellAlign::Center,
+        2 => crate::writer::CellAlign::Right,
+        _ => crate::writer::CellAlign::Left,
+    }
+}
+
+/// Read the table-column arrays (`headers`, `widths` with -1 for auto,
+/// `aligns`) shared by the buffered and streaming table ops.
+fn table_columns_from_request(
+    req: &Request<'_>,
+) -> Vec<(String, Option<f32>, crate::writer::CellAlign)> {
+    let headers = req.get_string_list("headers").unwrap_or_default();
+    let widths = req.get_f64_list("widths").unwrap_or(&[]);
+    let aligns = req.get_int_list("aligns").unwrap_or(&[]);
+    headers
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let width = widths.get(i).copied().filter(|w| *w >= 0.0).map(|w| w as f32);
+            let align = aligns.get(i).map(|a| align_from_index(*a));
+            let align = align.unwrap_or(crate::writer::CellAlign::Left);
+            (h.to_string(), width, align)
+        })
+        .collect()
+}
+
+/// Parse a stamp-type name — the same names the WASM binding's
+/// `parse_wasm_stamp_type` accepts. Unknown names fall through to
+/// `Custom(name)`.
+fn parse_stamp_name(name: &str) -> crate::writer::StampType {
+    use crate::writer::StampType;
+    match name {
+        "Approved" => StampType::Approved,
+        "Experimental" => StampType::Experimental,
+        "NotApproved" => StampType::NotApproved,
+        "AsIs" => StampType::AsIs,
+        "Expired" => StampType::Expired,
+        "NotForPublicRelease" => StampType::NotForPublicRelease,
+        "Confidential" => StampType::Confidential,
+        "Final" => StampType::Final,
+        "Sold" => StampType::Sold,
+        "Departmental" => StampType::Departmental,
+        "ForComment" => StampType::ForComment,
+        "TopSecret" => StampType::TopSecret,
+        "Draft" => StampType::Draft,
+        "ForPublicRelease" => StampType::ForPublicRelease,
+        other => StampType::Custom(other.to_string()),
+    }
+}
+
+/// Refuse a field-script or link op queued with nothing on its page to
+/// attach to. The engine drops such calls silently — a field script needs
+/// a `form_field_meta` entry, a link a `last_text_rect` — so the host
+/// refuses at queue time instead of reporting success over an op that
+/// never lands. `queued` is this handle's ops already buffered; the scan
+/// walks back to the most recent page start (`NewPage`, `NewPageSameSize`,
+/// `Done`), which resets both the page's form fields and its last text
+/// rect.
+fn refuse_unattached(
+    queued: &[dispatch::PageOp],
+    op: &dispatch::PageOp,
+) -> Option<&'static str> {
+    use dispatch::PageOp;
+    let unattached = match op {
+        PageOp::FieldKeystroke(_) => "fieldKeystroke needs a form field on this page first",
+        PageOp::FieldFormat(_) => "fieldFormat needs a form field on this page first",
+        PageOp::FieldValidate(_) => "fieldValidate needs a form field on this page first",
+        PageOp::FieldCalculate(_) => "fieldCalculate needs a form field on this page first",
+        PageOp::LinkUrl(_) => "linkUrl needs text on this page first",
+        PageOp::LinkPage(_) => "linkPage needs text on this page first",
+        PageOp::LinkNamed(_) => "linkNamed needs text on this page first",
+        PageOp::LinkJavaScript(_) => "linkJavaScript needs text on this page first",
+        PageOp::Highlight(..) => "highlight needs text on this page first",
+        PageOp::Underline(..) => "underline needs text on this page first",
+        PageOp::Strikeout(..) => "strikeout needs text on this page first",
+        PageOp::Squiggly(..) => "squiggly needs text on this page first",
+        _ => return None,
+    };
+    let wants_field = matches!(
+        op,
+        PageOp::FieldKeystroke(_)
+            | PageOp::FieldFormat(_)
+            | PageOp::FieldValidate(_)
+            | PageOp::FieldCalculate(_)
+    );
+    let mut has_field = false;
+    let mut has_text = false;
+    for queued_op in queued.iter().rev() {
+        match queued_op {
+            PageOp::NewPage { .. } | PageOp::NewPageSameSize | PageOp::Done => break,
+            PageOp::TextField { .. }
+            | PageOp::Checkbox { .. }
+            | PageOp::ComboBox { .. }
+            | PageOp::PushButton { .. }
+            | PageOp::SignatureField { .. }
+            | PageOp::RadioGroup { .. } => has_field = true,
+            PageOp::Text(_) | PageOp::Heading(_, _) => has_text = true,
+            // Inline runs and rect-wrapped text set the same
+            // `last_text_rect` as `.text()` does in the engine.
+            PageOp::Inline(_) | PageOp::InlineBold(_) | PageOp::InlineItalic(_) => has_text = true,
+            PageOp::InlineColor { .. } | PageOp::TextInRect { .. } => has_text = true,
+            _ => {}
+        }
+    }
+    if (wants_field && !has_field) || (!wants_field && !has_text) {
+        Some(unattached)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_unattached;
+    use crate::host::dispatch::PageOp;
+
+    fn text_field() -> PageOp {
+        PageOp::TextField {
+            name: "field".into(),
+            x: 50.0,
+            y: 700.0,
+            w: 200.0,
+            h: 20.0,
+            default_value: None,
+        }
+    }
+
+    #[test]
+    fn script_with_no_field_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::FieldKeystroke("s".into())),
+            Some("fieldKeystroke needs a form field on this page first")
+        );
+    }
+
+    #[test]
+    fn script_after_a_field_is_allowed() {
+        let queued = vec![text_field()];
+        assert_eq!(refuse_unattached(&queued, &PageOp::FieldFormat("s".into())), None);
+    }
+
+    #[test]
+    fn script_after_a_field_then_new_page_same_size_is_refused() {
+        let queued = vec![text_field(), PageOp::NewPageSameSize];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::FieldValidate("s".into())),
+            Some("fieldValidate needs a form field on this page first")
+        );
+    }
+
+    #[test]
+    fn link_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::LinkUrl("https://example.com".into())),
+            Some("linkUrl needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn link_after_text_is_allowed() {
+        let queued = vec![PageOp::Text("hello".into())];
+        assert_eq!(refuse_unattached(&queued, &PageOp::LinkPage(0)), None);
+    }
+
+    #[test]
+    fn link_after_heading_is_allowed() {
+        let queued = vec![PageOp::Heading(1, "Title".into())];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::LinkUrl("https://example.com".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn link_named_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::LinkNamed("sec-1".into())),
+            Some("linkNamed needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn link_javascript_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::LinkJavaScript("app.alert(1)".into())),
+            Some("linkJavaScript needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn highlight_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::Highlight(1.0, 1.0, 0.0)),
+            Some("highlight needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn underline_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::Underline(0.0, 0.0, 0.0)),
+            Some("underline needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn strikeout_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::Strikeout(0.0, 0.0, 0.0)),
+            Some("strikeout needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn squiggly_with_no_text_is_refused() {
+        assert_eq!(
+            refuse_unattached(&[], &PageOp::Squiggly(1.0, 0.0, 0.0)),
+            Some("squiggly needs text on this page first")
+        );
+    }
+
+    #[test]
+    fn inline_counts_as_text() {
+        let queued = vec![PageOp::Inline("run".into())];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::Highlight(1.0, 1.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_bold_counts_as_text() {
+        let queued = vec![PageOp::InlineBold("run".into())];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::LinkNamed("sec-1".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_italic_counts_as_text() {
+        let queued = vec![PageOp::InlineItalic("run".into())];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::Underline(0.0, 0.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_color_counts_as_text() {
+        let queued = vec![PageOp::InlineColor {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            text: "run".into(),
+        }];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::Squiggly(1.0, 0.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn text_in_rect_counts_as_text() {
+        let queued = vec![PageOp::TextInRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 20.0,
+            text: "run".into(),
+            align: crate::writer::TextAlign::Left,
+        }];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::LinkJavaScript("app.alert(1)".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_then_new_page_resets_text() {
+        let queued = vec![PageOp::Inline("run".into()), PageOp::NewPageSameSize];
+        assert_eq!(
+            refuse_unattached(&queued, &PageOp::LinkUrl("https://example.com".into())),
+            Some("linkUrl needs text on this page first")
+        );
+    }
+}
