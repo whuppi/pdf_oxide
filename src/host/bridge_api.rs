@@ -337,6 +337,12 @@ pub(crate) fn handle_editor_open(
     if let Some(resp) = authenticate_or_refuse(&doc, password) {
         return resp;
     }
+    // Encrypt-dict accessors return None on unencrypted documents —
+    // 0 / 0xFF are the wire's "not encrypted / all permitted" values,
+    // the same facts open_document reports.
+    let is_encrypted = doc.is_encrypted();
+    let enc_algo = doc.encryption_algorithm().unwrap_or(0) as i32;
+    let permission_bits = doc.permission_bits().map(|p| p as i32).unwrap_or(0xFF);
     let editor = match DocumentEditor::from_document(doc) {
         Ok(e) => e,
         Err(e) => return ResponseWriter::error_of(&e),
@@ -345,6 +351,9 @@ pub(crate) fn handle_editor_open(
     state.editors.insert(hid, editor);
     let mut w = ResponseWriter::ok();
     w.put_i32("handleId", hid as i32);
+    w.put_bool("isEncrypted", is_encrypted);
+    w.put_i32("encryptionAlgorithm", enc_algo);
+    w.put_i32("permissionBits", permission_bits);
     w.finish()
 }
 
