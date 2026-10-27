@@ -2,6 +2,9 @@
 //!
 //! Provides the DocumentEditor type for modifying PDF documents.
 
+// ── pdf_manipulator patch: the visible-order cache locks a mutex ──
+use crate::cache::MutexExt;
+// ── end pdf_manipulator patch ──
 use crate::document::PdfDocument;
 use crate::editor::form_fields::FormFieldWrapper;
 use crate::editor::resource_manager::ResourceManager;
@@ -540,6 +543,10 @@ pub struct DocumentEditor {
     /// Page add, delete, move and merge change `page_order` and `merged_pages`
     /// only, never the source tree, so only a source replacement clears it.
     source_page_refs: Option<std::sync::Arc<[ObjectRef]>>,
+    /// Source index of each visible output page (`page_order` without removed
+    /// slots), built on first use. Every write to `page_order` calls
+    /// `invalidate_visible_order`.
+    visible_order: std::sync::Mutex<Option<Vec<usize>>>,
     // ── end pdf_manipulator patch ──
 }
 
@@ -711,6 +718,7 @@ impl DocumentEditor {
             merged_acroform_dr: None,
             merged_acroform_da: None,
             source_page_refs: None,
+            visible_order: std::sync::Mutex::new(None),
             // ── end pdf_manipulator patch ──
         })
     }
@@ -757,6 +765,7 @@ impl DocumentEditor {
             merged_acroform_dr: None,
             merged_acroform_da: None,
             source_page_refs: None,
+            visible_order: std::sync::Mutex::new(None),
             // ── end pdf_manipulator patch ──
         })
     }
@@ -807,6 +816,7 @@ impl DocumentEditor {
             merged_acroform_dr: None,
             merged_acroform_da: None,
             source_page_refs: None,
+            visible_order: std::sync::Mutex::new(None),
             // ── end pdf_manipulator patch ──
         })
     }
@@ -976,7 +986,13 @@ impl DocumentEditor {
     pub fn page_order_visible(&self) -> Vec<i32> {
         self.page_order.iter().filter(|&&i| i >= 0).copied().collect()
     }
-    pub fn page_order_mut(&mut self) -> &mut Vec<i32> { &mut self.page_order }
+    pub fn page_order_mut(&mut self) -> &mut Vec<i32> {
+        self.invalidate_visible_order();
+        &mut self.page_order
+    }
+    fn invalidate_visible_order(&mut self) {
+        *self.visible_order.lock_or_recover() = None;
+    }
     pub fn modified_objects_mut(&mut self) -> &mut HashMap<u32, Object> { &mut self.modified_objects }
     // ── end pdf_manipulator patch ──
 
@@ -1131,12 +1147,17 @@ impl DocumentEditor {
     /// When no reordering has been applied `page_order = [0, 1, 2, …]` so the mapping is the
     /// identity and there is no observable difference for callers.
     fn output_to_source_index(&self, output: usize) -> usize {
-        self.page_order
-            .iter()
-            .filter(|&&i| i >= 0)
-            .map(|&i| i as usize)
-            .nth(output)
-            .unwrap_or(output)
+        // ── pdf_manipulator patch: cached visible order, not a scan per call ──
+        let mut cache = self.visible_order.lock_or_recover();
+        let visible = cache.get_or_insert_with(|| {
+            self.page_order
+                .iter()
+                .filter(|&&i| i >= 0)
+                .map(|&i| i as usize)
+                .collect()
+        });
+        visible.get(output).copied().unwrap_or(output)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Get the list of page objects in current order.
@@ -1144,72 +1165,11 @@ impl DocumentEditor {
         if let Some(refs) = &self.source_page_refs {
             return Ok(std::sync::Arc::clone(refs));
         }
-        let refs: std::sync::Arc<[ObjectRef]> = self.walk_source_page_refs()?.into();
+        // ── pdf_manipulator patch: one page walk in the crate (#261) ──
+        let refs: std::sync::Arc<[ObjectRef]> = self.source.all_page_refs()?.into();
+        // ── end pdf_manipulator patch ──
         self.source_page_refs = Some(std::sync::Arc::clone(&refs));
         Ok(refs)
-    }
-
-    /// Walk the source page tree for its leaf refs. A root whose `/Count`
-    /// equals its `/Kids` length is flat: the refs come straight from the
-    /// array, without loading each leaf. Any other root takes the full walk,
-    /// which keeps only kids typed `/Page` and recurses into `/Pages`.
-    fn walk_source_page_refs(&mut self) -> Result<Vec<ObjectRef>> {
-        // Get catalog and pages tree
-        let catalog = self.source.catalog()?;
-        let catalog_dict = catalog
-            .as_dict()
-            .ok_or_else(|| Error::InvalidPdf("Catalog is not a dictionary".to_string()))?;
-
-        let pages_ref = catalog_dict
-            .get("Pages")
-            .ok_or_else(|| Error::InvalidPdf("Catalog missing /Pages".to_string()))?
-            .as_reference()
-            .ok_or_else(|| Error::InvalidPdf("/Pages is not a reference".to_string()))?;
-
-        let pages_obj = self.source.load_object(pages_ref)?;
-        let pages_dict = pages_obj
-            .as_dict()
-            .ok_or_else(|| Error::InvalidPdf("Pages is not a dictionary".to_string()))?;
-
-        // Get Kids array
-        let kids = pages_dict
-            .get("Kids")
-            .ok_or_else(|| Error::InvalidPdf("Pages missing /Kids".to_string()))?
-            .as_array()
-            .ok_or_else(|| Error::InvalidPdf("/Kids is not an array".to_string()))?;
-
-        let count = pages_dict.get("Count").and_then(|c| c.as_integer());
-        if count == i64::try_from(kids.len()).ok() {
-            return self.source.all_page_refs();
-        }
-
-        // Collect page references (flattening any intermediate Pages nodes)
-        let mut page_refs = Vec::new();
-        self.collect_page_refs(kids, &mut page_refs)?;
-
-        Ok(page_refs)
-    }
-
-    /// Recursively collect page references from a Kids array.
-    fn collect_page_refs(&mut self, kids: &[Object], refs: &mut Vec<ObjectRef>) -> Result<()> {
-        for kid in kids {
-            if let Some(kid_ref) = kid.as_reference() {
-                let kid_obj = self.source.load_object(kid_ref)?;
-                if let Some(kid_dict) = kid_obj.as_dict() {
-                    let type_name = kid_dict.get("Type").and_then(|t| t.as_name()).unwrap_or("");
-
-                    if type_name == "Page" {
-                        refs.push(kid_ref);
-                    } else if type_name == "Pages" {
-                        // Intermediate Pages node - recurse
-                        if let Some(sub_kids) = kid_dict.get("Kids").and_then(|k| k.as_array()) {
-                            self.collect_page_refs(sub_kids, refs)?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Extract a subset of pages into a new PDF and write it to `output`.
@@ -1271,12 +1231,14 @@ impl DocumentEditor {
         let new_order: Vec<i32> = pages.iter().map(|&i| visible[i]).collect();
 
         let saved_order = std::mem::replace(&mut self.page_order, new_order);
+        self.invalidate_visible_order();
         let saved_is_modified = std::mem::replace(&mut self.is_modified, true);
 
         let result = self.save_to_bytes();
 
         // Always restore — even on Err — so the document is observably unchanged.
         self.page_order = saved_order;
+        self.invalidate_visible_order();
         self.is_modified = saved_is_modified;
         // ── end pdf_manipulator patch ──
 
@@ -1352,6 +1314,7 @@ impl DocumentEditor {
         let new_order: Vec<i32> = pages.iter().map(|&i| visible[i]).collect();
 
         self.page_order = new_order;
+        self.invalidate_visible_order();
         self.is_modified = true;
         Ok(())
     }
@@ -9372,6 +9335,7 @@ impl EditableDocument for DocumentEditor {
                 visible_index += 1;
             }
         }
+        self.invalidate_visible_order();
 
         self.is_modified = true;
         Ok(())
@@ -9401,6 +9365,7 @@ impl EditableDocument for DocumentEditor {
 
         // Rebuild page_order
         self.page_order = new_visible;
+        self.invalidate_visible_order();
         self.is_modified = true;
         Ok(())
     }
@@ -9425,6 +9390,7 @@ impl EditableDocument for DocumentEditor {
 
         // Add duplicate reference
         self.page_order.push(original_index);
+        self.invalidate_visible_order();
         self.is_modified = true;
 
         Ok(self.current_page_count() - 1)
@@ -13301,12 +13267,28 @@ mod tests {
     }
 
     #[test]
+    fn output_index_follows_removes_and_moves() {
+        let mut editor = open_editor_from_bytes(&nested_page_tree_pdf_bytes(), "output_index");
+        assert_eq!(editor.output_to_source_index(1), 1);
+
+        editor.remove_page(1).unwrap();
+        assert_eq!(editor.output_to_source_index(0), 0);
+        assert_eq!(editor.output_to_source_index(1), 2);
+
+        editor.move_page(0, 1).unwrap();
+        assert_eq!(editor.output_to_source_index(0), 2);
+        assert_eq!(editor.output_to_source_index(1), 0);
+
+        // Past the end falls back to the output index itself.
+        assert_eq!(editor.output_to_source_index(5), 5);
+    }
+
+    #[test]
     fn nested_tree_rotates_every_page_and_keeps_the_walk_refs() {
         let mut editor = open_editor_from_bytes(&nested_page_tree_pdf_bytes(), "nested_rotate");
 
         let expected: Vec<ObjectRef> = (4..=6).map(|id| ObjectRef::new(id, 0)).collect();
         assert_eq!(&*editor.get_page_refs().unwrap(), expected.as_slice());
-        assert_eq!(editor.walk_source_page_refs().unwrap(), expected);
 
         for i in 0..3 {
             editor.rotate_page_by(i, 90).unwrap();

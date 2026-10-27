@@ -2643,10 +2643,10 @@ impl PdfDocument {
     /// each `get_page_ref(i)` walks the tree from the root and stops at the
     /// i-th leaf, so collecting all n refs walks 1+2+...+n nodes.
     ///
-    /// Optimised for the common flat-tree case: when a `Pages` node's
-    /// `Count` matches `Kids.len()`, every kid is a leaf and we can take
-    /// the references straight from the array without loading each leaf.
-    /// Only when the tree is multi-level do we recurse and load child nodes.
+    // ── pdf_manipulator patch: the walk is exact, no /Count fast path (#261) ──
+    /// Every kid is loaded and classified: a `/Type /Pages` node or one with a
+    /// `/Kids` array is recursed into, anything else is a leaf.
+    // ── end pdf_manipulator patch ──
     pub(crate) fn all_page_refs(&self) -> Result<Vec<ObjectRef>> {
         let catalog = self.catalog()?;
         let catalog_dict = catalog.as_dict().ok_or_else(|| Error::InvalidObjectType {
@@ -2679,27 +2679,20 @@ impl PdfDocument {
             None => return Ok(()),
         };
 
+        // ── pdf_manipulator patch: the walk is exact, no /Count fast path (#261) ──
+        // A /Pages node whose kids are inner /Pages nodes can still have
+        // /Count == kids.len(), so every kid is loaded and classified.
         let kids = match dict.get("Kids").and_then(|k| k.as_array()) {
             Some(k) => k,
+            None if dict.get("Type").and_then(|t| t.as_name()) == Some("Pages") => return Ok(()),
             None => {
                 // Leaf reached (no /Kids — assume Page).
                 out.push(node_ref);
                 return Ok(());
             },
         };
+        // ── end pdf_manipulator patch ──
 
-        // Fast path: flat subtree — every kid is a leaf when /Count == kids.len().
-        let count = dict.get("Count").and_then(|c| c.as_integer()).unwrap_or(-1);
-        if count >= 0 && (count as usize) == kids.len() {
-            for kid in kids {
-                if let Some(kid_ref) = kid.as_reference() {
-                    out.push(kid_ref);
-                }
-            }
-            return Ok(());
-        }
-
-        // Mixed tree — recurse into each kid.
         for kid in kids {
             if let Some(kid_ref) = kid.as_reference() {
                 self.collect_page_refs(kid_ref, out, visited)?;
@@ -34205,6 +34198,44 @@ mod tests {
         assert_eq!(facts[0].media_box, Some([0.0, 0.0, 300.0, 400.0]));
         assert_eq!(facts[1].media_box, Some([0.0, 0.0, 500.0, 600.0]));
         assert_eq!(facts[0].rotation(), 90);
+    }
+
+    #[test]
+    fn test_all_page_refs_walks_inner_nodes_with_matching_count() {
+        let bodies = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 >>",
+            "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 3 0 R >>",
+            "<< /Type /Page /Parent 4 0 R >>",
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+        }
+        let xref_at = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                bodies.len() + 1,
+                xref_at
+            )
+            .as_bytes(),
+        );
+        let doc = PdfDocument::from_bytes(out).unwrap();
+        assert_eq!(
+            doc.all_page_refs().unwrap(),
+            vec![ObjectRef::new(5, 0), ObjectRef::new(6, 0)]
+        );
+        assert_eq!(doc.page_count().unwrap(), 2);
     }
     // ── end pdf_manipulator patch ──
 
