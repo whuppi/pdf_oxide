@@ -841,27 +841,21 @@ fn handle_editor_extract_pages(
         return ResponseWriter::error_of(&e);
     }
 
-    let visible: Vec<i32> = editor.page_order_visible();
-    let new_order: Vec<i32> = pages.iter().map(|&i| visible[i]).collect();
-
-    // Save + restore state — editor unchanged after this call.
-    let saved_order = std::mem::replace(editor.page_order_mut(), new_order);
-    let saved_modified = editor.is_modified();
-    editor.set_modified(true);
-
-    let result = if let Some(mut writer) = sink_writer {
-        dispatch::edit_save_with_options(
-            editor, &mut writer, &crate::editor::SaveOptions::full_rewrite(), cancel,
-        )
-    } else {
-        Err(crate::error::Error::InvalidPdf(
-            "editorExtractPages requires a sink".into(),
-        ))
-    };
-
-    // Always restore — even on error.
-    *editor.page_order_mut() = saved_order;
-    editor.set_modified(saved_modified);
+    // Save with the page list cut down, then put it back — the editor is
+    // unchanged after this call, merged pages included.
+    let result = editor
+        .with_pages_selected(&pages, |editor| {
+            if let Some(mut writer) = sink_writer {
+                dispatch::edit_save_with_options(
+                    editor, &mut writer, &crate::editor::SaveOptions::full_rewrite(), cancel,
+                )
+            } else {
+                Err(crate::error::Error::InvalidPdf(
+                    "editorExtractPages requires a sink".into(),
+                ))
+            }
+        })
+        .and_then(|saved| saved);
 
     match result {
         Ok(()) => {

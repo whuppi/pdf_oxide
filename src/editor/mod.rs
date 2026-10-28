@@ -94,6 +94,9 @@ pub use document_editor::{
     DocumentEditor, DocumentInfo, EditableDocument, EncryptionAlgorithm, EncryptionConfig,
     ImageInfo, PageInfo, Permissions, SaveOptions,
 };
+// ── pdf_manipulator patch: the page order's entries, read by the prune plan ──
+pub(crate) use document_editor::{PageKey, PageSlot};
+// ── end pdf_manipulator patch ──
 pub use dom::{
     AnnotationId, AnnotationWrapper, ElementId, ImageElementCollectionEditor, PageEditor,
     PathElementCollectionEditor, PdfElement, PdfImage, PdfPage, PdfPath, PdfStructure, PdfTable,

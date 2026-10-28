@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::document::PdfDocument;
+use crate::editor::{PageKey, PageSlot};
 use crate::object::{Object, ObjectRef};
 
 type Dict = HashMap<String, Object>;
@@ -63,11 +64,12 @@ impl PagePrune {
 }
 
 /// Plans the save of `doc` with the edits in `staged` and the pages in
-/// `page_order` (source leaf indices; `-1` is a removed slot).
+/// `page_order`. A source page missing from it is dropped; a merged page
+/// is never part of the plan, since it is not a page of `doc`.
 pub(crate) fn plan(
     doc: &PdfDocument,
     staged: &HashMap<u32, Object>,
-    page_order: &[i32],
+    page_order: &[PageSlot],
 ) -> PagePrune {
     let mut p = Planner {
         doc,
@@ -109,7 +111,7 @@ impl Planner<'_> {
         }
     }
 
-    fn run(&mut self, page_order: &[i32]) {
+    fn run(&mut self, page_order: &[PageSlot]) {
         let Some(catalog_ref) = self
             .doc
             .trailer()
@@ -128,8 +130,10 @@ impl Planner<'_> {
         let leaves = self.doc.all_page_refs().unwrap_or_default();
         let kept_idx: Vec<usize> = page_order
             .iter()
-            .filter(|&&i| i >= 0 && (i as usize) < leaves.len())
-            .map(|&i| i as usize)
+            .filter_map(|slot| match slot.key() {
+                PageKey::Source(i) if i < leaves.len() => Some(i),
+                _ => None,
+            })
             .collect();
         let kept: Vec<ObjectRef> = kept_idx.iter().map(|&i| leaves[i]).collect();
         let kept_ids: HashSet<u32> = kept.iter().map(|r| r.id).collect();
@@ -150,7 +154,7 @@ impl Planner<'_> {
             }
         }
 
-        self.renumber_page_labels(&catalog, &kept_idx);
+        self.renumber_page_labels(&catalog, page_order);
 
         // Nothing to prune: the tree was flat and every page is kept.
         if self.dropped_pages.is_empty() {
@@ -189,11 +193,19 @@ impl Planner<'_> {
     /// wrong pages. Each kept page keeps the label it had: a new range
     /// starts wherever the old range or the run of consecutive pages
     /// breaks, with `/St` moved on by the pages skipped.
-    fn renumber_page_labels(&mut self, catalog: &Dict, kept_idx: &[usize]) {
+    ///
+    /// A merged page has no entry of its own: it takes the label that runs
+    /// on from the page before it, and the source page after it starts a
+    /// new range.
+    fn renumber_page_labels(&mut self, catalog: &Dict, page_order: &[PageSlot]) {
         let Some(labels) = catalog.get("PageLabels").cloned() else {
             return;
         };
-        if kept_idx.iter().enumerate().all(|(j, &i)| i == j) {
+        let in_place = |(j, slot): (usize, &PageSlot)| match slot.key() {
+            PageKey::Source(i) => i == j,
+            PageKey::Merged(_) => true,
+        };
+        if page_order.iter().enumerate().all(in_place) {
             return;
         }
         let mut ranges: Vec<(usize, Dict)> = Vec::new();
@@ -202,7 +214,11 @@ impl Planner<'_> {
 
         let mut nums = Vec::new();
         let mut prev: Option<(Option<usize>, usize)> = None;
-        for (j, &i) in kept_idx.iter().enumerate() {
+        for (j, slot) in page_order.iter().enumerate() {
+            let PageKey::Source(i) = slot.key() else {
+                prev = None;
+                continue;
+            };
             let range = ranges.iter().rposition(|(start, _)| *start <= i);
             if prev == Some((range, i.wrapping_sub(1))) {
                 prev = Some((range, i));

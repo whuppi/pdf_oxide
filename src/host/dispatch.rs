@@ -866,7 +866,7 @@ pub fn edit_page_images(
 ) -> Result<Vec<crate::editor::ImageInfo>> {
     // Upstream records every `Do` (forms included); the contract is images.
     let placed = editor.get_page_images(page)?;
-    let source_page = editor.page_order_visible()[page] as usize;
+    let source_page = editor.source_page_index(page)?;
     let page_ref = editor.source().get_page_ref(source_page)?;
     let image_names =
         crate::host::images::inventory::page_image_xobject_names(editor.source(), page_ref)?;
