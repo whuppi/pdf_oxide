@@ -2579,12 +2579,12 @@ impl PdfDocument {
             head.dict.values().for_each(|o| push_refs(o, out));
             return;
         }
-        // Cold path: load into cache, then borrow.
-        if self.load_object(obj_ref).is_ok() {
-            let cache = self.object_cache.lock_or_recover();
-            if let Some(obj) = cache.get(&obj_ref) {
-                push_refs(obj, out);
-            }
+        // Cold path: read the references from the object the load returned.
+        // The cache is a bounded FIFO that keeps no object over its budget
+        // and evicts the rest, so reading it again after the load can find
+        // nothing and end the walk there.
+        if let Ok(obj) = self.load_object(obj_ref) {
+            push_refs(&obj, out);
         }
     }
     // ── end pdf_manipulator patch ──

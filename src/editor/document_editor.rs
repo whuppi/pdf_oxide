@@ -2692,6 +2692,9 @@ impl DocumentEditor {
         {
             queue.push(r.id);
         }
+        // The source root /Pages lists the nodes the save excludes; the
+        // output's root lists the kept pages, so the walk enters them here.
+        queue.extend_from_slice(&prune.kept_pages);
 
         while let Some(id) = queue.pop() {
             let idx = id as usize;
@@ -2717,6 +2720,42 @@ impl DocumentEditor {
             .map(|(i, _)| i as u32)
             .collect()
     }
+
+    // ── pdf_manipulator patch: the written objects are closed under reference ──
+    /// The first `(referenced id, referencing id)` of `references` that
+    /// names an object the save has on hand and did not write: a staged
+    /// object, a source object in use, or an id the save allocated. A
+    /// reference the save nulls is never in `references`; one to an id the
+    /// source itself lacks (no entry, or a free one) reads as null in the
+    /// source too, so it is left alone.
+    fn first_unwritten_reference(
+        &self,
+        references: &[(u32, u32)],
+        written: &XrefEntries,
+    ) -> Option<(u32, u32)> {
+        let mut source_ids: Option<(Vec<u32>, u32)> = None;
+        for &(target, writer_id) in references {
+            if written.contains_id(target) {
+                continue;
+            }
+            if self.modified_objects.contains_key(&target) {
+                return Some((target, writer_id));
+            }
+            let (ids, bound) = source_ids.get_or_insert_with(|| {
+                (self.source.all_object_ids(), Self::find_max_object_id(&self.source) + 1)
+            });
+            let on_hand = if target < *bound {
+                ids.binary_search(&target).is_ok() && !self.source.is_free_entry(target)
+            } else {
+                target < self.next_object_id
+            };
+            if on_hand {
+                return Some((target, writer_id));
+            }
+        }
+        None
+    }
+    // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: what only a dropped page reaches (#261) ──
     /// The objects reachable from the prune plan's excluded objects (dropped
@@ -3069,7 +3108,8 @@ impl DocumentEditor {
         // ── pdf_manipulator patch: references to what the save leaves out are null (#261) ──
         let serializer = ObjectSerializer::compact()
             .nulling(prune.excluded.clone())
-            .zero_generations();
+            .zero_generations()
+            .recording_references();
         // ── end pdf_manipulator patch ──
 
         // Set up encryption if configured
@@ -5693,6 +5733,17 @@ impl DocumentEditor {
                 xref_entries.push((obj_id, offset, 0, true));
             }
         }
+
+        // ── pdf_manipulator patch: the written objects are closed under reference ──
+        if let Some((target, writer_id)) =
+            self.first_unwritten_reference(&serializer.written_references(), &xref_entries)
+        {
+            return Err(Error::InvalidPdf(format!(
+                "the rewrite would leave object {} referenced by {} unwritten",
+                target, writer_id
+            )));
+        }
+        // ── end pdf_manipulator patch ──
 
         // Sort xref entries by object ID
         xref_entries.sort_by_key(|(id, _, _, _)| *id);
@@ -14292,5 +14343,237 @@ mod tests {
         assert!(editor.merge_pages_from_document(source, &[5]).is_err());
         assert_eq!(editor.current_page_count(), 1);
         assert!(editor.merged_sources.is_empty());
+    }
+
+    // ── a full rewrite writes everything a kept page reaches ──
+
+    const ICC_BYTES: &[u8] = b"ICCPROFILEBYTES-0123456789";
+    const FONT_FILE_BYTES: &[u8] = b"FONTFILE2BYTES-9876543210";
+    const CONTENT_A: &[u8] = b"q 0 0 1 rg 0 0 50 50 re f Q % CONTENTA\n";
+    const CONTENT_B: &[u8] = b"q 1 0 0 rg 50 50 40 40 re f Q % CONTENTB\n";
+
+    /// Root `/Pages` -> inner `/Pages` -> two pages. Page 4 has an indirect
+    /// `/Contents` array of two streams, a `/ColorSpace` with an ICC stream
+    /// and a font with a descriptor and a font file.
+    fn nested_resources_pdf_bytes() -> Vec<u8> {
+        pdf_from_objects(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 2 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>\nendobj\n"
+                .to_vec(),
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] /Contents 6 0 R \
+              /Resources << /ColorSpace << /Cs6 [/ICCBased 8 0 R] >> /Font << /F1 9 0 R >> >> >>\nendobj\n"
+                .to_vec(),
+            b"5 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec(),
+            b"6 0 obj\n[7 0 R 10 0 R]\nendobj\n".to_vec(),
+            stream_object(7, "", CONTENT_A),
+            stream_object(8, "/N 3", ICC_BYTES),
+            b"9 0 obj\n<< /Type /Font /Subtype /TrueType /BaseFont /TESTFONT /FontDescriptor 11 0 R >>\nendobj\n"
+                .to_vec(),
+            stream_object(10, "", CONTENT_B),
+            b"11 0 obj\n<< /Type /FontDescriptor /FontName /TESTFONT /Flags 32 /FontFile2 12 0 R >>\nendobj\n"
+                .to_vec(),
+            stream_object(12, "", FONT_FILE_BYTES),
+        ])
+    }
+
+    /// Asserts page 0 of `bytes` still reaches both content streams, the
+    /// ICC stream behind `/Cs6` and the font file behind the descriptor.
+    fn assert_nested_resources_survive(bytes: &[u8], what: &str) {
+        let doc = crate::document::PdfDocument::from_bytes(bytes.to_vec()).unwrap();
+        let resolve = |o: &Object| match o {
+            Object::Reference(r) => doc.load_object(*r).unwrap(),
+            other => other.clone(),
+        };
+        let page = doc.load_object(doc.get_page_ref(0).unwrap()).unwrap();
+        let page = page.as_dict().unwrap();
+
+        let contents = resolve(&page["Contents"]);
+        let streams: Vec<Vec<u8>> = contents
+            .as_array()
+            .unwrap_or_else(|| panic!("{what}: /Contents is not an array"))
+            .iter()
+            .map(|s| resolve(s).decode_stream_data().unwrap_or_else(|e| panic!("{what}: {e}")))
+            .collect();
+        assert_eq!(streams, vec![CONTENT_A.to_vec(), CONTENT_B.to_vec()], "{what}: content streams");
+
+        let resources = resolve(&page["Resources"]);
+        let resources = resources.as_dict().unwrap();
+        let spaces = resolve(&resources["ColorSpace"]);
+        let cs6 = spaces.as_dict().unwrap()["Cs6"].as_array().unwrap().clone();
+        let icc = resolve(&cs6[1]).decode_stream_data().unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(icc, ICC_BYTES, "{what}: ICC profile");
+
+        let fonts = resolve(&resources["Font"]);
+        let font = resolve(&fonts.as_dict().unwrap()["F1"]);
+        let descriptor = resolve(&font.as_dict().unwrap()["FontDescriptor"]);
+        let font_file = resolve(&descriptor.as_dict().unwrap()["FontFile2"]);
+        assert_eq!(
+            font_file.decode_stream_data().unwrap_or_else(|e| panic!("{what}: {e}")),
+            FONT_FILE_BYTES,
+            "{what}: font file"
+        );
+    }
+
+    #[test]
+    fn a_full_rewrite_of_a_nested_tree_writes_everything_a_kept_page_reaches() {
+        for garbage_collect in [true, false] {
+            for compress in [true, false] {
+                let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
+                let options = SaveOptions { garbage_collect, compress, ..SaveOptions::full_rewrite() };
+                let bytes = editor.save_to_bytes_with_options(options).unwrap();
+                assert_nested_resources_survive(
+                    &bytes,
+                    &format!("gc {garbage_collect}, compress {compress}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_tree_save_that_drops_a_page_keeps_what_the_kept_page_reaches() {
+        for garbage_collect in [true, false] {
+            let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
+            editor.remove_page(1).unwrap();
+            let options = SaveOptions { garbage_collect, ..SaveOptions::full_rewrite() };
+            let bytes = editor.save_to_bytes_with_options(options).unwrap();
+            assert_nested_resources_survive(&bytes, &format!("gc {garbage_collect}, page 1 dropped"));
+        }
+    }
+
+    #[test]
+    fn extracting_a_page_of_a_nested_tree_keeps_what_it_reaches() {
+        let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
+        let bytes = editor.extract_pages_to_bytes(&[0]).unwrap();
+        let doc = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
+        assert_eq!(doc.page_count().unwrap(), 1);
+        assert_nested_resources_survive(&bytes, "extract_pages");
+    }
+
+    /// A page tree and an object stream of three objects. Object 5 is
+    /// bigger than a 4 KiB object cache and names objects 6 and 7, which
+    /// name the streams 9 and 10. The catalog reaches 5 as `/Extra`.
+    fn objstm_pdf_bytes() -> Vec<u8> {
+        let pad = "x".repeat(8000);
+        let bodies = [
+            format!("<< /Pad ({pad}) /A 6 0 R /B 7 0 R >>"),
+            "<< /S 9 0 R >>".to_string(),
+            "<< /S 10 0 R >>".to_string(),
+        ];
+        let mut header = String::new();
+        let mut at = 0;
+        for (id, body) in [5, 6, 7].iter().zip(&bodies) {
+            header.push_str(&format!("{id} {at} "));
+            at += body.len() + 1;
+        }
+        let data = [header.clone(), bodies.iter().map(|b| format!("{b}\n")).collect::<String>()].concat();
+
+        let mut out = b"%PDF-1.5\n".to_vec();
+        let mut offsets = HashMap::new();
+        let mut put = |out: &mut Vec<u8>, id: u32, object: Vec<u8>| {
+            offsets.insert(id, out.len());
+            out.extend_from_slice(&object);
+        };
+        put(&mut out, 1, b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra 5 0 R >>\nendobj\n".to_vec());
+        put(&mut out, 2, b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec());
+        put(&mut out, 3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec());
+        put(
+            &mut out,
+            8,
+            stream_object(8, &format!("/Type /ObjStm /N 3 /First {}", header.len()), data.as_bytes()),
+        );
+        put(&mut out, 9, stream_object(9, "", b"REACHEDNINE"));
+        put(&mut out, 10, stream_object(10, "", b"REACHEDTEN"));
+
+        let xref_at = out.len();
+        let mut entries = Vec::new();
+        let mut entry = |kind: u8, field: u32, last: u16| {
+            entries.push(kind);
+            entries.extend_from_slice(&field.to_be_bytes());
+            entries.extend_from_slice(&last.to_be_bytes());
+        };
+        entry(0, 0, 65535);
+        for id in 1..=3 {
+            entry(1, offsets[&id] as u32, 0);
+        }
+        entry(0, 0, 0);
+        for index in 0..3 {
+            entry(2, 8, index);
+        }
+        for id in [8, 9, 10] {
+            entry(1, offsets[&id] as u32, 0);
+        }
+        entry(1, xref_at as u32, 0);
+        out.extend_from_slice(
+            format!("11 0 obj\n<< /Type /XRef /Size 12 /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n", entries.len())
+                .as_bytes(),
+        );
+        out.extend_from_slice(&entries);
+        out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref_at}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    /// A document whose object cache holds 4 KiB, less than object 5.
+    fn objstm_doc_with_a_small_cache() -> crate::document::PdfDocument {
+        crate::document::PdfDocument::from_external_reader_bounded(
+            Box::new(std::io::Cursor::new(objstm_pdf_bytes())),
+            4096,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn collect_refs_of_returns_the_same_refs_cold_and_warm() {
+        let cold = objstm_doc_with_a_small_cache();
+        let mut cold_refs = Vec::new();
+        cold.collect_refs_of(5, &mut cold_refs);
+
+        let warm = crate::document::PdfDocument::from_bytes(objstm_pdf_bytes()).unwrap();
+        warm.load_object(ObjectRef::new(5, 0)).unwrap();
+        let mut warm_refs = Vec::new();
+        warm.collect_refs_of(5, &mut warm_refs);
+
+        cold_refs.sort_unstable();
+        warm_refs.sort_unstable();
+        assert_eq!(warm_refs, vec![6, 7]);
+        assert_eq!(cold_refs, warm_refs);
+    }
+
+    #[test]
+    fn a_full_rewrite_keeps_what_an_object_too_big_for_the_cache_reaches() {
+        let mut editor = DocumentEditor::from_document(objstm_doc_with_a_small_cache()).unwrap();
+        let options = SaveOptions { compress: false, ..SaveOptions::full_rewrite() };
+        let bytes = editor.save_to_bytes_with_options(options).unwrap();
+
+        let saved = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
+        for id in [5, 6, 7, 9, 10] {
+            let object = saved.load_object(ObjectRef::new(id, 0)).unwrap();
+            assert!(!matches!(object, Object::Null), "object {id} was not written");
+        }
+        assert!(contains(&bytes, b"REACHEDNINE"), "stream 9 was not written");
+        assert!(contains(&bytes, b"REACHEDTEN"), "stream 10 was not written");
+    }
+
+    #[test]
+    fn the_rewrite_fails_when_a_written_object_names_one_it_did_not_write() {
+        let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
+        // The sweep skips this id, which page 4 still names.
+        editor.redacted_orphan_ids.insert(8);
+        let err = editor.save_to_bytes().unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidPdf(m) if m == "the rewrite would leave object 8 referenced by 4 unwritten"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_reference_the_source_itself_leaves_dangling_does_not_fail_the_rewrite() {
+        let source = pdf_from_objects(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Gone 99 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec(),
+        ]);
+        let mut editor = DocumentEditor::from_bytes(source).unwrap();
+        editor.save_to_bytes().unwrap();
     }
 }

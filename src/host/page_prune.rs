@@ -8,7 +8,10 @@
 //! sibling), named destinations, outline items, link annotations, the
 //! `/OpenAction` and the AcroForm's widgets.
 //!
-//! [`plan`] answers three things for one save:
+//! [`plan`] answers four things for one save:
+//! - `kept_pages`: the kept source pages, the kids of the output's root
+//!   `/Pages` node. The reachability walk starts from them, because the
+//!   source root points at nodes the save excludes.
 //! - `excluded`: object ids the save never writes and the reachability
 //!   walk never enters: dropped page leaves, every intermediate `/Pages`
 //!   node, and annotations only dropped pages list. A reference that is
@@ -38,6 +41,10 @@ const INHERITABLE: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 #[derive(Default)]
 pub(crate) struct PagePrune {
     pub excluded: HashSet<u32>,
+    /// The kept source pages: the kids of the root `/Pages` node in the
+    /// output. The reachability walk enters them directly, since the
+    /// source root lists the intermediate nodes the save excludes.
+    pub kept_pages: Vec<u32>,
     pub overrides: HashMap<u32, Object>,
     catalog_edits: Vec<(String, Object, Option<Object>)>,
 }
@@ -137,6 +144,7 @@ impl Planner<'_> {
             .collect();
         let kept: Vec<ObjectRef> = kept_idx.iter().map(|&i| leaves[i]).collect();
         let kept_ids: HashSet<u32> = kept.iter().map(|r| r.id).collect();
+        self.out.kept_pages = kept.iter().map(|r| r.id).collect();
         self.dropped_pages = leaves
             .iter()
             .map(|r| r.id)

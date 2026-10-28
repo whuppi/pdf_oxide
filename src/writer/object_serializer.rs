@@ -27,7 +27,22 @@ pub struct ObjectSerializer {
     /// every object at generation 0, so `5 1 R` would name nothing.
     zero_generations: bool,
     // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch: the references a save wrote ──
+    /// Every object id a written reference names, with the first indirect
+    /// object that wrote it. `None` unless `recording_references` is set.
+    reference_log: Option<std::sync::Arc<std::sync::Mutex<ReferenceLog>>>,
+    // ── end pdf_manipulator patch ──
 }
+
+// ── pdf_manipulator patch: the references a save wrote ──
+/// What a recording serializer saw: the indirect object being written and
+/// the first writer of each referenced id.
+#[derive(Debug, Default)]
+struct ReferenceLog {
+    current: u32,
+    first_writer: HashMap<u32, u32>,
+}
+// ── end pdf_manipulator patch ──
 
 impl ObjectSerializer {
     /// Create a new object serializer with default settings.
@@ -43,6 +58,7 @@ impl ObjectSerializer {
             // ── pdf_manipulator patch: references to unwritten objects as null ──
             null_refs: Default::default(),
             zero_generations: false,
+            reference_log: None,
             // ── end pdf_manipulator patch ──
         }
     }
@@ -63,10 +79,41 @@ impl ObjectSerializer {
         self
     }
 
+    /// This serializer, noting every reference it writes (a reference it
+    /// writes as `null` is not one) so `written_references` can say which
+    /// objects the output names. Clones share the log.
+    pub(crate) fn recording_references(mut self) -> Self {
+        self.reference_log = Some(Default::default());
+        self
+    }
+
+    /// `(referenced id, first indirect object that wrote a reference to
+    /// it)` for every reference written so far, ordered by referenced id.
+    pub(crate) fn written_references(&self) -> Vec<(u32, u32)> {
+        let Some(log) = &self.reference_log else {
+            return Vec::new();
+        };
+        let log = log.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all: Vec<(u32, u32)> = log.first_writer.iter().map(|(&t, &w)| (t, w)).collect();
+        all.sort_unstable();
+        all
+    }
+
+    fn begin_indirect(&self, id: u32) {
+        if let Some(log) = &self.reference_log {
+            log.lock().unwrap_or_else(|e| e.into_inner()).current = id;
+        }
+    }
+
     fn write_reference<W: Write>(&self, w: &mut W, r: &ObjectRef) -> std::io::Result<()> {
         if self.null_refs.contains(&r.id) {
             write!(w, "null")
         } else {
+            if let Some(log) = &self.reference_log {
+                let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+                let current = log.current;
+                log.first_writer.entry(r.id).or_insert(current);
+            }
             let gen = if self.zero_generations { 0 } else { r.gen };
             write!(w, "{} {} R", r.id, gen)
         }
@@ -91,6 +138,9 @@ impl ObjectSerializer {
     pub fn serialize_indirect(&self, id: u32, gen: u16, obj: &Object) -> Vec<u8> {
         let mut buf = Vec::new();
         writeln!(buf, "{} {} obj", id, gen).unwrap();
+        // ── pdf_manipulator patch: the references a save wrote ──
+        self.begin_indirect(id);
+        // ── end pdf_manipulator patch ──
         self.write_object(&mut buf, obj).unwrap();
         write!(buf, "\nendobj\n").unwrap();
         buf
@@ -111,6 +161,9 @@ impl ObjectSerializer {
     ) -> Vec<u8> {
         let mut buf = Vec::new();
         writeln!(buf, "{} {} obj", id, gen).unwrap();
+        // ── pdf_manipulator patch: the references a save wrote ──
+        self.begin_indirect(id);
+        // ── end pdf_manipulator patch ──
         self.write_object_encrypted(&mut buf, obj, id, gen, handler)
             .unwrap();
         write!(buf, "\nendobj\n").unwrap();
