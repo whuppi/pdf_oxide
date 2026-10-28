@@ -21,7 +21,17 @@ op_unit!(DISPOSE, "docDispose", pdf_op_doc_dispose_anchor, |ctx| {
 });
 
 op_unit!(EXTRACT, "extract", pdf_op_extract_anchor, |ctx| {
+    let mut sink = ctx.take_sink(0);
+    let cancel = ctx.cancel;
     handle_with_doc(ctx.state, ctx.req, |doc, req| {
+        if let (Some(writer), None) = (sink.as_mut(), req.get_i32("page")) {
+            let format = req.get_str("format").unwrap_or("plainText");
+            let count = dispatch::extract_text_framed(doc, format, writer, cancel)?;
+            let mut w = ResponseWriter::ok();
+            w.put_bool("streamed", true);
+            w.put_i32("itemCount", count as i32);
+            return Ok(w.finish());
+        }
         let page = match req.get_i32("page") {
             Some(p) => match page_of(p, doc.page_count()?) {
                 Ok(i) => Some(i),

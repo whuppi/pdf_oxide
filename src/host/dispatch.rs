@@ -315,6 +315,66 @@ pub fn extract_text(
     }
 }
 
+/// Extract text from all pages, one frame per page.
+///
+/// Each frame body is exactly the bytes the page adds to the output of
+/// [`extract_text`] for all pages: page 0 its text, later pages the page
+/// separator followed by their text. Joining the frame bodies gives the
+/// same string. At most one page of text is in memory at a time.
+///
+/// Frame format: [len: u32 LE] [binary-encoded response with `text`]
+/// End marker:   [0x00000000]
+pub fn extract_text_framed<W: std::io::Write>(
+    doc: &mut PdfDocument,
+    format: &str,
+    writer: &mut W,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<usize> {
+    #[cfg(not(feature = "extract"))]
+    {
+        let _ = (doc, format, writer, cancel);
+        return Err(Error::Unsupported("extract support not enabled in this build".into()));
+    }
+    #[cfg(feature = "extract")]
+    {
+        use crate::host::binary_codec::ResponseWriter;
+        let separator = match format {
+            "markdown" => "\n---\n\n",
+            _ => "\n",
+        };
+        // A locked document yields empty markdown, so it yields no frames.
+        let count = if format == "markdown" && doc.text_is_withheld() {
+            0
+        } else {
+            doc.page_count()?
+        };
+        let opts = crate::converters::ConversionOptions::default();
+        cancel.each(0..count, |i| {
+            let page_text = match format {
+                "markdown" => doc.to_markdown(i, &opts)?,
+                "html" => doc.to_html(i, &opts)?,
+                _ => doc.extract_text(i)?,
+            };
+            let mut body = String::with_capacity(separator.len() + page_text.len());
+            if i > 0 {
+                body.push_str(separator);
+            }
+            body.push_str(&page_text);
+            drop(page_text);
+            let mut w = ResponseWriter::ok();
+            w.put_str("text", &body);
+            let frame = w.finish();
+            let len_bytes = (frame.len() as u32).to_le_bytes();
+            writer.write_all(&len_bytes).map_err(|e| Error::InvalidPdf(e.to_string()))?;
+            writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
+            Ok(())
+        })?;
+        // A zero-length frame terminates the stream.
+        writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
+        Ok(count)
+    }
+}
+
 /// Search for text across the document, optionally filtered to one page.
 pub fn search_text(
     doc: &mut PdfDocument,
