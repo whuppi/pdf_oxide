@@ -170,6 +170,25 @@ impl PageFacts {
 }
 // ── end pdf_manipulator patch ──
 
+// ── pdf_manipulator patch: the page cache is a window, the page tree an index of refs ──
+/// Pages the page cache keeps; the same window as `page_content_cache`.
+const PAGE_WINDOW: usize = 64;
+
+/// Pages whose spans and chars stay cached. A text-dense page holds about a
+/// megabyte of spans, so the window is what a page's two reads need, not the
+/// eight pages a count-bounded cache would otherwise keep.
+const TEXT_PAGE_WINDOW: usize = 2;
+
+/// Where every page sits in the page tree: a leaf's ref and its nearest
+/// `/Pages` ancestor, and each `/Pages` node's ref and own parent (indexes
+/// into `nodes`). A page dictionary is rebuilt from these on demand.
+#[derive(Debug, Default)]
+pub(crate) struct PageTreeIndex {
+    nodes: Vec<(ObjectRef, Option<usize>)>,
+    pages: Vec<(ObjectRef, Option<usize>)>,
+}
+// ── end pdf_manipulator patch ──
+
 /// Default maximum number of entries for the XObject span/image caches.
 const DEFAULT_XOBJECT_CACHE_MAX_ENTRIES: usize = 1024;
 
@@ -549,7 +568,16 @@ pub struct PdfDocument {
     /// Page object cache keyed by page index to avoid re-traversing the page tree.
     /// The page tree structure is static (§7.7.3.2), so pages can be safely cached.
     /// Mutex provides interior mutability for `&self` read-path methods (#398).
-    page_cache: Mutex<HashMap<usize, Object>>,
+    // ── pdf_manipulator patch: the page cache is a window, the page tree an index of refs ──
+    /// Holds the last [`PAGE_WINDOW`] pages served; the rest are rebuilt from
+    /// `page_tree_index`, so memory does not scale with the page count.
+    page_cache: Mutex<BoundedEntryCache<usize, Object>>,
+    /// Leaf and ancestor refs of every page, built by the bulk walk. Eight
+    /// bytes per page and per tree node; no page dictionary is held.
+    page_tree_index: Mutex<Option<Arc<PageTreeIndex>>>,
+    /// Pages found by single-page traversal; the bulk walk starts at a threshold.
+    page_walks: AtomicUsize,
+    // ── end pdf_manipulator patch ──
     /// Whether the bulk page tree walk has been attempted (successful or not).
     /// Prevents re-walking the tree on every cache miss for malformed PDFs.
     page_cache_populated: AtomicBool,
@@ -593,7 +621,7 @@ pub struct PdfDocument {
     /// LRU cache of postprocessed [`TextSpan`]s per page. `to_markdown`/`to_html`
     /// reach `extract_spans` twice per page — once directly, once via
     /// `extract_page_tables` → `extract_words` → `page_reading_order`; this serves
-    /// the second from cache. Cleared by redaction (`erase_region` /
+    /// the second from cache. Holds [`TEXT_PAGE_WINDOW`] pages. Cleared by redaction (`erase_region` /
     /// `clear_erase_regions`), the only span-affecting mutation.
     page_spans_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
     /// Per-page lightweight search index (page text + span bounding boxes,
@@ -1407,7 +1435,9 @@ impl PdfDocument {
             actualtext_index_cache: Mutex::new(None),
             mc_actualtext_mcids: Mutex::new(HashMap::new()),
             table_elements_cache: Mutex::new(None),
-            page_cache: Mutex::new(HashMap::new()),
+            page_cache: Mutex::new(BoundedEntryCache::new(PAGE_WINDOW)),
+            page_tree_index: Mutex::new(None),
+            page_walks: AtomicUsize::new(0),
             page_cache_populated: AtomicBool::new(false),
             scanned_object_offsets: Mutex::new(prepopulated_scan),
             objstm_recovery_done: Mutex::new(false),
@@ -1423,9 +1453,11 @@ impl PdfDocument {
             )),
             erase_regions: Mutex::new(HashMap::new()),
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
-            page_spans_cache: Mutex::new(BoundedEntryCache::new(8)),
+            // ── pdf_manipulator patch: a page's spans and chars are held for its two reads, not for eight pages ──
+            page_spans_cache: Mutex::new(BoundedEntryCache::new(TEXT_PAGE_WINDOW)),
             search_index: Mutex::new(HashMap::new()),
-            page_chars_cache: Mutex::new(BoundedEntryCache::new(8)),
+            page_chars_cache: Mutex::new(BoundedEntryCache::new(TEXT_PAGE_WINDOW)),
+            // ── end pdf_manipulator patch ──
             running_artifact_signatures: Mutex::new(None),
             article_threads_cache: Mutex::new(None),
             output_intent_cmyk_profile_cache: Mutex::new(None),
@@ -2381,6 +2413,14 @@ impl PdfDocument {
         }
         Ok(())
     }
+
+    // ── pdf_manipulator patch: per-page extraction asks the same guard as the all-pages calls ──
+    /// True when the document is locked and text extraction degrades to
+    /// empty output; the host's page-by-page extract emits no pages then.
+    pub(crate) fn text_is_withheld(&self) -> bool {
+        self.is_encrypted_unreadable()
+    }
+    // ── end pdf_manipulator patch ──
 
     /// True once the empty user password has been tried and the document is
     /// still locked. Text extraction degrades to empty output in this case
@@ -5465,9 +5505,11 @@ impl PdfDocument {
 
         // Defer bulk page tree walk until enough pages are accessed.
         const LAZY_THRESHOLD: usize = 64;
-        let cache_misses = self.page_cache.lock_or_recover().len();
 
-        if !self.page_cache_populated.load(Ordering::Acquire) && cache_misses >= LAZY_THRESHOLD {
+        // ── pdf_manipulator patch: pages come back from the index, not a full-document cache ──
+        if !self.page_cache_populated.load(Ordering::Acquire)
+            && self.page_walks.load(Ordering::Acquire) >= LAZY_THRESHOLD
+        {
             self.page_cache_populated.store(true, Ordering::Release);
             if let Err(e) = self.populate_page_cache() {
                 log::warn!(
@@ -5475,11 +5517,17 @@ impl PdfDocument {
                     e
                 );
             }
-            // Check cache after bulk population
-            if let Some(cached) = self.page_cache.lock_or_recover().get(&page_index).cloned() {
-                return Ok(cached);
+        }
+        let index = self.page_tree_index.lock_or_recover().clone();
+        if let Some(index) = index {
+            if let Some(page) = self.page_from_index(&index, page_index) {
+                self.page_cache
+                    .lock_or_recover()
+                    .insert(page_index, page.clone());
+                return Ok(page);
             }
         }
+        // ── end pdf_manipulator patch ──
 
         // Per-page tree traversal: walks only the branches needed to find target page
         let catalog = self.catalog()?;
@@ -5525,13 +5573,42 @@ impl PdfDocument {
             },
         }?;
 
+        self.page_walks.fetch_add(1, Ordering::AcqRel);
         self.page_cache
             .lock_or_recover()
             .insert(page_index, page.clone());
         Ok(page)
     }
 
-    /// Walk the page tree once and populate page_cache for ALL pages.
+    // ── pdf_manipulator patch: pages come back from the index, not a full-document cache ──
+    /// Rebuild page `page_index` from the index: the leaf dictionary with each
+    /// inheritable attribute it lacks taken from its nearest ancestor that has
+    /// one. `None` when the index has no such page or a node fails to load, so
+    /// the caller falls back to single-page traversal.
+    fn page_from_index(&self, index: &PageTreeIndex, page_index: usize) -> Option<Object> {
+        let &(leaf_ref, parent) = index.pages.get(page_index)?;
+        let leaf = self.load_object(leaf_ref).ok()?;
+        let mut page_dict = leaf.as_dict()?.clone();
+        for attr_name in &["Resources", "MediaBox", "CropBox", "Rotate"] {
+            if page_dict.contains_key(*attr_name) {
+                continue;
+            }
+            let mut ancestor = parent;
+            while let Some(node) = ancestor {
+                let (node_ref, next) = index.nodes[node];
+                let node_obj = self.load_object(node_ref).ok()?;
+                if let Some(value) = node_obj.as_dict().and_then(|d| d.get(*attr_name)) {
+                    page_dict.insert(attr_name.to_string(), value.clone());
+                    break;
+                }
+                ancestor = next;
+            }
+        }
+        Some(Object::Dictionary(page_dict))
+    }
+    // ── end pdf_manipulator patch ──
+
+    /// Walk the page tree once and index ALL pages.
     /// This avoids O(n²) cost when pages are accessed sequentially.
     fn populate_page_cache(&self) -> Result<()> {
         let catalog = self.catalog()?;
@@ -5546,11 +5623,13 @@ impl PdfDocument {
             .as_reference()
             .ok_or_else(|| Error::InvalidPdf("/Pages is not a reference".to_string()))?;
 
-        let mut page_index = 0usize;
-        let mut inherited = HashMap::new();
-        self.collect_all_pages(pages_ref, &mut page_index, &mut inherited, &mut HashSet::new())?;
-        log::debug!("Populated page cache with {} pages", page_index);
+        // ── pdf_manipulator patch: index the tree, hold no page dictionary ──
+        let mut index = PageTreeIndex::default();
+        self.collect_all_pages(pages_ref, &mut index, None, &mut HashSet::new())?;
+        log::debug!("Indexed {} pages", index.pages.len());
+        *self.page_tree_index.lock_or_recover() = Some(Arc::new(index));
         Ok(())
+        // ── end pdf_manipulator patch ──
     }
 
     /// Pre-populate `image_xobject_cache` for all XObject refs across all cached pages.
@@ -5560,11 +5639,8 @@ impl PdfDocument {
     fn prefetch_xobject_subtypes(&self) {
         // Collect all unique XObject refs from all cached pages
         let mut xobj_refs: Vec<ObjectRef> = Vec::new();
-        let page_dicts: Vec<Object> = self
-            .page_cache
-            .lock_or_recover()
-            .values()
-            .cloned()
+        let page_dicts: Vec<Object> = (0..self.page_count().unwrap_or(0))
+            .filter_map(|i| self.get_page(i).ok())
             .collect();
 
         for page_obj in &page_dicts {
@@ -5632,12 +5708,14 @@ impl PdfDocument {
         }
     }
 
-    /// Recursively walk the page tree and collect all pages into page_cache.
+    // ── pdf_manipulator patch: the walk records refs and parents, not page dictionaries ──
+    /// Recursively walk the page tree and record every page and `/Pages` node
+    /// in `index`; `parent` is the index of the enclosing `/Pages` node.
     fn collect_all_pages(
         &self,
         node_ref: ObjectRef,
-        page_index: &mut usize,
-        inherited: &mut HashMap<String, Object>,
+        index: &mut PageTreeIndex,
+        parent: Option<usize>,
         visited: &mut HashSet<ObjectRef>,
     ) -> Result<()> {
         if !visited.insert(node_ref) {
@@ -5657,57 +5735,19 @@ impl PdfDocument {
 
         match node_type {
             "Page" => {
-                // Apply inherited attributes
-                let mut page_dict = node_dict.clone();
-                for attr_name in &["Resources", "MediaBox", "CropBox", "Rotate"] {
-                    if !page_dict.contains_key(*attr_name) {
-                        if let Some(inherited_value) = inherited.get(*attr_name) {
-                            log::debug!(
-                                "Page {} inheriting {}: {:?}",
-                                *page_index,
-                                attr_name,
-                                inherited_value
-                            );
-                            page_dict.insert(attr_name.to_string(), inherited_value.clone());
-                        }
-                    }
-                }
-                log::debug!("Collected page {}, keys: {:?}", *page_index, page_dict.keys());
-                if let Some(contents) = page_dict.get("Contents") {
-                    log::debug!("  -> /Contents: {:?}", contents);
-                }
-                if let Some(rotate) = page_dict.get("Rotate") {
-                    log::debug!("  -> /Rotate: {:?}", rotate);
-                }
-                self.page_cache
-                    .lock_or_recover()
-                    .insert(*page_index, Object::Dictionary(page_dict));
-                *page_index += 1;
+                index.pages.push((node_ref, parent));
             },
             "Pages" => {
-                // Save inherited state so siblings don't see each other's overrides
-                let saved = inherited.clone();
-
-                // Nearest ancestor's attributes override more distant ones (PDF spec §7.7.3.4).
-                // insert() is correct here because we snapshot/restore `inherited` around
-                // the recursion, so this node's values apply only to its subtree.
-                for attr_name in &["Resources", "MediaBox", "CropBox", "Rotate"] {
-                    if let Some(attr_value) = node_dict.get(*attr_name) {
-                        log::debug!(
-                            "Pages node at {:?} providing inheritable {}: {:?}",
-                            node_ref,
-                            attr_name,
-                            attr_value
-                        );
-                        inherited.insert(attr_name.to_string(), attr_value.clone());
-                    }
-                }
+                // Nearest ancestor's attributes override more distant ones (PDF spec §7.7.3.4):
+                // `page_from_index` walks the parents from the nearest.
+                let this = index.nodes.len();
+                index.nodes.push((node_ref, parent));
 
                 if let Some(kids) = node_dict.get("Kids").and_then(|obj| obj.as_array()) {
                     for kid in kids {
                         if let Some(kid_ref) = kid.as_reference() {
                             if let Err(e) =
-                                self.collect_all_pages(kid_ref, page_index, inherited, visited)
+                                self.collect_all_pages(kid_ref, index, Some(this), visited)
                             {
                                 log::warn!(
                                     "Error collecting page from tree: {}, skipping branch",
@@ -5717,14 +5757,13 @@ impl PdfDocument {
                         }
                     }
                 }
-
-                *inherited = saved;
             },
             _ => {}, // Unknown node type, skip
         }
 
         Ok(())
     }
+    // ── end pdf_manipulator patch ──
 
     /// Get a page by scanning all objects in the PDF (fallback for broken page trees)
     /// This method is used when the standard page tree traversal fails due to malformed structure.
@@ -17427,14 +17466,30 @@ impl PdfDocument {
             String,
             Vec<(usize, crate::geometry::Rect, String)>,
         > = std::collections::HashMap::new();
-        for pi in 0..page_count {
-            let spans = match self.extract_spans_raw(pi) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+        // ── pdf_manipulator patch: the pre-pass holds only signatures that can qualify ──
+        // A signature is admitted only when it sits in the chrome band of at
+        // least `threshold` pages, so a first pass counts pages per signature
+        // by hash (a collision only keeps a signature that the admission
+        // filter then drops) and the second pass collects the positions and
+        // literals of the signatures that reached the count. Without it the
+        // pre-pass holds every chrome-band span of the document at once.
+        let threshold = (page_count as f32 * 0.5).ceil() as usize;
+        let signature_hash = |sig: &str| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            sig.hash(&mut hasher);
+            hasher.finish()
+        };
+        // (has body content, [(signature, bbox, literal)]) of one page's
+        // chrome-band spans; `None` when the page cannot be read.
+        let scan_page = |pi: usize| -> Option<(
+            bool,
+            Vec<(String, crate::geometry::Rect, String)>,
+        )> {
+            let spans = self.extract_spans_raw(pi).ok()?;
             let (page_width, page_height) = match self.get_page_media_box(pi) {
                 Ok((_, _, w, h)) if h > 0.0 => (w, h),
-                _ => continue,
+                _ => return None,
             };
             let vertical = Self::page_is_vertical(&spans);
             // Require that the page has CONTENT outside the chrome band(s)
@@ -17446,11 +17501,7 @@ impl PdfDocument {
                 !s.text.trim().is_empty()
                     && !Self::in_chrome_band(&s.bbox, page_width, page_height, vertical)
             });
-            if has_body_content {
-                body_content_pages.insert(pi);
-            }
-            let mut seen_this_page: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
+            let mut band = Vec::new();
             for s in spans.iter() {
                 let trimmed = s.text.trim();
                 if trimmed.is_empty() {
@@ -17463,15 +17514,47 @@ impl PdfDocument {
                 if sig.is_empty() || sig.chars().count() < 2 {
                     continue;
                 }
-                signature_positions.entry(sig.clone()).or_default().push((
-                    pi,
-                    s.bbox,
-                    trimmed.to_string(),
-                ));
-                seen_this_page
-                    .entry(sig)
-                    .or_insert_with(|| trimmed.to_string());
+                band.push((sig, s.bbox, trimmed.to_string()));
             }
+            Some((has_body_content, band))
+        };
+        let mut pages_per_signature: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        for pi in 0..page_count {
+            let Some((_, band)) = scan_page(pi) else {
+                continue;
+            };
+            let on_page: std::collections::HashSet<u64> =
+                band.iter().map(|(sig, _, _)| signature_hash(sig)).collect();
+            for hash in on_page {
+                *pages_per_signature.entry(hash).or_insert(0) += 1;
+            }
+        }
+        let candidates: std::collections::HashSet<u64> = pages_per_signature
+            .into_iter()
+            .filter(|&(_, pages)| pages >= threshold.max(2))
+            .map(|(hash, _)| hash)
+            .collect();
+        for pi in 0..page_count {
+            let Some((has_body_content, band)) = scan_page(pi) else {
+                continue;
+            };
+            if has_body_content {
+                body_content_pages.insert(pi);
+            }
+            let mut seen_this_page: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (sig, bbox, literal) in band {
+                if !candidates.contains(&signature_hash(&sig)) {
+                    continue;
+                }
+                signature_positions
+                    .entry(sig.clone())
+                    .or_default()
+                    .push((pi, bbox, literal.clone()));
+                seen_this_page.entry(sig).or_insert(literal);
+            }
+            // ── end pdf_manipulator patch ──
             for (sig, literal) in &seen_this_page {
                 literal_variants
                     .entry(sig.clone())
@@ -17497,7 +17580,6 @@ impl PdfDocument {
             &body_content_pages,
         );
 
-        let threshold = (page_count as f32 * 0.5).ceil() as usize;
         let signatures: std::collections::HashMap<String, RunningArtifactSignature> = occurrences
             .into_iter()
             .filter(|(sig, (count, _))| {
@@ -27404,7 +27486,7 @@ mod tests {
     /// `prepare_search()` must populate the index for every page so a
     /// subsequent full-document `search()` sweep hits cache on every page,
     /// not just the last few (the failure mode `search()`'s own bounded
-    /// `page_spans_cache` has for documents with more than 8 pages).
+    /// `page_spans_cache` has for documents with more than `TEXT_PAGE_WINDOW` pages).
     #[test]
     fn prepare_search_populates_every_page() {
         let pdf = build_multi_page_pdf(10);
@@ -34228,8 +34310,9 @@ mod tests {
         let refs = doc.all_page_refs().unwrap();
         assert_eq!(refs, vec![ObjectRef::new(4, 0), ObjectRef::new(5, 0)]);
         let facts: Vec<PageFacts> = refs.iter().map(|r| doc.page_facts(*r).unwrap()).collect();
-        assert!(
-            doc.page_cache.lock_or_recover().is_empty(),
+        assert_eq!(
+            doc.page_cache.lock_or_recover().len(),
+            0,
             "page_facts must not fill the page cache"
         );
         for (i, f) in facts.iter().enumerate() {
@@ -34241,6 +34324,30 @@ mod tests {
         assert_eq!(facts[0].media_box, Some([0.0, 0.0, 300.0, 400.0]));
         assert_eq!(facts[1].media_box, Some([0.0, 0.0, 500.0, 600.0]));
         assert_eq!(facts[0].rotation(), 90);
+    }
+
+    #[test]
+    fn test_indexed_pages_equal_traversed_pages_and_cache_is_a_window() {
+        let traversed = PdfDocument::from_bytes(nested_page_tree_pdf()).unwrap();
+        let indexed = PdfDocument::from_bytes(nested_page_tree_pdf()).unwrap();
+        indexed.populate_page_cache().unwrap();
+        for i in 0..2 {
+            assert_eq!(
+                indexed.get_page(i).unwrap(),
+                traversed.get_page(i).unwrap(),
+                "page {i} from the index must carry the same inherited attributes"
+            );
+        }
+
+        let many = PdfDocument::from_bytes(build_multi_page_pdf(PAGE_WINDOW + 40)).unwrap();
+        for i in 0..PAGE_WINDOW + 40 {
+            many.get_page(i).unwrap();
+        }
+        assert!(
+            many.page_cache.lock_or_recover().len() <= PAGE_WINDOW,
+            "the page cache must hold a window, not every page"
+        );
+        assert!(many.page_tree_index.lock_or_recover().is_some());
     }
 
     #[test]
