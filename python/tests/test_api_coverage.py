@@ -900,7 +900,7 @@ class TestSaveOptions:
 
     def test_to_bytes_all_options(self):
         doc = _make_simple_doc()
-        data = doc.to_bytes(compress=True, garbage_collect=True, linearize=False)
+        data = doc.to_bytes(compress=True, garbage_collect=True)
         assert data[:5] == _PDF_MAGIC
 
     def test_to_bytes_round_trips_content(self):
@@ -942,7 +942,7 @@ class TestSaveOptions:
 
         doc = _make_simple_doc()
         path = str(tmp_path / "all_opts.pdf")
-        doc.save(path, compress=True, garbage_collect=True, linearize=False)
+        doc.save(path, compress=True, garbage_collect=True)
         assert os.path.getsize(path) > 100
         doc2 = PdfDocument(path)
         assert doc2.page_count() >= 1

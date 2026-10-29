@@ -1002,10 +1002,9 @@ static ERL_NIF_TERM editor_save_to_bytes_with_options(ErlNifEnv *env, int argc, 
     GET_EDIT
     bool compress = enif_is_identical(a[1], enif_make_atom(env, "true"));
     bool gc = enif_is_identical(a[2], enif_make_atom(env, "true"));
-    bool linearize = enif_is_identical(a[3], enif_make_atom(env, "true"));
     uintptr_t len = 0;
     int32_t code = 0;
-    uint8_t *p = document_editor_save_to_bytes_with_options(r->h, compress, gc, linearize, &len, &code);
+    uint8_t *p = document_editor_save_to_bytes_with_options(r->h, compress, gc, &len, &code);
     return ok_bytes(env, p, (size_t)len, code);
 }
 
@@ -4609,7 +4608,7 @@ static ErlNifFunc funcs[] = {
     {"editor_set_creation_date", 2, editor_set_creation_date, 0},
     {"editor_save", 2, editor_save, DIRTY},
     {"editor_save_to_bytes", 1, editor_save_to_bytes, DIRTY},
-    {"editor_save_to_bytes_with_options", 4, editor_save_to_bytes_with_options, DIRTY},
+    {"editor_save_to_bytes_with_options", 3, editor_save_to_bytes_with_options, DIRTY},
     {"editor_extract_pages_to_bytes", 2, editor_extract_pages_to_bytes, DIRTY},
     {"editor_convert_to_pdf_a", 2, editor_convert_to_pdf_a, DIRTY},
     {"editor_save_encrypted_to_bytes", 3, editor_save_encrypted_to_bytes, DIRTY},

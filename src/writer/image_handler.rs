@@ -402,7 +402,9 @@ fn compress_image_data(pixels: &[u8], width: u32, components: u8) -> Result<Vec<
     let row_bytes = width as usize * components as usize;
 
     if row_bytes == 0 || pixels.is_empty() {
-        let encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        // ── pdf_manipulator patch: PDF bytes are deflated at the best level ──
+        let encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        // ── end pdf_manipulator patch ──
         return encoder
             .finish()
             .map_err(|e| ImageError::CompressionError(e.to_string()));
@@ -416,7 +418,9 @@ fn compress_image_data(pixels: &[u8], width: u32, components: u8) -> Result<Vec<
         filtered.extend_from_slice(row);
     }
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    // ── pdf_manipulator patch: PDF bytes are deflated at the best level ──
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    // ── end pdf_manipulator patch ──
     encoder
         .write_all(&filtered)
         .map_err(|e| ImageError::CompressionError(e.to_string()))?;

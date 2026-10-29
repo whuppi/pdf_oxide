@@ -170,9 +170,9 @@ typedef _DeSaveBytesC = Pointer<Uint8> Function(
 typedef _DeSaveBytesD = Pointer<Uint8> Function(
     Pointer<Void>, Pointer<IntPtr>, Pointer<Int32>);
 typedef _DeSaveBytesOptsC = Pointer<Uint8> Function(
-    Pointer<Void>, Bool, Bool, Bool, Pointer<IntPtr>, Pointer<Int32>);
+    Pointer<Void>, Bool, Bool, Pointer<IntPtr>, Pointer<Int32>);
 typedef _DeSaveBytesOptsD = Pointer<Uint8> Function(
-    Pointer<Void>, bool, bool, bool, Pointer<IntPtr>, Pointer<Int32>);
+    Pointer<Void>, bool, bool, Pointer<IntPtr>, Pointer<Int32>);
 typedef _DeExtractPagesC = Pointer<Uint8> Function(
     Pointer<Void>, Pointer<Int32>, IntPtr, Pointer<IntPtr>, Pointer<Int32>);
 typedef _DeExtractPagesD = Pointer<Uint8> Function(
@@ -4804,13 +4804,12 @@ class DocumentEditor implements Finalizable {
         (len, code) => _n.deSaveToBytes(_handle, len, code), 'saveToBytes');
   }
 
-  /// Save to bytes with explicit compression / GC / linearize options.
-  Uint8List saveToBytesWithOptions(
-      bool compress, bool garbageCollect, bool linearize) {
+  /// Save to bytes with explicit compression / GC options.
+  Uint8List saveToBytesWithOptions(bool compress, bool garbageCollect) {
     _check();
     return _bytesOut(
         (len, code) => _n.deSaveToBytesWithOptions(
-            _handle, compress, garbageCollect, linearize, len, code),
+            _handle, compress, garbageCollect, len, code),
         'saveToBytesWithOptions');
   }
 

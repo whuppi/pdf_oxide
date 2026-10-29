@@ -180,8 +180,6 @@ pub struct SaveOptions {
     pub incremental: bool,
     /// Compress streams
     pub compress: bool,
-    /// Linearize for fast web view
-    pub linearize: bool,
     /// Remove unused objects
     pub garbage_collect: bool,
     /// Encryption configuration (None = no encryption)
@@ -201,6 +199,13 @@ pub struct SaveOptions {
     /// save ignores it and keeps the source's own layout.
     pub object_streams: bool,
     // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch: the Flate level of a compressing save ──
+    /// zlib level (0 to 9) of every stream a compressing full rewrite
+    /// deflates or re-deflates. A stream whose re-encoding is not smaller
+    /// keeps its source bytes. A level above 9 fails the save with
+    /// `Error::InvalidOperation`.
+    pub deflate_level: u32,
+    // ── end pdf_manipulator patch ──
 }
 
 // ── pdf_manipulator patch: Default is written out, object_streams defaults to true ──
@@ -209,11 +214,11 @@ impl Default for SaveOptions {
         Self {
             incremental: false,
             compress: false,
-            linearize: false,
             garbage_collect: false,
             encryption: None,
             keep_source_encryption: false,
             object_streams: true,
+            deflate_level: 9,
         }
     }
 }
@@ -2229,6 +2234,9 @@ impl DocumentEditor {
             }
         }
         let mut info_id = None;
+        // The id a new /Info takes belongs to this save: the editor's own
+        // next id stays what it was.
+        let mut next_id = self.next_object_id;
         if let Some(info) = self.build_info_object() {
             let id = match self
                 .source
@@ -2238,7 +2246,10 @@ impl DocumentEditor {
                 .and_then(|i| i.as_reference())
             {
                 Some(r) => r.id,
-                None => self.allocate_object_id(),
+                None => {
+                    next_id += 1;
+                    next_id - 1
+                },
             };
             objects.insert(id, info);
             info_id = Some(id);
@@ -2246,7 +2257,7 @@ impl DocumentEditor {
         Ok(crate::host::incremental::IncrementalChanges {
             objects: objects.into_iter().collect(),
             info_id,
-            next_id: self.next_object_id,
+            next_id,
         })
     }
     // ── end pdf_manipulator patch ──
@@ -2719,9 +2730,16 @@ impl DocumentEditor {
     /// Zero-clone: borrows cached objects via collect_refs_of() instead of
     /// cloning every Object. For modified objects, borrows from the HashMap
     /// directly. Uses a bit-vec for O(1) membership checks.
+    ///
+    /// With `written` (the save's cross-reference entries so far and the ids
+    /// its written objects name), the walk starts from what the output
+    /// already names and never reads the source version of an object the
+    /// save has written: a catalog that drops /AcroForm or a page that drops
+    /// its widgets does not keep their objects alive.
     fn collect_reachable_ids(
         &self,
         prune: &crate::host::page_prune::PagePrune,
+        written: Option<(&XrefEntries, &[(u32, u32)])>,
     ) -> std::collections::HashSet<u32> {
         fn push_refs(obj: &Object, out: &mut Vec<u32>) {
             match obj {
@@ -2760,7 +2778,10 @@ impl DocumentEditor {
         };
         // ── end pdf_manipulator patch ──
 
-        if let Some(r) = self
+        if let Some((_, named)) = written {
+            let named: Vec<u32> = named.iter().map(|&(target, _)| target).collect();
+            route(&named, &seen, &mut queue, &mut by_stream);
+        } else if let Some(r) = self
             .source
             .trailer()
             .as_dict()
@@ -2810,6 +2831,10 @@ impl DocumentEditor {
             }
             seen[idx] = true;
 
+            // An object the save has written names what it wrote.
+            if written.is_some_and(|(entries, _)| entries.contains_id(id)) {
+                continue;
+            }
             refs_buf.clear();
             if let Some(o) = prune.overrides.get(&id) {
                 push_refs(o, &mut refs_buf);
@@ -2887,7 +2912,7 @@ impl DocumentEditor {
         if prune.excluded.is_empty() {
             return only;
         }
-        let kept = self.collect_reachable_ids(prune);
+        let kept = self.collect_reachable_ids(prune, None);
         let mut queue: Vec<u32> = prune.excluded.iter().copied().collect();
         let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
         while let Some(id) = queue.pop() {
@@ -2940,9 +2965,13 @@ impl DocumentEditor {
     /// hold); the caller then loads and serializes it. The caller checks
     /// that no staged or overridden version of `r` exists. The dictionary
     /// goes through `serializer`, so nulling and generation 0 apply. With
-    /// `compress` and no /Filter the data is deflated while streaming,
-    /// and /Length becomes a reference to a fresh object holding the
-    /// compressed size, written right after.
+    /// `deflate` (a level) a stream with no /Filter or a single FlateDecode
+    /// is re-encoded at that level and written so only when strictly
+    /// smaller than the source data; otherwise the source bytes are copied.
+    /// A source data over `MEMORY_STREAM` is first re-encoded into a byte
+    /// counter, and a smaller one is then deflated while streaming, with
+    /// /Length a reference to a fresh object holding the compressed size,
+    /// written right after.
     fn write_source_stream(
         source: &PdfDocument,
         next_object_id: &mut u32,
@@ -2950,7 +2979,7 @@ impl DocumentEditor {
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
         encrypting_output: bool,
-        compress: bool,
+        deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
         Self::write_stream_copy(
@@ -2962,7 +2991,7 @@ impl DocumentEditor {
             writer,
             serializer,
             encrypting_output,
-            compress,
+            deflate,
             xref_entries,
         )
     }
@@ -2978,7 +3007,7 @@ impl DocumentEditor {
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
         encrypting_output: bool,
-        compress: bool,
+        deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
         Self::write_stream_copy(
@@ -2990,7 +3019,7 @@ impl DocumentEditor {
             writer,
             serializer,
             encrypting_output,
-            compress,
+            deflate,
             xref_entries,
         )
     }
@@ -3033,11 +3062,21 @@ impl DocumentEditor {
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
         encrypting_output: bool,
-        compress: bool,
+        deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
+        use crate::host::deflate::{self, Counter, Encoding, SourceRead, MEMORY_STREAM};
+
         const CHUNK: usize = 64 * 1024;
         const EMPTY_TAIL: &[u8] = b"\nstream\n\nendstream\nendobj\n";
+
+        /// How the data is written: as the source holds it, as an in-memory
+        /// re-encoding, or deflated while streaming (the level).
+        enum Body {
+            Copy,
+            Memory(Vec<u8>),
+            Streamed(u32),
+        }
 
         if encrypting_output || source.is_encrypted() {
             return Ok(false);
@@ -3052,20 +3091,60 @@ impl DocumentEditor {
             return Ok(false);
         }
 
-        let deflate = compress && !head.dict.contains_key("Filter");
+        // A re-encoding is kept only when strictly smaller than the source
+        // data; a stream that does not inflate keeps its source bytes.
+        let encoding = deflate::encoding(&head.dict);
+        let body = match deflate.filter(|_| encoding != Encoding::Other) {
+            None => Body::Copy,
+            Some(level) if head.data_len <= MEMORY_STREAM => {
+                let mut raw = vec![0u8; head.data_len as usize];
+                std::io::Read::read_exact(
+                    &mut SourceRead::new(source, head.data_start, head.data_len),
+                    &mut raw,
+                )?;
+                match deflate::smaller(&raw, encoding, level) {
+                    Some(encoded) => Body::Memory(encoded),
+                    None => Body::Copy,
+                }
+            },
+            Some(level) => {
+                let mut counter = Counter::default();
+                let counted = deflate::recode(
+                    SourceRead::new(source, head.data_start, head.data_len),
+                    encoding == Encoding::Flate,
+                    level,
+                    &mut counter,
+                );
+                if counted.is_ok() && counter.0 < head.data_len {
+                    Body::Streamed(level)
+                } else {
+                    Body::Copy
+                }
+            },
+        };
+
         let mut dict = head.dict;
         if let Some((id_map, page_id)) = remap {
             Self::remap_dict_refs(&mut dict, id_map, page_id);
         }
-        let length_id = if deflate {
-            let id = *next_object_id;
-            *next_object_id += 1;
+        if !matches!(body, Body::Copy) && encoding == Encoding::Raw {
             dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
-            dict.insert("Length".to_string(), Object::Reference(ObjectRef::new(id, 0)));
-            Some(id)
-        } else {
-            dict.insert("Length".to_string(), Object::Integer(head.data_len as i64));
-            None
+        }
+        let length_id = match &body {
+            Body::Copy => {
+                dict.insert("Length".to_string(), Object::Integer(head.data_len as i64));
+                None
+            },
+            Body::Memory(encoded) => {
+                dict.insert("Length".to_string(), Object::Integer(encoded.len() as i64));
+                None
+            },
+            Body::Streamed(_) => {
+                let id = *next_object_id;
+                *next_object_id += 1;
+                dict.insert("Length".to_string(), Object::Reference(ObjectRef::new(id, 0)));
+                Some(id)
+            },
         };
 
         let framed = serializer.serialize_indirect(
@@ -3097,15 +3176,25 @@ impl DocumentEditor {
             Ok(())
         };
 
-        let compressed_len = if length_id.is_some() {
-            let start = writer.position();
-            let mut enc = flate2::write::ZlibEncoder::new(&mut *writer, flate2::Compression::default());
-            copy(&mut enc)?;
-            let w = enc.finish()?;
-            Some(w.position() - start)
-        } else {
-            copy(&mut *writer)?;
-            None
+        let compressed_len = match body {
+            Body::Copy => {
+                copy(&mut *writer)?;
+                None
+            },
+            Body::Memory(encoded) => {
+                writer.write_all(&encoded)?;
+                None
+            },
+            Body::Streamed(level) => {
+                let start = writer.position();
+                deflate::recode(
+                    SourceRead::new(source, head.data_start, head.data_len),
+                    encoding == Encoding::Flate,
+                    level,
+                    &mut *writer,
+                )?;
+                Some(writer.position() - start)
+            },
         };
         writer.write_all(b"\nendstream\nendobj\n")?;
         xref_entries.push((out_id, offset, 0, true));
@@ -3129,7 +3218,7 @@ impl DocumentEditor {
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
         handler: &Option<crate::encryption::EncryptionWriteHandler>,
-        compress: bool,
+        deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
         rest: bool,
     ) -> Result<()> {
@@ -3137,7 +3226,7 @@ impl DocumentEditor {
             let id = *next_object_id;
             *next_object_id += 1;
             let ids: Vec<u32> = batch.iter().map(|(member, _)| *member).collect();
-            let stream = crate::host::object_streams::object_stream(batch, compress);
+            let stream = crate::host::object_streams::object_stream(batch, deflate);
             let offset = writer.position();
             let bytes = match handler {
                 Some(h) => serializer.serialize_indirect_encrypted(id, 0, &stream, h),
@@ -3170,10 +3259,37 @@ impl DocumentEditor {
         options: &SaveOptions,
         cancel: &crate::cancel::CancelCheck,
     ) -> Result<()> {
+        // ── pdf_manipulator patch: the ids a save allocates are the save's own ──
+        // A second save of the same editor must write the bytes the first
+        // did, so the editor's next id is what it was before the save, whether
+        // the save succeeded or failed.
+        let next_object_id = self.next_object_id;
+        let result = self.write_full_to_writer_allocating(writer, options, cancel);
+        self.next_object_id = next_object_id;
+        result
+    }
+
+    fn write_full_to_writer_allocating(
+        &mut self,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        options: &SaveOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<()> {
+        // ── end pdf_manipulator patch ──
         use crate::encryption::{
             generate_file_id, Algorithm, EncryptDictBuilder, EncryptionWriteHandler,
         };
-        use flate2::{write::ZlibEncoder, Compression};
+
+        // ── pdf_manipulator patch: the Flate level of this save ──
+        if options.deflate_level > crate::host::deflate::MAX_LEVEL {
+            return Err(Error::InvalidOperation(format!(
+                "deflate_level {} is above {}",
+                options.deflate_level,
+                crate::host::deflate::MAX_LEVEL
+            )));
+        }
+        let deflate = options.compress.then_some(options.deflate_level);
+        // ── end pdf_manipulator patch ──
 
         // Fail closed rather than silently copying unreadable ciphertext
         // (#1032): every stream object read from `self.source` below goes
@@ -3193,38 +3309,38 @@ impl DocumentEditor {
         let (merged_kept, merged_left_out) = self.merged_prune()?;
         // ── end pdf_manipulator patch ──
 
-        /// Compress a stream object with FlateDecode if it has no filter yet.
-        fn compress_stream_if_raw(obj: Object) -> Object {
+        // ── pdf_manipulator patch: a loaded stream is deflated or re-deflated, kept only if smaller ──
+        /// Deflate a stream object with no filter, or re-deflate one with a
+        /// single FlateDecode (its /DecodeParms stay valid: only the zlib
+        /// layer is redone), at `level`. The stream keeps its data when the
+        /// result is not strictly smaller.
+        fn deflate_stream(obj: Object, level: u32) -> Object {
+            use crate::host::deflate::{encoding, smaller, Encoding};
             match obj {
                 Object::Stream { mut dict, data } => {
-                    if dict.contains_key("Filter") {
+                    let kind = encoding(&dict);
+                    let Some(compressed) = smaller(&data, kind, level) else {
                         return Object::Stream { dict, data };
+                    };
+                    if kind == Encoding::Raw {
+                        dict.insert(
+                            "Filter".to_string(),
+                            Object::Name("FlateDecode".to_string()),
+                        );
                     }
-                    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-                    if std::io::Write::write_all(&mut enc, &data).is_err() {
-                        return Object::Stream { dict, data };
-                    }
-                    match enc.finish() {
-                        Ok(compressed) => {
-                            dict.insert(
-                                "Filter".to_string(),
-                                Object::Name("FlateDecode".to_string()),
-                            );
-                            dict.insert(
-                                "Length".to_string(),
-                                Object::Integer(compressed.len() as i64),
-                            );
-                            Object::Stream {
-                                dict,
-                                data: compressed.into(),
-                            }
-                        },
-                        Err(_) => Object::Stream { dict, data },
+                    dict.insert(
+                        "Length".to_string(),
+                        Object::Integer(compressed.len() as i64),
+                    );
+                    Object::Stream {
+                        dict,
+                        data: compressed.into(),
                     }
                 },
                 other => other,
             }
         }
+        // ── end pdf_manipulator patch ──
 
         // ── pdf_manipulator patch: keep the source's own encryption ──
         // Read before the first byte is written, so an unsupported source
@@ -3865,7 +3981,7 @@ impl DocumentEditor {
                                     writer,
                                     &serializer,
                                     &encryption_handler,
-                                    options.compress,
+                                    deflate,
                                     &mut xref_entries,
                                     false,
                                 )?;
@@ -4881,7 +4997,7 @@ impl DocumentEditor {
                                                         writer,
                                                         &serializer,
                                                         encryption_handler.is_some(),
-                                                        false,
+                                                        None,
                                                         &mut xref_entries,
                                                     )?
                                                 {
@@ -5076,7 +5192,7 @@ impl DocumentEditor {
                                                                         writer,
                                                                         &serializer,
                                                                         encryption_handler.is_some(),
-                                                                        options.compress,
+                                                                        deflate,
                                                                         &mut xref_entries,
                                                                     )?
                                                                 {
@@ -5146,7 +5262,7 @@ impl DocumentEditor {
                                                                         writer,
                                                                         &serializer,
                                                                         encryption_handler.is_some(),
-                                                                        options.compress,
+                                                                        deflate,
                                                                         &mut xref_entries,
                                                                     )?
                                                                 {
@@ -5694,7 +5810,7 @@ impl DocumentEditor {
                             writer,
                             &serializer,
                             &encryption_handler,
-                            options.compress,
+                            deflate,
                             &mut xref_entries,
                             false,
                         )?;
@@ -5707,7 +5823,7 @@ impl DocumentEditor {
                         writer,
                         &serializer,
                         encryption_handler.is_some(),
-                        options.compress,
+                        deflate,
                         &mut xref_entries,
                     )? {
                         continue;
@@ -5829,7 +5945,10 @@ impl DocumentEditor {
         // dropped page's own annotation, and reads the plan's overrides,
         // so nothing that only a dropped page reaches is written.
         let reachable_ids = if options.garbage_collect {
-            Some(self.collect_reachable_ids(&prune))
+            Some(self.collect_reachable_ids(
+                &prune,
+                Some((&xref_entries, &serializer.written_references())),
+            ))
         } else {
             None
         };
@@ -5855,7 +5974,7 @@ impl DocumentEditor {
                     writer,
                     &serializer,
                     &encryption_handler,
-                    options.compress,
+                    deflate,
                     &mut xref_entries,
                     false,
                 )?;
@@ -5895,7 +6014,7 @@ impl DocumentEditor {
                     writer,
                     &serializer,
                     encryption_handler.is_some(),
-                    options.compress,
+                    deflate,
                     &mut xref_entries,
                 )?
             {
@@ -5925,10 +6044,9 @@ impl DocumentEditor {
                     ) => {},
                 // ── end pdf_manipulator patch ──
                 Ok(obj) => {
-                    let obj = if options.compress {
-                        compress_stream_if_raw(obj)
-                    } else {
-                        obj
+                    let obj = match deflate {
+                        Some(level) => deflate_stream(obj, level),
+                        None => obj,
                     };
                     let offset = writer.position();
                     let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
@@ -5968,7 +6086,7 @@ impl DocumentEditor {
                         writer,
                         &serializer,
                         &encryption_handler,
-                        options.compress,
+                        deflate,
                         &mut xref_entries,
                         false,
                     )?;
@@ -5990,7 +6108,7 @@ impl DocumentEditor {
             writer,
             &serializer,
             &encryption_handler,
-            options.compress,
+            deflate,
             &mut xref_entries,
             true,
         )?;
@@ -6072,7 +6190,7 @@ impl DocumentEditor {
             } else if let Some(id) = source_file_id {
                 trailer.insert("ID".to_string(), id);
             }
-            let stream = xref_stream(rows, field_width(widest), options.compress, trailer);
+            let stream = xref_stream(rows, field_width(widest), deflate, trailer);
             writer.write_all(&serializer.serialize_indirect(stream_id, 0, &stream))?;
             write!(writer, "startxref\n{}\n%%EOF\n", xref_offset)?;
 
@@ -9474,11 +9592,14 @@ impl DocumentEditor {
         }
 
         // ── pdf_manipulator patch: the same prune plan the save uses (#261) ──
-        let reachable = self.collect_reachable_ids(&crate::host::page_prune::plan(
-            &self.source,
-            &self.modified_objects,
-            &self.page_order,
-        ));
+        let reachable = self.collect_reachable_ids(
+            &crate::host::page_prune::plan(
+                &self.source,
+                &self.modified_objects,
+                &self.page_order,
+            ),
+            None,
+        );
         // ── end pdf_manipulator patch ──
 
         // Expand the catalog-derived roots → full subtree, excluding
@@ -10567,7 +10688,9 @@ mod tests {
         let opts = SaveOptions::default();
         assert!(!opts.incremental);
         assert!(!opts.compress);
-        assert!(!opts.linearize);
+        // ── pdf_manipulator patch: the level defaults to 9 ──
+        assert_eq!(opts.deflate_level, 9);
+        // ── end pdf_manipulator patch ──
         assert!(!opts.garbage_collect);
         assert!(opts.encryption.is_none());
     }

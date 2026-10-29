@@ -19,7 +19,6 @@ pub fn run(file: &Path, output: Option<&Path>, password: Option<&str>) -> pdf_ox
         SaveOptions {
             compress: true,
             garbage_collect: true,
-            linearize: true,
             ..Default::default()
         },
     )?;

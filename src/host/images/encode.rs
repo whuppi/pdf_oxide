@@ -135,7 +135,7 @@ pub fn encode_flate_predicted(
         prior.copy_from_slice(row);
     }
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
     encoder
         .write_all(&filtered)
         .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib write failed: {e}")))?;

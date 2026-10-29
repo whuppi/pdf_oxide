@@ -3621,24 +3621,21 @@ impl WasmPdfDocument {
             .map_err(|e| JsValue::from_str(&format!("Failed to save PDF: {}", e)))
     }
 
-    /// Save with options (compress, garbage_collect, linearize) and return bytes.
+    /// Save with options (compress, garbage_collect) and return bytes.
     ///
     /// @param {Object} [options] - Optional save options.
     /// @param {boolean} [options.compress=true] - Compress raw streams with FlateDecode.
     /// @param {boolean} [options.garbageCollect=true] - Remove unreachable objects.
-    /// @param {boolean} [options.linearize=false] - Linearize (reserved, no-op).
     /// @returns Uint8Array containing the modified PDF
     #[wasm_bindgen(js_name = "saveWithOptions")]
     pub fn save_with_options_js(
         &mut self,
         compress: Option<bool>,
         garbage_collect: Option<bool>,
-        linearize: Option<bool>,
     ) -> Result<Vec<u8>, JsValue> {
         let options = SaveOptions {
             compress: compress.unwrap_or(true),
             garbage_collect: garbage_collect.unwrap_or(true),
-            linearize: linearize.unwrap_or(false),
             incremental: false,
             encryption: None,
             // ── pdf_manipulator patch: keep the source's own encryption ──
@@ -3646,6 +3643,9 @@ impl WasmPdfDocument {
             // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: object streams ──
             object_streams: true,
+            // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: the Flate level ──
+            deflate_level: 9,
             // ── end pdf_manipulator patch ──
         };
         let editor_arc = self.ensure_editor()?;

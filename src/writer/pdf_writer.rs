@@ -128,7 +128,9 @@ fn compress_data(data: &[u8]) -> std::io::Result<Vec<u8>> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    // ── pdf_manipulator patch: PDF bytes are deflated at the best level ──
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    // ── end pdf_manipulator patch ──
     encoder.write_all(data)?;
     encoder.finish()
 }

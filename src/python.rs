@@ -1229,22 +1229,14 @@ impl PyPdfDocument {
     ///     path (str): Destination file path.
     ///     compress (bool): Compress unfiltered streams with FlateDecode. Default ``True``.
     ///     garbage_collect (bool): Remove unreachable objects. Default ``True``.
-    ///     linearize (bool): Linearize for fast web view (no-op, reserved). Default ``False``.
-    #[pyo3(signature = (path, compress=true, garbage_collect=true, linearize=false))]
-    fn save(
-        &mut self,
-        path: &str,
-        compress: bool,
-        garbage_collect: bool,
-        linearize: bool,
-    ) -> PyResult<()> {
+    #[pyo3(signature = (path, compress=true, garbage_collect=true))]
+    fn save(&mut self, path: &str, compress: bool, garbage_collect: bool) -> PyResult<()> {
         use crate::editor::{EditableDocument, SaveOptions};
         self.ensure_editor()?;
         if let Some(ref mut editor) = self.editor {
             let options = SaveOptions {
                 compress,
                 garbage_collect,
-                linearize,
                 incremental: false,
                 encryption: None,
                 // ── pdf_manipulator patch: keep the source's own encryption ──
@@ -1252,6 +1244,9 @@ impl PyPdfDocument {
                 // ── end pdf_manipulator patch ──
                 // ── pdf_manipulator patch: object streams ──
                 object_streams: true,
+                // ── end pdf_manipulator patch ──
+                // ── pdf_manipulator patch: the Flate level ──
+                deflate_level: 9,
                 // ── end pdf_manipulator patch ──
             };
             editor
@@ -1270,14 +1265,12 @@ impl PyPdfDocument {
     /// Args:
     ///     compress (bool): Compress unfiltered streams with FlateDecode. Default ``True``.
     ///     garbage_collect (bool): Remove unreachable objects. Default ``True``.
-    ///     linearize (bool): Linearize for fast web view (no-op, reserved). Default ``False``.
-    #[pyo3(signature = (compress=true, garbage_collect=true, linearize=false))]
+    #[pyo3(signature = (compress=true, garbage_collect=true))]
     fn to_bytes<'py>(
         &mut self,
         py: Python<'py>,
         compress: bool,
         garbage_collect: bool,
-        linearize: bool,
     ) -> PyResult<Py<PyBytes>> {
         use crate::editor::SaveOptions;
         self.ensure_editor()?;
@@ -1285,7 +1278,6 @@ impl PyPdfDocument {
             let options = SaveOptions {
                 compress,
                 garbage_collect,
-                linearize,
                 incremental: false,
                 encryption: None,
                 // ── pdf_manipulator patch: keep the source's own encryption ──
@@ -1293,6 +1285,9 @@ impl PyPdfDocument {
                 // ── end pdf_manipulator patch ──
                 // ── pdf_manipulator patch: object streams ──
                 object_streams: true,
+                // ── end pdf_manipulator patch ──
+                // ── pdf_manipulator patch: the Flate level ──
+                deflate_level: 9,
                 // ── end pdf_manipulator patch ──
             };
             let bytes = editor.save_to_bytes_with_options(options).map_err(|e| {

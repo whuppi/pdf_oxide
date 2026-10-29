@@ -914,12 +914,11 @@ uint8_t *document_editor_save_to_bytes(DocumentEditor *handle,
 
 #if !defined(PDF_OXIDE_TARGET_WASM32)
 /**
- * Save the editor contents to bytes with compression / GC / linearize options.
+ * Save the editor contents to bytes with compression / GC options.
  */
 uint8_t *document_editor_save_to_bytes_with_options(DocumentEditor *handle,
                                                     bool compress,
                                                     bool garbage_collect,
-                                                    bool linearize,
                                                     uintptr_t *out_len,
                                                     int32_t *error_code);
 #endif

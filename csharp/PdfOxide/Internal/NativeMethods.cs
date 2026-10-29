@@ -6365,14 +6365,13 @@ namespace PdfOxide.Internal
             [MarshalAs(UnmanagedType.LPUTF8Str)] string ownerPassword,
             out nuint outLen, out int errorCode);
 
-        /// <summary>Saves the editor to bytes with compress / garbage-collect / linearize options.</summary>
+        /// <summary>Saves the editor to bytes with compress / garbage-collect options.</summary>
         [LibraryImport(LibName, EntryPoint = "document_editor_save_to_bytes_with_options")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         public static partial IntPtr document_editor_save_to_bytes_with_options(
             NativeHandle handle,
             [MarshalAs(UnmanagedType.I1)] bool compress,
             [MarshalAs(UnmanagedType.I1)] bool garbageCollect,
-            [MarshalAs(UnmanagedType.I1)] bool linearize,
             out nuint outLen,
             out int errorCode);
 

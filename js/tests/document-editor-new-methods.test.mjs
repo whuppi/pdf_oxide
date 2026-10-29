@@ -53,7 +53,7 @@ test('saveToBytes returns valid PDF bytes', () => {
 
 test('saveToBytesWithOptions returns valid PDF bytes', () => {
   withEditor('# saveToBytesWithOptions', (editor) => {
-    const bytes = editor.saveToBytesWithOptions(true, true, false);
+    const bytes = editor.saveToBytesWithOptions(true, true);
     assert.ok(bytes.length > 100);
     assert.equal(String.fromCharCode(bytes[0]), '%');
   });

@@ -181,7 +181,6 @@ uint8_t *document_editor_save_to_bytes(DocumentEditor *handle,
 uint8_t *document_editor_save_to_bytes_with_options(DocumentEditor *handle,
                                                     bool compress,
                                                     bool garbage_collect,
-                                                    bool linearize,
                                                     uintptr_t *out_len,
                                                     int32_t *error_code);
 

@@ -2036,13 +2036,13 @@ public final class DocumentEditor {
         return try takeBytes(p, len, code, "saveToBytes")
     }
 
-    public func saveToBytesWithOptions(compress: Bool, garbageCollect: Bool, linearize: Bool) throws
+    public func saveToBytesWithOptions(compress: Bool, garbageCollect: Bool) throws
         -> [UInt8]
     {
         var code: Int32 = 0
         var len = 0
         let p = document_editor_save_to_bytes_with_options(
-            try ptr(), compress, garbageCollect, linearize, &len, &code)
+            try ptr(), compress, garbageCollect, &len, &code)
         return try takeBytes(p, len, code, "saveToBytesWithOptions")
     }
 

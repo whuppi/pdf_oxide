@@ -2352,14 +2352,13 @@ class DocumentEditor {
                                   "DocumentEditor::save_to_bytes");
     }
 
-    /// Save to bytes with compression / garbage-collect / linearize options.
+    /// Save to bytes with compression / garbage-collect options.
     std::vector<std::uint8_t> save_to_bytes_with_options(bool compress,
-                                                         bool garbage_collect,
-                                                         bool linearize) const {
+                                                         bool garbage_collect) const {
         int32_t code = 0;
         std::uintptr_t out_len = 0;
         std::uint8_t* p = document_editor_save_to_bytes_with_options(
-            ptr(), compress, garbage_collect, linearize, &out_len, &code);
+            ptr(), compress, garbage_collect, &out_len, &code);
         return detail::take_bytes(p, static_cast<std::size_t>(out_len), code,
                                   "DocumentEditor::save_to_bytes_with_options");
     }

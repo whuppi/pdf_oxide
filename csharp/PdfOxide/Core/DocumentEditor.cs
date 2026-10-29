@@ -632,13 +632,13 @@ namespace PdfOxide.Core
         }
 
         /// <summary>
-        /// Saves the editor contents to bytes with compression / garbage-collection / linearize flags.
+        /// Saves the editor contents to bytes with compression / garbage-collection flags.
         /// </summary>
-        public byte[] SaveToBytesWithOptions(bool compress, bool garbageCollect, bool linearize)
+        public byte[] SaveToBytesWithOptions(bool compress, bool garbageCollect)
         {
             ThrowIfDisposed();
             var ptr = NativeMethods.document_editor_save_to_bytes_with_options(
-                _handle, compress, garbageCollect, linearize, out nuint outLen, out int errorCode);
+                _handle, compress, garbageCollect, out nuint outLen, out int errorCode);
             ExceptionMapper.ThrowIfError(errorCode);
             if (ptr == IntPtr.Zero || outLen == 0) return Array.Empty<byte>();
             try

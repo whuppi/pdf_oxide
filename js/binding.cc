@@ -278,7 +278,7 @@ extern "C" {
   // New functions (v0.3.39)
   extern void* document_editor_open_from_bytes(const uint8_t* data, size_t len, int* error_code);
   extern uint8_t* document_editor_save_to_bytes(void* handle, size_t* out_len, int* error_code);
-  extern uint8_t* document_editor_save_to_bytes_with_options(void* handle, bool compress, bool garbage_collect, bool linearize, size_t* out_len, int* error_code);
+  extern uint8_t* document_editor_save_to_bytes_with_options(void* handle, bool compress, bool garbage_collect, size_t* out_len, int* error_code);
   extern char* document_editor_get_keywords(const void* handle, int* error_code);
   extern int   document_editor_set_keywords(void* handle, const char* keywords, int* error_code);
   extern int   document_editor_merge_from_bytes(void* handle, const uint8_t* data, size_t len, int* error_code);
@@ -2794,14 +2794,13 @@ Napi::Value EditorSaveToBytes(const Napi::CallbackInfo& info) {
 
 Napi::Value EditorSaveToBytesWithOptions(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (info.Length() < 4) throw Napi::TypeError::New(env, "Expected (handle, compress, garbageCollect, linearize)");
+  if (info.Length() < 3) throw Napi::TypeError::New(env, "Expected (handle, compress, garbageCollect)");
   void* handle = info[0].As<Napi::External<void>>().Data();
   bool compress      = info[1].As<Napi::Boolean>().Value();
   bool garbageCollect = info[2].As<Napi::Boolean>().Value();
-  bool linearize     = info[3].As<Napi::Boolean>().Value();
   size_t outLen = 0;
   int errorCode = 0;
-  uint8_t* data = document_editor_save_to_bytes_with_options(handle, compress, garbageCollect, linearize, &outLen, &errorCode);
+  uint8_t* data = document_editor_save_to_bytes_with_options(handle, compress, garbageCollect, &outLen, &errorCode);
   if (errorCode != 0) throw Napi::Error::New(env, "Failed to save editor to bytes: " + getErrorMessage(errorCode));
   if (!data || outLen == 0) return Napi::Buffer<uint8_t>::New(env, 0);
   auto buf = Napi::Buffer<uint8_t>::Copy(env, data, outLen);

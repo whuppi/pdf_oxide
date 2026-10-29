@@ -2381,13 +2381,11 @@ static NSData* _Nullable POXTakeBytes(uint8_t* p, NSUInteger len, int32_t code,
 
 - (NSData*)saveToBytesCompress:(BOOL)compress
                 garbageCollect:(BOOL)garbageCollect
-                     linearize:(BOOL)linearize
                          error:(NSError**)error {
     uintptr_t len = 0;
     int32_t code = 0;
     uint8_t* p = document_editor_save_to_bytes_with_options(
-        _handle, compress ? true : false, garbageCollect ? true : false,
-        linearize ? true : false, &len, &code);
+        _handle, compress ? true : false, garbageCollect ? true : false, &len, &code);
     return POXTakeBytes(p, (NSUInteger)len, code, @"saveToBytesWithOptions", error);
 }
 

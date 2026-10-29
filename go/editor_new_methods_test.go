@@ -59,7 +59,7 @@ func TestDocumentEditor_SaveToBytesWithOptions_ReturnsPDF(t *testing.T) {
 	editor, cleanup := openEditorForTest(t, "# SaveToBytesWithOptions")
 	defer cleanup()
 
-	data, err := editor.SaveToBytesWithOptions(true, true, false)
+	data, err := editor.SaveToBytesWithOptions(true, true)
 	if err != nil {
 		t.Fatalf("SaveToBytesWithOptions: %v", err)
 	}

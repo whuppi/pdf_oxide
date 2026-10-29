@@ -332,8 +332,8 @@ editor.save_with_options("output.pdf", SaveOptions::incremental())?;
 let options = SaveOptions {
     incremental: false,
     compress: true,
-    linearize: false,
     garbage_collect: true,
+    ..Default::default()
 };
 editor.save_with_options("output.pdf", options)?;
 ```

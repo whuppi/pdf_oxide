@@ -1225,13 +1225,12 @@ pub extern "C" fn document_editor_save_to_bytes(
     }
 }
 
-/// Save the editor contents to bytes with compression / GC / linearize options.
+/// Save the editor contents to bytes with compression / GC options.
 #[no_mangle]
 pub extern "C" fn document_editor_save_to_bytes_with_options(
     handle: *mut DocumentEditor,
     compress: bool,
     garbage_collect: bool,
-    linearize: bool,
     out_len: *mut usize,
     error_code: *mut i32,
 ) -> *mut u8 {
@@ -1243,7 +1242,6 @@ pub extern "C" fn document_editor_save_to_bytes_with_options(
     let mut opts = crate::editor::SaveOptions::full_rewrite();
     opts.compress = compress;
     opts.garbage_collect = garbage_collect;
-    opts.linearize = linearize;
     match editor.save_to_bytes_with_options(opts) {
         Ok(bytes) => {
             set_error(error_code, ERR_SUCCESS);

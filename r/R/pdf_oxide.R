@@ -778,16 +778,15 @@ pdf_editor_save_to_bytes <- function(editor) {
   .Call(C_r_editor_save_to_bytes, editor)
 }
 
-#' Serialize the edited document with compress / GC / linearize options.
+#' Serialize the edited document with compress / GC options.
 #' @param editor A `pdfoxide_editor`.
-#' @param compress,garbage_collect,linearize Logical save options.
+#' @param compress,garbage_collect Logical save options.
 #' @return A `raw` vector.
 #' @export
 pdf_editor_save_to_bytes_with_options <- function(editor, compress = TRUE,
-                                                  garbage_collect = TRUE,
-                                                  linearize = FALSE) {
+                                                  garbage_collect = TRUE) {
   .Call(C_r_editor_save_to_bytes_with_options, editor, isTRUE(compress),
-        isTRUE(garbage_collect), isTRUE(linearize))
+        isTRUE(garbage_collect))
 }
 
 #' Save the edited document with AES-256 encryption to a path.

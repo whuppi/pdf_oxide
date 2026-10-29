@@ -181,11 +181,9 @@ fn demonstrate_save_options() -> Result<(), Box<dyn Error>> {
         "\nSaveOptions::full_rewrite():\n  \
         - incremental: {}\n  \
         - compress: {}\n  \
-        - linearize: {}\n  \
         - garbage_collect: {}",
         full_rewrite.incremental,
         full_rewrite.compress,
-        full_rewrite.linearize,
         full_rewrite.garbage_collect
     );
 
@@ -194,11 +192,9 @@ fn demonstrate_save_options() -> Result<(), Box<dyn Error>> {
         "\nSaveOptions::incremental():\n  \
         - incremental: {}\n  \
         - compress: {}\n  \
-        - linearize: {}\n  \
         - garbage_collect: {}",
         incremental.incremental,
         incremental.compress,
-        incremental.linearize,
         incremental.garbage_collect
     );
 

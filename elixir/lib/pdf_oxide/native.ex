@@ -66,7 +66,7 @@ defmodule PdfOxide.Native do
   def editor_set_creation_date(_ed, _date), do: nif_error()
   def editor_save(_ed, _path), do: nif_error()
   def editor_save_to_bytes(_ed), do: nif_error()
-  def editor_save_to_bytes_with_options(_ed, _compress, _gc, _linearize), do: nif_error()
+  def editor_save_to_bytes_with_options(_ed, _compress, _gc), do: nif_error()
   def editor_extract_pages_to_bytes(_ed, _pages), do: nif_error()
   def editor_convert_to_pdf_a(_ed, _level), do: nif_error()
   def editor_save_encrypted_to_bytes(_ed, _user_pw, _owner_pw), do: nif_error()

@@ -1139,12 +1139,12 @@ SEXP r_editor_save_to_bytes(SEXP ext) {
     return out;
 }
 SEXP r_editor_save_to_bytes_with_options(SEXP ext, SEXP compress,
-                                         SEXP garbage_collect, SEXP linearize) {
+                                         SEXP garbage_collect) {
     int32_t code = 0;
     uintptr_t out_len = 0;
     uint8_t *buf = document_editor_save_to_bytes_with_options(
         editor_ptr(ext), Rf_asLogical(compress) == TRUE,
-        Rf_asLogical(garbage_collect) == TRUE, Rf_asLogical(linearize) == TRUE,
+        Rf_asLogical(garbage_collect) == TRUE,
         &out_len, &code);
     if (!buf) pdfox_raise(code, "editor_save_to_bytes_with_options");
     R_xlen_t n = (R_xlen_t)out_len;
@@ -3694,7 +3694,7 @@ static const R_CallMethodDef CallEntries[] = {
     CDEF(r_editor_extract_pages_to_bytes, 2),
     CDEF(r_editor_save, 2),
     CDEF(r_editor_save_to_bytes, 1),
-    CDEF(r_editor_save_to_bytes_with_options, 4),
+    CDEF(r_editor_save_to_bytes_with_options, 3),
     CDEF(r_editor_save_encrypted, 4),
     CDEF(r_editor_save_encrypted_to_bytes, 3),
     CDEF(r_editor_close, 1),

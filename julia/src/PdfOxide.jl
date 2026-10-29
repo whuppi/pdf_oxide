@@ -1542,23 +1542,21 @@ function save_to_bytes(e::DocumentEditor)
     return _take_bytes_uptr(ptr, len[], code[], "save_to_bytes")
 end
 
-"""Serialize with compress / garbage-collect / linearize options."""
+"""Serialize with compress / garbage-collect options."""
 function save_to_bytes_with_options(
     e::DocumentEditor,
     compress::Bool,
     garbage_collect::Bool,
-    linearize::Bool,
 )
     len = Ref{Csize_t}(0)
     code = Ref{Int32}(0)
     ptr = ccall(
         (:document_editor_save_to_bytes_with_options, LIB),
         Ptr{UInt8},
-        (Ptr{Cvoid}, Bool, Bool, Bool, Ref{Csize_t}, Ref{Int32}),
+        (Ptr{Cvoid}, Bool, Bool, Ref{Csize_t}, Ref{Int32}),
         _editor(e),
         compress,
         garbage_collect,
-        linearize,
         len,
         code,
     )

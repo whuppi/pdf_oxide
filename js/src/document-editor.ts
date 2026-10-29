@@ -364,14 +364,13 @@ export class DocumentEditor {
     return native.editorSaveToBytes(this._handle) as Buffer;
   }
 
-  /** Save to an in-memory Buffer with explicit compression / GC / linearize flags. */
-  saveToBytesWithOptions(compress: boolean, garbageCollect: boolean, linearize: boolean): Buffer {
+  /** Save to an in-memory Buffer with explicit compression / GC flags. */
+  saveToBytesWithOptions(compress: boolean, garbageCollect: boolean): Buffer {
     this._throwIfClosed();
     return native.editorSaveToBytesWithOptions(
       this._handle,
       compress,
-      garbageCollect,
-      linearize
+      garbageCollect
     ) as Buffer;
   }
 

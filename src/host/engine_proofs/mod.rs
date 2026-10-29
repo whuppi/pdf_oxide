@@ -6,9 +6,11 @@
 
 mod determinism;
 mod document_pages;
+mod editor_deflate;
 mod editor_merge;
 mod editor_nested;
 mod editor_objstm;
+mod editor_orphans;
 mod editor_packed;
 mod editor_trailer;
 mod editor_pages;

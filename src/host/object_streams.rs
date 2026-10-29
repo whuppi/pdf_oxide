@@ -100,8 +100,9 @@ pub(crate) fn mark_packed(
 
 /// The `/Type /ObjStm` stream object holding `batch`: the id/offset table,
 /// then the objects, offsets counted from `/First`. The bodies are deflated
-/// as they are read, so the batch is held once besides its output.
-pub(crate) fn object_stream(batch: Vec<(u32, Vec<u8>)>, compress: bool) -> Object {
+/// as they are read (at level `deflate`, when set), so the batch is held once
+/// besides its output.
+pub(crate) fn object_stream(batch: Vec<(u32, Vec<u8>)>, deflate: Option<u32>) -> Object {
     let count = batch.len();
     let mut table = String::new();
     let mut at = 0usize;
@@ -109,10 +110,9 @@ pub(crate) fn object_stream(batch: Vec<(u32, Vec<u8>)>, compress: bool) -> Objec
         table.push_str(&format!("{id} {at} "));
         at += body.len() + 1;
     }
-    let mut sink = if compress {
-        Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::default()))
-    } else {
-        Sink::Plain(Vec::new())
+    let mut sink = match deflate {
+        Some(level) => Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::new(level))),
+        None => Sink::Plain(Vec::new()),
     };
     sink.put(table.as_bytes());
     for (_, body) in batch {
@@ -124,7 +124,7 @@ pub(crate) fn object_stream(batch: Vec<(u32, Vec<u8>)>, compress: bool) -> Objec
     dict.insert("Type".to_string(), Object::Name("ObjStm".to_string()));
     dict.insert("N".to_string(), Object::Integer(count as i64));
     dict.insert("First".to_string(), Object::Integer(table.len() as i64));
-    if compress {
+    if deflate.is_some() {
         dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
     }
     Object::Stream { dict, data: sink.finish().into() }
@@ -203,15 +203,15 @@ pub(crate) fn field_width(max: u64) -> usize {
 pub(crate) fn xref_stream(
     rows: impl Iterator<Item = Row>,
     width: usize,
-    compress: bool,
+    deflate: Option<u32>,
     mut trailer: HashMap<String, Object>,
 ) -> Object {
     let width = width.max(1);
     let row_len = 1 + width + 2;
-    let mut out = if compress {
-        Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::default()))
-    } else {
-        Sink::Plain(Vec::new())
+    let compress = deflate.is_some();
+    let mut out = match deflate {
+        Some(level) => Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::new(level))),
+        None => Sink::Plain(Vec::new()),
     };
     let mut previous = vec![0u8; row_len];
     let mut row = vec![0u8; row_len];

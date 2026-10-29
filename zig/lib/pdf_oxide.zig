@@ -2009,14 +2009,13 @@ pub const DocumentEditor = struct {
         return alloc.dupe(u8, p[0..len]);
     }
 
-    /// Serialize with compression / garbage-collect / linearize options; caller
+    /// Serialize with compression / garbage-collect options; caller
     /// owns the returned slice.
     pub fn saveToBytesWithOptions(
         self: DocumentEditor,
         alloc: std.mem.Allocator,
         compress: bool,
         garbage_collect: bool,
-        linearize: bool,
     ) Error![]u8 {
         const h = try self.live();
         var len: usize = 0;
@@ -2025,7 +2024,6 @@ pub const DocumentEditor = struct {
             h,
             compress,
             garbage_collect,
-            linearize,
             &len,
             &code,
         ) orelse return fail(code);

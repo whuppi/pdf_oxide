@@ -588,7 +588,6 @@ typedef struct {
 - (nullable NSData*)saveToBytesWithError:(NSError**)error;
 - (nullable NSData*)saveToBytesCompress:(BOOL)compress
                          garbageCollect:(BOOL)garbageCollect
-                              linearize:(BOOL)linearize
                                   error:(NSError**)error;
 - (BOOL)saveEncryptedToPath:(NSString*)path
                userPassword:(NSString*)userPassword

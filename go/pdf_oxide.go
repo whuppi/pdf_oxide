@@ -342,7 +342,7 @@ extern int32_t document_editor_save_encrypted(void* handle, const char* path, co
 // Editor: new functions (v0.3.39)
 extern void* document_editor_open_from_bytes(const uint8_t* data, size_t len, int* error_code);
 extern uint8_t* document_editor_save_to_bytes(void* handle, size_t* out_len, int* error_code);
-extern uint8_t* document_editor_save_to_bytes_with_options(void* handle, bool compress, bool garbage_collect, bool linearize, size_t* out_len, int* error_code);
+extern uint8_t* document_editor_save_to_bytes_with_options(void* handle, bool compress, bool garbage_collect, size_t* out_len, int* error_code);
 
 // Editor: v0.3.40 additions
 extern void* document_editor_extract_pages_to_bytes(void* handle, int32_t* pages, size_t count, size_t* out_len, int* error_code);
@@ -2739,8 +2739,8 @@ func (editor *DocumentEditor) SaveToBytes() ([]byte, error) {
 	return result, nil
 }
 
-// SaveToBytesWithOptions saves the edited document to bytes with compression / GC / linearize flags.
-func (editor *DocumentEditor) SaveToBytesWithOptions(compress, garbageCollect, linearize bool) ([]byte, error) {
+// SaveToBytesWithOptions saves the edited document to bytes with compression / GC flags.
+func (editor *DocumentEditor) SaveToBytesWithOptions(compress, garbageCollect bool) ([]byte, error) {
 	if err := editor.acquireWrite(); err != nil {
 		return nil, err
 	}
@@ -2751,7 +2751,6 @@ func (editor *DocumentEditor) SaveToBytesWithOptions(compress, garbageCollect, l
 		editor.handle,
 		C.bool(compress),
 		C.bool(garbageCollect),
-		C.bool(linearize),
 		&outLen,
 		&errorCode,
 	)

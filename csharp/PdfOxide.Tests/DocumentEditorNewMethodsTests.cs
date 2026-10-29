@@ -74,7 +74,7 @@ namespace PdfOxide.Tests
             try
             {
                 using var editor = DocumentEditor.Open(path);
-                var bytes = editor.SaveToBytesWithOptions(compress: true, garbageCollect: true, linearize: false);
+                var bytes = editor.SaveToBytesWithOptions(compress: true, garbageCollect: true);
                 Assert.NotNull(bytes);
                 Assert.True(bytes.Length > 100);
                 Assert.Equal((byte)'%', bytes[0]);

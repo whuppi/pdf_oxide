@@ -722,14 +722,13 @@ defmodule PdfOxide do
   @doc "Serialize the edited document to a binary."
   def editor_save_to_bytes(%DocumentEditor{ref: ref}), do: Native.editor_save_to_bytes(ref)
 
-  @doc "Serialize the edited document to bytes with compress/GC/linearize options."
+  @doc "Serialize the edited document to bytes with compress/GC options."
   def editor_save_to_bytes_with_options(
         %DocumentEditor{ref: ref},
         compress,
-        garbage_collect,
-        linearize
+        garbage_collect
       ),
-      do: Native.editor_save_to_bytes_with_options(ref, compress, garbage_collect, linearize)
+      do: Native.editor_save_to_bytes_with_options(ref, compress, garbage_collect)
 
   @doc "Save the edited document AES-256 encrypted to `path`."
   def editor_save_encrypted(%DocumentEditor{ref: ref}, path, user_password, owner_password),
