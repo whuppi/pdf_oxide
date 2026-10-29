@@ -9,8 +9,9 @@
 //! wasm_bindgen resolves the import via global lookup — no bare "env"
 //! import specifier that would break in ES module Workers.
 //!
-//! O(1)-memory guarantee: at most one 64KB chunk in WASM linear memory.
-//! The source file is never fully buffered.
+//! O(1)-memory guarantee: one 64KB window per reader in WASM linear memory.
+//! The source file is never fully buffered. A read inside the last window
+//! is a copy; only a miss calls `host_read_at`, for a whole chunk.
 //!
 //! Three JS-side implementations (transparent to this reader):
 //!   Atomics:  host_read_at blocks via Atomics.wait, main thread fills SAB
@@ -32,45 +33,72 @@ extern "C" {
 ///
 /// Each reader carries a `source_index` so the JS side routes
 /// readAt to the correct DataSource when multiple sources exist.
+///
+/// The engine reads through a small `BufReader` that drops its buffer on
+/// every seek, and a `host_read_at` call is a suspended wasm stack or an
+/// `Atomics.wait`. So a miss asks for a whole chunk, kept as the window,
+/// and every read inside the window is a copy.
 pub struct JsCallbackReader {
     source_index: u32,
     length: u64,
     position: u64,
+    window: Vec<u8>,
+    window_start: u64,
+    window_len: usize,
 }
 
 impl JsCallbackReader {
     /// Create a reader for the source at `source_index`.
     pub fn new(source_index: u32, length: u64) -> Self {
-        Self { source_index, length, position: 0 }
+        Self {
+            source_index,
+            length,
+            position: 0,
+            window: Vec::new(),
+            window_start: 0,
+            window_len: 0,
+        }
     }
 }
 
 impl Read for JsCallbackReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.position >= self.length {
+        if self.position >= self.length || buf.is_empty() {
             return Ok(0);
         }
 
-        let remaining = self.length - self.position;
-        let to_read = buf.len().min(remaining as usize).min(crate::host::constants::READ_BUF_CAPACITY);
+        let in_window = self.position >= self.window_start
+            && self.position < self.window_start + self.window_len as u64;
+        if !in_window {
+            if self.window.is_empty() {
+                self.window = vec![0; crate::host::constants::READ_BUF_CAPACITY];
+            }
+            self.window_len = 0;
+            let remaining = self.length - self.position;
+            let to_read = (remaining as usize).min(self.window.len());
 
-        let n = host_read_at(
-            self.source_index,
-            self.position as u32,
-            to_read as u32,
-            buf.as_mut_ptr() as u32,
-        );
+            let n = host_read_at(
+                self.source_index,
+                self.position as u32,
+                to_read as u32,
+                self.window.as_mut_ptr() as u32,
+            );
 
-        if n == crate::host::constants::HOST_IO_CANCELLED {
-            // Deliberately NOT ErrorKind::Interrupted — std combinators
-            // retry that kind, which would spin forever on a cancel.
-            return Err(io::Error::other("operation cancelled"));
+            if n == crate::host::constants::HOST_IO_CANCELLED {
+                // Deliberately NOT ErrorKind::Interrupted — std combinators
+                // retry that kind, which would spin forever on a cancel.
+                return Err(io::Error::other("operation cancelled"));
+            }
+            if n < 0 {
+                return Err(io::Error::new(io::ErrorKind::Other, "host_read_at failed"));
+            }
+            self.window_start = self.position;
+            self.window_len = n as usize;
         }
-        if n < 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "host_read_at failed"));
-        }
 
-        let n = n as usize;
+        let at = (self.position - self.window_start) as usize;
+        let n = buf.len().min(self.window_len - at);
+        buf[..n].copy_from_slice(&self.window[at..at + n]);
         self.position += n as u64;
         Ok(n)
     }
