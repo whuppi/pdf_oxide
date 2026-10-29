@@ -13,5 +13,7 @@ mod editor_pages;
 mod editor_save;
 mod kept_encryption;
 mod lzw;
+#[cfg(feature = "rendering")]
+mod source_trips;
 mod stream_head;
 mod support;

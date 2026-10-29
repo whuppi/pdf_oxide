@@ -39,6 +39,9 @@ pub struct CallbackReader {
     token: CancelToken,
     position: u64,
     length: u64,
+    /// The source range the shared buffer's data region holds from the last
+    /// response: `(offset, length)`. A read inside it is a copy, not a trip.
+    window: (u64, usize),
 }
 
 unsafe impl Send for CallbackReader {}
@@ -57,7 +60,7 @@ impl CallbackReader {
         length: u64,
         token: CancelToken,
     ) -> Self {
-        Self { buf, notify_fn, token, position: 0, length }
+        Self { buf, notify_fn, token, position: 0, length, window: (0, 0) }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -75,10 +78,29 @@ impl Read for CallbackReader {
             return Err(crate::host::native::cancel::cancelled());
         }
 
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        // The data region keeps the last response until the next request
+        // overwrites it, so a read that lands inside it needs no trip.
+        let (window_start, window_len) = self.window;
+        if self.position >= window_start && self.position < window_start + window_len as u64 {
+            let at = (self.position - window_start) as usize;
+            let n = out.len().min(window_len - at);
+            unsafe {
+                let src = sb::data_ptr(self.buf, rc::OFFSET_DATA).add(at);
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+            }
+            self.position += n as u64;
+            return Ok(n);
+        }
+        self.window = (0, 0);
+
+        // Always ask for a whole chunk: the engine reads through a small
+        // buffer, and every trip costs a wake-up of the host, whatever its size.
         let remaining = self.length - self.position;
-        let to_read = out.len()
-            .min(remaining as usize)
-            .min(rc::DATA_CAPACITY);
+        let to_read = (remaining as usize).min(rc::DATA_CAPACITY);
 
         let pair = unsafe { sb::get_sync(self.buf, rc::OFFSET_SYNC_PTR) };
         let guard = pair.mutex.lock().unwrap();
@@ -108,7 +130,9 @@ impl Read for CallbackReader {
         )?;
 
         if flags & sb::FLAG_READY != 0 {
-            let n = unsafe { sb::read_i64(self.buf, rc::OFFSET_RESPONSE_LENGTH) as usize };
+            let got = unsafe { sb::read_i64(self.buf, rc::OFFSET_RESPONSE_LENGTH) as usize };
+            self.window = (self.position, got);
+            let n = got.min(out.len());
             unsafe {
                 let src = sb::data_ptr(self.buf, rc::OFFSET_DATA);
                 std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
