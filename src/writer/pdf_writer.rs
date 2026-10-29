@@ -1983,7 +1983,10 @@ impl PdfWriter {
         output.write_all(&serializer.serialize_indirect(pages_id, 0, &pages_obj))?;
 
         // Font objects (Base-14)
-        for font_ref in self.fonts.values() {
+        // Id order: a HashMap's order differs per instance.
+        let mut font_refs: Vec<&ObjectRef> = self.fonts.values().collect();
+        font_refs.sort_by_key(|r| r.id);
+        for font_ref in font_refs {
             if let Some(font_obj) = self.objects.get(&font_ref.id) {
                 xref_offsets.push((font_ref.id, output.position() as usize));
                 output.write_all(&serializer.serialize_indirect(font_ref.id, 0, font_obj))?;

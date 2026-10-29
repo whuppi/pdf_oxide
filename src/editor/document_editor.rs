@@ -1108,6 +1108,12 @@ impl DocumentEditor {
         Ok(result)
     }
     pub fn modified_objects_mut(&mut self) -> &mut HashMap<u32, Object> { &mut self.modified_objects }
+
+    /// Makes the full rewrite skip source object `id`, as a destructive redaction does.
+    #[cfg(test)]
+    pub(crate) fn withhold_from_rewrite(&mut self, id: u32) {
+        self.redacted_orphan_ids.insert(id);
+    }
     // ── end pdf_manipulator patch ──
 
     /// Get the source file path.
@@ -1335,7 +1341,9 @@ impl DocumentEditor {
     ///
     /// When no reordering has been applied `page_order = [0, 1, 2, …]` so the mapping is the
     /// identity and there is no observable difference for callers.
-    fn output_to_source_index(&self, output: usize) -> usize {
+    // ── pdf_manipulator patch: read by the engine proofs ──
+    pub(crate) fn output_to_source_index(&self, output: usize) -> usize {
+    // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: a page order lookup, not a scan per call ──
         match self.page_key(output) {
             PageKey::Source(index) => index,
@@ -1809,11 +1817,22 @@ impl DocumentEditor {
         Ok(())
     }
 
+    /// A dictionary's entries in key order. A HashMap's own order differs
+    /// per instance, so anything that allocates ids or writes bytes while it
+    /// walks a dictionary walks this instead.
+    fn sorted_entries(dict: &HashMap<String, Object>) -> Vec<(&String, &Object)> {
+        let mut entries: Vec<_> = dict.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries
+    }
+
     /// The references the merge walk follows out of `obj`.
     fn push_walk_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
         fn push_dict_refs(dict: &HashMap<String, Object>, out: &mut Vec<ObjectRef>) {
             let annotation = dict.contains_key("Subtype");
-            for (key, value) in dict {
+            // Key order, so the ids the walk allocates do not depend on a
+            // HashMap's per-instance order.
+            for (key, value) in DocumentEditor::sorted_entries(dict) {
                 if annotation && key == "P" && matches!(value, Object::Reference(_)) {
                     continue;
                 }
@@ -1975,8 +1994,11 @@ impl DocumentEditor {
         let serializer = ObjectSerializer::compact();
 
         // ── pdf_manipulator patch: positions are a byte count ──
-        // Write modified objects
-        for (&obj_id, obj) in &self.modified_objects {
+        // Write modified objects, in id order: a HashMap's order differs per
+        // instance and the xref offsets follow it.
+        let mut modified: Vec<(&u32, &Object)> = self.modified_objects.iter().collect();
+        modified.sort_by_key(|(id, _)| **id);
+        for (&obj_id, obj) in modified {
             let offset = writer.position();
             let bytes = serializer.serialize_indirect(obj_id, 0, obj);
             writer.write_all(&bytes)?;
@@ -2371,7 +2393,11 @@ impl DocumentEditor {
 
         let fields_to_flush: Vec<FieldFlush> = {
             let mut result = Vec::new();
-            for wrapper in self.modified_form_fields.values() {
+            // ── pdf_manipulator patch: name order, two fields on one widget object resolve the same way every save ──
+            let mut by_name: Vec<_> = self.modified_form_fields.iter().collect();
+            by_name.sort_by(|a, b| a.0.cmp(b.0));
+            for (_, wrapper) in by_name {
+            // ── end pdf_manipulator patch ──
                 if !wrapper.is_modified() || wrapper.is_new() {
                     continue;
                 }
@@ -3933,7 +3959,10 @@ impl DocumentEditor {
                                 // Registering the emitted name closes all three; only Standard-14
                                 // names are ever emitted here (embedded fonts take the
                                 // ShowEmbeddedText path and never reach this registration).
-                                let mut overlay_font_ids: HashMap<String, u32> = HashMap::new();
+                                // ── pdf_manipulator patch: name order, so the font objects are written in a fixed order ──
+                                let mut overlay_font_ids: std::collections::BTreeMap<String, u32> =
+                                    std::collections::BTreeMap::new();
+                                // ── end pdf_manipulator patch ──
                                 if let Some(added) = self.overlay_additions.get(&source_page_index)
                                 {
                                     let mut needed: Vec<String> = added
@@ -4863,7 +4892,9 @@ impl DocumentEditor {
                                                     _ => None,
                                                 };
                                                 if let Some(fdict) = font_dict {
-                                                    for font_ref in fdict.values() {
+                                                    // ── pdf_manipulator patch: key order, so the objects are written in a fixed order ──
+                                                    for (_, font_ref) in DocumentEditor::sorted_entries(&fdict) {
+                                                    // ── end pdf_manipulator patch ──
                                                         if let Some(ref_obj) =
                                                             font_ref.as_reference()
                                                         {
@@ -4928,7 +4959,9 @@ impl DocumentEditor {
                                                     _ => None,
                                                 };
                                                 if let Some(xobj_dict) = xobject_dict {
-                                                    for xobj_ref in xobj_dict.values() {
+                                                    // ── pdf_manipulator patch: key order, so the objects are written in a fixed order ──
+                                                    for (_, xobj_ref) in DocumentEditor::sorted_entries(&xobj_dict) {
+                                                    // ── end pdf_manipulator patch ──
                                                         if let Some(ref_obj) =
                                                             xobj_ref.as_reference()
                                                         {
@@ -4997,7 +5030,9 @@ impl DocumentEditor {
                                                     _ => None,
                                                 };
                                                 if let Some(gsd) = gs_dict {
-                                                    for gs_ref in gsd.values() {
+                                                    // ── pdf_manipulator patch: key order, so the objects are written in a fixed order ──
+                                                    for (_, gs_ref) in DocumentEditor::sorted_entries(&gsd) {
+                                                    // ── end pdf_manipulator patch ──
                                                         if let Some(ref_obj) = gs_ref.as_reference()
                                                         {
                                                             if !xref_entries.contains_id(ref_obj.id) {
@@ -5768,7 +5803,7 @@ impl DocumentEditor {
         // Write any new objects from modified_objects whose IDs are not in the
         // original source xref (e.g. XMP streams allocated by the PDF/A converter).
         {
-            let new_objs: Vec<(u32, Object)> = self
+            let mut new_objs: Vec<(u32, Object)> = self
                 .modified_objects
                 .iter()
                 .filter(|(&id, _)| !xref_entries.contains_id(id))
@@ -5777,6 +5812,9 @@ impl DocumentEditor {
                 // ── end pdf_manipulator patch ──
                 .map(|(&id, obj)| (id, obj.clone()))
                 .collect();
+            // ── pdf_manipulator patch: id order, a HashMap's order differs per instance ──
+            new_objs.sort_by_key(|(id, _)| *id);
+            // ── end pdf_manipulator patch ──
             for (obj_id, obj) in new_objs {
                 let offset = writer.position();
                 let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
@@ -10504,21 +10542,6 @@ mod tests {
     }
 
     /// Generates bytes for a minimal valid PDF with one page.
-    #[test]
-    // ── pdf_manipulator patch ──
-    fn test_minimal_pdf_source_opens_without_xref_repair() {
-        // minimal_pdf_bytes' startxref must point at the xref keyword: if
-        // it drifts, every helper test below silently opens through xref
-        // reconstruction instead of the table the file declares.
-        let doc = PdfDocument::from_bytes(minimal_pdf_bytes()).unwrap();
-        assert!(
-            !doc.xref_repaired(),
-            "minimal_pdf_bytes' startxref does not point at the xref keyword, \
-             so every open goes through reconstruction"
-        );
-    }
-    // ── end pdf_manipulator patch ──
-
     fn minimal_pdf_bytes() -> Vec<u8> {
         // ── pdf_manipulator patch: startxref recomputed to the true xref
         // offset — the upstream constant pointed a byte-count past the
@@ -12883,51 +12906,6 @@ mod tests {
     // find_max_object_id
     // =========================================================================
 
-    // ── pdf_manipulator patch: positions are a byte count ──
-    #[test]
-    fn incremental_file_save_writes_offsets_the_xref_can_follow() {
-        // The incremental file save re-reads its source from disk, so the
-        // source file lives until the save is done.
-        let dir = std::env::temp_dir();
-        let src = dir.join(format!("pdf_oxide_incremental_src_{}.pdf", std::process::id()));
-        let out = dir.join(format!("pdf_oxide_incremental_out_{}.pdf", std::process::id()));
-        // A source whose own xref is right, so a repair can only come
-        // from the appended section.
-        let objects = [
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
-        ];
-        let mut pdf = String::from("%PDF-1.4\n");
-        let mut offsets = Vec::new();
-        for (i, body) in objects.iter().enumerate() {
-            offsets.push(pdf.len());
-            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
-        }
-        let xref_at = pdf.len();
-        pdf.push_str("xref\n0 4\n0000000000 65535 f \n");
-        for off in offsets {
-            pdf.push_str(&format!("{off:010} 00000 n \n"));
-        }
-        pdf.push_str(&format!(
-            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
-        ));
-        std::fs::write(&src, pdf).unwrap();
-        assert!(!PdfDocument::open(&src).unwrap().xref_repaired(), "the source itself must be sound");
-        let mut editor = DocumentEditor::open(&src).unwrap();
-        editor.set_title("Appended");
-        editor.save_with_options(&out, SaveOptions::incremental()).unwrap();
-        let doc = PdfDocument::open(&out).unwrap();
-        let repaired = doc.xref_repaired();
-        let mut reopened = DocumentEditor::open(&out).unwrap();
-        let title = reopened.title().unwrap();
-        let _ = std::fs::remove_file(&src);
-        let _ = std::fs::remove_file(&out);
-        assert!(!repaired, "the appended xref must point at its objects without repair");
-        assert_eq!(title.as_deref(), Some("Appended"));
-    }
-    // ── end pdf_manipulator patch ──
-
     #[test]
     fn test_find_max_object_id() {
         let editor = create_test_editor();
@@ -13836,944 +13814,5 @@ mod tests {
             !pe.page.find_text_containing("OVERLAYTOKEN").is_empty(),
             "overlay text must survive with its font registered"
         );
-    }
-
-    /// Three pages under a nested tree: root `[inner(4, 5), 6]`.
-    fn nested_page_tree_pdf_bytes() -> Vec<u8> {
-        let objs: Vec<&[u8]> = vec![
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 3 >>\nendobj\n",
-            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>\nendobj\n",
-            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>\nendobj\n",
-            b"5 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>\nendobj\n",
-            b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n",
-        ];
-        let mut body = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for o in &objs {
-            offsets.push(body.len());
-            body.extend_from_slice(o);
-        }
-        let xref_offset = body.len();
-        let mut tail = format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1);
-        for off in &offsets {
-            tail.push_str(&format!("{off:010} 00000 n \n"));
-        }
-        tail.push_str(&format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
-            objs.len() + 1
-        ));
-        [body, tail.into_bytes()].concat()
-    }
-
-    #[test]
-    fn output_index_follows_removes_and_moves() {
-        let mut editor = open_editor_from_bytes(&nested_page_tree_pdf_bytes(), "output_index");
-        assert_eq!(editor.output_to_source_index(1), 1);
-
-        editor.remove_page(1).unwrap();
-        assert_eq!(editor.output_to_source_index(0), 0);
-        assert_eq!(editor.output_to_source_index(1), 2);
-
-        editor.move_page(0, 1).unwrap();
-        assert_eq!(editor.output_to_source_index(0), 2);
-        assert_eq!(editor.output_to_source_index(1), 0);
-
-        // Past the end falls back to the output index itself.
-        assert_eq!(editor.output_to_source_index(5), 5);
-    }
-
-    #[test]
-    fn nested_tree_rotates_every_page_and_keeps_the_walk_refs() {
-        let mut editor = open_editor_from_bytes(&nested_page_tree_pdf_bytes(), "nested_rotate");
-
-        let expected: Vec<ObjectRef> = (4..=6).map(|id| ObjectRef::new(id, 0)).collect();
-        assert_eq!(&*editor.get_page_refs().unwrap(), expected.as_slice());
-
-        for i in 0..3 {
-            editor.rotate_page_by(i, 90).unwrap();
-        }
-        let bytes = editor.save_to_bytes().unwrap();
-
-        let mut reopened = open_editor_from_bytes(&bytes, "nested_rotate_verify");
-        assert_eq!(reopened.page_count().unwrap(), 3);
-        for i in 0..3 {
-            assert_eq!(reopened.get_page_rotation(i).unwrap(), 90, "page {i}");
-        }
-    }
-
-    // ── a merge records ids and streams the merged document at save ──
-
-    const MERGE_CONTENT: &[u8] = b"BT\n/F1 12 Tf\n1 0 0 1 72 700 Tm\n(MERGEDTEXT) Tj\nET\n";
-    const MERGE_IMAGE: [u8; 48] = [
-        7, 200, 13, 91, 42, 250, 3, 118, 66, 29, 180, 5, 99, 141, 77, 230, 18, 61, 154, 9, 205,
-        88, 37, 172, 24, 111, 246, 53, 130, 2, 195, 70, 16, 223, 84, 149, 31, 167, 58, 240, 12,
-        104, 191, 45, 126, 8, 215, 93,
-    ];
-
-    /// Objects are numbered from 1 in the order given; offsets are computed.
-    fn pdf_from_objects(objs: &[Vec<u8>]) -> Vec<u8> {
-        let mut out = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for o in objs {
-            offsets.push(out.len());
-            out.extend_from_slice(o);
-        }
-        let xref_at = out.len();
-        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
-        for off in offsets {
-            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        out.extend_from_slice(
-            format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n", objs.len() + 1)
-                .as_bytes(),
-        );
-        out
-    }
-
-    fn stream_object(id: u32, dict: &str, data: &[u8]) -> Vec<u8> {
-        [
-            format!("{id} 0 obj\n<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes(),
-            data.to_vec(),
-            b"\nendstream\nendobj\n".to_vec(),
-        ]
-        .concat()
-    }
-
-    /// One page with a known content stream, an unfiltered image, a link
-    /// whose /P and /Dest name the page, a text field, outlines and an
-    /// AcroForm with /DR.
-    fn merge_source_pdf_bytes() -> Vec<u8> {
-        pdf_from_objects(&[
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R \
-              /AcroForm << /Fields [10 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 8 0 R >> >> >> >>\nendobj\n"
-                .to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Contents 4 0 R \
-              /Resources << /Font << /F1 8 0 R >> /XObject << /Im1 5 0 R >> >> /Annots [6 0 R 10 0 R] >>\nendobj\n"
-                .to_vec(),
-            stream_object(4, "", MERGE_CONTENT),
-            stream_object(
-                5,
-                "/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB /BitsPerComponent 8",
-                &MERGE_IMAGE,
-            ),
-            b"6 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 10 90 40] /P 3 0 R \
-              /Dest [3 0 R /Fit] /Border [0 0 0] >>\nendobj\n"
-                .to_vec(),
-            b"7 0 obj\n<< /Unused true >>\nendobj\n".to_vec(),
-            b"8 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
-            b"9 0 obj\n<< /Type /Outlines /Count 0 >>\nendobj\n".to_vec(),
-            b"10 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (mergedfield) /Rect [10 100 90 120] \
-              /P 3 0 R /DA (/Helv 0 Tf 0 g) >>\nendobj\n"
-                .to_vec(),
-        ])
-    }
-
-    fn merge_base_pdf_bytes() -> Vec<u8> {
-        crate::api::Pdf::from_text("base page").unwrap().into_bytes()
-    }
-
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
-    }
-
-    fn merged_editor() -> DocumentEditor {
-        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
-        assert_eq!(editor.merge_from_bytes(&merge_source_pdf_bytes()).unwrap(), 1);
-        editor
-    }
-
-    #[test]
-    fn merged_content_and_image_are_copied_byte_for_byte() {
-        let mut editor = merged_editor();
-        let bytes = editor
-            .save_to_bytes_with_options(SaveOptions { compress: false, ..SaveOptions::full_rewrite() })
-            .unwrap();
-
-        assert!(contains(&bytes, MERGE_CONTENT), "content stream bytes differ");
-        assert!(contains(&bytes, &MERGE_IMAGE), "image bytes differ");
-    }
-
-    #[test]
-    fn merged_save_writes_one_object_per_id() {
-        let mut editor = merged_editor();
-        let bytes = editor.save_to_bytes().unwrap();
-
-        let text = String::from_utf8_lossy(&bytes);
-        let mut ids = Vec::new();
-        for line in text.lines() {
-            if let Some(id) = line.strip_suffix(" 0 obj").and_then(|n| n.parse::<u32>().ok()) {
-                ids.push(id);
-            }
-        }
-        let unique: HashSet<u32> = ids.iter().copied().collect();
-        assert_eq!(ids.len(), unique.len(), "an object id was written twice: {ids:?}");
-
-        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
-        for id in &ids {
-            assert!(!doc.is_free_entry(*id), "object {id} is missing from the xref");
-        }
-    }
-
-    #[test]
-    fn merged_save_with_compression_keeps_the_decoded_content() {
-        let mut editor = merged_editor();
-        let bytes = editor.save_to_bytes().unwrap();
-        assert!(!contains(&bytes, MERGE_CONTENT), "content stream was not deflated");
-
-        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
-        let page = doc.get_page_ref(1).unwrap();
-        let page_dict = doc.load_object(page).unwrap();
-        let contents = page_dict.as_dict().unwrap().get("Contents").unwrap().as_reference().unwrap();
-        let stream = doc.load_object(contents).unwrap();
-        let decoded = doc.decode_stream_with_encryption(&stream, contents).unwrap();
-        assert_eq!(decoded, MERGE_CONTENT);
-    }
-
-    #[test]
-    fn merged_link_keeps_its_destination_and_points_at_the_merged_page() {
-        let mut editor = merged_editor();
-        let bytes = editor.save_to_bytes().unwrap();
-        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
-
-        let page_ref = doc.get_page_ref(1).unwrap();
-        let page = doc.load_object(page_ref).unwrap();
-        let annots = page.as_dict().unwrap().get("Annots").unwrap().as_array().unwrap().clone();
-        let link = annots
-            .iter()
-            .filter_map(|a| a.as_reference())
-            .filter_map(|r| doc.load_object(r).ok())
-            .find(|o| o.as_dict().and_then(|d| d.get("Subtype")).and_then(|s| s.as_name()) == Some("Link"))
-            .expect("the merged page lost its link");
-        let link = link.as_dict().unwrap();
-        assert_eq!(link.get("P").and_then(|p| p.as_reference()), Some(page_ref));
-        let dest = link.get("Dest").and_then(|d| d.as_array()).expect("link lost its /Dest");
-        assert_eq!(dest[0].as_reference(), Some(page_ref), "a destination names the merged page");
-    }
-
-    #[test]
-    fn merge_does_not_import_outlines_and_lists_merged_fields() {
-        let mut editor = merged_editor();
-        let bytes = editor.save_to_bytes().unwrap();
-        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
-
-        let catalog = doc.catalog().unwrap();
-        let catalog = catalog.as_dict().unwrap();
-        assert!(!catalog.contains_key("Outlines"), "the first document's outline is kept, not the merged one");
-
-        let acroform = catalog.get("AcroForm").and_then(|a| a.as_dict()).expect("no AcroForm");
-        let fields = acroform.get("Fields").and_then(|f| f.as_array()).expect("no /Fields");
-        assert_eq!(fields.len(), 1);
-        let field = doc.load_object(fields[0].as_reference().unwrap()).unwrap();
-        assert_eq!(
-            field.as_dict().and_then(|d| d.get("T")).and_then(|t| t.as_string()),
-            Some(&b"mergedfield"[..])
-        );
-        assert!(acroform.contains_key("DR"), "the merged /DR is carried");
-    }
-
-    #[test]
-    fn rotating_a_merged_page_rotates_only_that_page() {
-        let mut editor = merged_editor();
-        assert_eq!(editor.current_page_count(), 2);
-        editor.set_page_rotation(1, 90).unwrap();
-        assert_eq!(editor.get_page_rotation(1).unwrap(), 90);
-        assert_eq!(editor.get_page_rotation(0).unwrap(), 0);
-        assert_eq!(editor.get_page_media_box(1).unwrap(), [0.0, 0.0, 300.0, 400.0]);
-        editor.set_page_media_box(1, [0.0, 0.0, 100.0, 200.0]).unwrap();
-
-        let bytes = editor.save_to_bytes().unwrap();
-        let mut reopened = open_editor_from_bytes(&bytes, "merged_rotate");
-        assert_eq!(reopened.get_page_rotation(1).unwrap(), 90);
-        assert_eq!(reopened.get_page_rotation(0).unwrap(), 0);
-        assert_eq!(reopened.get_page_media_box(1).unwrap(), [0.0, 0.0, 100.0, 200.0]);
-    }
-
-    #[test]
-    fn content_edits_on_a_merged_page_are_refused() {
-        let mut editor = merged_editor();
-        let err = editor.get_page(1).err().expect("editing merged content must fail");
-        assert!(matches!(err, Error::Unsupported(ref m) if m.contains("merged")), "{err}");
-        assert!(matches!(
-            editor.add_redaction(1, [0.0, 0.0, 10.0, 10.0], None),
-            Err(Error::Unsupported(_))
-        ));
-        assert!(matches!(editor.erase_region(1, [0.0, 0.0, 10.0, 10.0]), Err(Error::Unsupported(_))));
-        assert!(matches!(editor.flatten_forms_on_page(1), Err(Error::Unsupported(_))));
-        // The source page is still editable.
-        editor.erase_region(0, [0.0, 0.0, 10.0, 10.0]).unwrap();
-    }
-
-    /// One page per marker, all sharing one font. The page text is the marker
-    /// in parentheses, so a raw save holds `(marker)` once per written page.
-    fn marker_pdf_bytes(markers: &[&str]) -> Vec<u8> {
-        let font_id = 3 + 2 * markers.len();
-        let kids: Vec<String> = (0..markers.len()).map(|i| format!("{} 0 R", 3 + 2 * i)).collect();
-        let mut objects = vec![
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            format!(
-                "2 0 obj\n<< /Type /Pages /Kids [{}] /Count {} >>\nendobj\n",
-                kids.join(" "),
-                markers.len()
-            )
-            .into_bytes(),
-        ];
-        for (i, marker) in markers.iter().enumerate() {
-            objects.push(
-                format!(
-                    "{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Contents {} 0 R \
-                     /Resources << /Font << /F1 {font_id} 0 R >> >> >>\nendobj\n",
-                    3 + 2 * i,
-                    4 + 2 * i
-                )
-                .into_bytes(),
-            );
-            let content = format!("BT\n/F1 18 Tf\n1 0 0 1 20 200 Tm\n({marker}) Tj\nET\n");
-            objects.push(stream_object(4 + 2 * i as u32, "", content.as_bytes()));
-        }
-        objects.push(
-            format!("{font_id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
-                .into_bytes(),
-        );
-        pdf_from_objects(&objects)
-    }
-
-    /// Two source pages (`S0`, `S1`) with three merged pages (`M0`, `M1`,
-    /// `M2`) after them.
-    fn editor_with_three_merged_pages() -> DocumentEditor {
-        let mut editor = DocumentEditor::from_bytes(marker_pdf_bytes(&["S0", "S1"])).unwrap();
-        assert_eq!(editor.merge_from_bytes(&marker_pdf_bytes(&["M0", "M1", "M2"])).unwrap(), 3);
-        editor
-    }
-
-    /// The text of every page of a saved file, in page order.
-    fn page_texts(bytes: &[u8]) -> Vec<String> {
-        let mut doc = crate::document::PdfDocument::from_bytes(bytes.to_vec()).unwrap();
-        (0..doc.page_count().unwrap())
-            .map(|i| doc.extract_text(i).unwrap().trim().to_string())
-            .collect()
-    }
-
-    fn raw_save() -> SaveOptions {
-        SaveOptions { compress: false, ..SaveOptions::full_rewrite() }
-    }
-
-    #[test]
-    fn a_page_slot_holds_both_kinds_of_page_in_four_bytes() {
-        assert_eq!(std::mem::size_of::<PageSlot>(), 4);
-        for index in [0, 1, 9_999, (1 << 31) - 1] {
-            assert_eq!(PageSlot::source(index).key(), PageKey::Source(index));
-            assert_eq!(PageSlot::merged(index).key(), PageKey::Merged(index));
-        }
-        assert_ne!(PageSlot::source(3), PageSlot::merged(3));
-    }
-
-    #[test]
-    fn page_list_edits_work_on_merged_pages() {
-        use crate::editor::EditableDocument;
-        let mut editor = editor_with_three_merged_pages();
-        assert_eq!(page_texts(&editor.save_to_bytes().unwrap()), ["S0", "S1", "M0", "M1", "M2"]);
-        assert!(editor.incremental_refusal().is_some_and(|why| why.contains("merged")));
-
-        editor.remove_page(3).unwrap();
-        assert_eq!(editor.current_page_count(), 4);
-        assert_eq!(page_texts(&editor.save_to_bytes().unwrap()), ["S0", "S1", "M0", "M2"]);
-
-        editor.move_page(3, 0).unwrap();
-        assert_eq!(page_texts(&editor.save_to_bytes().unwrap()), ["M2", "S0", "S1", "M0"]);
-
-        editor.select_pages(&[3, 0]).unwrap();
-        assert_eq!(editor.current_page_count(), 2);
-        assert_eq!(page_texts(&editor.save_to_bytes().unwrap()), ["M0", "M2"]);
-    }
-
-    #[test]
-    fn a_duplicated_page_is_a_new_page_object_and_every_page_is_reachable() {
-        use crate::editor::EditableDocument;
-        let mut editor = editor_with_three_merged_pages();
-        assert_eq!(editor.duplicate_page(0).unwrap(), 5);
-        assert_eq!(editor.duplicate_page(3).unwrap(), 6);
-        assert_eq!(editor.current_page_count(), 7);
-
-        let bytes = editor.save_to_bytes().unwrap();
-        let objects = saved_objects(&bytes);
-        let pages = objects
-            .iter()
-            .find(|o| o.as_dict().and_then(|d| d.get("Type")).and_then(|t| t.as_name()) == Some("Pages"))
-            .unwrap();
-        let kids = pages.as_dict().and_then(|d| d.get("Kids")).and_then(|k| k.as_array()).unwrap();
-        assert_eq!(kids.len(), 7);
-        let ids: HashSet<u32> = kids.iter().filter_map(|k| k.as_reference()).map(|r| r.id).collect();
-        assert_eq!(ids.len(), 7, "a page object is listed in /Kids once: {kids:?}");
-
-        let mut doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
-        assert_eq!(doc.page_count().unwrap(), 7);
-        let texts: Vec<String> =
-            (0..7).map(|i| doc.extract_text(i).unwrap().trim().to_string()).collect();
-        assert_eq!(texts, ["S0", "S1", "M0", "M1", "M2", "S0", "M1"]);
-    }
-
-    #[test]
-    fn extracting_pages_of_a_merged_document_leaves_the_editor_unchanged() {
-        let mut editor = editor_with_three_merged_pages();
-        let extracted = editor.extract_pages_to_bytes(&[1, 3]).unwrap();
-        assert_eq!(page_texts(&extracted), ["S1", "M1"]);
-        let reversed = editor.extract_pages_to_bytes(&[4, 0]).unwrap();
-        assert_eq!(page_texts(&reversed), ["M2", "S0"]);
-
-        assert_eq!(editor.current_page_count(), 5);
-        assert_eq!(page_texts(&editor.save_to_bytes().unwrap()), ["S0", "S1", "M0", "M1", "M2"]);
-        assert!(editor.extract_pages_to_bytes(&[5]).is_err());
-    }
-
-    #[test]
-    fn dropped_merged_pages_are_not_written_and_a_shared_object_is_written_once() {
-        let mut editor = editor_with_three_merged_pages();
-        let bytes = editor.with_pages_selected(&[3], |e| e.save_to_bytes_with_options(raw_save())).unwrap().unwrap();
-
-        assert_eq!(page_texts(&bytes), ["M1"]);
-        for dropped in ["(S0)", "(S1)", "(M0)", "(M2)"] {
-            assert!(!contains(&bytes, dropped.as_bytes()), "{dropped} was written");
-        }
-        assert!(contains(&bytes, b"(M1)"));
-        let fonts = String::from_utf8_lossy(&bytes).matches("/BaseFont /Helvetica").count();
-        assert_eq!(fonts, 1, "the font the pages share is written once");
-    }
-
-    #[test]
-    fn an_object_only_a_dropped_merged_page_met_first_is_written_for_a_kept_page() {
-        // The merged font is first met by M0, which is dropped; M1 and M2 still need it.
-        use crate::editor::EditableDocument;
-        let mut editor = editor_with_three_merged_pages();
-        editor.remove_page(2).unwrap();
-        let bytes = editor.save_to_bytes_with_options(raw_save()).unwrap();
-        assert_eq!(page_texts(&bytes), ["S0", "S1", "M1", "M2"]);
-        assert!(!contains(&bytes, b"(M0)"));
-        let fonts = String::from_utf8_lossy(&bytes).matches("/BaseFont /Helvetica").count();
-        assert_eq!(fonts, 2, "one font for the source pages, one for the merged pages");
-    }
-
-    #[test]
-    fn a_dropped_merged_page_takes_its_form_field_with_it() {
-        let mut editor = merged_editor();
-        editor.merge_from_bytes(&merge_source_pdf_bytes()).unwrap();
-        assert_eq!(editor.current_page_count(), 3);
-        editor.remove_page(2).unwrap();
-        let bytes = editor.save_to_bytes().unwrap();
-
-        let doc = crate::document::PdfDocument::from_bytes(bytes).unwrap();
-        assert_eq!(doc.page_count().unwrap(), 2);
-        let catalog = doc.catalog().unwrap();
-        let acroform = catalog.as_dict().and_then(|c| c.get("AcroForm")).and_then(|a| a.as_dict()).unwrap();
-        let fields = acroform.get("Fields").and_then(|f| f.as_array()).unwrap();
-        assert_eq!(fields.len(), 1, "only the kept page's field is listed");
-    }
-
-    #[test]
-    fn removing_every_merged_page_leaves_the_source_pages_alone() {
-        let mut editor = editor_with_three_merged_pages();
-        for _ in 0..3 {
-            editor.remove_page(2).unwrap();
-        }
-        let bytes = editor.save_to_bytes_with_options(raw_save()).unwrap();
-        assert_eq!(page_texts(&bytes), ["S0", "S1"]);
-        assert!(!contains(&bytes, b"(M0)"));
-    }
-
-    /// A page whose /MediaBox, /Rotate and /Resources live only on its
-    /// /Pages node.
-    fn inheriting_source_pdf_bytes() -> Vec<u8> {
-        let content: &[u8] = b"BT\n/F1 18 Tf\n1 0 0 1 20 200 Tm\n(INHERITEDTEXT) Tj\nET\n";
-        pdf_from_objects(&[
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] /Rotate 90 \
-              /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n"
-                .to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n".to_vec(),
-            stream_object(4, "", content),
-            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
-        ])
-    }
-
-    /// Two pages: the first links to the second.
-    fn linked_pair_source_pdf_bytes() -> Vec<u8> {
-        pdf_from_objects(&[
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 200 200] >>\nendobj\n"
-                .to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>\nendobj\n".to_vec(),
-            b"4 0 obj\n<< /Type /Annot /Subtype /Link /Rect [10 10 50 50] /P 3 0 R \
-              /Dest [5 0 R /Fit] >>\nendobj\n"
-                .to_vec(),
-            b"5 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n".to_vec(),
-        ])
-    }
-
-    /// Every object the saved file holds, once.
-    fn saved_objects(bytes: &[u8]) -> Vec<Object> {
-        let doc = crate::document::PdfDocument::from_bytes(bytes.to_vec()).unwrap();
-        doc.all_object_ids()
-            .into_iter()
-            .filter(|&id| id != 0 && !doc.is_free_entry(id))
-            .map(|id| doc.load_object(ObjectRef::new(id, 0)).unwrap())
-            .collect()
-    }
-
-    fn count_of_type(objects: &[Object], type_name: &str) -> usize {
-        objects
-            .iter()
-            .filter(|o| {
-                o.as_dict().and_then(|d| d.get("Type")).and_then(|t| t.as_name()) == Some(type_name)
-            })
-            .count()
-    }
-
-    #[test]
-    fn a_merged_page_keeps_what_it_inherited_from_its_page_tree() {
-        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
-        editor.merge_from_bytes(&inheriting_source_pdf_bytes()).unwrap();
-        let bytes = editor.save_to_bytes().unwrap();
-
-        let mut doc = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
-        assert!(
-            doc.extract_text(1).unwrap().contains("INHERITEDTEXT"),
-            "the inherited /Resources font is imported with the page"
-        );
-        let mut reopened = open_editor_from_bytes(&bytes, "merged_inherited");
-        assert_eq!(reopened.get_page_media_box(1).unwrap(), [0.0, 0.0, 300.0, 400.0]);
-        assert_eq!(reopened.get_page_rotation(1).unwrap(), 90);
-    }
-
-    #[test]
-    fn page_info_of_a_merged_page_reads_the_merged_page() {
-        use crate::editor::EditableDocument;
-        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
-        editor.merge_from_bytes(&inheriting_source_pdf_bytes()).unwrap();
-
-        let info = editor.get_page_info(1).unwrap();
-        assert_eq!((info.index, info.width, info.height, info.rotation), (1, 300.0, 400.0, 90));
-        editor.set_page_rotation(1, 180).unwrap();
-        editor.set_page_media_box(1, [0.0, 0.0, 100.0, 50.0]).unwrap();
-        let info = editor.get_page_info(1).unwrap();
-        assert_eq!((info.width, info.height, info.rotation), (100.0, 50.0, 180));
-        assert!(editor.get_page_info(2).is_err());
-    }
-
-    #[test]
-    fn a_link_to_a_page_that_was_not_merged_imports_no_page_tree() {
-        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
-        let source = crate::document::PdfDocument::from_bytes(linked_pair_source_pdf_bytes()).unwrap();
-        assert_eq!(editor.merge_pages_from_document(source, &[0]).unwrap(), 1);
-        let bytes = editor.save_to_bytes().unwrap();
-
-        let objects = saved_objects(&bytes);
-        assert_eq!(count_of_type(&objects, "Pages"), 1, "only the output's own page tree");
-        assert_eq!(count_of_type(&objects, "Page"), 2, "the unmerged source page is not imported");
-
-        let text = String::from_utf8_lossy(&bytes);
-        let ids: Vec<u32> = text
-            .lines()
-            .filter_map(|l| l.strip_suffix(" 0 obj").and_then(|n| n.parse().ok()))
-            .collect();
-        let unique: HashSet<u32> = ids.iter().copied().collect();
-        assert_eq!(ids.len(), unique.len(), "an object id was written twice: {ids:?}");
-
-        let link = objects
-            .iter()
-            .find(|o| o.as_dict().and_then(|d| d.get("Subtype")).and_then(|s| s.as_name()) == Some("Link"))
-            .expect("the merged page lost its link");
-        let dest = link.as_dict().unwrap().get("Dest").and_then(|d| d.as_array()).expect("no /Dest");
-        assert!(matches!(dest[0], Object::Null), "a destination page that was left out is null");
-    }
-
-    #[test]
-    fn a_failed_merge_leaves_the_editor_unchanged() {
-        let mut editor = DocumentEditor::from_bytes(merge_base_pdf_bytes()).unwrap();
-        let source = crate::document::PdfDocument::from_bytes(merge_source_pdf_bytes()).unwrap();
-        assert!(editor.merge_pages_from_document(source, &[5]).is_err());
-        assert_eq!(editor.current_page_count(), 1);
-        assert!(editor.merged_sources.is_empty());
-    }
-
-    // ── a full rewrite writes everything a kept page reaches ──
-
-    const ICC_BYTES: &[u8] = b"ICCPROFILEBYTES-0123456789";
-    const FONT_FILE_BYTES: &[u8] = b"FONTFILE2BYTES-9876543210";
-    const CONTENT_A: &[u8] = b"q 0 0 1 rg 0 0 50 50 re f Q % CONTENTA\n";
-    const CONTENT_B: &[u8] = b"q 1 0 0 rg 50 50 40 40 re f Q % CONTENTB\n";
-
-    /// Root `/Pages` -> inner `/Pages` -> two pages. Page 4 has an indirect
-    /// `/Contents` array of two streams, a `/ColorSpace` with an ICC stream
-    /// and a font with a descriptor and a font file.
-    fn nested_resources_pdf_bytes() -> Vec<u8> {
-        pdf_from_objects(&[
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 2 >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>\nendobj\n"
-                .to_vec(),
-            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] /Contents 6 0 R \
-              /Resources << /ColorSpace << /Cs6 [/ICCBased 8 0 R] >> /Font << /F1 9 0 R >> >> >>\nendobj\n"
-                .to_vec(),
-            b"5 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec(),
-            b"6 0 obj\n[7 0 R 10 0 R]\nendobj\n".to_vec(),
-            stream_object(7, "", CONTENT_A),
-            stream_object(8, "/N 3", ICC_BYTES),
-            b"9 0 obj\n<< /Type /Font /Subtype /TrueType /BaseFont /TESTFONT /FontDescriptor 11 0 R >>\nendobj\n"
-                .to_vec(),
-            stream_object(10, "", CONTENT_B),
-            b"11 0 obj\n<< /Type /FontDescriptor /FontName /TESTFONT /Flags 32 /FontFile2 12 0 R >>\nendobj\n"
-                .to_vec(),
-            stream_object(12, "", FONT_FILE_BYTES),
-        ])
-    }
-
-    /// Asserts page 0 of `bytes` still reaches both content streams, the
-    /// ICC stream behind `/Cs6` and the font file behind the descriptor.
-    fn assert_nested_resources_survive(bytes: &[u8], what: &str) {
-        let doc = crate::document::PdfDocument::from_bytes(bytes.to_vec()).unwrap();
-        let resolve = |o: &Object| match o {
-            Object::Reference(r) => doc.load_object(*r).unwrap(),
-            other => other.clone(),
-        };
-        let page = doc.load_object(doc.get_page_ref(0).unwrap()).unwrap();
-        let page = page.as_dict().unwrap();
-
-        let contents = resolve(&page["Contents"]);
-        let streams: Vec<Vec<u8>> = contents
-            .as_array()
-            .unwrap_or_else(|| panic!("{what}: /Contents is not an array"))
-            .iter()
-            .map(|s| resolve(s).decode_stream_data().unwrap_or_else(|e| panic!("{what}: {e}")))
-            .collect();
-        assert_eq!(streams, vec![CONTENT_A.to_vec(), CONTENT_B.to_vec()], "{what}: content streams");
-
-        let resources = resolve(&page["Resources"]);
-        let resources = resources.as_dict().unwrap();
-        let spaces = resolve(&resources["ColorSpace"]);
-        let cs6 = spaces.as_dict().unwrap()["Cs6"].as_array().unwrap().clone();
-        let icc = resolve(&cs6[1]).decode_stream_data().unwrap_or_else(|e| panic!("{what}: {e}"));
-        assert_eq!(icc, ICC_BYTES, "{what}: ICC profile");
-
-        let fonts = resolve(&resources["Font"]);
-        let font = resolve(&fonts.as_dict().unwrap()["F1"]);
-        let descriptor = resolve(&font.as_dict().unwrap()["FontDescriptor"]);
-        let font_file = resolve(&descriptor.as_dict().unwrap()["FontFile2"]);
-        assert_eq!(
-            font_file.decode_stream_data().unwrap_or_else(|e| panic!("{what}: {e}")),
-            FONT_FILE_BYTES,
-            "{what}: font file"
-        );
-    }
-
-    #[test]
-    fn a_full_rewrite_of_a_nested_tree_writes_everything_a_kept_page_reaches() {
-        for garbage_collect in [true, false] {
-            for compress in [true, false] {
-                let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
-                let options = SaveOptions { garbage_collect, compress, ..SaveOptions::full_rewrite() };
-                let bytes = editor.save_to_bytes_with_options(options).unwrap();
-                assert_nested_resources_survive(
-                    &bytes,
-                    &format!("gc {garbage_collect}, compress {compress}"),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_nested_tree_save_that_drops_a_page_keeps_what_the_kept_page_reaches() {
-        for garbage_collect in [true, false] {
-            let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
-            editor.remove_page(1).unwrap();
-            let options = SaveOptions { garbage_collect, ..SaveOptions::full_rewrite() };
-            let bytes = editor.save_to_bytes_with_options(options).unwrap();
-            assert_nested_resources_survive(&bytes, &format!("gc {garbage_collect}, page 1 dropped"));
-        }
-    }
-
-    #[test]
-    fn extracting_a_page_of_a_nested_tree_keeps_what_it_reaches() {
-        let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
-        let bytes = editor.extract_pages_to_bytes(&[0]).unwrap();
-        let doc = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
-        assert_eq!(doc.page_count().unwrap(), 1);
-        assert_nested_resources_survive(&bytes, "extract_pages");
-    }
-
-    /// A page tree and an object stream of three objects. Object 5 is
-    /// bigger than a 4 KiB object cache and names objects 6 and 7, which
-    /// name the streams 9 and 10. The catalog reaches 5 as `/Extra`.
-    fn objstm_pdf_bytes() -> Vec<u8> {
-        let pad = "x".repeat(8000);
-        let bodies = [
-            format!("<< /Pad ({pad}) /A 6 0 R /B 7 0 R >>"),
-            "<< /S 9 0 R >>".to_string(),
-            "<< /S 10 0 R >>".to_string(),
-        ];
-        let mut header = String::new();
-        let mut at = 0;
-        for (id, body) in [5, 6, 7].iter().zip(&bodies) {
-            header.push_str(&format!("{id} {at} "));
-            at += body.len() + 1;
-        }
-        let data = [header.clone(), bodies.iter().map(|b| format!("{b}\n")).collect::<String>()].concat();
-
-        let mut out = b"%PDF-1.5\n".to_vec();
-        let mut offsets = HashMap::new();
-        let mut put = |out: &mut Vec<u8>, id: u32, object: Vec<u8>| {
-            offsets.insert(id, out.len());
-            out.extend_from_slice(&object);
-        };
-        put(&mut out, 1, b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra 5 0 R >>\nendobj\n".to_vec());
-        put(&mut out, 2, b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec());
-        put(&mut out, 3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec());
-        put(
-            &mut out,
-            8,
-            stream_object(8, &format!("/Type /ObjStm /N 3 /First {}", header.len()), data.as_bytes()),
-        );
-        put(&mut out, 9, stream_object(9, "", b"REACHEDNINE"));
-        put(&mut out, 10, stream_object(10, "", b"REACHEDTEN"));
-
-        let xref_at = out.len();
-        let mut entries = Vec::new();
-        let mut entry = |kind: u8, field: u32, last: u16| {
-            entries.push(kind);
-            entries.extend_from_slice(&field.to_be_bytes());
-            entries.extend_from_slice(&last.to_be_bytes());
-        };
-        entry(0, 0, 65535);
-        for id in 1..=3 {
-            entry(1, offsets[&id] as u32, 0);
-        }
-        entry(0, 0, 0);
-        for index in 0..3 {
-            entry(2, 8, index);
-        }
-        for id in [8, 9, 10] {
-            entry(1, offsets[&id] as u32, 0);
-        }
-        entry(1, xref_at as u32, 0);
-        out.extend_from_slice(
-            format!("11 0 obj\n<< /Type /XRef /Size 12 /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n", entries.len())
-                .as_bytes(),
-        );
-        out.extend_from_slice(&entries);
-        out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref_at}\n%%EOF\n").as_bytes());
-        out
-    }
-
-    /// A document whose object cache holds 4 KiB, less than object 5.
-    fn objstm_doc_with_a_small_cache() -> crate::document::PdfDocument {
-        crate::document::PdfDocument::from_external_reader_bounded(
-            Box::new(std::io::Cursor::new(objstm_pdf_bytes())),
-            4096,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn collect_refs_of_returns_the_same_refs_cold_and_warm() {
-        let cold = objstm_doc_with_a_small_cache();
-        let mut cold_refs = Vec::new();
-        cold.collect_refs_of(5, &mut cold_refs);
-
-        let warm = crate::document::PdfDocument::from_bytes(objstm_pdf_bytes()).unwrap();
-        warm.load_object(ObjectRef::new(5, 0)).unwrap();
-        let mut warm_refs = Vec::new();
-        warm.collect_refs_of(5, &mut warm_refs);
-
-        cold_refs.sort_unstable();
-        warm_refs.sort_unstable();
-        assert_eq!(warm_refs, vec![6, 7]);
-        assert_eq!(cold_refs, warm_refs);
-    }
-
-    #[test]
-    fn a_full_rewrite_keeps_what_an_object_too_big_for_the_cache_reaches() {
-        let mut editor = DocumentEditor::from_document(objstm_doc_with_a_small_cache()).unwrap();
-        let options = SaveOptions { compress: false, ..SaveOptions::full_rewrite() };
-        let bytes = editor.save_to_bytes_with_options(options).unwrap();
-
-        let saved = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
-        for id in [5, 6, 7, 9, 10] {
-            let object = saved.load_object(ObjectRef::new(id, 0)).unwrap();
-            assert!(!matches!(object, Object::Null), "object {id} was not written");
-        }
-        assert!(contains(&bytes, b"REACHEDNINE"), "stream 9 was not written");
-        assert!(contains(&bytes, b"REACHEDTEN"), "stream 10 was not written");
-    }
-
-    #[test]
-    fn stream_head_finds_streams_whatever_the_size_of_their_dictionary() {
-        let small = b"hello stream".to_vec();
-        let wide = b"wide dictionary stream".to_vec();
-        let doc = crate::document::PdfDocument::from_bytes(pdf_from_objects(&[
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec(),
-            stream_object(4, "", &small),
-            // A dictionary wider than the first read of the source.
-            stream_object(5, &format!("/Pad ({})", "p".repeat(5000)), &wide),
-        ]))
-        .unwrap();
-
-        for (id, data) in [(4, &small), (5, &wide)] {
-            let head = doc.stream_head(ObjectRef::new(id, 0)).unwrap().expect("a plain stream");
-            assert_eq!(head.data_len as usize, data.len(), "object {id}");
-            let mut copied = vec![0u8; data.len()];
-            doc.read_source_at(head.data_start, &mut copied).unwrap();
-            assert_eq!(&copied, data, "object {id}");
-        }
-        for id in [1, 3] {
-            assert!(doc.stream_head(ObjectRef::new(id, 0)).unwrap().is_none(), "object {id}");
-        }
-    }
-
-    /// Members per object stream of `two_objstm_pdf_bytes`.
-    const TWO_STREAM_MEMBERS: u32 = 8;
-
-    /// A page tree and two Flate object streams of `TWO_STREAM_MEMBERS` 3 KB
-    /// dictionaries each, ids 10..18 in stream 100 and 18..26 in stream 101,
-    /// so each stream decodes to more than a 4 KiB object cache holds. The
-    /// catalog's /Extra names the members alternating between the streams.
-    fn two_objstm_pdf_bytes() -> Vec<u8> {
-        use flate2::{write::ZlibEncoder, Compression};
-        use std::io::Write;
-
-        let n = TWO_STREAM_MEMBERS;
-        let mut out = b"%PDF-1.5\n".to_vec();
-        let mut offsets = HashMap::new();
-        let mut put = |out: &mut Vec<u8>, id: u32, object: Vec<u8>| {
-            offsets.insert(id, out.len());
-            out.extend_from_slice(&object);
-        };
-        let extra: String = (0..n)
-            .flat_map(|i| [10 + i, 10 + n + i])
-            .map(|id| format!("{id} 0 R "))
-            .collect();
-        put(&mut out, 1, format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra [{extra}] >>\nendobj\n").into_bytes());
-        put(&mut out, 2, b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec());
-        put(&mut out, 3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec());
-        for (stream_id, first_member) in [(100u32, 10u32), (101, 10 + n)] {
-            let mut header = String::new();
-            let mut bodies = String::new();
-            for id in first_member..first_member + n {
-                header.push_str(&format!("{id} {} ", bodies.len()));
-                bodies.push_str(&format!("<< /Pad ({}) /Tag (MEMBER{id}) >>\n", "x".repeat(3000)));
-            }
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(format!("{header}{bodies}").as_bytes()).unwrap();
-            let packed = encoder.finish().unwrap();
-            put(
-                &mut out,
-                stream_id,
-                stream_object(
-                    stream_id,
-                    &format!("/Type /ObjStm /N {n} /First {} /Filter /FlateDecode", header.len()),
-                    &packed,
-                ),
-            );
-        }
-
-        let xref_at = out.len();
-        let size = 103u32;
-        let mut entries = Vec::new();
-        for id in 0..size - 1 {
-            let (kind, field, last) = match id {
-                1..=3 | 100 | 101 => (1u8, offsets[&id] as u32, 0u16),
-                10..=25 => {
-                    let stream = if id < 10 + n { 100 } else { 101 };
-                    (2, stream, ((id - 10) % n) as u16)
-                },
-                _ => (0, 0, if id == 0 { 65535 } else { 0 }),
-            };
-            entries.push(kind);
-            entries.extend_from_slice(&field.to_be_bytes());
-            entries.extend_from_slice(&last.to_be_bytes());
-        }
-        entries.push(1);
-        entries.extend_from_slice(&(xref_at as u32).to_be_bytes());
-        entries.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(
-            format!(
-                "{} 0 obj\n<< /Type /XRef /Size {size} /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
-                size - 1,
-                entries.len()
-            )
-            .as_bytes(),
-        );
-        out.extend_from_slice(&entries);
-        out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref_at}\n%%EOF\n").as_bytes());
-        out
-    }
-
-    fn two_objstm_doc_with_a_small_cache() -> crate::document::PdfDocument {
-        crate::document::PdfDocument::from_external_reader_bounded(
-            Box::new(std::io::Cursor::new(two_objstm_pdf_bytes())),
-            4096,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn a_full_rewrite_decodes_each_object_stream_at_most_twice() {
-        let mut editor = DocumentEditor::from_document(two_objstm_doc_with_a_small_cache()).unwrap();
-        let bytes = editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap();
-
-        // Once for the reachability walk, once for the sweep that writes.
-        let decoded = editor.source.objstm_inflations();
-        assert!(decoded <= 4, "two object streams were decoded {decoded} times");
-
-        let saved = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
-        for id in 10..10 + 2 * TWO_STREAM_MEMBERS {
-            assert!(
-                contains(&bytes, format!("(MEMBER{id})").as_bytes()),
-                "member {id} was not written"
-            );
-            assert!(!matches!(saved.load_object(ObjectRef::new(id, 0)).unwrap(), Object::Null));
-        }
-    }
-
-    #[test]
-    fn the_decoded_object_stream_is_kept_until_released() {
-        let doc = two_objstm_doc_with_a_small_cache();
-        let member = |id: u32| doc.load_object(ObjectRef::new(id, 0)).unwrap();
-
-        member(10);
-        member(11);
-        member(12);
-        assert_eq!(doc.objstm_inflations(), 1, "members of one stream share one decode");
-
-        doc.release_objstm_memo();
-        member(13);
-        assert_eq!(doc.objstm_inflations(), 2, "a released memo decodes again");
-
-        member(10 + TWO_STREAM_MEMBERS);
-        assert_eq!(doc.objstm_inflations(), 3, "the memo holds one stream");
-    }
-
-    #[test]
-    fn the_rewrite_fails_when_a_written_object_names_one_it_did_not_write() {
-        let mut editor = DocumentEditor::from_bytes(nested_resources_pdf_bytes()).unwrap();
-        // The sweep skips this id, which page 4 still names.
-        editor.redacted_orphan_ids.insert(8);
-        let err = editor.save_to_bytes().unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidPdf(m) if m == "the rewrite would leave object 8 referenced by 4 unwritten"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn a_reference_the_source_itself_leaves_dangling_does_not_fail_the_rewrite() {
-        let source = pdf_from_objects(&[
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Gone 99 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec(),
-        ]);
-        let mut editor = DocumentEditor::from_bytes(source).unwrap();
-        editor.save_to_bytes().unwrap();
     }
 }

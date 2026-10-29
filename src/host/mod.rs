@@ -12,6 +12,8 @@ pub mod binary_codec;
 pub mod bridge_api;
 pub mod constants;
 pub mod dispatch;
+#[cfg(test)]
+mod engine_proofs;
 pub mod fallback_fonts;
 pub mod lane_state;
 /// Per-op dispatch units (entry + handler + linker anchor).

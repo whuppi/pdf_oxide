@@ -189,7 +189,7 @@ impl PageFacts {
 
 // ── pdf_manipulator patch: the page cache is a window, the page tree an index of refs ──
 /// Pages the page cache keeps; the same window as `page_content_cache`.
-const PAGE_WINDOW: usize = 64;
+pub(crate) const PAGE_WINDOW: usize = 64;
 
 /// Pages whose spans and chars stay cached. A text-dense page holds about a
 /// megabyte of spans, so the window is what a page's two reads need, not the
@@ -203,6 +203,14 @@ const TEXT_PAGE_WINDOW: usize = 2;
 pub(crate) struct PageTreeIndex {
     nodes: Vec<(ObjectRef, Option<usize>)>,
     pages: Vec<(ObjectRef, Option<usize>)>,
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: the engine proofs compare the object cache's size estimate ──
+/// The size the object cache charges for `obj`.
+#[cfg(test)]
+pub(crate) fn estimated_object_size(obj: &Object) -> usize {
+    BoundedObjectCache::estimate_size(obj)
 }
 // ── end pdf_manipulator patch ──
 
@@ -4449,6 +4457,30 @@ impl PdfDocument {
     #[cfg(test)]
     pub(crate) fn objstm_inflations(&self) -> usize {
         self.objstm_inflations.load(Ordering::Relaxed)
+    }
+
+    /// Pages the page cache holds now.
+    #[cfg(test)]
+    pub(crate) fn cached_page_count(&self) -> usize {
+        self.page_cache.lock_or_recover().len()
+    }
+
+    /// Whether a page-tree index has been built.
+    #[cfg(test)]
+    pub(crate) fn page_tree_is_indexed(&self) -> bool {
+        self.page_tree_index.lock_or_recover().is_some()
+    }
+
+    /// Whether the object cache holds `r`.
+    #[cfg(test)]
+    pub(crate) fn object_is_cached(&self, r: ObjectRef) -> bool {
+        self.object_cache.lock_or_recover().get(&r).is_some()
+    }
+
+    /// Walks the page tree once and indexes every page.
+    #[cfg(test)]
+    pub(crate) fn index_all_pages(&self) -> Result<()> {
+        self.populate_page_cache()
     }
     // ── end pdf_manipulator patch ──
 
@@ -34290,167 +34322,6 @@ mod tests {
         assert!(c.current_bytes <= budget);
     }
 
-    // ── pdf_manipulator patch: honest estimate and page facts ──
-    #[test]
-    fn test_estimate_size_counts_a_page_dictionary_heap() {
-        use std::collections::HashMap;
-        use std::mem::size_of;
-        let mut font = HashMap::new();
-        font.insert("F1".to_string(), Object::Reference(ObjectRef::new(5, 0)));
-        let mut resources = HashMap::new();
-        resources.insert("Font".to_string(), Object::Dictionary(font));
-        let mut page = HashMap::new();
-        page.insert("Type".to_string(), Object::Name("Page".to_string()));
-        page.insert("Parent".to_string(), Object::Reference(ObjectRef::new(2, 0)));
-        page.insert(
-            "MediaBox".to_string(),
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(612),
-                Object::Integer(792),
-            ]),
-        );
-        page.insert("Resources".to_string(), Object::Dictionary(resources));
-        let page = Object::Dictionary(page);
-
-        // Computed independently of the estimator: 4 entries need 8 slots,
-        // 1 entry needs 1 slot; a slot is a String, an Object and a control
-        // byte. Key and name buffers are exactly as long as their text.
-        let slot = size_of::<String>() + size_of::<Object>() + 1;
-        let expected = size_of::<Object>()
-            + 8 * slot
-            + ("Type".len() + "Parent".len() + "MediaBox".len() + "Resources".len())
-            + "Page".len()
-            + 4 * size_of::<Object>()
-            + (slot + "Font".len())
-            + (slot + "F1".len());
-        let got = BoundedObjectCache::estimate_size(&page);
-        let ratio = got as f64 / expected as f64;
-        assert!(
-            (1.0 / 1.5..=1.5).contains(&ratio),
-            "estimate {got} vs independent sum {expected}"
-        );
-    }
-
-    /// A Pages root (MediaBox, Rotate 90) holding an inner Pages node
-    /// (CropBox) with two leaves, the second overriding MediaBox.
-    fn nested_page_tree_pdf() -> Vec<u8> {
-        let bodies = [
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R] /Count 2 /MediaBox [0 0 300 400] /Rotate 90 >>",
-            "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 /CropBox [10 10 200 300] >>",
-            "<< /Type /Page /Parent 3 0 R >>",
-            "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 500 600] >>",
-        ];
-        let mut out = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for (i, body) in bodies.iter().enumerate() {
-            offsets.push(out.len());
-            out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
-        }
-        let xref_at = out.len();
-        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
-        out.extend_from_slice(b"0000000000 65535 f \n");
-        for off in &offsets {
-            out.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
-        }
-        out.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-                bodies.len() + 1,
-                xref_at
-            )
-            .as_bytes(),
-        );
-        out
-    }
-
-    #[test]
-    fn test_page_facts_match_get_page_accessors() {
-        let doc = PdfDocument::from_bytes(nested_page_tree_pdf()).unwrap();
-        let refs = doc.all_page_refs().unwrap();
-        assert_eq!(refs, vec![ObjectRef::new(4, 0), ObjectRef::new(5, 0)]);
-        let facts: Vec<PageFacts> = refs.iter().map(|r| doc.page_facts(*r).unwrap()).collect();
-        assert_eq!(
-            doc.page_cache.lock_or_recover().len(),
-            0,
-            "page_facts must not fill the page cache"
-        );
-        for (i, f) in facts.iter().enumerate() {
-            let (x0, y0, x1, y1) = doc.get_page_media_box(i).unwrap();
-            assert_eq!(f.media_box, Some([x0, y0, x1, y1]), "media box of page {i}");
-            assert_eq!(f.rotation(), doc.get_page_rotation(i).unwrap(), "rotation of page {i}");
-            assert_eq!(f.crop_box, Some([10.0, 10.0, 200.0, 300.0]), "crop box of page {i}");
-        }
-        assert_eq!(facts[0].media_box, Some([0.0, 0.0, 300.0, 400.0]));
-        assert_eq!(facts[1].media_box, Some([0.0, 0.0, 500.0, 600.0]));
-        assert_eq!(facts[0].rotation(), 90);
-    }
-
-    #[test]
-    fn test_indexed_pages_equal_traversed_pages_and_cache_is_a_window() {
-        let traversed = PdfDocument::from_bytes(nested_page_tree_pdf()).unwrap();
-        let indexed = PdfDocument::from_bytes(nested_page_tree_pdf()).unwrap();
-        indexed.populate_page_cache().unwrap();
-        for i in 0..2 {
-            assert_eq!(
-                indexed.get_page(i).unwrap(),
-                traversed.get_page(i).unwrap(),
-                "page {i} from the index must carry the same inherited attributes"
-            );
-        }
-
-        let many = PdfDocument::from_bytes(build_multi_page_pdf(PAGE_WINDOW + 40)).unwrap();
-        for i in 0..PAGE_WINDOW + 40 {
-            many.get_page(i).unwrap();
-        }
-        assert!(
-            many.page_cache.lock_or_recover().len() <= PAGE_WINDOW,
-            "the page cache must hold a window, not every page"
-        );
-        assert!(many.page_tree_index.lock_or_recover().is_some());
-    }
-
-    #[test]
-    fn test_all_page_refs_walks_inner_nodes_with_matching_count() {
-        let bodies = [
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
-            "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 >>",
-            "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 3 0 R >>",
-            "<< /Type /Page /Parent 4 0 R >>",
-        ];
-        let mut out = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for (i, body) in bodies.iter().enumerate() {
-            offsets.push(out.len());
-            out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
-        }
-        let xref_at = out.len();
-        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
-        out.extend_from_slice(b"0000000000 65535 f \n");
-        for off in &offsets {
-            out.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
-        }
-        out.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-                bodies.len() + 1,
-                xref_at
-            )
-            .as_bytes(),
-        );
-        let doc = PdfDocument::from_bytes(out).unwrap();
-        assert_eq!(
-            doc.all_page_refs().unwrap(),
-            vec![ObjectRef::new(5, 0), ObjectRef::new(6, 0)]
-        );
-        assert_eq!(doc.page_count().unwrap(), 2);
-    }
-    // ── end pdf_manipulator patch ──
-
     #[test]
     fn test_estimate_size_depth_bottoms_out() {
         // Deeply nested array — should not stack overflow
@@ -35375,312 +35246,3 @@ mod soft_hyphen_seam_tests {
         assert_eq!(PdfDocument::soft_hyphen_seam(em, 0.0, 0.0), SoftHyphenSeam::Contiguous);
     }
 }
-
-// ── pdf_manipulator patch: stream extent without loading the data ──
-#[cfg(test)]
-mod stream_head_tests {
-    use super::*;
-
-    /// A sound PDF whose object 4 is `object_4` (a whole indirect object),
-    /// with the integer 11 as object 5.
-    fn pdf_with(object_4: &[u8]) -> Vec<u8> {
-        let objects: Vec<Vec<u8>> = vec![
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n".to_vec(),
-            object_4.to_vec(),
-            b"5 0 obj\n11\nendobj\n".to_vec(),
-        ];
-        let mut pdf = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for o in &objects {
-            offsets.push(pdf.len());
-            pdf.extend_from_slice(o);
-        }
-        let xref_at = pdf.len();
-        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
-        for off in offsets {
-            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        pdf.extend_from_slice(
-            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
-        );
-        pdf
-    }
-
-    fn head_of(object_4: &[u8]) -> (Vec<u8>, Option<StreamHead>) {
-        let pdf = pdf_with(object_4);
-        let doc = PdfDocument::from_bytes(pdf.clone()).unwrap();
-        let head = doc.stream_head(ObjectRef { id: 4, gen: 0 }).unwrap();
-        (pdf, head)
-    }
-
-    #[test]
-    fn direct_length_gives_the_data_extent() {
-        let (pdf, head) = head_of(b"4 0 obj\n<< /Length 5 /Subtype /Image >>\nstream\nhello\nendstream\nendobj\n");
-        let head = head.expect("a plain stream");
-        assert_eq!(head.data_len, 5);
-        assert_eq!(&pdf[head.data_start as usize..][..5], b"hello");
-        assert_eq!(head.dict.get("Subtype").and_then(|o| o.as_name()), Some("Image"));
-    }
-
-    #[test]
-    fn indirect_length_is_resolved() {
-        let (pdf, head) = head_of(b"4 0 obj\n<< /Length 5 0 R >>\nstream\nabcdefghijk\nendstream\nendobj\n");
-        let head = head.expect("a stream with an indirect length");
-        assert_eq!(head.data_len, 11);
-        assert_eq!(&pdf[head.data_start as usize..][..11], b"abcdefghijk");
-    }
-
-    #[test]
-    fn crlf_after_stream_is_skipped() {
-        let (pdf, head) = head_of(b"4 0 obj\n<< /Length 3 >>\nstream\r\nxyz\r\nendstream\nendobj\n");
-        let head = head.expect("a stream with CRLF");
-        assert_eq!(&pdf[head.data_start as usize..][..3], b"xyz");
-    }
-
-    #[test]
-    fn wrong_length_gives_none() {
-        let (_, head) = head_of(b"4 0 obj\n<< /Length 2 >>\nstream\nhello\nendstream\nendobj\n");
-        assert!(head.is_none());
-    }
-
-    #[test]
-    fn non_stream_object_gives_none() {
-        let (_, head) = head_of(b"4 0 obj\n<< /Type /Font >>\nendobj\n");
-        assert!(head.is_none());
-    }
-
-    #[test]
-    fn a_stream_head_leaves_the_object_cache_alone() {
-        let pdf = pdf_with(b"4 0 obj\n<< /Length 5 >>\nstream\nhello\nendstream\nendobj\n");
-        let doc = PdfDocument::from_bytes(pdf).unwrap();
-        let r = ObjectRef { id: 4, gen: 0 };
-        assert!(doc.stream_head(r).unwrap().is_some());
-        assert!(doc.object_cache.lock_or_recover().get(&r).is_none());
-    }
-}
-// ── end pdf_manipulator patch ──
-
-// ── pdf_manipulator patch: keep the source's own encryption ──
-#[cfg(test)]
-mod kept_encryption_tests {
-    use super::*;
-    use crate::editor::{DocumentEditor, EncryptionConfig, SaveOptions};
-    use crate::encryption::{Algorithm, EncryptDictBuilder};
-    use crate::writer::ObjectSerializer;
-
-    const FILE_ID: [u8; 16] = [0x11; 16];
-
-    type Entries = HashMap<String, Object>;
-
-    /// An AES-256 source whose /Encrypt dictionary is the engine writer's own
-    /// (`EncryptDictBuilder`) after `edit` changed it, since wrapping the file
-    /// key by hand is the engine's job. Every offset is computed here.
-    /// `id_entry` is the trailer's /ID text, empty for none.
-    fn source(user_password: &[u8], id_entry: &str, edit: impl FnOnce(&mut Entries)) -> Vec<u8> {
-        let (dict, _key) = EncryptDictBuilder::new(Algorithm::Aes256)
-            .user_password(user_password)
-            .owner_password(b"owner")
-            .permissions(-3900)
-            .encrypt_metadata(true)
-            .build_with_key(&FILE_ID)
-            .unwrap();
-        let mut encrypt = dict.to_object();
-        if let Object::Dictionary(entries) = &mut encrypt {
-            edit(entries);
-        }
-        let objects: Vec<Vec<u8>> = vec![
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n".to_vec(),
-            ObjectSerializer::compact().serialize_indirect(4, 0, &encrypt),
-        ];
-        let mut pdf = b"%PDF-1.7\n".to_vec();
-        let mut offsets = Vec::new();
-        for o in &objects {
-            offsets.push(pdf.len());
-            pdf.extend_from_slice(o);
-        }
-        let xref_at = pdf.len();
-        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
-        for off in offsets {
-            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        pdf.extend_from_slice(
-            format!(
-                "trailer\n<< /Size 5 /Root 1 0 R /Encrypt 4 0 R {id_entry} >>\n\
-                 startxref\n{xref_at}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        pdf
-    }
-
-    const ID: &str = "/ID [<11111111111111111111111111111111> <22222222222222222222222222222222>]";
-
-    fn name(n: &str) -> Object {
-        Object::Name(n.to_string())
-    }
-
-    fn refusal(pdf: Vec<u8>, reason: &str) {
-        let doc = PdfDocument::from_bytes(pdf).unwrap();
-        match doc.kept_encryption() {
-            Err(Error::Unsupported(msg)) => {
-                assert!(
-                    msg.starts_with("keeping this source's encryption is not supported: ")
-                        && msg.contains(reason)
-                        && msg.ends_with("save it with explicit encryption"),
-                    "unexpected message: {msg}"
-                );
-            },
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Unsupported, got Ok"),
-        }
-    }
-
-    #[test]
-    fn a_plain_source_keeps_its_parameters() {
-        let doc = PdfDocument::from_bytes(source(b"", ID, |_| {})).unwrap();
-        let kept = doc.kept_encryption().unwrap().expect("an encrypted source");
-        assert_eq!(kept.file_id, (vec![0x11; 16], vec![0x22; 16]));
-        assert_eq!(kept.algorithm, Algorithm::Aes256);
-        assert_eq!(kept.file_key.len(), 32);
-        assert!(kept.encrypt_metadata);
-        let dict = kept.encrypt_dict.as_dict().unwrap();
-        for key in ["Filter", "V", "R", "O", "U", "OE", "UE", "P", "Perms", "CF", "StmF", "StrF"] {
-            assert!(dict.contains_key(key), "/{key} missing from the kept dictionary");
-        }
-    }
-
-    #[test]
-    fn an_unencrypted_source_has_nothing_to_keep() {
-        let mut pdf = b"%PDF-1.4\n".to_vec();
-        let objects: [&[u8]; 3] = [
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n",
-        ];
-        let mut offsets = Vec::new();
-        for o in objects {
-            offsets.push(pdf.len());
-            pdf.extend_from_slice(o);
-        }
-        let xref_at = pdf.len();
-        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for off in offsets {
-            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        pdf.extend_from_slice(
-            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
-        );
-        let doc = PdfDocument::from_bytes(pdf).unwrap();
-        assert!(doc.kept_encryption().unwrap().is_none());
-    }
-
-    #[test]
-    fn refuses_a_non_standard_filter() {
-        let pdf = source(b"", ID, |d| {
-            d.insert("Filter".into(), name("Adobe.PubSec"));
-        });
-        refusal(pdf, "public-key or non-standard security handler");
-    }
-
-    #[test]
-    fn refuses_a_sub_filter() {
-        let pdf = source(b"", ID, |d| {
-            d.insert("SubFilter".into(), name("adbe.pkcs7.s5"));
-        });
-        refusal(pdf, "/SubFilter");
-    }
-
-    #[test]
-    fn refuses_version_three() {
-        // The handler rejects V=3 while it initialises, before the keep checks.
-        let pdf = source(b"", ID, |d| {
-            d.insert("V".into(), Object::Integer(3));
-        });
-        let doc = PdfDocument::from_bytes(pdf).unwrap();
-        match doc.kept_encryption() {
-            Err(Error::Unsupported(msg)) => assert!(msg.contains("V=3"), "{msg}"),
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Unsupported, got Ok"),
-        }
-    }
-
-    #[test]
-    fn refuses_strings_and_streams_on_different_filters() {
-        let pdf = source(b"", ID, |d| {
-            d.insert("StrF".into(), name("Identity"));
-        });
-        refusal(pdf, "strings and streams use different crypt filters");
-    }
-
-    #[test]
-    fn refuses_identity_streams() {
-        let pdf = source(b"", ID, |d| {
-            d.insert("StmF".into(), name("Identity"));
-        });
-        refusal(pdf, "streams use /Identity");
-    }
-
-    #[test]
-    fn refuses_embedded_files_on_another_filter() {
-        let pdf = source(b"", ID, |d| {
-            d.insert("EFF".into(), name("Identity"));
-        });
-        refusal(pdf, "embedded files use a different crypt filter");
-    }
-
-    #[test]
-    fn refuses_a_crypt_method_that_is_not_the_versions() {
-        let pdf = source(b"", ID, |d| {
-            if let Some(Object::Dictionary(cf)) = d.get_mut("CF") {
-                if let Some(Object::Dictionary(std_cf)) = cf.get_mut("StdCF") {
-                    std_cf.insert("CFM".into(), name("AESV2"));
-                }
-            }
-        });
-        refusal(pdf, "crypt filter method is not AESV3");
-    }
-
-    #[test]
-    fn refuses_a_missing_id() {
-        refusal(source(b"", "", |_| {}), "no two-string /ID");
-    }
-
-    #[test]
-    fn refuses_a_one_element_id() {
-        refusal(
-            source(b"", "/ID [<11111111111111111111111111111111>]", |_| {}),
-            "no two-string /ID",
-        );
-    }
-
-    #[test]
-    fn refuses_an_id_that_is_not_strings() {
-        refusal(source(b"", "/ID [1 2]", |_| {}), "not two strings");
-    }
-
-    #[test]
-    fn refuses_an_unauthenticated_source() {
-        refusal(source(b"secret", ID, |_| {}), "the source is not authenticated");
-    }
-
-    #[test]
-    fn keep_and_an_explicit_config_exclude_each_other() {
-        let doc = PdfDocument::from_bytes(source(b"", ID, |_| {})).unwrap();
-        let mut editor = DocumentEditor::from_document(doc).unwrap();
-        let options = SaveOptions {
-            keep_source_encryption: true,
-            encryption: Some(EncryptionConfig::new("user", "owner")),
-            ..Default::default()
-        };
-        match editor.save_to_bytes_with_options(options) {
-            Err(Error::InvalidOperation(msg)) => assert!(msg.contains("exclusive"), "{msg}"),
-            Err(other) => panic!("expected InvalidOperation, got {other:?}"),
-            Ok(_) => panic!("expected InvalidOperation, got Ok"),
-        }
-    }
-}
-// ── end pdf_manipulator patch ──

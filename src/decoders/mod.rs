@@ -23,7 +23,9 @@ mod dct;
 mod flate;
 mod jbig2;
 pub(crate) mod jpx;
-mod lzw;
+// ── pdf_manipulator patch: the engine proofs build a decoder with a chosen switch ──
+pub(crate) mod lzw;
+// ── end pdf_manipulator patch ──
 mod predictor;
 mod runlength;
 
