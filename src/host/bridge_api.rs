@@ -98,10 +98,18 @@ pub(crate) fn handle_request(
         sinks: &mut sinks,
         cancel,
     };
-    match crate::host::ops::registry::find(req.op()) {
+    let response = match crate::host::ops::registry::find(req.op()) {
         Some(entry) => (entry.handle)(&mut ctx),
         None => ResponseWriter::error(&format!("unknown op: {}", req.op())),
+    };
+    // An op ends here: no open document keeps the object stream it decoded.
+    for document in ctx.state.documents.values() {
+        document.release_objstm_memo();
     }
+    for editor in ctx.state.editors.values() {
+        editor.release_objstm_memo();
+    }
+    response
 }
 
 // ═══════════════════════════════════════════════════════════════════

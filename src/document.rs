@@ -97,6 +97,23 @@ impl Seek for PdfReader {
     }
 }
 
+impl PdfReader {
+    /// Moves to absolute `offset`. A target inside the bytes already
+    /// buffered keeps them, so objects read one after another cost one
+    /// read of the source, not one each.
+    fn seek_keeping_buffer(&mut self, offset: u64) -> std::io::Result<()> {
+        let here = match self {
+            PdfReader::Memory(r) => r.stream_position()?,
+            PdfReader::External(r) => r.stream_position()?,
+        };
+        let by = offset as i64 - here as i64;
+        match self {
+            PdfReader::Memory(r) => r.seek_relative(by),
+            PdfReader::External(r) => r.seek_relative(by),
+        }
+    }
+}
+
 impl BufRead for PdfReader {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         match self {
@@ -589,6 +606,15 @@ pub struct PdfDocument {
     /// cache because the sweep is only triggered on free-entry misses that
     /// also failed the file-body scan — the common path never needs it.
     objstm_recovery_done: Mutex<bool>,
+    // ── pdf_manipulator patch: the last object stream decoded is kept for its next member ──
+    /// The object stream the last compressed object was read from, decoded
+    /// once so its other members cost a parse each and no inflate. One slot,
+    /// no size cap: answering any member needs the decoded stream in memory
+    /// anyway. `release_objstm_memo` empties it when an operation ends.
+    objstm_memo: Mutex<Option<(u32, Arc<crate::objstm::DecodedObjStm>)>>,
+    /// Object streams decoded since the document opened.
+    objstm_inflations: AtomicUsize,
+    // ── end pdf_manipulator patch ──
     /// Cache of XObject refs known to NOT be Form XObjects (i.e., Image or unknown).
     /// Used by text extraction to skip expensive full-object loads for images.
     image_xobject_cache: Mutex<HashSet<ObjectRef>>,
@@ -1224,10 +1250,11 @@ impl PdfDocument {
         Ok(doc)
     }
 
-    /// Drops every cached object and frees the cache's memory, keeping
-    /// its budget. A document read once per object calls this between
+    /// Drops every cached object and the decoded object stream memo and
+    /// frees the cache's memory, keeping its budget. A document read once per object calls this between
     /// pieces of work so a full cache does not sit beside the work.
     pub(crate) fn clear_object_cache(&self) {
+        self.release_objstm_memo();
         let mut cache = self.object_cache.lock_or_recover();
         // Pinned objects exist only here and cannot be re-read: they stay.
         let pinned: Vec<(ObjectRef, Object)> = cache
@@ -1441,6 +1468,10 @@ impl PdfDocument {
             page_cache_populated: AtomicBool::new(false),
             scanned_object_offsets: Mutex::new(prepopulated_scan),
             objstm_recovery_done: Mutex::new(false),
+            // ── pdf_manipulator patch: the last object stream decoded is kept for its next member ──
+            objstm_memo: Mutex::new(None),
+            objstm_inflations: AtomicUsize::new(0),
+            // ── end pdf_manipulator patch ──
             image_xobject_cache: Mutex::new(HashSet::new()),
             xobject_text_free_cache: Mutex::new(HashSet::new()),
             xobject_stream_cache: Mutex::new(HashMap::new()),
@@ -2507,7 +2538,7 @@ impl PdfDocument {
     /// fewer than `buf.len()` only at the end of the source.
     pub(crate) fn read_source_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let mut r = self.reader.lock_or_recover();
-        r.seek(SeekFrom::Start(offset))?;
+        r.seek_keeping_buffer(offset)?;
         let mut filled = 0;
         while filled < buf.len() {
             let n = r.read(&mut buf[filled..])?;
@@ -2596,6 +2627,10 @@ impl PdfDocument {
     /// stream whose /Length is trustworthy; the caller then loads it whole,
     /// which also repairs a wrong /Length.
     pub(crate) fn stream_head(&self, r: ObjectRef) -> Result<Option<StreamHead>> {
+        // The header and dictionary of a stream are usually under a
+        // kilobyte; a read that grows from there costs a fraction of a
+        // 64 KiB read per stream on a file of thousands of them.
+        const FIRST_READ: usize = 1024;
         const CHUNK: usize = 64 * 1024;
         const HEAD_MAX: usize = 1024 * 1024;
 
@@ -2610,11 +2645,14 @@ impl PdfDocument {
         // Read until the buffer holds the header, a dictionary, `stream`
         // and the end-of-line after it.
         let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; CHUNK];
+        let mut want = FIRST_READ;
+        let mut chunk = vec![0u8; want];
         let (dict_start, stream_kw) = loop {
+            chunk.resize(want, 0);
             let n = self.read_source_at(entry.offset + buf.len() as u64, &mut chunk)?;
             buf.extend_from_slice(&chunk[..n]);
-            let at_end = n < CHUNK;
+            let at_end = n < want;
+            want = (want * 2).min(CHUNK);
 
             let Some(obj_pos) = find_substring(&buf[..buf.len().min(64)], b"obj") else {
                 if at_end || buf.len() >= 64 {
@@ -2630,6 +2668,12 @@ impl PdfDocument {
                         .find(|&&b| !is_space(b))
                         .is_some_and(|&b| b == b'>')
             });
+            // An object that ends before any `stream` is not a stream.
+            if let Some(end) = find_substring(&buf[obj_pos + 3..], b"endobj") {
+                if found.map_or(true, |i| obj_pos + 3 + end < i) {
+                    return Ok(None);
+                }
+            }
             if let Some(i) = found {
                 if buf.len() >= i + 8 || at_end {
                     break (obj_pos + 3, i);
@@ -3968,7 +4012,7 @@ impl PdfDocument {
         // seek() and read_until() calls.
         let (header_bytes, full_header) = {
             let mut reader = self.reader.lock_or_recover();
-            reader.seek(SeekFrom::Start(offset))?;
+            reader.seek_keeping_buffer(offset)?;
 
             // Read bytes for object header (e.g., "1 0 obj")
             let mut header_bytes = Vec::new();
@@ -4257,8 +4301,6 @@ impl PdfDocument {
         stream_obj_num: u32,
         _index_in_stream: u16,
     ) -> Result<Object> {
-        use crate::objstm::parse_object_stream_with_decryption;
-
         log::debug!(
             "[load_compressed_debug] Loading obj {} from stream {}",
             obj_ref.id,
@@ -4279,24 +4321,67 @@ impl PdfDocument {
             );
         }
 
-        // Load the object stream
+        // ── pdf_manipulator patch: a member is parsed alone from the decoded stream ──
+        // Parsing the whole stream per request rebuilt every member of a
+        // stream of large arrays each time (hundreds of megabytes parsed, more
+        // than the object cache holds), so each next member cost the same
+        // again. The decoded stream is kept in a one-slot memo and only the
+        // requested member is parsed and cached.
+        let Some(decoded) = self.decoded_object_stream(stream_obj_num)? else {
+            // PDF Spec §7.3.10: treat as null
+            log::warn!(
+                "Object stream {} not in xref, treating compressed object {} as Null",
+                stream_obj_num,
+                obj_ref.id
+            );
+            self.object_cache
+                .lock_or_recover()
+                .insert(obj_ref, Object::Null);
+            return Ok(Object::Null);
+        };
+
+        // The requested object's own xref entry names this stream, so a
+        // stale copy in another stream of an incremental update is not read.
+        match decoded.member(obj_ref.id) {
+            Some(obj) => {
+                self.object_cache
+                    .lock_or_recover()
+                    .insert(obj_ref, obj.clone());
+                Ok(obj)
+            },
+            None => {
+                // PDF Spec §7.3.10: treat as null
+                log::warn!(
+                    "Object {} not found in object stream {}, treating as Null",
+                    obj_ref.id,
+                    stream_obj_num
+                );
+                Ok(Object::Null)
+            },
+        }
+    }
+
+    /// The decoded object stream `stream_obj_num`, from the memo when it
+    /// holds that stream, else loaded, decoded and memoised. `Ok(None)` when
+    /// the xref has no entry for the stream.
+    fn decoded_object_stream(
+        &self,
+        stream_obj_num: u32,
+    ) -> Result<Option<Arc<crate::objstm::DecodedObjStm>>> {
+        use crate::objstm::decode_object_stream;
+
+        if let Some((held, decoded)) = self.objstm_memo.lock_or_recover().as_ref() {
+            if *held == stream_obj_num {
+                return Ok(Some(Arc::clone(decoded)));
+            }
+        }
+
         let stream_ref = ObjectRef::new(stream_obj_num, 0);
         let stream_obj = self.load_uncompressed_object(stream_ref, {
             // Look up the stream's offset in the xref table
             let stream_entry = match self.xref.get(stream_obj_num) {
                 Some(entry) => entry,
-                None => {
-                    // PDF Spec §7.3.10: treat as null
-                    log::warn!(
-                        "Object stream {} not in xref, treating compressed object {} as Null",
-                        stream_obj_num,
-                        obj_ref.id
-                    );
-                    self.object_cache
-                        .lock_or_recover()
-                        .insert(obj_ref, Object::Null);
-                    return Ok(Object::Null);
-                },
+                None => return Ok(None),
             };
 
             if stream_entry.entry_type != crate::xref::XRefEntryType::Uncompressed {
@@ -4309,8 +4394,6 @@ impl PdfDocument {
             stream_entry.offset
         })?;
 
-        // Parse all objects from the stream.
-        //
         // Per ISO 32000-2:2020 Section 7.6.3, object streams (/Type /ObjStm)
         // cross-reference streams (/Type /XRef) shall NOT be individually encrypted.
         // The stream data is only compressed, not encrypted. Many PDF producers
@@ -4318,77 +4401,56 @@ impl PdfDocument {
         // PDF 1.x, so attempting AES decryption on the raw stream bytes fails
         // because the data length is not a multiple of the AES block size (16).
         //
-        // We therefore always parse object streams WITHOUT decryption. If a
+        // We therefore always decode object streams WITHOUT decryption. If a
         // future PDF is encountered where the producer DID encrypt the ObjStm
-        // (non-standard), the unencrypted parse will fail and we fall back to
+        // (non-standard), the unencrypted decode will fail and we fall back to
         // trying with decryption.
+        self.objstm_inflations.fetch_add(1, Ordering::Relaxed);
         let handler_ref = self.encryption_handler.lock_or_recover();
-        let objects_map = if handler_ref.is_some() {
+        let decoded = if handler_ref.is_some() {
             // First try without decryption (spec-compliant path)
-            match parse_object_stream_with_decryption(&stream_obj, None, 0, 0) {
-                Ok(map) => map,
+            match decode_object_stream(&stream_obj, None, 0, 0) {
+                Ok(decoded) => decoded,
                 Err(_no_decrypt_err) => {
                     // Fallback: try with decryption for non-standard producers
                     let handler = handler_ref.as_ref().unwrap();
                     let decrypt_fn = |data: &[u8]| -> Result<Vec<u8>> {
                         handler.decrypt_stream(data, stream_obj_num, 0)
                     };
-                    parse_object_stream_with_decryption(
-                        &stream_obj,
-                        Some(&decrypt_fn),
-                        stream_obj_num,
-                        0,
-                    )?
+                    decode_object_stream(&stream_obj, Some(&decrypt_fn), stream_obj_num, 0)?
                 },
             }
         } else {
-            parse_object_stream_with_decryption(&stream_obj, None, 0, 0)?
+            decode_object_stream(&stream_obj, None, 0, 0)?
         };
         drop(handler_ref);
 
-        // Extract the requested object
-        let obj = match objects_map.get(&obj_ref.id) {
-            Some(o) => o.clone(),
-            None => {
-                // PDF Spec §7.3.10: treat as null
-                log::warn!(
-                    "Object {} not found in object stream {}, treating as Null",
-                    obj_ref.id,
-                    stream_obj_num
-                );
-                Object::Null
-            },
-        };
-
-        // Cache all objects from the stream for future access
-        // IMPORTANT: Only cache objects whose xref entry points to THIS stream.
-        // In incremental updates, the same object number may exist in multiple streams,
-        // and we must not cache a stale version from an older stream.
-        for (obj_num, object) in objects_map {
-            let cache_ref = ObjectRef::new(obj_num, 0);
-            let should_cache = if let Some(entry) = self.xref.get(obj_num) {
-                // Only cache if the xref says this object belongs to this stream
-                entry.entry_type == crate::xref::XRefEntryType::Compressed
-                    && entry.offset == stream_obj_num as u64
-            } else {
-                // Object not in xref at all -- safe to cache as it's only in this stream
-                true
-            };
-            if should_cache {
-                self.object_cache
-                    .lock_or_recover()
-                    .insert(cache_ref, object);
-            } else {
-                log::debug!(
-                    "[cache_debug] NOT caching obj {} from stream {} (xref points elsewhere)",
-                    obj_num,
-                    stream_obj_num
-                );
-            }
-        }
-
-        Ok(obj)
+        let decoded = Arc::new(decoded);
+        *self.objstm_memo.lock_or_recover() = Some((stream_obj_num, Arc::clone(&decoded)));
+        Ok(Some(decoded))
     }
+
+    /// The object stream that holds `id`, from its xref entry; `None` for an
+    /// object stored on its own or not in use.
+    pub(crate) fn container_stream_of(&self, id: u32) -> Option<u32> {
+        self.xref.get(id).and_then(|e| {
+            (e.in_use && e.entry_type == crate::xref::XRefEntryType::Compressed)
+                .then_some(e.offset as u32)
+        })
+    }
+
+    /// Empties the object stream memo. An operation calls this when it ends
+    /// so an idle document holds no decoded stream.
+    pub(crate) fn release_objstm_memo(&self) {
+        *self.objstm_memo.lock_or_recover() = None;
+    }
+
+    /// Object streams decoded since the document opened.
+    #[cfg(test)]
+    pub(crate) fn objstm_inflations(&self) -> usize {
+        self.objstm_inflations.load(Ordering::Relaxed)
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Find object header by searching backwards from a given offset.
     ///

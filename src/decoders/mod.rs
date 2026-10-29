@@ -142,13 +142,22 @@ fn normalize_filter_name(name: &str) -> Result<&'static str> {
     }
 }
 
-fn create_decoder(filter_name: &str) -> Result<Box<dyn StreamDecoder>> {
+// ── pdf_manipulator patch: the filter's DecodeParms reach the LZW decoder ──
+fn create_decoder(
+    filter_name: &str,
+    params: Option<&DecodeParams>,
+) -> Result<Box<dyn StreamDecoder>> {
+    // ── end pdf_manipulator patch ──
     let canonical = normalize_filter_name(filter_name)?;
     Ok(match canonical {
         "FlateDecode" => Box::new(FlateDecoder::default()),
         "ASCIIHexDecode" => Box::new(AsciiHexDecoder),
         "ASCII85Decode" => Box::new(Ascii85Decoder),
-        "LZWDecode" => Box::new(LzwDecoder),
+        // ── pdf_manipulator patch: /EarlyChange from the DecodeParms ──
+        "LZWDecode" => Box::new(lzw::ConfiguredLzwDecoder {
+            early_change: params.map_or(true, |p| p.early_change),
+        }),
+        // ── end pdf_manipulator patch ──
         "RunLengthDecode" => Box::new(RunLengthDecoder),
         "DCTDecode" => Box::new(DctDecoder),
         "CCITTFaxDecode" => Box::new(CcittFaxDecoder),
@@ -228,7 +237,7 @@ pub fn decode_stream_with_options(
 
     // Apply filters in order
     for filter_name in filters {
-        let decoder = create_decoder(filter_name)?;
+        let decoder = create_decoder(filter_name, params)?;
 
         current = decoder.decode(&current)?;
 
@@ -291,7 +300,7 @@ pub fn decode_stream_with_params(
 
     // Apply filters in order
     for filter_name in filters {
-        let decoder = create_decoder(filter_name)?;
+        let decoder = create_decoder(filter_name, params)?;
 
         current = decoder.decode(&current)?;
     }

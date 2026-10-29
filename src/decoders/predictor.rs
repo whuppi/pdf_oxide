@@ -34,6 +34,11 @@ pub struct DecodeParams {
     pub colors: usize,
     /// Bits per component (default 8)
     pub bits_per_component: usize,
+    // ── pdf_manipulator patch: LZW code-width switch ──
+    /// LZWDecode `/EarlyChange`: true (the default, entry 1) widens the
+    /// codes one code before the GIF boundary, false (entry 0) at it.
+    pub early_change: bool,
+    // ── end pdf_manipulator patch ──
 }
 
 impl Default for DecodeParams {
@@ -43,6 +48,7 @@ impl Default for DecodeParams {
             columns: 1,
             colors: 1,
             bits_per_component: 8,
+            early_change: true,
         }
     }
 }
@@ -382,6 +388,7 @@ mod tests {
             columns: 5,
             colors: 1,
             bits_per_component: 8,
+            early_change: true,
         };
 
         // Encoded data: predictor tag (2 for Up) + encoded bytes
@@ -405,6 +412,7 @@ mod tests {
             columns: 5,
             colors: 1,
             bits_per_component: 8,
+            early_change: true,
         };
 
         assert_eq!(params.bytes_per_row(), 6); // 5 pixels + 1 predictor tag
@@ -441,6 +449,7 @@ mod tests {
             columns: 5,
             colors: 1,
             bits_per_component: 8,
+            early_change: true,
         };
         let encoded = vec![
             0, 10, 20, 30, 40, 50, // Row 0: tag=None, raw bytes
@@ -460,6 +469,7 @@ mod tests {
             columns: 5,
             colors: 1,
             bits_per_component: 8,
+            early_change: true,
         };
         let encoded = vec![
             0, 10, 20, 30, 40, 50, // Row 0: None
@@ -479,6 +489,7 @@ mod tests {
             columns: 710,
             colors: 1,
             bits_per_component: 4,
+            early_change: true,
         };
         assert_eq!(params.pixel_bytes_per_row(), 355);
         assert_eq!(params.bytes_per_row(), 356);

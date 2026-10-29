@@ -7,28 +7,24 @@
 //! - Uses MSB-first bit ordering
 //! - Starts with 9-bit codes
 //! - Increases code size when table fills up
-//! - Uses EarlyChange=1 (change code size one code earlier than GIF/TIFF)
+//! - Uses EarlyChange=1 by default (change code size one code earlier than
+//!   GIF); a `/EarlyChange 0` entry in DecodeParms selects the GIF switch
 //! - Clear code is 256, EOD code is 257
 //! - First available code is 258
 
 use crate::decoders::StreamDecoder;
 use crate::error::{Error, Result};
 
-/// LZWDecode filter implementation.
+// ── pdf_manipulator patch: one weezl decoder, early or late switch per /EarlyChange ──
+/// LZWDecode filter implementation with PDF's default, `/EarlyChange 1`.
 ///
-/// Decompresses data using the LZW algorithm.
+/// Decompresses data using the LZW algorithm. A stream that sets
+/// `/EarlyChange 0` goes through the filter pipeline, which reads the entry.
 pub struct LzwDecoder;
 
 impl StreamDecoder for LzwDecoder {
     fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        // Try weezl first with PDF-compatible settings
-        match decode_lzw_weezl(input) {
-            Ok(data) => Ok(data),
-            Err(_) => {
-                // Fall back to custom implementation for edge cases
-                decode_lzw_custom(input)
-            },
-        }
+        decode_lzw(input, true)
     }
 
     fn name(&self) -> &str {
@@ -36,237 +32,143 @@ impl StreamDecoder for LzwDecoder {
     }
 }
 
-/// Decode using weezl crate (well-tested LZW implementation).
-fn decode_lzw_weezl(input: &[u8]) -> Result<Vec<u8>> {
-    use weezl::{decode::Decoder as WeezlDecoder, BitOrder};
+/// LZWDecode with the `/EarlyChange` value the stream's DecodeParms name.
+pub(crate) struct ConfiguredLzwDecoder {
+    pub(crate) early_change: bool,
+}
 
-    // PDF uses MSB bit order, 8-bit minimum code size
-    let mut decoder = WeezlDecoder::new(BitOrder::Msb, 8);
+impl StreamDecoder for ConfiguredLzwDecoder {
+    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+        decode_lzw(input, self.early_change)
+    }
 
-    match decoder.decode(input) {
-        Ok(output) => Ok(output),
-        Err(e) => {
-            log::warn!("Weezl LZW decode failed: {:?}, falling back to custom", e);
-            Err(Error::Decode(format!("LZWDecode error: {:?}", e)))
-        },
+    fn name(&self) -> &str {
+        "LZWDecode"
     }
 }
 
-/// Custom LZW decoder for PDF (handles edge cases).
-///
-/// This implementation follows the PDF spec exactly, including EarlyChange behavior.
-fn decode_lzw_custom(input: &[u8]) -> Result<Vec<u8>> {
-    const CLEAR_CODE: u16 = 256;
-    const EOD_CODE: u16 = 257;
-    const FIRST_CODE: u16 = 258;
-    const MAX_CODE_BITS: u8 = 12;
+/// Decodes with weezl: MSB bit order, 8-bit minimum code size. The code
+/// width grows one code early (TIFF size switch) with `/EarlyChange 1` and
+/// at the GIF boundary with `/EarlyChange 0`; reading one as the other
+/// decodes the wrong bytes without an error.
+fn decode_lzw(input: &[u8], early_change: bool) -> Result<Vec<u8>> {
+    use weezl::{decode::Decoder, BitOrder};
 
-    let mut output = Vec::new();
-    let mut table = init_lzw_table();
-    let mut code_bits = 9;
-    let mut next_code = FIRST_CODE;
-    let mut bit_reader = BitReader::new(input);
-    let mut prev_code: Option<u16> = None;
-
-    loop {
-        // EarlyChange=1: Check if we need to increase code size BEFORE reading
-        // PDF's EarlyChange=1 means: increase code size when next_code == 2^code_bits - 1
-        // This is "one code early" compared to standard LZW (which waits until 2^code_bits)
-        if code_bits < MAX_CODE_BITS && next_code > 0 {
-            let increase_at = (1 << code_bits) - 1; // 2^code_bits - 1 (511, 1023, 2047)
-            if next_code == increase_at {
-                code_bits += 1;
-            }
-        }
-
-        let code = match bit_reader.read_bits(code_bits) {
-            Some(c) => c as u16,
-            None => break, // End of data
-        };
-
-        if code == EOD_CODE {
-            break;
-        }
-
-        if code == CLEAR_CODE {
-            // Reset table
-            table = init_lzw_table();
-            code_bits = 9;
-            next_code = FIRST_CODE;
-            prev_code = None;
-            continue;
-        }
-
-        // Get the string for this code
-        let string = if code < next_code {
-            // Code is in table
-            table
-                .get(&code)
-                .ok_or_else(|| {
-                    Error::Decode(format!(
-                        "Invalid LZW code: {} (table size: {})",
-                        code,
-                        table.len()
-                    ))
-                })?
-                .clone()
-        } else if code == next_code && prev_code.is_some() {
-            // Special case: code == next_code
-            // String is prev_string + prev_string[0]
-            let prev_string = table.get(&prev_code.unwrap()).unwrap();
-            let mut s = prev_string.clone();
-            s.push(prev_string[0]);
-            s
-        } else {
-            return Err(Error::Decode(format!(
-                "Invalid LZW code: {} (next_code={}, code_bits={})",
-                code, next_code, code_bits
-            )));
-        };
-
-        // Output the string
-        output.extend_from_slice(&string);
-
-        // Add new entry to table
-        if let Some(prev) = prev_code {
-            if next_code < 4096 {
-                let prev_string = table.get(&prev).unwrap();
-                let mut new_string = prev_string.clone();
-                new_string.push(string[0]);
-                table.insert(next_code, new_string);
-                next_code += 1;
-            }
-        }
-
-        prev_code = Some(code);
-    }
-
-    Ok(output)
+    let mut decoder = if early_change {
+        Decoder::with_tiff_size_switch(BitOrder::Msb, 8)
+    } else {
+        Decoder::new(BitOrder::Msb, 8)
+    };
+    decoder
+        .decode(input)
+        .map_err(|e| Error::Decode(format!("LZWDecode error: {:?}", e)))
 }
-
-/// Initialize the LZW string table with single-byte strings.
-fn init_lzw_table() -> std::collections::HashMap<u16, Vec<u8>> {
-    let mut table = std::collections::HashMap::new();
-    for i in 0..=255u16 {
-        table.insert(i, vec![i as u8]);
-    }
-    table
-}
-
-/// Bit reader for MSB-first bit ordering.
-struct BitReader<'a> {
-    data: &'a [u8],
-    byte_pos: usize,
-    bit_pos: u8, // 0-7, position within current byte (0 = MSB)
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            byte_pos: 0,
-            bit_pos: 0,
-        }
-    }
-
-    fn read_bits(&mut self, n: u8) -> Option<u32> {
-        if n == 0 || n > 16 {
-            return None;
-        }
-
-        let mut result = 0u32;
-        let mut remaining = n;
-
-        while remaining > 0 {
-            if self.byte_pos >= self.data.len() {
-                return None;
-            }
-
-            let bits_in_current_byte = 8 - self.bit_pos;
-            let bits_to_read = remaining.min(bits_in_current_byte);
-
-            // Extract bits from current byte
-            let byte = self.data[self.byte_pos];
-            let shift_amount = bits_in_current_byte - bits_to_read;
-            let mask = if bits_to_read == 8 {
-                0xFF
-            } else {
-                ((1u8 << bits_to_read) - 1) << shift_amount
-            };
-            let bits = (byte & mask) >> shift_amount;
-
-            result = (result << bits_to_read) | (bits as u32);
-
-            self.bit_pos += bits_to_read;
-            if self.bit_pos >= 8 {
-                self.byte_pos += 1;
-                self.bit_pos = 0;
-            }
-
-            remaining -= bits_to_read;
-        }
-
-        Some(result)
-    }
-}
+// ── end pdf_manipulator patch ──
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use weezl::{encode::Encoder as LzwEncoder, BitOrder};
 
+    fn early(data: &[u8]) -> Vec<u8> {
+        LzwEncoder::with_tiff_size_switch(BitOrder::Msb, 8).encode(data).unwrap()
+    }
+
+    /// Varied bytes, enough to fill the 4096-entry table several times, so
+    /// the stream crosses the 9, 10, 11 and 12 bit code widths and holds
+    /// clear codes.
+    fn long_sample() -> Vec<u8> {
+        let mut state = 12345u32;
+        (0..300_000)
+            .map(|i| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                if i % 5000 < 1500 { (i % 251) as u8 } else { ((state >> 24) % 11) as u8 }
+            })
+            .collect()
+    }
+
     #[test]
     fn test_lzw_decode_simple() {
-        let decoder = LzwDecoder;
-
-        // Compress some data
         let original = b"ABCABCABCABC";
-        let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
-        let compressed = encoder.encode(original).unwrap();
-
-        // Decompress
-        let decoded = decoder.decode(&compressed).unwrap();
-        assert_eq!(decoded, original);
+        assert_eq!(LzwDecoder.decode(&early(original)).unwrap(), original);
     }
 
     #[test]
     fn test_lzw_decode_empty() {
-        let decoder = LzwDecoder;
-
-        let original = b"";
-        let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
-        let compressed = encoder.encode(original).unwrap();
-
-        let decoded = decoder.decode(&compressed).unwrap();
-        assert_eq!(decoded, original);
+        assert_eq!(LzwDecoder.decode(&early(b"")).unwrap(), b"");
     }
 
     #[test]
     fn test_lzw_decode_repeated_pattern() {
-        let decoder = LzwDecoder;
-
-        // LZW is efficient with repeated patterns
         let original = b"The quick brown fox jumps over the lazy dog. ".repeat(10);
-        let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
-        let compressed = encoder.encode(&original).unwrap();
+        assert_eq!(LzwDecoder.decode(&early(&original)).unwrap(), original);
+    }
 
-        let decoded = decoder.decode(&compressed).unwrap();
-        assert_eq!(decoded, original);
+    #[test]
+    fn early_change_one_round_trips_across_every_code_width_and_clear_codes() {
+        let original = long_sample();
+        assert_eq!(LzwDecoder.decode(&early(&original)).unwrap(), original);
+    }
+
+    #[test]
+    fn early_change_zero_round_trips_across_every_code_width_and_clear_codes() {
+        let original = long_sample();
+        let late = LzwEncoder::new(BitOrder::Msb, 8).encode(&original).unwrap();
+        let decoder = ConfiguredLzwDecoder { early_change: false };
+        assert_eq!(decoder.decode(&late).unwrap(), original);
+    }
+
+    #[test]
+    fn a_stream_read_with_the_wrong_switch_is_not_decoded_as_the_right_one() {
+        let original = long_sample();
+        let late = LzwEncoder::new(BitOrder::Msb, 8).encode(&original).unwrap();
+        // Either an error or other bytes, never the original.
+        let wrong = LzwDecoder.decode(&late);
+        assert!(wrong.map_or(true, |bytes| bytes != original));
+    }
+
+    #[test]
+    fn a_streams_early_change_entry_selects_the_switch() {
+        use crate::object::Object;
+        use std::collections::HashMap;
+
+        let original = long_sample();
+        let late = LzwEncoder::new(BitOrder::Msb, 8).encode(&original).unwrap();
+        let stream = |parms: Option<(&str, i64)>, data: &[u8]| {
+            let mut dict = HashMap::new();
+            dict.insert("Filter".to_string(), Object::Name("LZWDecode".to_string()));
+            if let Some((key, value)) = parms {
+                let mut p = HashMap::new();
+                p.insert(key.to_string(), Object::Integer(value));
+                dict.insert("DecodeParms".to_string(), Object::Dictionary(p));
+            }
+            Object::Stream { dict, data: bytes::Bytes::copy_from_slice(data) }
+        };
+
+        let zero = stream(Some(("EarlyChange", 0)), &late);
+        assert_eq!(zero.decode_stream_data().unwrap(), original);
+        let one = stream(Some(("EarlyChange", 1)), &early(&original));
+        assert_eq!(one.decode_stream_data().unwrap(), original);
+        let absent = stream(None, &early(&original));
+        assert_eq!(absent.decode_stream_data().unwrap(), original);
+    }
+
+    #[test]
+    fn a_corrupt_stream_is_refused() {
+        // 9-bit codes: 'A' (65), then 300, a code far past the next free one.
+        let bits: u32 = (65 << 9) | 300;
+        let bytes = [(bits >> 10) as u8, (bits >> 2) as u8, ((bits & 3) << 6) as u8];
+        assert!(LzwDecoder.decode(&bytes).is_err());
     }
 
     #[test]
     fn test_lzw_decode_invalid_data() {
-        let decoder = LzwDecoder;
-
-        // Invalid LZW data
         let invalid = b"This is not LZW compressed data";
-        let result = decoder.decode(invalid);
-        assert!(result.is_err());
+        assert!(LzwDecoder.decode(invalid).is_err());
     }
 
     #[test]
     fn test_lzw_decoder_name() {
-        let decoder = LzwDecoder;
-        assert_eq!(decoder.name(), "LZWDecode");
+        assert_eq!(LzwDecoder.name(), "LZWDecode");
     }
 }

@@ -253,6 +253,7 @@ mod tests {
                 columns: 16,
                 colors: 3,
                 bits_per_component: 8,
+                early_change: true,
             },
         )
         .expect("valid predictor stream");

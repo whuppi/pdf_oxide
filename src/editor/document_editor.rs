@@ -2643,6 +2643,14 @@ impl DocumentEditor {
         // ── end pdf_manipulator patch ──
     }
 
+    // ── pdf_manipulator patch: no decoded object stream outlives an operation ──
+    /// Empties the source's object stream memo; the host calls it when an
+    /// operation ends.
+    pub(crate) fn release_objstm_memo(&self) {
+        self.source.release_objstm_memo();
+    }
+    // ── end pdf_manipulator patch ──
+
     // ── pdf_manipulator patch: zero-clone BFS for GC ──
     /// Collect all object IDs reachable from the catalog root via BFS.
     ///
@@ -2673,6 +2681,28 @@ impl DocumentEditor {
         let mut seen = vec![false; max_id];
         let mut queue: Vec<u32> = Vec::with_capacity(256);
         let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
+        // ── pdf_manipulator patch: an object stream is drained before the walk leaves it ──
+        // Ids whose objects sit in an object stream wait here by container;
+        // the walk reads the members of one stream together, so the stream
+        // is decoded once instead of once per member.
+        let mut by_stream: std::collections::BTreeMap<u32, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        let mut stream_now: Option<u32> = None;
+        let route = |ids: &[u32],
+                     seen: &[bool],
+                     queue: &mut Vec<u32>,
+                     by_stream: &mut std::collections::BTreeMap<u32, Vec<u32>>| {
+            for &id in ids {
+                if seen.get(id as usize).copied() != Some(false) {
+                    continue;
+                }
+                match self.source.container_stream_of(id) {
+                    Some(stream) => by_stream.entry(stream).or_default().push(id),
+                    None => queue.push(id),
+                }
+            }
+        };
+        // ── end pdf_manipulator patch ──
 
         if let Some(r) = self
             .source
@@ -2694,9 +2724,30 @@ impl DocumentEditor {
         }
         // The source root /Pages lists the nodes the save excludes; the
         // output's root lists the kept pages, so the walk enters them here.
-        queue.extend_from_slice(&prune.kept_pages);
+        route(&prune.kept_pages, &seen, &mut queue, &mut by_stream);
 
-        while let Some(id) = queue.pop() {
+        loop {
+            // ── pdf_manipulator patch: an object stream is drained before the walk leaves it ──
+            let id = match queue.pop() {
+                Some(id) => id,
+                None => {
+                    let stream = match stream_now.filter(|s| by_stream.contains_key(s)) {
+                        Some(stream) => stream,
+                        None => match by_stream.keys().next() {
+                            Some(&stream) => stream,
+                            None => break,
+                        },
+                    };
+                    stream_now = Some(stream);
+                    let pending = by_stream.get_mut(&stream).expect("stream was just found");
+                    let id = pending.pop().expect("a pending list is never empty");
+                    if pending.is_empty() {
+                        by_stream.remove(&stream);
+                    }
+                    id
+                },
+            };
+            // ── end pdf_manipulator patch ──
             let idx = id as usize;
             if idx >= max_id || seen[idx] || prune.excluded.contains(&id) {
                 continue;
@@ -2711,7 +2762,7 @@ impl DocumentEditor {
             } else {
                 self.source.collect_refs_of(id, &mut refs_buf);
             }
-            queue.extend_from_slice(&refs_buf);
+            route(&refs_buf, &seen, &mut queue, &mut by_stream);
         }
 
         seen.iter()
@@ -14552,6 +14603,155 @@ mod tests {
         }
         assert!(contains(&bytes, b"REACHEDNINE"), "stream 9 was not written");
         assert!(contains(&bytes, b"REACHEDTEN"), "stream 10 was not written");
+    }
+
+    #[test]
+    fn stream_head_finds_streams_whatever_the_size_of_their_dictionary() {
+        let small = b"hello stream".to_vec();
+        let wide = b"wide dictionary stream".to_vec();
+        let doc = crate::document::PdfDocument::from_bytes(pdf_from_objects(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec(),
+            stream_object(4, "", &small),
+            // A dictionary wider than the first read of the source.
+            stream_object(5, &format!("/Pad ({})", "p".repeat(5000)), &wide),
+        ]))
+        .unwrap();
+
+        for (id, data) in [(4, &small), (5, &wide)] {
+            let head = doc.stream_head(ObjectRef::new(id, 0)).unwrap().expect("a plain stream");
+            assert_eq!(head.data_len as usize, data.len(), "object {id}");
+            let mut copied = vec![0u8; data.len()];
+            doc.read_source_at(head.data_start, &mut copied).unwrap();
+            assert_eq!(&copied, data, "object {id}");
+        }
+        for id in [1, 3] {
+            assert!(doc.stream_head(ObjectRef::new(id, 0)).unwrap().is_none(), "object {id}");
+        }
+    }
+
+    /// Members per object stream of `two_objstm_pdf_bytes`.
+    const TWO_STREAM_MEMBERS: u32 = 8;
+
+    /// A page tree and two Flate object streams of `TWO_STREAM_MEMBERS` 3 KB
+    /// dictionaries each, ids 10..18 in stream 100 and 18..26 in stream 101,
+    /// so each stream decodes to more than a 4 KiB object cache holds. The
+    /// catalog's /Extra names the members alternating between the streams.
+    fn two_objstm_pdf_bytes() -> Vec<u8> {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+
+        let n = TWO_STREAM_MEMBERS;
+        let mut out = b"%PDF-1.5\n".to_vec();
+        let mut offsets = HashMap::new();
+        let mut put = |out: &mut Vec<u8>, id: u32, object: Vec<u8>| {
+            offsets.insert(id, out.len());
+            out.extend_from_slice(&object);
+        };
+        let extra: String = (0..n)
+            .flat_map(|i| [10 + i, 10 + n + i])
+            .map(|id| format!("{id} 0 R "))
+            .collect();
+        put(&mut out, 1, format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra [{extra}] >>\nendobj\n").into_bytes());
+        put(&mut out, 2, b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec());
+        put(&mut out, 3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec());
+        for (stream_id, first_member) in [(100u32, 10u32), (101, 10 + n)] {
+            let mut header = String::new();
+            let mut bodies = String::new();
+            for id in first_member..first_member + n {
+                header.push_str(&format!("{id} {} ", bodies.len()));
+                bodies.push_str(&format!("<< /Pad ({}) /Tag (MEMBER{id}) >>\n", "x".repeat(3000)));
+            }
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(format!("{header}{bodies}").as_bytes()).unwrap();
+            let packed = encoder.finish().unwrap();
+            put(
+                &mut out,
+                stream_id,
+                stream_object(
+                    stream_id,
+                    &format!("/Type /ObjStm /N {n} /First {} /Filter /FlateDecode", header.len()),
+                    &packed,
+                ),
+            );
+        }
+
+        let xref_at = out.len();
+        let size = 103u32;
+        let mut entries = Vec::new();
+        for id in 0..size - 1 {
+            let (kind, field, last) = match id {
+                1..=3 | 100 | 101 => (1u8, offsets[&id] as u32, 0u16),
+                10..=25 => {
+                    let stream = if id < 10 + n { 100 } else { 101 };
+                    (2, stream, ((id - 10) % n) as u16)
+                },
+                _ => (0, 0, if id == 0 { 65535 } else { 0 }),
+            };
+            entries.push(kind);
+            entries.extend_from_slice(&field.to_be_bytes());
+            entries.extend_from_slice(&last.to_be_bytes());
+        }
+        entries.push(1);
+        entries.extend_from_slice(&(xref_at as u32).to_be_bytes());
+        entries.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(
+            format!(
+                "{} 0 obj\n<< /Type /XRef /Size {size} /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+                size - 1,
+                entries.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&entries);
+        out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref_at}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    fn two_objstm_doc_with_a_small_cache() -> crate::document::PdfDocument {
+        crate::document::PdfDocument::from_external_reader_bounded(
+            Box::new(std::io::Cursor::new(two_objstm_pdf_bytes())),
+            4096,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_full_rewrite_decodes_each_object_stream_at_most_twice() {
+        let mut editor = DocumentEditor::from_document(two_objstm_doc_with_a_small_cache()).unwrap();
+        let bytes = editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap();
+
+        // Once for the reachability walk, once for the sweep that writes.
+        let decoded = editor.source.objstm_inflations();
+        assert!(decoded <= 4, "two object streams were decoded {decoded} times");
+
+        let saved = crate::document::PdfDocument::from_bytes(bytes.clone()).unwrap();
+        for id in 10..10 + 2 * TWO_STREAM_MEMBERS {
+            assert!(
+                contains(&bytes, format!("(MEMBER{id})").as_bytes()),
+                "member {id} was not written"
+            );
+            assert!(!matches!(saved.load_object(ObjectRef::new(id, 0)).unwrap(), Object::Null));
+        }
+    }
+
+    #[test]
+    fn the_decoded_object_stream_is_kept_until_released() {
+        let doc = two_objstm_doc_with_a_small_cache();
+        let member = |id: u32| doc.load_object(ObjectRef::new(id, 0)).unwrap();
+
+        member(10);
+        member(11);
+        member(12);
+        assert_eq!(doc.objstm_inflations(), 1, "members of one stream share one decode");
+
+        doc.release_objstm_memo();
+        member(13);
+        assert_eq!(doc.objstm_inflations(), 2, "a released memo decodes again");
+
+        member(10 + TWO_STREAM_MEMBERS);
+        assert_eq!(doc.objstm_inflations(), 3, "the memo holds one stream");
     }
 
     #[test]

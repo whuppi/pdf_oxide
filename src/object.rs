@@ -419,11 +419,19 @@ fn extract_decode_params(params_obj: Option<&Object>) -> Option<crate::decoders:
         .and_then(|obj| obj.as_integer())
         .unwrap_or(8) as usize;
 
+    // ── pdf_manipulator patch: LZW /EarlyChange (default 1) ──
+    let early_change = dict
+        .get("EarlyChange")
+        .and_then(|obj| obj.as_integer())
+        .map_or(true, |v| v != 0);
+    // ── end pdf_manipulator patch ──
+
     Some(crate::decoders::DecodeParams {
         predictor,
         columns,
         colors,
         bits_per_component,
+        early_change,
     })
 }
 

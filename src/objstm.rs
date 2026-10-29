@@ -283,6 +283,97 @@ fn read_integer_string(data: &[u8]) -> Option<(&[u8], String)> {
     Some((&data[i..], int_str))
 }
 
+// ── pdf_manipulator patch: object stream members parse one at a time ──
+/// An object stream decoded once: its bytes and the offset of each member.
+/// `member` parses a single object from the bytes, so answering one request
+/// never builds the whole stream's objects (a stream of large arrays holds
+/// hundreds of megabytes parsed, a few megabytes decoded).
+#[derive(Debug)]
+pub struct DecodedObjStm {
+    data: Vec<u8>,
+    first: usize,
+    offsets: HashMap<u32, usize>,
+}
+
+impl DecodedObjStm {
+    /// Parses member `obj_num`; `None` when the stream does not hold it or
+    /// its bytes do not parse.
+    pub fn member(&self, obj_num: u32) -> Option<Object> {
+        let offset = *self.offsets.get(&obj_num)?;
+        let objects_data = &self.data[self.first..];
+        if offset >= objects_data.len() {
+            log::warn!(
+                "Object {} offset {} is beyond stream data length {}",
+                obj_num,
+                offset,
+                objects_data.len()
+            );
+            return None;
+        }
+        match parse_object(&objects_data[offset..]) {
+            Ok((_remaining, obj)) => Some(obj),
+            Err(e) => {
+                log::warn!(
+                    "Failed to parse object {} from stream at offset {}: {:?}",
+                    obj_num,
+                    offset,
+                    e
+                );
+                None
+            },
+        }
+    }
+}
+
+/// Decodes an object stream and reads its offset table, parsing no member.
+/// The arguments and errors are those of `parse_object_stream_with_decryption`.
+pub fn decode_object_stream(
+    stream_obj: &Object,
+    decryption_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
+    obj_num: u32,
+    gen_num: u32,
+) -> Result<DecodedObjStm> {
+    let dict = match stream_obj {
+        Object::Stream { dict, .. } => dict,
+        _ => return Err(Error::InvalidPdf("object stream is not a Stream object".to_string())),
+    };
+    if let Some(type_name) = dict.get("Type").and_then(|t| t.as_name()) {
+        if type_name != "ObjStm" {
+            return Err(Error::InvalidPdf(format!(
+                "expected /Type /ObjStm, got /Type /{}",
+                type_name
+            )));
+        }
+    }
+    let n = dict
+        .get("N")
+        .and_then(|o| o.as_integer())
+        .ok_or_else(|| Error::InvalidPdf("object stream missing /N entry".to_string()))?;
+    let first = dict
+        .get("First")
+        .and_then(|o| o.as_integer())
+        .ok_or_else(|| Error::InvalidPdf("object stream missing /First entry".to_string()))?;
+    if !(0..=1_000_000).contains(&n) {
+        return Err(Error::InvalidPdf(format!("invalid object stream /N value: {}", n)));
+    }
+    if !(0..=10_000_000).contains(&first) {
+        return Err(Error::InvalidPdf(format!("invalid object stream /First value: {}", first)));
+    }
+    let first = first as usize;
+
+    let data = stream_obj.decode_stream_data_with_decryption(decryption_fn, obj_num, gen_num)?;
+    if data.len() < first {
+        return Err(Error::InvalidPdf(format!(
+            "object stream data too short: {} bytes, expected at least {}",
+            data.len(),
+            first
+        )));
+    }
+    let pairs = parse_object_number_pairs(&data[..first], n as usize)?;
+    Ok(DecodedObjStm { data, first, offsets: pairs.into_iter().collect() })
+}
+// ── end pdf_manipulator patch ──
+
 #[cfg(test)]
 mod tests {
     use super::*;
