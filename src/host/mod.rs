@@ -25,6 +25,7 @@ pub mod positioned_write;
 pub mod font_optimizer;
 pub mod images;
 pub(crate) mod incremental;
+pub(crate) mod object_streams;
 #[cfg(feature = "signatures")]
 pub mod sign;
 #[cfg(feature = "signatures")]

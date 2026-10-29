@@ -90,9 +90,14 @@ fn test_font_resources_preserved_after_save() {
     std::fs::write(&original_path, create_text_pdf()).unwrap();
 
     let mut editor = DocumentEditor::open(&original_path).unwrap();
+    // ── pdf_manipulator patch: the assertion reads plain bytes, so no object streams ──
     editor
-        .save_with_options(&saved_path, SaveOptions::full_rewrite())
+        .save_with_options(
+            &saved_path,
+            SaveOptions { object_streams: false, ..SaveOptions::full_rewrite() },
+        )
         .unwrap();
+    // ── end pdf_manipulator patch ──
 
     let saved_bytes = std::fs::read(&saved_path).unwrap();
     let saved_content = String::from_utf8_lossy(&saved_bytes);

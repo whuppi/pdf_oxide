@@ -748,6 +748,7 @@ fn handle_editor_save(
 
     let compress = req.get_bool("compress").unwrap_or(true);
     let gc = req.get_bool("garbageCollect").unwrap_or(true);
+    let object_streams = req.get_bool("objectStreams").unwrap_or(true);
     let mode = req.get_i32("saveMode").unwrap_or(0);
     let encrypt_mode = req.get_i32("encryptMode").unwrap_or(0);
     let encryption = match encrypt_mode {
@@ -778,6 +779,7 @@ fn handle_editor_save(
         garbage_collect: gc,
         encryption,
         keep_source_encryption: encrypt_mode == 0,
+        object_streams,
         ..Default::default()
     };
 

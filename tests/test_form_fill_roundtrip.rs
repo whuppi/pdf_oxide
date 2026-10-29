@@ -54,7 +54,12 @@ fn japanese_form_fill_roundtrip_no_mojibake() {
     let mut ed = DocumentEditor::from_bytes(one_field_form()).unwrap();
     ed.set_form_field_value("full_name", FormFieldValue::Text("山田太郎".into()))
         .unwrap();
-    let out = ed.save_to_bytes().unwrap();
+    // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+    let out = ed.save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+        object_streams: false,
+        ..pdf_oxide::editor::SaveOptions::full_rewrite()
+    }).unwrap();
+    // ── end pdf_manipulator patch ──
 
     // #616: /V is serialized as a PDF hex string of UTF-16BE + BOM
     // (`<FEFF5C71753059 2A90CE>`), never the raw UTF-8 (`E5B1B1…`). pdf_oxide

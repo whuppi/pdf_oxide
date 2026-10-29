@@ -230,7 +230,9 @@ fn two_objstm_doc_with_a_small_cache() -> crate::document::PdfDocument {
 #[test]
 fn a_full_rewrite_decodes_each_object_stream_at_most_twice() {
     let mut editor = DocumentEditor::from_document(two_objstm_doc_with_a_small_cache()).unwrap();
-    let bytes = editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap();
+    let bytes = editor
+        .save_to_bytes_with_options(SaveOptions { object_streams: false, ..SaveOptions::full_rewrite() })
+        .unwrap();
 
     // Once for the reachability walk, once for the sweep that writes.
     let decoded = editor.source().objstm_inflations();

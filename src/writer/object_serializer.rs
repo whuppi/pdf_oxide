@@ -99,6 +99,14 @@ impl ObjectSerializer {
         all
     }
 
+    /// Serialize the body of object `id` for an object stream: the object
+    /// alone, without the `obj`/`endobj` frame, its references noted as
+    /// written by `id`.
+    pub(crate) fn serialize_member(&self, id: u32, obj: &Object) -> Vec<u8> {
+        self.begin_indirect(id);
+        self.serialize(obj)
+    }
+
     fn begin_indirect(&self, id: u32) {
         if let Some(log) = &self.reference_log {
             log.lock().unwrap_or_else(|e| e.into_inner()).current = id;

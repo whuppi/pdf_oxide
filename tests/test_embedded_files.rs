@@ -154,7 +154,10 @@ mod embed_file_api {
         // Verify output exists and is valid
         assert!(output_path.exists());
         let output_bytes = std::fs::read(&output_path).expect("Failed to read output");
-        assert!(output_bytes.len() > bytes.len()); // Should be larger with attachments
+        // ── pdf_manipulator patch: packed objects can make the output smaller, so read the attachments back ──
+        let saved = pdf_oxide::PdfDocument::from_bytes(output_bytes).expect("Failed to parse output");
+        assert_eq!(saved.extract_embedded_files().expect("embedded files").len(), 3);
+        // ── end pdf_manipulator patch ──
 
         // Cleanup
         let _ = std::fs::remove_file(&input_path);

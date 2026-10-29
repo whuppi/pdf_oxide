@@ -3644,6 +3644,9 @@ impl WasmPdfDocument {
             // ── pdf_manipulator patch: keep the source's own encryption ──
             keep_source_encryption: false,
             // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: object streams ──
+            object_streams: true,
+            // ── end pdf_manipulator patch ──
         };
         let editor_arc = self.ensure_editor()?;
         let mut editor = editor_arc

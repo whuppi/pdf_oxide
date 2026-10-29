@@ -163,10 +163,24 @@ fn save_encrypted_works_with_embedded_font_subsetting() {
     // Both features present: encryption + subset tag.
     assert!(text.contains("/Encrypt"), "missing /Encrypt dict");
     assert!(text.contains("/V 5"), "missing /V 5 for AES-256");
-    let has_subset_prefix = bytes
-        .windows(8)
-        .any(|w| w[0] == b'/' && w[1..7].iter().all(|&b| b.is_ascii_uppercase()) && w[7] == b'+');
-    assert!(has_subset_prefix, "missing /XXXXXX+ subset-tag prefix");
+    // ── pdf_manipulator patch: the font dictionaries sit in an encrypted object stream, so read them through the document ──
+    let doc = PdfDocument::from_bytes(bytes.clone()).expect("encrypted PDF should parse");
+    assert!(doc.authenticate(b"userpw").expect("authenticate"), "user password should authenticate");
+    let has_subset_prefix = doc.all_object_ids().into_iter().any(|id| {
+        let Ok(pdf_oxide::object::Object::Dictionary(d)) =
+            doc.load_object(pdf_oxide::object::ObjectRef::new(id, 0))
+        else {
+            return false;
+        };
+        d.get("BaseFont").or_else(|| d.get("FontName")).is_some_and(|n| {
+            n.as_name().is_some_and(|n| {
+                let b = n.as_bytes();
+                b.len() > 7 && b[..6].iter().all(|c| c.is_ascii_uppercase()) && b[6] == b'+'
+            })
+        })
+    });
+    assert!(has_subset_prefix, "missing XXXXXX+ subset-tag prefix");
+    // ── end pdf_manipulator patch ──
 
     // And the encrypted PDF should still be much smaller than the
     // original face: encryption overhead doesn't re-embed the full

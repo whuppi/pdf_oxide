@@ -31,7 +31,12 @@ fn build_pdf_with_secrets() -> Vec<u8> {
     ed.set_title(INFO_SECRET);
     ed.embed_file("attachment.txt", EF_SECRET.as_bytes().to_vec())
         .expect("embed file");
-    ed.save_to_bytes().expect("save fixture with secrets")
+    // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+    ed.save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+        object_streams: false,
+        ..pdf_oxide::editor::SaveOptions::full_rewrite()
+    }).expect("save fixture with secrets")
+    // ── end pdf_manipulator patch ──
 }
 
 #[test]
@@ -57,7 +62,12 @@ fn sanitize_document_strips_info_and_embedded_file_secrets() {
     );
     assert!(report.bytes_removed > 0, "expected non-zero bytes removed, report = {report:?}");
 
-    let out = ed.save_to_bytes().expect("save sanitized pdf");
+    // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+    let out = ed.save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+        object_streams: false,
+        ..pdf_oxide::editor::SaveOptions::full_rewrite()
+    }).expect("save sanitized pdf");
+    // ── end pdf_manipulator patch ──
 
     // G5/G6: the /Info secret must not survive anywhere in the output
     // (the original /Info object is replaced by an empty dict and

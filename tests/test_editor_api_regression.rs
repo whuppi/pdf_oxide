@@ -282,7 +282,14 @@ fn set_page_rotation_after_select_pages() {
     editor.select_pages(&[1]).expect("select_pages");
     editor.set_page_rotation(0, 90).expect("set_page_rotation");
 
-    let bytes = editor.save_to_bytes().expect("save_to_bytes");
+    // ── pdf_manipulator patch: the assertion reads plain bytes, so no object streams ──
+    let bytes = editor
+        .save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+            object_streams: false,
+            ..pdf_oxide::editor::SaveOptions::full_rewrite()
+        })
+        .expect("save_to_bytes");
+    // ── end pdf_manipulator patch ──
 
     // /Rotate 90 must appear in the output PDF bytes
     assert!(
@@ -301,7 +308,14 @@ fn set_page_rotation_before_select_pages() {
     editor.set_page_rotation(1, 180).expect("set_page_rotation");
     editor.select_pages(&[1]).expect("select_pages");
 
-    let bytes = editor.save_to_bytes().expect("save_to_bytes");
+    // ── pdf_manipulator patch: the assertion reads plain bytes, so no object streams ──
+    let bytes = editor
+        .save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+            object_streams: false,
+            ..pdf_oxide::editor::SaveOptions::full_rewrite()
+        })
+        .expect("save_to_bytes");
+    // ── end pdf_manipulator patch ──
 
     assert!(
         bytes.windows(11).any(|w| w == b"/Rotate 180"),
@@ -344,7 +358,14 @@ fn set_page_media_box_after_select_pages() {
         "media_box not reflected by getter after select_pages"
     );
 
-    let bytes = editor.save_to_bytes().expect("save_to_bytes");
+    // ── pdf_manipulator patch: the assertion reads plain bytes, so no object streams ──
+    let bytes = editor
+        .save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+            object_streams: false,
+            ..pdf_oxide::editor::SaveOptions::full_rewrite()
+        })
+        .expect("save_to_bytes");
+    // ── end pdf_manipulator patch ──
     // /MediaBox [0 0 400 600] should appear
     assert!(bytes.windows(8).any(|w| w == b"MediaBox"), "/MediaBox not written to output");
 }

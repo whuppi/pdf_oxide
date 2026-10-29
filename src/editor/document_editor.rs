@@ -172,7 +172,9 @@ pub struct PageInfo {
 }
 
 /// Options for saving the document.
-#[derive(Debug, Clone, Default)]
+// ── pdf_manipulator patch: Default is written out, object_streams defaults to true ──
+#[derive(Debug, Clone)]
+// ── end pdf_manipulator patch ──
 pub struct SaveOptions {
     /// Use incremental update (append to original file)
     pub incremental: bool,
@@ -192,7 +194,30 @@ pub struct SaveOptions {
     /// `encryption`.
     pub keep_source_encryption: bool,
     // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch: object streams and a cross-reference stream ──
+    /// Pack the non-stream objects of a full rewrite into object streams
+    /// and write a cross-reference stream (PDF 1.5). Off writes every
+    /// object plain with a classic cross-reference table. An incremental
+    /// save ignores it and keeps the source's own layout.
+    pub object_streams: bool,
+    // ── end pdf_manipulator patch ──
 }
+
+// ── pdf_manipulator patch: Default is written out, object_streams defaults to true ──
+impl Default for SaveOptions {
+    fn default() -> Self {
+        Self {
+            incremental: false,
+            compress: false,
+            linearize: false,
+            garbage_collect: false,
+            encryption: None,
+            keep_source_encryption: false,
+            object_streams: true,
+        }
+    }
+}
+// ── end pdf_manipulator patch ──
 
 impl SaveOptions {
     /// Create options for full rewrite (default).
@@ -575,6 +600,11 @@ impl XrefEntries {
 
     fn contains_id(&self, id: u32) -> bool {
         self.ids.contains(&id)
+    }
+
+    /// Frees the id set once nothing asks `contains_id` any more.
+    fn release_ids(&mut self) {
+        self.ids = HashSet::new();
     }
 
     fn into_entries(self) -> Vec<(u32, u64, u16, bool)> {
@@ -3089,6 +3119,42 @@ impl DocumentEditor {
     }
     // ── end pdf_manipulator patch ──
 
+    // ── pdf_manipulator patch: queued objects become object streams ──
+    /// Writes the objects the packer holds as object streams: every full
+    /// batch, and with `rest` the last partial one too. The stream is an
+    /// object of its own, encrypted as a stream when the save encrypts.
+    fn write_object_streams(
+        packer: &crate::host::object_streams::ObjectPacker,
+        next_object_id: &mut u32,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
+        compress: bool,
+        xref_entries: &mut XrefEntries,
+        rest: bool,
+    ) -> Result<()> {
+        while let Some(batch) = packer.take_batch(rest) {
+            let id = *next_object_id;
+            *next_object_id += 1;
+            let ids: Vec<u32> = batch.iter().map(|(member, _)| *member).collect();
+            let stream = crate::host::object_streams::object_stream(batch, compress);
+            let offset = writer.position();
+            let bytes = match handler {
+                Some(h) => serializer.serialize_indirect_encrypted(id, 0, &stream, h),
+                None => serializer.serialize_indirect(id, 0, &stream),
+            };
+            writer.write_all(&bytes)?;
+            xref_entries.push((id, offset, 0, true));
+            if !crate::host::object_streams::mark_packed(xref_entries, &ids, id) {
+                return Err(Error::InvalidPdf(
+                    "an object queued for an object stream has no cross-reference entry".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    // ── end pdf_manipulator patch ──
+
     // ── end pdf_manipulator patch ──
 
     /// Write a full rewrite of the PDF to a generic writer.
@@ -3178,6 +3244,13 @@ impl DocumentEditor {
 
         // Write PDF header
         let (major, minor) = self.version();
+        // ── pdf_manipulator patch: object streams and a cross-reference stream are PDF 1.5 ──
+        let (major, minor) = if options.object_streams && (major, minor) < (1, 5) {
+            (1, 5)
+        } else {
+            (major, minor)
+        };
+        // ── end pdf_manipulator patch ──
         write!(writer, "%PDF-{}.{}\n", major, minor)?;
         // Binary marker per spec (bytes > 127 to indicate binary content)
         writer.write_all(b"%\x80\x81\x82\x83\n")?;
@@ -3246,6 +3319,14 @@ impl DocumentEditor {
                 (None, None, None)
             };
 
+        // ── pdf_manipulator patch: non-stream objects wait in the packer for an object stream ──
+        // Returns no bytes for such an object: the caller's `write_all` of
+        // them writes nothing and its xref push records an offset the xref
+        // stream replaces with the object's place in its stream. Strings in
+        // a packed object are not encrypted: the object stream is.
+        let packer = crate::host::object_streams::ObjectPacker::new(options.object_streams);
+        // ── end pdf_manipulator patch ──
+
         // Helper to serialize with or without encryption
         let serialize_obj = |s: &ObjectSerializer,
                              id: u32,
@@ -3253,6 +3334,12 @@ impl DocumentEditor {
                              obj: &Object,
                              handler: &Option<EncryptionWriteHandler>|
          -> Vec<u8> {
+            // ── pdf_manipulator patch: non-stream objects wait in the packer ──
+            if gen == 0 && packer.takes(obj) {
+                packer.add(id, s.serialize_member(id, obj));
+                return Vec::new();
+            }
+            // ── end pdf_manipulator patch ──
             if let Some(ref h) = handler {
                 s.serialize_indirect_encrypted(id, gen, obj, h)
             } else {
@@ -3769,6 +3856,20 @@ impl DocumentEditor {
                         for kid in kids {
                             // ── pdf_manipulator patch: stop within one page of a cancel ──
                             cancel.check()?;
+                            // ── end pdf_manipulator patch ──
+                            // ── pdf_manipulator patch: full batches of queued objects become object streams ──
+                            if packer.is_full() {
+                                Self::write_object_streams(
+                                    &packer,
+                                    &mut self.next_object_id,
+                                    writer,
+                                    &serializer,
+                                    &encryption_handler,
+                                    options.compress,
+                                    &mut xref_entries,
+                                    false,
+                                )?;
+                            }
                             // ── end pdf_manipulator patch ──
                             if let Some(page_ref) = kid.as_reference() {
                                 // ── pdf_manipulator patch: staged page dict wins over source ──
@@ -5586,6 +5687,18 @@ impl DocumentEditor {
                     if xref_entries.contains_id(new_id) || merged_left_out.contains(&new_id) {
                         continue;
                     }
+                    if packer.is_full() {
+                        Self::write_object_streams(
+                            &packer,
+                            &mut self.next_object_id,
+                            writer,
+                            &serializer,
+                            &encryption_handler,
+                            options.compress,
+                            &mut xref_entries,
+                            false,
+                        )?;
+                    }
                     if Self::write_merged_stream(
                         &source.doc,
                         &mut self.next_object_id,
@@ -5656,9 +5769,26 @@ impl DocumentEditor {
         }
 
         // Write info dictionary if modified
+        // ── pdf_manipulator patch: the new /Info takes the source /Info's id ──
+        // Unmodified, the source /Info is written by the sweep under its own
+        // id and the trailer names it below; modified, the new dictionary
+        // replaces it at that id, so no old copy is left beside it.
+        let source_info_id = self
+            .source
+            .trailer()
+            .as_dict()
+            .and_then(|d| d.get("Info"))
+            .and_then(|r| r.as_reference())
+            .map(|r| r.id);
+        // ── end pdf_manipulator patch ──
         let info_ref = if self.modified_info.is_some() {
             let info = self.modified_info.clone().unwrap();
-            let info_id = self.allocate_object_id();
+            // ── pdf_manipulator patch: the new /Info takes the source /Info's id ──
+            let info_id = match source_info_id.filter(|id| !xref_entries.contains_id(*id)) {
+                Some(id) => id,
+                None => self.allocate_object_id(),
+            };
+            // ── end pdf_manipulator patch ──
             let info_obj = info.to_object();
             let offset = writer.position();
             let bytes = serialize_obj(&serializer, info_id, 0, &info_obj, &encryption_handler);
@@ -5717,6 +5847,20 @@ impl DocumentEditor {
             if obj_id == 0 || xref_entries.contains_id(obj_id) {
                 continue;
             }
+            // ── pdf_manipulator patch: full batches of queued objects become object streams ──
+            if packer.is_full() {
+                Self::write_object_streams(
+                    &packer,
+                    &mut self.next_object_id,
+                    writer,
+                    &serializer,
+                    &encryption_handler,
+                    options.compress,
+                    &mut xref_entries,
+                    false,
+                )?;
+            }
+            // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: free entries skipped, unreadable objects refused ──
             // Free xref entries hold no object; `all_object_ids` unions the
             // whole table, free slots included, so skip them before loading
@@ -5816,12 +5960,41 @@ impl DocumentEditor {
             new_objs.sort_by_key(|(id, _)| *id);
             // ── end pdf_manipulator patch ──
             for (obj_id, obj) in new_objs {
+                // ── pdf_manipulator patch: full batches of queued objects become object streams ──
+                if packer.is_full() {
+                    Self::write_object_streams(
+                        &packer,
+                        &mut self.next_object_id,
+                        writer,
+                        &serializer,
+                        &encryption_handler,
+                        options.compress,
+                        &mut xref_entries,
+                        false,
+                    )?;
+                }
+                // ── end pdf_manipulator patch ──
                 let offset = writer.position();
                 let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
                 writer.write_all(&bytes)?;
                 xref_entries.push((obj_id, offset, 0, true));
             }
         }
+
+        // ── pdf_manipulator patch: the last queued objects become an object stream ──
+        // Every object counts as written once it is in `xref_entries`, queued
+        // or not, so the closure check below sees them either way.
+        Self::write_object_streams(
+            &packer,
+            &mut self.next_object_id,
+            writer,
+            &serializer,
+            &encryption_handler,
+            options.compress,
+            &mut xref_entries,
+            true,
+        )?;
+        // ── end pdf_manipulator patch ──
 
         // ── pdf_manipulator patch: the written objects are closed under reference ──
         if let Some((target, writer_id)) =
@@ -5834,8 +6007,80 @@ impl DocumentEditor {
         }
         // ── end pdf_manipulator patch ──
 
+        // ── pdf_manipulator patch: the trailer keeps the source's /Info and /ID ──
+        // The unmodified /Info is named only when the save wrote it (a
+        // sanitize or garbage collection can leave it out). /ID is carried
+        // unchanged unless the save sets its own with encryption.
+        let info_ref = info_ref.or_else(|| {
+            source_info_id
+                .filter(|id| xref_entries.contains_id(*id))
+                .map(|id| ObjectRef::new(id, 0))
+        });
+        let source_file_id: Option<Object> = if file_id.is_none() {
+            self.source
+                .trailer()
+                .as_dict()
+                .and_then(|d| d.get("ID"))
+                .filter(|id| matches!(id, Object::Array(_)))
+                .cloned()
+        } else {
+            None
+        };
+        // ── end pdf_manipulator patch ──
+
         // Sort xref entries by object ID
         xref_entries.sort_by_key(|(id, _, _, _)| *id);
+
+        // ── pdf_manipulator patch: the cross-reference section is a stream (ISO 32000-1 §7.5.8) ──
+        // Objects in an object stream are type 2 rows; the stream itself is
+        // the last object and is not encrypted (§7.6.1).
+        if options.object_streams {
+            use crate::host::object_streams::{field_width, xref_stream, Row, XrefRows};
+
+            xref_entries.release_ids();
+            let max_id = xref_entries.iter().map(|(id, _, _, _)| *id).max().unwrap_or(0);
+            let stream_id = max_id + 1;
+            let xref_offset = writer.position();
+            let rows = XrefRows::new(&xref_entries, stream_id, xref_offset);
+            let widest = rows
+                .clone()
+                .map(|row| match row {
+                    Row::Offset { offset, .. } => offset,
+                    Row::Packed { stream, .. } => stream as u64,
+                    Row::Free { .. } => 0,
+                })
+                .max()
+                .unwrap_or(0);
+
+            let mut trailer: HashMap<String, Object> = HashMap::new();
+            trailer.insert("Size".to_string(), Object::Integer(stream_id as i64 + 1));
+            trailer.insert(
+                "Root".to_string(),
+                Object::Reference(ObjectRef::new(catalog_ref.id, 0)),
+            );
+            if let Some(info_ref) = info_ref {
+                trailer.insert("Info".to_string(), Object::Reference(info_ref));
+            }
+            if let Some(enc_id) = encrypt_obj_id {
+                trailer.insert("Encrypt".to_string(), Object::Reference(ObjectRef::new(enc_id, 0)));
+            }
+            if let Some((id1, id2)) = file_id {
+                trailer.insert(
+                    "ID".to_string(),
+                    Object::Array(vec![Object::String(id1), Object::String(id2)]),
+                );
+            } else if let Some(id) = source_file_id {
+                trailer.insert("ID".to_string(), id);
+            }
+            let stream = xref_stream(rows, field_width(widest), options.compress, trailer);
+            writer.write_all(&serializer.serialize_indirect(stream_id, 0, &stream))?;
+            write!(writer, "startxref\n{}\n%%EOF\n", xref_offset)?;
+
+            writer.flush()?;
+            self.is_modified = false;
+            return Ok(());
+        }
+        // ── end pdf_manipulator patch ──
 
         // Write xref table
         let xref_offset = writer.position();
@@ -5889,6 +6134,12 @@ impl DocumentEditor {
             let id1_hex: String = id1.iter().map(|b| format!("{:02X}", b)).collect();
             let id2_hex: String = id2.iter().map(|b| format!("{:02X}", b)).collect();
             write!(writer, "  /ID [<{}> <{}>]\n", id1_hex, id2_hex)?;
+        // ── pdf_manipulator patch: the source's /ID is carried unchanged ──
+        } else if let Some(id) = source_file_id {
+            write!(writer, "  /ID ")?;
+            writer.write_all(&serializer.serialize(&id))?;
+            write!(writer, "\n")?;
+        // ── end pdf_manipulator patch ──
         }
 
         write!(writer, ">>\n")?;
@@ -13577,7 +13828,12 @@ mod tests {
         let page = pe.done().unwrap();
         editor.save_page_from_editor(page).unwrap();
 
-        let bytes = editor.save_to_bytes().unwrap();
+        // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+        let bytes = editor.save_to_bytes_with_options(SaveOptions {
+            object_streams: false,
+            ..SaveOptions::full_rewrite()
+        }).unwrap();
+        // ── end pdf_manipulator patch ──
 
         // (d) No dangling /Contents reference after the multi-stream
         // rewrite — this is the core of must-fix 1. Checked on the raw
@@ -13633,7 +13889,12 @@ mod tests {
         let page = pe.done().unwrap();
         editor.save_page_from_editor(page).unwrap();
 
-        let bytes = editor.save_to_bytes().unwrap();
+        // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+        let bytes = editor.save_to_bytes_with_options(SaveOptions {
+            object_streams: false,
+            ..SaveOptions::full_rewrite()
+        }).unwrap();
+        // ── end pdf_manipulator patch ──
         let mut verify = open_editor_from_bytes(&bytes, "boldfont_verify");
 
         // The bold overlay text and the original page text must both

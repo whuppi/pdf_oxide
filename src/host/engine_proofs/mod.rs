@@ -9,6 +9,8 @@ mod document_pages;
 mod editor_merge;
 mod editor_nested;
 mod editor_objstm;
+mod editor_packed;
+mod editor_trailer;
 mod editor_pages;
 mod editor_save;
 mod kept_encryption;

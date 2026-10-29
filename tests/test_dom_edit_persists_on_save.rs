@@ -205,7 +205,12 @@ fn set_text_replacement_on_multi_stream_page_leaves_no_dangling_contents_ref() {
     page.set_text(target, "REPLACEMENT_TEXT").unwrap();
     editor.save_page(page).unwrap();
 
-    let out = editor.save_to_bytes().unwrap();
+    // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+    let out = editor.save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+        object_streams: false,
+        ..pdf_oxide::editor::SaveOptions::full_rewrite()
+    }).unwrap();
+    // ── end pdf_manipulator patch ──
     assert_no_dangling_contents_refs(&out);
 
     let path = write_temp(&out, "multi_stream_contents_replace.pdf");

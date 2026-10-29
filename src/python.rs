@@ -1250,6 +1250,9 @@ impl PyPdfDocument {
                 // ── pdf_manipulator patch: keep the source's own encryption ──
                 keep_source_encryption: false,
                 // ── end pdf_manipulator patch ──
+                // ── pdf_manipulator patch: object streams ──
+                object_streams: true,
+                // ── end pdf_manipulator patch ──
             };
             editor
                 .save_with_options(path, options)
@@ -1287,6 +1290,9 @@ impl PyPdfDocument {
                 encryption: None,
                 // ── pdf_manipulator patch: keep the source's own encryption ──
                 keep_source_encryption: false,
+                // ── end pdf_manipulator patch ──
+                // ── pdf_manipulator patch: object streams ──
+                object_streams: true,
                 // ── end pdf_manipulator patch ──
             };
             let bytes = editor.save_to_bytes_with_options(options).map_err(|e| {

@@ -189,7 +189,12 @@ fn fill_and_flatten(field_name: &str, value: &str) -> Vec<u8> {
     ed.set_form_field_value(field_name, FormFieldValue::Text(value.into()))
         .unwrap();
     ed.flatten_forms().unwrap();
-    ed.save_to_bytes().unwrap()
+    // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+    ed.save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+        object_streams: false,
+        ..pdf_oxide::editor::SaveOptions::full_rewrite()
+    }).unwrap()
+    // ── end pdf_manipulator patch ──
 }
 
 #[test]
@@ -324,7 +329,12 @@ fn fixture_non_flatten_roundtrips_cjk_value() {
     let mut ed = DocumentEditor::from_bytes(bytes).unwrap();
     ed.set_form_field_value("full_name", FormFieldValue::Text("やまだたろう".into()))
         .unwrap();
-    let out = ed.save_to_bytes().unwrap();
+    // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+    let out = ed.save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+        object_streams: false,
+        ..pdf_oxide::editor::SaveOptions::full_rewrite()
+    }).unwrap();
+    // ── end pdf_manipulator patch ──
 
     // Non-flatten path: value round-trips and /NeedAppearances is set so viewers
     // regenerate the appearance.
@@ -358,7 +368,12 @@ fn fixture_flatten_embeds_cjk_and_emoji_fonts() {
     ed.set_form_field_value("city", FormFieldValue::Text("とうきょう".into()))
         .unwrap();
     ed.flatten_forms().unwrap();
-    let out = ed.save_to_bytes().unwrap();
+    // ── pdf_manipulator patch: the assertions read plain bytes, so no object streams ──
+    let out = ed.save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+        object_streams: false,
+        ..pdf_oxide::editor::SaveOptions::full_rewrite()
+    }).unwrap();
+    // ── end pdf_manipulator patch ──
 
     // A composite font with an embedded TrueType program must be present.
     assert!(
