@@ -11,6 +11,7 @@ pub mod attachments;
 pub mod binary_codec;
 pub mod bridge_api;
 pub mod constants;
+pub mod content;
 pub(crate) mod deflate;
 pub mod dispatch;
 pub(crate) mod duplicates;

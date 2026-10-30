@@ -4,6 +4,7 @@
 //! why a battery in `test/ops/` cannot see what it proves. A proof a battery
 //! can make belongs there.
 
+mod content_stream;
 mod determinism;
 mod document_pages;
 mod editor_deflate;

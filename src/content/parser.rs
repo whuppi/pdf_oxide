@@ -1966,7 +1966,9 @@ fn parse_operator_name(input: &[u8]) -> IResult<&[u8], &str> {
 /// Accepts `SmallVec<[Object; 6]>` to avoid heap allocation for the common case
 /// (most PDF operators have 0-6 operands). The operands are consumed and dropped
 /// after extraction.
-fn build_operator(name: &str, operands: SmallVec<[Object; 6]>) -> Operator {
+// ── pdf_manipulator patch: the streaming Operators build operators here ──
+pub(crate) fn build_operator(name: &str, operands: SmallVec<[Object; 6]>) -> Operator {
+    // ── end pdf_manipulator patch ──
     match name {
         // Text positioning
         "Td" => {
