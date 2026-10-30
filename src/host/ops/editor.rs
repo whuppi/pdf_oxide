@@ -754,6 +754,7 @@ fn handle_editor_save(
         .get_i32("deflateLevel")
         .map_or(9, |level| u32::try_from(level).unwrap_or(u32::MAX));
     let merge_duplicates = req.get_bool("mergeDuplicates").unwrap_or(false);
+    let prune_resources = req.get_bool("pruneResources").unwrap_or(false);
     let mode = req.get_i32("saveMode").unwrap_or(0);
     let encrypt_mode = req.get_i32("encryptMode").unwrap_or(0);
     let encryption = match encrypt_mode {
@@ -787,6 +788,7 @@ fn handle_editor_save(
         object_streams,
         deflate_level,
         merge_duplicates,
+        prune_resources,
         ..Default::default()
     };
 

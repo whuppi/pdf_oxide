@@ -1622,6 +1622,9 @@ fn test_editor_save_with_compression() {
         // ── pdf_manipulator patch: merge duplicates ──
         merge_duplicates: false,
         // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: prune resources ──
+        prune_resources: false,
+        // ── end pdf_manipulator patch ──
     };
     editor.save_with_options(&out_path, opts).unwrap();
 
@@ -1655,6 +1658,9 @@ fn test_editor_save_no_compress_no_gc() {
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: merge duplicates ──
         merge_duplicates: false,
+        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: prune resources ──
+        prune_resources: false,
         // ── end pdf_manipulator patch ──
     };
     editor.save_with_options(&out_path, opts).unwrap();
@@ -1870,6 +1876,9 @@ fn test_save_to_bytes_with_compress_produces_valid_pdf() {
         // ── pdf_manipulator patch: merge duplicates ──
         merge_duplicates: false,
         // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: prune resources ──
+        prune_resources: false,
+        // ── end pdf_manipulator patch ──
     };
     let bytes = editor.save_to_bytes_with_options(opts).unwrap();
     assert!(!bytes.is_empty());
@@ -1903,6 +1912,9 @@ fn test_save_to_bytes_with_garbage_collect_produces_valid_pdf() {
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: merge duplicates ──
         merge_duplicates: false,
+        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: prune resources ──
+        prune_resources: false,
         // ── end pdf_manipulator patch ──
     };
     let bytes = editor.save_to_bytes_with_options(opts).unwrap();
@@ -1973,6 +1985,9 @@ fn test_gc_produces_smaller_or_equal_output_than_no_gc() {
             // ── pdf_manipulator patch: merge duplicates ──
             merge_duplicates: false,
             // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: prune resources ──
+            prune_resources: false,
+            // ── end pdf_manipulator patch ──
         })
         .unwrap();
 
@@ -1994,6 +2009,9 @@ fn test_gc_produces_smaller_or_equal_output_than_no_gc() {
             // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: merge duplicates ──
             merge_duplicates: false,
+            // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: prune resources ──
+            prune_resources: false,
             // ── end pdf_manipulator patch ──
         })
         .unwrap();
@@ -2054,6 +2072,9 @@ fn test_compress_produces_smaller_or_equal_output_for_raw_streams() {
             // ── pdf_manipulator patch: merge duplicates ──
             merge_duplicates: false,
             // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: prune resources ──
+            prune_resources: false,
+            // ── end pdf_manipulator patch ──
         })
         .unwrap();
 
@@ -2075,6 +2096,9 @@ fn test_compress_produces_smaller_or_equal_output_for_raw_streams() {
             // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: merge duplicates ──
             merge_duplicates: false,
+            // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: prune resources ──
+            prune_resources: false,
             // ── end pdf_manipulator patch ──
         })
         .unwrap();

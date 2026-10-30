@@ -223,6 +223,18 @@ pub struct SaveOptions {
     /// save ignores it.
     pub merge_duplicates: bool,
     // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch: unused resources dropped ──
+    /// Drop from each resource dictionary of a full rewrite's kept pages
+    /// (and of the pages merged in) the entries of `/Font`, `/XObject`,
+    /// `/ColorSpace`, `/ExtGState`, `/Pattern`, `/Shading` and
+    /// `/Properties` that no content using the dictionary names, and with
+    /// garbage collection the objects only those entries reached. A
+    /// dictionary whose content cannot be read, or that an object outside
+    /// the pages' own resources also points at, stays whole, and so do the
+    /// resources of a page the save edits. The AcroForm's `/DR` is never
+    /// touched. An incremental save ignores it.
+    pub prune_resources: bool,
+    // ── end pdf_manipulator patch ──
 }
 
 // ── pdf_manipulator patch: Default is written out, object_streams defaults to true ──
@@ -237,6 +249,7 @@ impl Default for SaveOptions {
             object_streams: true,
             deflate_level: 9,
             merge_duplicates: false,
+            prune_resources: false,
         }
     }
 }
@@ -1905,8 +1918,16 @@ impl DocumentEditor {
     /// `/AcroForm /DR`, which a form field of a kept page needs, counts as
     /// reached. An object two pages share is reached when either is kept.
     /// A merged document that lost no page leaves nothing out, and costs no
-    /// walk.
-    fn merged_prune(&self) -> Result<(Vec<bool>, HashSet<u32>)> {
+    /// walk. The walk applies `cuts` (the resource prune's, by output id) to
+    /// the objects it reads, so what only a dropped resource entry reached
+    /// is left out; a document with a cut is walked even when it lost no
+    /// page.
+    fn merged_prune(
+        &self,
+        cuts: &HashMap<u32, crate::host::resource_prune::Cuts>,
+    ) -> Result<(Vec<bool>, HashSet<u32>)> {
+        use crate::host::resource_prune::apply;
+
         let mut kept = vec![false; self.merged_page_total()];
         for slot in &self.page_order {
             if let PageKey::Merged(index) = slot.key() {
@@ -1918,14 +1939,20 @@ impl DocumentEditor {
         for (source_index, source) in self.merged_sources.iter().enumerate() {
             let pages = first..first + source.pages.len();
             first = pages.end;
-            if kept[pages.clone()].iter().all(|&k| k) {
+            let cut_here = source.pages.iter().any(|p| cuts.contains_key(&p.page_id))
+                || source.objects.iter().any(|(out, _)| cuts.contains_key(out));
+            if kept[pages.clone()].iter().all(|&k| k) && !cut_here {
                 continue;
             }
             let imported: HashSet<u32> = source.pages.iter().map(|p| p.page_ref.id).collect();
             let mut reached: HashSet<u32> = HashSet::new();
             let mut pending: Vec<ObjectRef> = Vec::new();
             for (page, _) in source.pages.iter().zip(&kept[pages.clone()]).filter(|(_, &k)| k) {
-                Self::push_walk_refs(&Self::merged_page_object(source, page.page_ref)?, &mut pending);
+                let mut page_object = Self::merged_page_object(source, page.page_ref)?;
+                if let Some(cuts) = cuts.get(&page.page_id) {
+                    page_object = apply(page_object, cuts);
+                }
+                Self::push_walk_refs(&page_object, &mut pending);
             }
             if let Some((owner, dr)) = &self.merged_acroform_dr {
                 if *owner == source_index {
@@ -1937,7 +1964,11 @@ impl DocumentEditor {
                 if imported.contains(&r.id) || !reached.insert(new_id) {
                     continue;
                 }
-                Self::push_walk_refs(&source.doc.load_object(r)?, &mut pending);
+                let mut object = source.doc.load_object(r)?;
+                if let Some(cuts) = cuts.get(&new_id) {
+                    object = apply(object, cuts);
+                }
+                Self::push_walk_refs(&object, &mut pending);
             }
             source.doc.clear_object_cache();
             for page in &source.pages {
@@ -1949,6 +1980,67 @@ impl DocumentEditor {
             }
         }
         Ok((kept, left_out))
+    }
+
+    /// The resource prune's cuts for the merged pages the save writes: by
+    /// output id, applied to the object of the merged document before
+    /// remapping.
+    fn merged_resource_prune(
+        &self,
+        merged_kept: &[bool],
+        merged_left_out: &HashSet<u32>,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<HashMap<u32, crate::host::resource_prune::Cuts>> {
+        use crate::host::resource_prune::{plan, Scope, ScopePage};
+
+        let unstaged = HashMap::new();
+        let none = HashSet::new();
+        let mut by_output = HashMap::new();
+        let mut cut = HashMap::new();
+        let mut first = 0;
+        for source in &self.merged_sources {
+            let range = first..first + source.pages.len();
+            first = range.end;
+            let mut pages = Vec::new();
+            let mut writers: Vec<u32> = Vec::new();
+            for (page, _) in source.pages.iter().zip(&merged_kept[range]).filter(|(_, &kept)| kept) {
+                pages.push(ScopePage { id: page.page_ref.id, held: false });
+                writers.push(page.page_ref.id);
+            }
+            if pages.is_empty() {
+                continue;
+            }
+            writers.extend(
+                source
+                    .objects
+                    .iter()
+                    .filter(|(out, _)| !merged_left_out.contains(out))
+                    .map(|&(_, src)| src),
+            );
+            writers.sort_unstable();
+            writers.dedup();
+            let page_object = |id: u32| Self::merged_page_object(source, ObjectRef::new(id, 0)).ok();
+            plan(
+                Scope {
+                    doc: &source.doc,
+                    staged: &unstaged,
+                    overrides: &unstaged,
+                    cuts: &mut cut,
+                    excluded: &none,
+                    pages,
+                    page_object: Some(&page_object),
+                    writers: Some(writers),
+                },
+                cancel,
+            )?;
+            for (id, cuts) in cut.drain() {
+                if let Some(&out) = source.id_map.get(&id) {
+                    by_output.insert(out, cuts);
+                }
+            }
+            source.doc.clear_object_cache();
+        }
+        Ok(by_output)
     }
     // ── end pdf_manipulator patch ──
 
@@ -2853,7 +2945,19 @@ impl DocumentEditor {
                 continue;
             }
             refs_buf.clear();
-            if let Some(o) = prune.overrides.get(&id) {
+            // The references of an object the resource prune cuts are those
+            // that are left.
+            if let Some(cuts) = prune.cuts.get(&id) {
+                let base = prune
+                    .overrides
+                    .get(&id)
+                    .or_else(|| self.modified_objects.get(&id))
+                    .cloned()
+                    .or_else(|| self.source.load_object(ObjectRef::new(id, 0)).ok());
+                if let Some(base) = base {
+                    push_refs(&crate::host::resource_prune::apply(base, cuts), &mut refs_buf);
+                }
+            } else if let Some(o) = prune.overrides.get(&id) {
                 push_refs(o, &mut refs_buf);
             } else if let Some(m) = self.modified_objects.get(&id) {
                 push_refs(m, &mut refs_buf);
@@ -2903,6 +3007,26 @@ impl DocumentEditor {
             }
         }
         None
+    }
+
+    /// The object ids of the source pages whose content or resources the
+    /// page loop of a full rewrite changes while writing: the page loop
+    /// reads each of these fields, so the resource prune leaves the pages
+    /// they name whole. Keep it in step with `incremental_refusal`.
+    fn pages_edited_while_writing(&self) -> HashSet<u32> {
+        let leaves = self.source.all_page_refs().unwrap_or_default();
+        let mut indices: HashSet<usize> = HashSet::new();
+        indices.extend(self.modified_content.keys());
+        indices.extend(self.overlay_additions.keys());
+        indices.extend(self.erase_regions.keys());
+        indices.extend(self.image_modifications.keys());
+        indices.extend(self.modified_annotations.keys());
+        indices.extend(&self.flatten_annotations_pages);
+        indices.extend(&self.flatten_forms_pages);
+        indices.extend(&self.apply_redactions_pages);
+        indices.extend(self.redaction_regions.keys());
+        indices.extend(self.redacted_content.keys());
+        indices.into_iter().filter_map(|index| leaves.get(index).map(|r| r.id)).collect()
     }
 
     // one copy of identical images, ICC profiles and font programs
@@ -3029,11 +3153,33 @@ impl DocumentEditor {
     /// resource walk writes XObjects and ExtGStates before the sweep, and
     /// the sweep skips ids already written, so a lookup that ignores
     /// `modified_objects` here would drop every staged image on save.
-    fn staged_or_source_object(&self, r: ObjectRef) -> Result<Object> {
-        match self.modified_objects.get(&r.id) {
-            Some(m) => Ok(m.clone()),
-            None => self.load_source_object(r),
-        }
+    /// The prune plan's replacement wins over both, and its cuts apply to
+    /// what is found: the walk writes the resource dictionaries the plan
+    /// cut down.
+    fn staged_or_source_object(
+        &self,
+        prune: &crate::host::page_prune::PagePrune,
+        r: ObjectRef,
+    ) -> Result<Object> {
+        let base = match prune.overrides.get(&r.id).or_else(|| self.modified_objects.get(&r.id)) {
+            Some(m) => m.clone(),
+            None => self.load_source_object(r)?,
+        };
+        Ok(prune.cut(r.id, base))
+    }
+
+    /// Like `load_source_object`, but the prune plan's replacement wins, and
+    /// its cuts apply to what is found.
+    fn pruned_or_source_object(
+        &self,
+        prune: &crate::host::page_prune::PagePrune,
+        r: ObjectRef,
+    ) -> Result<Object> {
+        let base = match prune.overrides.get(&r.id) {
+            Some(pruned) => pruned.clone(),
+            None => self.load_source_object(r)?,
+        };
+        Ok(prune.cut(r.id, base))
     }
 
     // an unchanged source stream is copied, not loaded
@@ -3042,8 +3188,10 @@ impl DocumentEditor {
     /// when the object cannot be copied raw (not a plain stream, an
     /// encrypted source or output, a container, a /Length that does not
     /// hold); the caller then loads and serializes it. The caller checks
-    /// that no staged or overridden version of `r` exists. The dictionary
-    /// goes through `serializer`, so nulling and generation 0 apply. With
+    /// that no staged version of `r` exists; the prune plan's `cuts` of a
+    /// stream apply to its dictionary and the data is still copied from the
+    /// source. The dictionary goes through
+    /// `serializer`, so nulling and generation 0 apply. With
     /// `deflate` (a level) a stream with no /Filter or a single FlateDecode
     /// is re-encoded at that level and written so only when strictly
     /// smaller than the source data; otherwise the source bytes are copied.
@@ -3055,6 +3203,7 @@ impl DocumentEditor {
         source: &PdfDocument,
         next_object_id: &mut u32,
         r: ObjectRef,
+        cuts: Option<&[crate::host::resource_prune::Cut]>,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
         encrypting_output: bool,
@@ -3067,6 +3216,7 @@ impl DocumentEditor {
             r,
             r.id,
             None,
+            cuts,
             writer,
             serializer,
             encrypting_output,
@@ -3083,6 +3233,7 @@ impl DocumentEditor {
         next_object_id: &mut u32,
         (new_id, src_id): (u32, u32),
         remap: (&HashMap<u32, u32>, u32),
+        cuts: Option<&[crate::host::resource_prune::Cut]>,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
         encrypting_output: bool,
@@ -3095,6 +3246,7 @@ impl DocumentEditor {
             ObjectRef::new(src_id, 0),
             new_id,
             Some(remap),
+            cuts,
             writer,
             serializer,
             encrypting_output,
@@ -3138,6 +3290,7 @@ impl DocumentEditor {
         r: ObjectRef,
         out_id: u32,
         remap: Option<(&HashMap<u32, u32>, u32)>,
+        cuts: Option<&[crate::host::resource_prune::Cut]>,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
         encrypting_output: bool,
@@ -3203,6 +3356,9 @@ impl DocumentEditor {
         };
 
         let mut dict = head.dict;
+        if let Some(cuts) = cuts {
+            crate::host::resource_prune::apply_to_dict(&mut dict, cuts);
+        }
         if let Some((id_map, page_id)) = remap {
             Self::remap_dict_refs(&mut dict, id_map, page_id);
         }
@@ -3364,10 +3520,41 @@ impl DocumentEditor {
         }
 
         // ── pdf_manipulator patch: what the save drops with dropped pages (#261) ──
-        let prune = crate::host::page_prune::plan(&self.source, &self.modified_objects, &self.page_order);
+        let mut prune = crate::host::page_prune::plan(&self.source, &self.modified_objects, &self.page_order);
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: the merged pages and objects the save drops ──
-        let (merged_kept, merged_left_out) = self.merged_prune()?;
+        let (merged_kept, mut merged_left_out) = self.merged_prune(&HashMap::new())?;
+        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: unused resources dropped ──
+        let merged_cuts = if options.prune_resources {
+            use crate::host::resource_prune::{plan, Scope, ScopePage};
+
+            let held = self.pages_edited_while_writing();
+            plan(
+                Scope {
+                    doc: &self.source,
+                    staged: &self.modified_objects,
+                    overrides: &prune.overrides,
+                    cuts: &mut prune.cuts,
+                    excluded: &prune.excluded,
+                    pages: prune
+                        .kept_pages
+                        .iter()
+                        .map(|&id| ScopePage { id, held: held.contains(&id) })
+                        .collect(),
+                    page_object: None,
+                    writers: None,
+                },
+                cancel,
+            )?;
+            let cuts = self.merged_resource_prune(&merged_kept, &merged_left_out, cancel)?;
+            if !cuts.is_empty() {
+                merged_left_out = self.merged_prune(&cuts)?.1;
+            }
+            cuts
+        } else {
+            HashMap::new()
+        };
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: one copy of identical images, ICC profiles and font programs ──
         let aliases = std::sync::Arc::new(self.duplicate_aliases(
@@ -4089,15 +4276,19 @@ impl DocumentEditor {
                                 // the new content stream becomes an orphan and
                                 // the edit vanishes from the saved document.
                                 // The page's re-parented form (#261) wins over both.
-                                let page_obj = if let Some(pruned) = prune.overrides.get(&page_ref.id) {
-                                    pruned.clone()
-                                } else if let Some(staged) =
-                                    self.modified_objects.get(&page_ref.id)
-                                {
-                                    staged.clone()
-                                } else {
-                                    self.load_source_object(page_ref)?
-                                };
+                                // The resource prune's cuts apply to what is found.
+                                let page_obj = prune.cut(
+                                    page_ref.id,
+                                    if let Some(pruned) = prune.overrides.get(&page_ref.id) {
+                                        pruned.clone()
+                                    } else if let Some(staged) =
+                                        self.modified_objects.get(&page_ref.id)
+                                    {
+                                        staged.clone()
+                                    } else {
+                                        self.load_source_object(page_ref)?
+                                    },
+                                );
                                 // ── end pdf_manipulator patch ──
 
                                 // Resolve the original source page index for all HashMap lookups.
@@ -5107,6 +5298,7 @@ impl DocumentEditor {
                                                         &self.source,
                                                         &mut self.next_object_id,
                                                         contents_ref,
+                                                        None,
                                                         writer,
                                                         &serializer,
                                                         encryption_handler.is_some(),
@@ -5144,8 +5336,10 @@ impl DocumentEditor {
                                     if let Some(resources_ref) =
                                         page_dict.get("Resources").and_then(|r| r.as_reference())
                                     {
+                                        // ── pdf_manipulator patch: the prune plan's resource dictionary wins ──
                                         let mut resources_obj =
-                                            self.load_source_object(resources_ref)?;
+                                            self.pruned_or_source_object(&prune, resources_ref)?;
+                                        // ── end pdf_manipulator patch ──
 
                                         // Inject new XObject refs into Resources dict
                                         if !new_xobject_refs.is_empty() {
@@ -5202,27 +5396,29 @@ impl DocumentEditor {
 
                                     // Write font objects referenced in Resources (handles inline Resources dict)
                                     if let Some(resources) = page_dict.get("Resources") {
+                                        // ── pdf_manipulator patch: the prune plan's resource dictionaries win ──
                                         let resources_dict = match resources {
                                             Object::Dictionary(d) => Some(d.clone()),
                                             Object::Reference(r) => self
-                                                .source
-                                                .load_object(*r)
+                                                .pruned_or_source_object(&prune, *r)
                                                 .ok()
                                                 .and_then(|o| o.as_dict().cloned()),
                                             _ => None,
                                         };
+                                        // ── end pdf_manipulator patch ──
                                         if let Some(res_dict) = resources_dict {
                                             // Copy Font dictionary entries
                                             if let Some(fonts) = res_dict.get("Font") {
+                                                // ── pdf_manipulator patch: the prune plan's font dictionary wins ──
                                                 let font_dict = match fonts {
                                                     Object::Dictionary(d) => Some(d.clone()),
                                                     Object::Reference(r) => self
-                                                        .source
-                                                        .load_object(*r)
+                                                        .pruned_or_source_object(&prune, *r)
                                                         .ok()
                                                         .and_then(|o| o.as_dict().cloned()),
                                                     _ => None,
                                                 };
+                                                // ── end pdf_manipulator patch ──
                                                 if let Some(fdict) = font_dict {
                                                     // ── pdf_manipulator patch: key order, so the objects are written in a fixed order ──
                                                     for (_, font_ref) in DocumentEditor::sorted_entries(&fdict) {
@@ -5233,15 +5429,9 @@ impl DocumentEditor {
                                                             // Check if we've already written this object
                                                             if !xref_entries.contains_id(ref_obj.id) {
                                                                 // Prefer a staged modification over the original source.
-                                                                let font_obj = self
-                                                                    .modified_objects
-                                                                    .get(&ref_obj.id)
-                                                                    .cloned()
-                                                                    .map(Ok)
-                                                                    .unwrap_or_else(|| {
-                                                                        self.source
-                                                                            .load_object(ref_obj)
-                                                                    });
+                                                                // ── pdf_manipulator patch: the prune plan's replacement and cuts win ──
+                                                                let font_obj = self.staged_or_source_object(&prune, ref_obj);
+                                                                // ── end pdf_manipulator patch ──
                                                                 if let Ok(font_obj) = font_obj {
                                                                     let offset =
                                                                         writer.position();
@@ -5274,7 +5464,7 @@ impl DocumentEditor {
                                                         // A resource object the page references
                                                         // that cannot be read would dangle in the
                                                         // output xref; fail the save instead.
-                                                        let obj = self.staged_or_source_object(*r)?;
+                                                        let obj = self.staged_or_source_object(&prune, *r)?;
                                                         if !xref_entries.contains_id(r.id) {
                                                             let offset = writer.position();
                                                             write_obj(
@@ -5306,6 +5496,7 @@ impl DocumentEditor {
                                                                         &self.source,
                                                                         &mut self.next_object_id,
                                                                         ref_obj,
+                                                                        prune.cuts.get(&ref_obj.id).map(|cuts| cuts.as_slice()),
                                                                         writer,
                                                                         &serializer,
                                                                         encryption_handler.is_some(),
@@ -5314,7 +5505,7 @@ impl DocumentEditor {
                                                                     )?
                                                                 {
                                                                     let xobj_obj =
-                                                                        self.staged_or_source_object(ref_obj)?;
+                                                                        self.staged_or_source_object(&prune, ref_obj)?;
                                                                     let offset =
                                                                         writer.position();
                                                                     write_obj(
@@ -5345,7 +5536,7 @@ impl DocumentEditor {
                                                         // A resource object the page references
                                                         // that cannot be read would dangle in the
                                                         // output xref; fail the save instead.
-                                                        let obj = self.staged_or_source_object(*r)?;
+                                                        let obj = self.staged_or_source_object(&prune, *r)?;
                                                         if !xref_entries.contains_id(r.id) {
                                                             let offset = writer.position();
                                                             write_obj(
@@ -5376,6 +5567,7 @@ impl DocumentEditor {
                                                                         &self.source,
                                                                         &mut self.next_object_id,
                                                                         ref_obj,
+                                                                        prune.cuts.get(&ref_obj.id).map(|cuts| cuts.as_slice()),
                                                                         writer,
                                                                         &serializer,
                                                                         encryption_handler.is_some(),
@@ -5384,7 +5576,7 @@ impl DocumentEditor {
                                                                     )?
                                                                 {
                                                                     let obj =
-                                                                        self.staged_or_source_object(ref_obj)?;
+                                                                        self.staged_or_source_object(&prune, ref_obj)?;
                                                                     let offset =
                                                                         writer.position();
                                                                     write_obj(
@@ -5931,7 +6123,11 @@ impl DocumentEditor {
                 if merged_kept[merged_index] {
                     // The page dictionary is read again here, so the merge kept
                     // no copy of it. Its /Parent was never imported.
+                    // The resource prune's cuts apply to it.
                     let mut page_obj = Self::merged_page_object(source, page.page_ref)?;
+                    if let Some(cuts) = merged_cuts.get(&page.page_id) {
+                        page_obj = crate::host::resource_prune::apply(page_obj, cuts);
+                    }
                     if let Object::Dictionary(dict) = &mut page_obj {
                         Self::remap_dict_refs(dict, &source.id_map, page.page_id);
                     }
@@ -5974,11 +6170,14 @@ impl DocumentEditor {
                             false,
                         )?;
                     }
+                    // The resource prune's cuts apply to the object.
+                    let cuts = merged_cuts.get(&new_id).map(|cuts| cuts.as_slice());
                     if Self::write_merged_stream(
                         &source.doc,
                         &mut self.next_object_id,
                         (new_id, src_id),
                         (&source.id_map, page.page_id),
+                        cuts,
                         writer,
                         &serializer,
                         encryption_handler.is_some(),
@@ -5989,6 +6188,9 @@ impl DocumentEditor {
                     }
                     let src_ref = ObjectRef::new(src_id, 0);
                     let mut obj = source.doc.load_object(src_ref)?;
+                    if let Some(cuts) = cuts {
+                        obj = crate::host::resource_prune::apply(obj, cuts);
+                    }
                     Self::remap_refs(&mut obj, &source.id_map, page.page_id);
                     let offset = writer.position();
                     write_obj(&mut *writer, &serializer, new_id, 0, &obj, &encryption_handler)?;
@@ -6164,12 +6366,12 @@ impl DocumentEditor {
                 }
             }
             // ── pdf_manipulator patch: an unchanged source stream is copied, not loaded ──
-            if !prune.overrides.contains_key(&obj_id)
-                && !self.modified_objects.contains_key(&obj_id)
+            if !self.modified_objects.contains_key(&obj_id)
                 && Self::write_source_stream(
                     &self.source,
                     &mut self.next_object_id,
                     ObjectRef { id: obj_id, gen: 0 },
+                    prune.cuts.get(&obj_id).map(|cuts| cuts.as_slice()),
                     writer,
                     &serializer,
                     encryption_handler.is_some(),
@@ -6190,6 +6392,8 @@ impl DocumentEditor {
             } else {
                 self.load_source_object(ObjectRef { id: obj_id, gen: 0 })
             };
+            // The resource prune's cuts apply to what is found.
+            let loaded = loaded.map(|object| prune.cut(obj_id, object));
             match loaded {
                 // ── pdf_manipulator patch: source containers are never copied (#261) ──
                 // The rewrite writes each object on its own and a fresh xref

@@ -134,7 +134,8 @@ fn components_of_array(items: &[Object], resolver: Option<&Resolver>) -> Option<
     }
 }
 
-fn components(colour_space: &Object, resolver: Option<&Resolver>) -> Option<usize> {
+/// The component count of a colour space given as a name or an array.
+pub(crate) fn components(colour_space: &Object, resolver: Option<&Resolver>) -> Option<usize> {
     match colour_space {
         Object::Name(name) => components_of_name(name, resolver),
         Object::Array(items) => components_of_array(items, resolver),

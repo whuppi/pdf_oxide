@@ -22,6 +22,7 @@ pub mod lane_state;
 /// Per-op dispatch units (entry + handler + linker anchor).
 pub mod ops;
 pub(crate) mod page_prune;
+pub(crate) mod resource_prune;
 #[cfg(feature = "test-support")]
 pub mod probe;
 pub mod positioned_write;

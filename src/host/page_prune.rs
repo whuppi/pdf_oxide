@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::document::PdfDocument;
 use crate::editor::{PageKey, PageSlot};
+use crate::host::resource_prune::Cuts;
 use crate::object::{Object, ObjectRef};
 
 type Dict = HashMap<String, Object>;
@@ -46,10 +47,22 @@ pub(crate) struct PagePrune {
     /// source root lists the intermediate nodes the save excludes.
     pub kept_pages: Vec<u32>,
     pub overrides: HashMap<u32, Object>,
+    /// What the resource prune cuts out of objects, by id: applied to the
+    /// object the save writes (the override, else the staged object, else
+    /// the source's) with [`PagePrune::cut`]. No object body is held.
+    pub cuts: HashMap<u32, Cuts>,
     catalog_edits: Vec<(String, Object, Option<Object>)>,
 }
 
 impl PagePrune {
+    /// `object`, the object the save writes for `id`, with its cuts applied.
+    pub fn cut(&self, id: u32, object: Object) -> Object {
+        match self.cuts.get(&id) {
+            Some(cuts) => crate::host::resource_prune::apply(object, cuts),
+            None => object,
+        }
+    }
+
     /// Applies the edits to catalog entries held directly in the catalog.
     /// An entry the save has already rebuilt (it no longer equals the
     /// value the plan read) is left to its rebuilder.
