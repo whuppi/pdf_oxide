@@ -154,22 +154,10 @@ impl StreamBody {
     /// The whole decrypted data in one buffer: the one named whole read of
     /// raw bytes. Every caller is on the allow-list the engine proofs hold.
     pub fn read_whole_raw(&self) -> Result<Vec<u8>> {
-        match self {
-            StreamBody::Inline(bytes) => Ok(bytes.to_vec()),
-            StreamBody::Extent(extent) => {
-                // The decrypted data is never longer than the stored data, so
-                // one allocation of that size holds it with no growth slack.
-                let mut out = Vec::new();
-                out.try_reserve_exact(extent.len as usize).map_err(|_| {
-                    Error::InvalidPdf(format!("a stream of {} bytes does not fit in memory", extent.len))
-                })?;
-                extent
-                    .raw_reader()?
-                    .read_to_end(&mut out)
-                    .map_err(crate::encryption::stream::from_io)?;
-                Ok(out)
-            },
-        }
+        // The decrypted data is never longer than the stored data, so one
+        // allocation of that size holds it with no growth slack; a refused
+        // allocation is a typed error.
+        crate::decoders::stream::read_whole(self.raw_reader()?, self.len() as usize)
     }
 }
 
@@ -451,36 +439,23 @@ impl Object {
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
             Object::Stream { dict, body } => {
                 // PDF Spec: Section 7.6.2 - streams are decrypted BEFORE
-                // their filters run. The body is never trimmed: the loader
-                // already consumed exactly one EOL after `stream`
-                // (ISO 32000-1:2008 §7.3.8.1), and trimming CR/LF would corrupt
-                // binary streams that legitimately start with 0x0A or 0x0D —
-                // e.g. an Indexed palette whose first CMYK byte is 0x0D.
-                let decrypted_data = body.read_whole_raw()?;
-                // ── end pdf_manipulator patch ──
-
-                // Step 2: Apply filters (decompression)
-                // PDF Spec: ISO 32000-1:2008, Section 7.3.8.2 - Stream Objects
-                let filters = dict
-                    .get("Filter")
-                    .map(extract_filter_names)
-                    .unwrap_or_default();
-
-                if filters.is_empty() {
-                    // No filters, return decrypted data
-                    Ok(decrypted_data)
+                // their filters run, which is what `raw_reader` yields. The
+                // body is never trimmed: the loader already consumed exactly
+                // one EOL after `stream` (ISO 32000-1:2008 §7.3.8.1), and
+                // trimming CR/LF would corrupt binary streams that
+                // legitimately start with 0x0A or 0x0D — e.g. an Indexed
+                // palette whose first CMYK byte is 0x0D.
+                // The filters run as readers over it (ISO 32000-1:2008
+                // §7.3.8.2, §7.4.2) and the decoded data is read whole once.
+                if dict.get("Filter").map(extract_filter_names).unwrap_or_default().is_empty() {
+                    body.read_whole_raw()
                 } else {
-                    // Get decode parameters if present
-                    // PDF Spec: ISO 32000-1:2008, Section 7.4.2 - DecodeParms
-                    let decode_params = extract_decode_params(dict.get("DecodeParms"));
-
-                    // Decode using filter pipeline with parameters
-                    crate::decoders::decode_stream_with_params(
-                        &decrypted_data,
-                        &filters,
-                        decode_params.as_ref(),
+                    crate::decoders::stream::read_whole(
+                        crate::decoders::stream::reader(dict, || body.raw_reader())?,
+                        0,
                     )
                 }
+                // ── end pdf_manipulator patch ──
             },
             Object::Dictionary(dict) => {
                 // Per ISO 32000, every stream is a dictionary. Some PDFs (e.g.,
@@ -518,7 +493,9 @@ impl Object {
 /// The Filter entry can be either:
 /// - A single Name (e.g., /FlateDecode)
 /// - An Array of Names (e.g., [/ASCII85Decode /FlateDecode])
-fn extract_filter_names(filter_obj: &Object) -> Vec<String> {
+// ── pdf_manipulator patch: the stream reader reads the dictionary's filters ──
+pub(crate) fn extract_filter_names(filter_obj: &Object) -> Vec<String> {
+    // ── end pdf_manipulator patch ──
     match filter_obj {
         Object::Name(name) => vec![name.clone()],
         Object::Array(arr) => arr
@@ -539,7 +516,11 @@ fn extract_filter_names(filter_obj: &Object) -> Vec<String> {
 /// - Null or absent (no parameters)
 ///
 /// This function extracts predictor parameters used for PNG/TIFF encoding.
-fn extract_decode_params(params_obj: Option<&Object>) -> Option<crate::decoders::DecodeParams> {
+// ── pdf_manipulator patch: the stream reader reads the dictionary's filters ──
+pub(crate) fn extract_decode_params(
+    params_obj: Option<&Object>,
+) -> Option<crate::decoders::DecodeParams> {
+    // ── end pdf_manipulator patch ──
     let dict = match params_obj? {
         Object::Dictionary(d) => d,
         Object::Array(arr) => {

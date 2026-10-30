@@ -4,7 +4,9 @@
 //! Whitespace is ignored, and odd-length input is padded with implicit '0'.
 
 use crate::decoders::StreamDecoder;
-use crate::error::{Error, Result};
+// ── pdf_manipulator patch: the filter is a reader ──
+use crate::error::Result;
+// ── end pdf_manipulator patch ──
 
 /// ASCIIHexDecode filter implementation.
 ///
@@ -13,30 +15,9 @@ pub struct AsciiHexDecoder;
 
 impl StreamDecoder for AsciiHexDecoder {
     fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        let mut chars = input
-            .iter()
-            .filter(|&&c| !c.is_ascii_whitespace() && c != b'>')
-            .peekable();
-
-        while let Some(&high) = chars.next() {
-            // If odd length, pad with '0'
-            let low = chars.next().copied().unwrap_or(b'0');
-
-            // Convert hex digits to byte
-            let high_nibble = hex_digit_to_value(high).ok_or_else(|| {
-                Error::Decode(format!("ASCIIHexDecode: invalid hex digit '{}'", high as char))
-            })?;
-
-            let low_nibble = hex_digit_to_value(low).ok_or_else(|| {
-                Error::Decode(format!("ASCIIHexDecode: invalid hex digit '{}'", low as char))
-            })?;
-
-            let byte = (high_nibble << 4) | low_nibble;
-            output.push(byte);
-        }
-
-        Ok(output)
+        // ── pdf_manipulator patch: the filter is a reader ──
+        crate::decoders::stream::decode_slice(input, &["ASCIIHexDecode"], None)
+        // ── end pdf_manipulator patch ──
     }
 
     fn name(&self) -> &str {
@@ -45,6 +26,9 @@ impl StreamDecoder for AsciiHexDecoder {
 }
 
 /// Convert a hexadecimal ASCII character to its numeric value.
+// ── pdf_manipulator patch: the reader has its own digit table ──
+#[cfg(test)]
+// ── end pdf_manipulator patch ──
 fn hex_digit_to_value(digit: u8) -> Option<u8> {
     match digit {
         b'0'..=b'9' => Some(digit - b'0'),

@@ -13,14 +13,15 @@
 //! Decoders can be chained together in a filter pipeline.
 
 use crate::error::{Error, Result};
-use crate::parser_config::ParserOptions;
 
 mod ascii85;
 mod ascii_hex;
 mod brotli;
 pub(crate) mod ccitt;
 mod dct;
-mod flate;
+// ── pdf_manipulator patch: the engine proofs compare the reader with the committed recovery ──
+pub(crate) mod flate;
+// ── end pdf_manipulator patch ──
 mod jbig2;
 pub(crate) mod jpx;
 // ── pdf_manipulator patch: the engine proofs build a decoder with a chosen switch ──
@@ -28,6 +29,9 @@ pub(crate) mod lzw;
 // ── end pdf_manipulator patch ──
 mod predictor;
 mod runlength;
+// ── pdf_manipulator patch: every filter is a reader ──
+pub mod stream;
+// ── end pdf_manipulator patch ──
 
 pub use ascii85::Ascii85Decoder;
 pub use ascii_hex::AsciiHexDecoder;
@@ -39,17 +43,6 @@ pub use jbig2::Jbig2Decoder;
 pub use lzw::LzwDecoder;
 pub use predictor::{decode_predictor, CcittParams, DecodeParams, PngPredictor};
 pub use runlength::RunLengthDecoder;
-
-/// Security limits for decompression (decompression bomb protection).
-///
-/// PDF Spec: ISO 32000-1:2008 does not specify decompression limits, but these
-/// are necessary security measures to prevent memory exhaustion attacks.
-///
-/// Default values:
-/// - Max decompression ratio: 100:1 (compressed:decompressed)
-/// - Max decompressed size: 100 MB
-const DEFAULT_MAX_DECOMPRESSION_RATIO: u32 = 100;
-const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 100 * 1024 * 1024;
 
 /// PDF stream filter types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,33 +137,6 @@ fn normalize_filter_name(name: &str) -> Result<&'static str> {
     }
 }
 
-// ── pdf_manipulator patch: the filter's DecodeParms reach the LZW decoder ──
-fn create_decoder(
-    filter_name: &str,
-    params: Option<&DecodeParams>,
-) -> Result<Box<dyn StreamDecoder>> {
-    // ── end pdf_manipulator patch ──
-    let canonical = normalize_filter_name(filter_name)?;
-    Ok(match canonical {
-        "FlateDecode" => Box::new(FlateDecoder::default()),
-        "ASCIIHexDecode" => Box::new(AsciiHexDecoder),
-        "ASCII85Decode" => Box::new(Ascii85Decoder),
-        // ── pdf_manipulator patch: /EarlyChange from the DecodeParms ──
-        "LZWDecode" => Box::new(lzw::ConfiguredLzwDecoder {
-            early_change: params.map_or(true, |p| p.early_change),
-        }),
-        // ── end pdf_manipulator patch ──
-        "RunLengthDecode" => Box::new(RunLengthDecoder),
-        "DCTDecode" => Box::new(DctDecoder),
-        "CCITTFaxDecode" => Box::new(CcittFaxDecoder),
-        "JBIG2Decode" => Box::new(Jbig2Decoder),
-        "JPXDecode" => Box::new(jpx::JpxDecoder),
-        "BrotliDecode" => Box::new(BrotliDecoder),
-        // normalize_filter_name already returns Err for unknown filters
-        _ => unreachable!(),
-    })
-}
-
 /// Decode stream data using a filter pipeline.
 ///
 /// PDF streams can have multiple filters applied in sequence. This function
@@ -198,87 +164,6 @@ pub fn decode_stream(data: &[u8], filters: &[String]) -> Result<Vec<u8>> {
     decode_stream_with_params(data, filters, None)
 }
 
-/// Decode stream data with parser options (includes decompression bomb protection).
-///
-/// This function extends `decode_stream` by supporting parser options for
-/// security limits and strict mode behavior.
-///
-/// # Arguments
-///
-/// * `data` - The raw stream data
-/// * `filters` - List of filter names to apply in order
-/// * `params` - Optional decode parameters (for predictors, etc.)
-/// * `options` - Parser options for security limits
-///
-/// # Returns
-///
-/// The fully decoded data or an error if any filter fails or security limits are exceeded.
-///
-/// # Security
-///
-/// This function includes decompression bomb protection:
-/// - Checks decompression ratio before decompressing
-/// - Checks output size limit after decompression
-/// - Uses limits from `options` or defaults if None
-pub fn decode_stream_with_options(
-    data: &[u8],
-    filters: &[String],
-    params: Option<&DecodeParams>,
-    options: Option<&ParserOptions>,
-) -> Result<Vec<u8>> {
-    // Get security limits from options or use defaults
-    let max_ratio = options
-        .map(|o| o.max_decompression_ratio)
-        .unwrap_or(DEFAULT_MAX_DECOMPRESSION_RATIO);
-    let max_size = options
-        .map(|o| o.max_decompressed_size)
-        .unwrap_or(DEFAULT_MAX_DECOMPRESSED_SIZE);
-
-    let compressed_size = data.len();
-    let mut current = data.to_vec();
-
-    // Apply filters in order
-    for filter_name in filters {
-        let decoder = create_decoder(filter_name, params)?;
-
-        current = decoder.decode(&current)?;
-
-        // SECURITY: Check decompression ratio after each filter
-        // PDF Spec: ISO 32000-1:2008 does not specify limits, but this is a
-        // critical security measure to prevent decompression bomb attacks.
-        if max_ratio > 0 && compressed_size > 0 {
-            let ratio = current.len() as u64 / compressed_size.max(1) as u64;
-            if ratio > max_ratio as u64 {
-                return Err(Error::Decode(format!(
-                    "Decompression bomb detected: ratio {}:1 exceeds limit {}:1 (compressed: {} bytes, decompressed: {} bytes)",
-                    ratio,
-                    max_ratio,
-                    compressed_size,
-                    current.len()
-                )));
-            }
-        }
-
-        // SECURITY: Check maximum decompressed size
-        if max_size > 0 && current.len() > max_size {
-            return Err(Error::Decode(format!(
-                "Decompression bomb detected: decompressed size {} bytes exceeds limit {} bytes",
-                current.len(),
-                max_size
-            )));
-        }
-    }
-
-    // Apply predictor if specified
-    if let Some(params) = params {
-        if params.predictor != 1 {
-            current = decode_predictor(&current, params)?;
-        }
-    }
-
-    Ok(current)
-}
-
 /// Decode stream data using a filter pipeline with optional decode parameters.
 ///
 /// This function extends `decode_stream` by supporting decode parameters
@@ -298,23 +183,9 @@ pub fn decode_stream_with_params(
     filters: &[String],
     params: Option<&DecodeParams>,
 ) -> Result<Vec<u8>> {
-    let mut current = data.to_vec();
-
-    // Apply filters in order
-    for filter_name in filters {
-        let decoder = create_decoder(filter_name, params)?;
-
-        current = decoder.decode(&current)?;
-    }
-
-    // Apply predictor if specified
-    if let Some(params) = params {
-        if params.predictor != 1 {
-            current = decode_predictor(&current, params)?;
-        }
-    }
-
-    Ok(current)
+    // ── pdf_manipulator patch: every filter is a reader ──
+    stream::decode_slice(data, filters, params)
+    // ── end pdf_manipulator patch ──
 }
 
 #[cfg(test)]

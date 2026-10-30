@@ -414,7 +414,9 @@ struct RunningArtifactSignature {
 /// # Memory management
 ///
 /// The document maintains several internal caches for performance. The main
-/// object cache is bounded at 64 MB (see `DEFAULT_OBJECT_CACHE_MAX_BYTES`)
+// ── pdf_manipulator patch: the cache budget is 8 MiB ──
+/// object cache is bounded at 8 MiB (see `DEFAULT_OBJECT_CACHE_MAX_BYTES`) and
+// ── end pdf_manipulator patch ──
 /// uses FIFO eviction to prevent unbounded heap growth when processing
 /// many pages sequentially.
 pub struct PdfDocument {

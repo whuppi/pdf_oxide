@@ -1,7 +1,8 @@
 //! BrotliDecode filter (PDF 2.0, ISO 32000-2:2020).
 
-use crate::error::{Error, Result};
-use std::io::Read;
+// ── pdf_manipulator patch: the filter is a reader ──
+use crate::error::Result;
+// ── end pdf_manipulator patch ──
 
 use super::StreamDecoder;
 
@@ -10,12 +11,9 @@ pub struct BrotliDecoder;
 
 impl StreamDecoder for BrotliDecoder {
     fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        let mut reader = brotli::Decompressor::new(input, 4096);
-        reader
-            .read_to_end(&mut output)
-            .map_err(|e| Error::Decode(format!("BrotliDecode: {}", e)))?;
-        Ok(output)
+        // ── pdf_manipulator patch: the filter is a reader ──
+        super::stream::decode_slice(input, &["BrotliDecode"], None)
+        // ── end pdf_manipulator patch ──
     }
 
     fn name(&self) -> &str {

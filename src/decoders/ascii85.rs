@@ -5,7 +5,9 @@
 //! Special case: 'z' represents 4 zero bytes (00000000).
 
 use crate::decoders::StreamDecoder;
-use crate::error::{Error, Result};
+// ── pdf_manipulator patch: the filter is a reader ──
+use crate::error::Result;
+// ── end pdf_manipulator patch ──
 
 /// ASCII85Decode filter implementation.
 ///
@@ -14,74 +16,9 @@ pub struct Ascii85Decoder;
 
 impl StreamDecoder for Ascii85Decoder {
     fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        let mut acc: u32 = 0;
-        let mut count = 0;
-
-        for &byte in input {
-            match byte {
-                b'~' => break, // End marker '~>'
-                b'z' => {
-                    // Special case: 'z' represents 4 zero bytes
-                    if count != 0 {
-                        return Err(Error::Decode(
-                            "ASCII85Decode: 'z' must not appear in the middle of a group"
-                                .to_string(),
-                        ));
-                    }
-                    output.extend_from_slice(&[0, 0, 0, 0]);
-                },
-                b'!'..=b'u' => {
-                    // Valid ASCII85 character (33-117)
-                    acc = acc
-                        .checked_mul(85)
-                        .and_then(|v| v.checked_add((byte - b'!') as u32))
-                        .ok_or_else(|| {
-                            Error::Decode("ASCII85Decode: overflow in decoding".to_string())
-                        })?;
-                    count += 1;
-
-                    if count == 5 {
-                        // Got a complete group - output 4 bytes
-                        output.extend_from_slice(&acc.to_be_bytes());
-                        acc = 0;
-                        count = 0;
-                    }
-                },
-                _ if byte.is_ascii_whitespace() => {}, // Skip whitespace
-                _ => {
-                    return Err(Error::Decode(format!(
-                        "ASCII85Decode: invalid character '{}'",
-                        byte as char
-                    )));
-                },
-            }
-        }
-
-        // Handle trailing bytes (incomplete group)
-        if count > 0 {
-            if count == 1 {
-                return Err(Error::Decode(
-                    "ASCII85Decode: incomplete group (need at least 2 characters)".to_string(),
-                ));
-            }
-
-            // Pad with 'u' (84 = 117 - 33) to complete the group
-            for _ in count..5 {
-                acc = acc
-                    .checked_mul(85)
-                    .and_then(|v| v.checked_add(84))
-                    .ok_or_else(|| {
-                        Error::Decode("ASCII85Decode: overflow in padding".to_string())
-                    })?;
-            }
-
-            // Output count-1 bytes (first N-1 bytes are valid)
-            let bytes = acc.to_be_bytes();
-            output.extend_from_slice(&bytes[..count - 1]);
-        }
-
-        Ok(output)
+        // ── pdf_manipulator patch: the filter is a reader ──
+        crate::decoders::stream::decode_slice(input, &["ASCII85Decode"], None)
+        // ── end pdf_manipulator patch ──
     }
 
     fn name(&self) -> &str {

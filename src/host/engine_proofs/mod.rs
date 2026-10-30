@@ -17,9 +17,11 @@ mod editor_objstm;
 mod editor_orphans;
 mod editor_packed;
 mod editor_trailer;
+mod filter_readers;
 mod editor_pages;
 mod editor_save;
 mod kept_encryption;
+mod legacy_decoders;
 mod lzw;
 #[cfg(feature = "rendering")]
 mod source_trips;

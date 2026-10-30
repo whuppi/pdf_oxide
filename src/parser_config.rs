@@ -23,8 +23,6 @@
 ///     max_nesting: 100,
 ///     allow_missing_endobj: true,
 ///     allow_malformed_streams: true,
-///     max_decompression_ratio: 100,
-///     max_decompressed_size: 100 * 1024 * 1024,
 ///     max_recursion_depth: 100,
 ///     max_file_size: 500 * 1024 * 1024,
 /// };
@@ -58,27 +56,6 @@ pub struct ParserOptions {
     /// Allow streams with missing or incorrect Length
     pub allow_malformed_streams: bool,
 
-    /// Maximum decompression ratio (compressed:decompressed)
-    ///
-    /// Prevents decompression bomb attacks where small compressed data
-    /// expands to enormous uncompressed data, causing memory exhaustion.
-    ///
-    /// Default: 100 (100:1 ratio). Set to 0 to disable check.
-    ///
-    /// Security: ISO 32000-1:2008 does not specify limits, but 100:1 is
-    /// a reasonable security threshold that allows legitimate compressed
-    /// content while preventing memory exhaustion attacks.
-    pub max_decompression_ratio: u32,
-
-    /// Maximum decompressed stream size in bytes
-    ///
-    /// Prevents memory exhaustion from extremely large decompressed streams.
-    ///
-    /// Default: 100 MB. Set to 0 to disable check.
-    ///
-    /// Security: Protects against decompression bombs and malicious PDFs.
-    pub max_decompressed_size: usize,
-
     /// Maximum recursion depth (same as max_nesting, for clarity)
     ///
     /// PDF Spec: ISO 32000-1:2008, Section H.1 - Implementation Limits
@@ -109,8 +86,6 @@ impl ParserOptions {
             max_nesting: 100, // PDF spec recommended limit
             allow_missing_endobj: false,
             allow_malformed_streams: false,
-            max_decompression_ratio: 100,
-            max_decompressed_size: 100 * 1024 * 1024, // 100 MB
             max_recursion_depth: 100,
             max_file_size: 500 * 1024 * 1024, // 500 MB
         }
@@ -128,8 +103,6 @@ impl ParserOptions {
             max_nesting: 100, // PDF spec recommended limit
             allow_missing_endobj: true,
             allow_malformed_streams: true,
-            max_decompression_ratio: 100,
-            max_decompressed_size: 100 * 1024 * 1024, // 100 MB
             max_recursion_depth: 100,
             max_file_size: 500 * 1024 * 1024, // 500 MB
         }
@@ -147,8 +120,6 @@ impl ParserOptions {
             max_nesting: 200, // Higher limit for very lenient mode
             allow_missing_endobj: true,
             allow_malformed_streams: true,
-            max_decompression_ratio: 200, // Higher for damaged PDFs
-            max_decompressed_size: 200 * 1024 * 1024, // 200 MB
             max_recursion_depth: 200,
             max_file_size: 1024 * 1024 * 1024, // 1 GB
         }

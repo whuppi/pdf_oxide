@@ -13,7 +13,9 @@
 //! - First available code is 258
 
 use crate::decoders::StreamDecoder;
-use crate::error::{Error, Result};
+// ── pdf_manipulator patch: the filter is a reader ──
+use crate::error::Result;
+// ── end pdf_manipulator patch ──
 
 // ── pdf_manipulator patch: one weezl decoder, early or late switch per /EarlyChange ──
 /// LZWDecode filter implementation with PDF's default, `/EarlyChange 1`.
@@ -24,7 +26,7 @@ pub struct LzwDecoder;
 
 impl StreamDecoder for LzwDecoder {
     fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        decode_lzw(input, true)
+        ConfiguredLzwDecoder { early_change: true }.decode(input)
     }
 
     fn name(&self) -> &str {
@@ -47,21 +49,13 @@ impl StreamDecoder for ConfiguredLzwDecoder {
     }
 }
 
-/// Decodes with weezl: MSB bit order, 8-bit minimum code size. The code
-/// width grows one code early (TIFF size switch) with `/EarlyChange 1` and
-/// at the GIF boundary with `/EarlyChange 0`; reading one as the other
-/// decodes the wrong bytes without an error.
+/// Decodes with weezl through the filter's reader: MSB bit order, 8-bit
+/// minimum code size. The code width grows one code early (TIFF size switch)
+/// with `/EarlyChange 1` and at the GIF boundary with `/EarlyChange 0`;
+/// reading one as the other decodes the wrong bytes without an error.
 fn decode_lzw(input: &[u8], early_change: bool) -> Result<Vec<u8>> {
-    use weezl::{decode::Decoder, BitOrder};
-
-    let mut decoder = if early_change {
-        Decoder::with_tiff_size_switch(BitOrder::Msb, 8)
-    } else {
-        Decoder::new(BitOrder::Msb, 8)
-    };
-    decoder
-        .decode(input)
-        .map_err(|e| Error::Decode(format!("LZWDecode error: {:?}", e)))
+    let params = crate::decoders::DecodeParams { early_change, ..Default::default() };
+    crate::decoders::stream::decode_slice(input, &["LZWDecode"], Some(&params))
 }
 // ── end pdf_manipulator patch ──
 

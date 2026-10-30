@@ -141,6 +141,15 @@ impl CcittParams {
 ///
 /// The decoded data with predictors reversed, or an error if decoding fails.
 pub fn decode_predictor(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> {
+    // ── pdf_manipulator patch: a test build checks the stream reader against this whole decode ──
+    let whole = decode_predictor_whole(data, params);
+    #[cfg(test)]
+    super::stream::assert_predictor_reader_agrees(data, params, &whole);
+    whole
+}
+
+fn decode_predictor_whole(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> {
+    // ── end pdf_manipulator patch ──
     match params.predictor {
         1 => {
             // No predictor
@@ -176,16 +185,9 @@ fn decode_tiff_predictor(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> 
     let mut output = Vec::with_capacity(data.len());
 
     for row_data in data.chunks(bytes_per_row) {
-        // First pixel in row is unchanged
-        for i in 0..colors {
-            output.push(row_data[i]);
-        }
-
-        // Subsequent pixels: add left neighbor
-        for i in colors..row_data.len() {
-            let left = output[output.len() - colors];
-            output.push(row_data[i].wrapping_add(left));
-        }
+        // ── pdf_manipulator patch: the row algorithms are shared with the reader ──
+        tiff_row(row_data, colors, &mut output);
+        // ── end pdf_manipulator patch ──
     }
 
     Ok(output)
@@ -227,36 +229,70 @@ fn decode_png_predictor(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> {
 
         let encoded_pixels = &row_data[1..]; // Skip predictor tag
 
-        // Decode based on predictor type
-        match predictor_tag {
-            0 => {
-                // None: copy as-is
-                output.extend_from_slice(encoded_pixels);
-            },
-            1 => {
-                // Sub: each byte is difference from left neighbor
-                decode_png_sub(encoded_pixels, &mut output, bpp);
-            },
-            2 => {
-                // Up: each byte is difference from above neighbor
-                decode_png_up(encoded_pixels, &mut output, row_idx, pixel_bytes);
-            },
-            3 => {
-                // Average: each byte is difference from average of left and above
-                decode_png_average(encoded_pixels, &mut output, row_idx, pixel_bytes, bpp);
-            },
-            4 => {
-                // Paeth: uses Paeth predictor function
-                decode_png_paeth(encoded_pixels, &mut output, row_idx, pixel_bytes, bpp);
-            },
-            _ => {
-                return Err(Error::Decode(format!("Invalid PNG predictor tag: {}", predictor_tag)));
-            },
-        }
+        // ── pdf_manipulator patch: the row algorithms are shared with the reader ──
+        png_row(predictor_tag, encoded_pixels, &mut output, row_idx, pixel_bytes, bpp)?;
+        // ── end pdf_manipulator patch ──
     }
 
     Ok(output)
 }
+
+// ── pdf_manipulator patch: the row algorithms are shared with the reader ──
+/// Decodes one PNG-predicted row by its tag, appending it to `output`. The
+/// row above, when there is one (`row_idx > 0`), is the `pixel_bytes` that
+/// end `output` before this row is appended at `(row_idx - 1) * pixel_bytes`;
+/// the stream reader keeps only that one row in `output`.
+pub(super) fn png_row(
+    predictor_tag: u8,
+    encoded_pixels: &[u8],
+    output: &mut Vec<u8>,
+    row_idx: usize,
+    pixel_bytes: usize,
+    bpp: usize,
+) -> Result<()> {
+    match predictor_tag {
+        0 => {
+            // None: copy as-is
+            output.extend_from_slice(encoded_pixels);
+        },
+        1 => {
+            // Sub: each byte is difference from left neighbor
+            decode_png_sub(encoded_pixels, output, bpp);
+        },
+        2 => {
+            // Up: each byte is difference from above neighbor
+            decode_png_up(encoded_pixels, output, row_idx, pixel_bytes);
+        },
+        3 => {
+            // Average: each byte is difference from average of left and above
+            decode_png_average(encoded_pixels, output, row_idx, pixel_bytes, bpp);
+        },
+        4 => {
+            // Paeth: uses Paeth predictor function
+            decode_png_paeth(encoded_pixels, output, row_idx, pixel_bytes, bpp);
+        },
+        _ => {
+            return Err(Error::Decode(format!("Invalid PNG predictor tag: {}", predictor_tag)));
+        },
+    }
+    Ok(())
+}
+
+/// Decodes one TIFF-predicted row, appending it to `output`.
+pub(super) fn tiff_row(row_data: &[u8], colors: usize, output: &mut Vec<u8>) {
+    let start = output.len();
+    // First pixel in row is unchanged
+    for i in 0..colors.min(row_data.len()) {
+        output.push(row_data[i]);
+    }
+
+    // Subsequent pixels: add left neighbor
+    for i in colors..row_data.len() {
+        let left = output[start + i - colors];
+        output.push(row_data[i].wrapping_add(left));
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// PNG Sub predictor: each byte is the difference from the left neighbor.
 fn decode_png_sub(encoded: &[u8], output: &mut Vec<u8>, bpp: usize) {

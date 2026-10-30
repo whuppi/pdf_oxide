@@ -12,26 +12,6 @@
 use crate::error::Error;
 use crate::error::Result;
 
-/// Pass-through filter for `/JPXDecode`.
-///
-/// Like `DCTDecode`/`JBIG2Decode`, the JPEG 2000 codestream is not decompressed
-/// by the generic filter pipeline — it is handed to the image extractor, which
-/// decodes it with hayro-jpeg2000 (`decode_jpx`). So this decoder returns its input
-/// unchanged. It is always available (even without the `jpeg2000` feature) so the
-/// pipeline can surface the codestream; the extractor's feature-gated path then
-/// either decodes it or returns a typed `UnsupportedFilter` error.
-pub struct JpxDecoder;
-
-impl super::StreamDecoder for JpxDecoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        Ok(input.to_vec())
-    }
-
-    fn name(&self) -> &str {
-        "JPXDecode"
-    }
-}
-
 /// A decoded JPEG 2000 image: interleaved 8-bit samples plus component count.
 #[cfg(feature = "jpeg2000")]
 pub struct JpxImage {

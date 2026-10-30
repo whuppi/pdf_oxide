@@ -6,7 +6,9 @@
 //! - Length byte 129-255: Repeat next byte 257-N times
 
 use crate::decoders::StreamDecoder;
-use crate::error::{Error, Result};
+// ── pdf_manipulator patch: the filter is a reader ──
+use crate::error::Result;
+// ── end pdf_manipulator patch ──
 
 /// RunLengthDecode filter implementation.
 ///
@@ -15,51 +17,9 @@ pub struct RunLengthDecoder;
 
 impl StreamDecoder for RunLengthDecoder {
     fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        let mut i = 0;
-
-        while i < input.len() {
-            let length = input[i];
-            i += 1;
-
-            match length {
-                0..=127 => {
-                    // Copy next length+1 bytes literally
-                    let count = length as usize + 1;
-
-                    if i + count > input.len() {
-                        return Err(Error::Decode(format!(
-                            "RunLengthDecode: not enough data for literal run (need {}, have {})",
-                            count,
-                            input.len() - i
-                        )));
-                    }
-
-                    output.extend_from_slice(&input[i..i + count]);
-                    i += count;
-                },
-                128 => {
-                    // EOD marker - no-op, but we'll break to end decoding
-                    break;
-                },
-                129..=255 => {
-                    // Repeat next byte 257-length times
-                    let count = 257 - length as usize;
-
-                    if i >= input.len() {
-                        return Err(Error::Decode(
-                            "RunLengthDecode: missing byte for run".to_string(),
-                        ));
-                    }
-
-                    let byte = input[i];
-                    i += 1;
-                    output.resize(output.len() + count, byte);
-                },
-            }
-        }
-
-        Ok(output)
+        // ── pdf_manipulator patch: the filter is a reader ──
+        crate::decoders::stream::decode_slice(input, &["RunLengthDecode"], None)
+        // ── end pdf_manipulator patch ──
     }
 
     fn name(&self) -> &str {
