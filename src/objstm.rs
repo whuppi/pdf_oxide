@@ -439,10 +439,9 @@ mod tests {
         dict.insert("First".to_string(), Object::Integer(9)); // Length of pairs section
         dict.insert("Length".to_string(), Object::Integer(combined.len() as i64));
 
-        let stream = Object::Stream {
-            dict,
-            data: Bytes::from(combined),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream = Object::stream(dict, Bytes::from(combined));
+        // ── end pdf_manipulator patch ──
 
         let objects = parse_object_stream(&stream).unwrap();
         assert_eq!(objects.len(), 2);
@@ -463,10 +462,9 @@ mod tests {
         dict.insert("N".to_string(), Object::Integer(1));
         dict.insert("First".to_string(), Object::Integer(5));
 
-        let stream = Object::Stream {
-            dict,
-            data: Bytes::from(b"1 0 42".to_vec()),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream = Object::stream(dict, Bytes::from(b"1 0 42".to_vec()));
+        // ── end pdf_manipulator patch ──
 
         // Should still work - Type is optional if we trust the caller
         let result = parse_object_stream(&stream);
@@ -479,10 +477,9 @@ mod tests {
         dict.insert("Type".to_string(), Object::Name("ObjStm".to_string()));
         dict.insert("First".to_string(), Object::Integer(5));
 
-        let stream = Object::Stream {
-            dict,
-            data: Bytes::from(b"1 0 42".to_vec()),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream = Object::stream(dict, Bytes::from(b"1 0 42".to_vec()));
+        // ── end pdf_manipulator patch ──
 
         let result = parse_object_stream(&stream);
         assert!(result.is_err());
@@ -494,10 +491,9 @@ mod tests {
         dict.insert("Type".to_string(), Object::Name("ObjStm".to_string()));
         dict.insert("N".to_string(), Object::Integer(1));
 
-        let stream = Object::Stream {
-            dict,
-            data: Bytes::from(b"1 0 42".to_vec()),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream = Object::stream(dict, Bytes::from(b"1 0 42".to_vec()));
+        // ── end pdf_manipulator patch ──
 
         let result = parse_object_stream(&stream);
         assert!(result.is_err());
@@ -510,10 +506,9 @@ mod tests {
         dict.insert("N".to_string(), Object::Integer(-1));
         dict.insert("First".to_string(), Object::Integer(5));
 
-        let stream = Object::Stream {
-            dict,
-            data: Bytes::from(b"1 0 42".to_vec()),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream = Object::stream(dict, Bytes::from(b"1 0 42".to_vec()));
+        // ── end pdf_manipulator patch ──
 
         let result = parse_object_stream(&stream);
         assert!(result.is_err());
@@ -526,10 +521,9 @@ mod tests {
         dict.insert("N".to_string(), Object::Integer(1));
         dict.insert("First".to_string(), Object::Integer(100)); // Too large
 
-        let stream = Object::Stream {
-            dict,
-            data: Bytes::from(b"1 0 42".to_vec()),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream = Object::stream(dict, Bytes::from(b"1 0 42".to_vec()));
+        // ── end pdf_manipulator patch ──
 
         let result = parse_object_stream(&stream);
         assert!(result.is_err());

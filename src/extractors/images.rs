@@ -3152,10 +3152,9 @@ mod indexed_tests {
                 Object::Array(vec![Object::Integer(0), Object::Integer(0), Object::Integer(0)]),
             ]),
         );
-        let xobject = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(&[0, 1]),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let xobject = Object::stream(dict, bytes::Bytes::from_static(&[0, 1]));
+        // ── end pdf_manipulator patch ──
 
         let err = extract_image_from_xobject(None, &xobject, None, None)
             .expect_err("Indexed with Array lookup must error");
@@ -3482,7 +3481,9 @@ impl<'doc> PdfImageHandle<'doc> {
             PdfImageSource::XObject(obj_ref) => {
                 let obj = self.doc.load_object(*obj_ref)?;
                 match obj {
-                    crate::object::Object::Stream { data, .. } => Ok(data.to_vec()),
+                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                    crate::object::Object::Stream { body, .. } => Ok(body.inline().to_vec()),
+                    // ── end pdf_manipulator patch ──
                     _ => Err(crate::error::Error::Image("XObject is not a stream".to_string())),
                 }
             },
@@ -3806,10 +3807,9 @@ pub(crate) fn image_handle_from_inline<'doc>(
     let mut stream_dict = expanded;
     stream_dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
     let compressed_bytes = bytes::Bytes::from(data);
-    let stream_object = Object::Stream {
-        dict: stream_dict,
-        data: compressed_bytes.clone(),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let stream_object = Object::stream(stream_dict, compressed_bytes.clone());
+    // ── end pdf_manipulator patch ──
 
     Some(PdfImageHandle {
         width: w,
@@ -4230,10 +4230,9 @@ mod ccitt_decode_array_polarity_tests {
             );
         }
 
-        Object::Stream {
-            dict,
-            data: bytes::Bytes::from(black_majority_g4_stream()),
-        }
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(dict, bytes::Bytes::from(black_majority_g4_stream()))
+        // ── end pdf_manipulator patch ──
     }
 
     /// Decode `xobject` to a Luma8 image and count white (0xFF) vs black
@@ -4346,10 +4345,9 @@ mod non_ccitt_1bpc_devicegray_tests {
             );
         }
 
-        Object::Stream {
-            dict,
-            data: bytes::Bytes::from(data),
-        }
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(dict, bytes::Bytes::from(data))
+        // ── end pdf_manipulator patch ──
     }
 
     fn white_black_counts(xobject: &Object) -> (u32, u32) {

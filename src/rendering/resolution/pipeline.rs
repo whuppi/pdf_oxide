@@ -470,10 +470,9 @@ mod tests {
         let program = b"{ 0.0 exch 0.0 0.0 }";
         let mut func_dict: HashMap<String, Object> = HashMap::new();
         func_dict.insert("FunctionType".into(), Object::Integer(4));
-        let func_obj = Object::Stream {
-            dict: func_dict,
-            data: program.to_vec().into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let func_obj = Object::stream(func_dict, program.to_vec());
+        // ── end pdf_manipulator patch ──
         let space = Object::Array(vec![
             Object::Name("Separation".into()),
             Object::Name("MagentaSpot".into()),

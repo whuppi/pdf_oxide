@@ -223,9 +223,11 @@ impl ObjectSerializer {
             Object::Dictionary(dict) => {
                 self.write_dictionary_encrypted(w, dict, obj_num, gen_num, handler)
             },
-            Object::Stream { dict, data } => {
-                self.write_stream_encrypted(w, dict, data, obj_num, gen_num, handler)
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::Stream { dict, body } => {
+                self.write_stream_encrypted(w, dict, body.inline(), obj_num, gen_num, handler)
             },
+            // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: references to unwritten objects as null ──
             Object::Reference(r) => self.write_reference(w, r),
             // ── end pdf_manipulator patch ──
@@ -318,7 +320,9 @@ impl ObjectSerializer {
             Object::Name(n) => self.write_name(w, n),
             Object::Array(arr) => self.write_array(w, arr),
             Object::Dictionary(dict) => self.write_dictionary(w, dict),
-            Object::Stream { dict, data } => self.write_stream(w, dict, data),
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::Stream { dict, body } => self.write_stream(w, dict, body.inline()),
+            // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: references to unwritten objects as null ──
             Object::Reference(r) => self.write_reference(w, r),
             // ── end pdf_manipulator patch ──
@@ -589,10 +593,9 @@ mod tests {
     fn stream(tag: &str) -> Object {
         let mut d = HashMap::new();
         d.insert("Subtype".to_string(), Object::Name("Form".to_string()));
-        Object::Stream {
-            dict: d,
-            data: bytes::Bytes::from(tag.to_string()),
-        }
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(d, bytes::Bytes::from(tag.to_string()))
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]
@@ -761,10 +764,9 @@ mod tests {
         let mut dict = HashMap::new();
         dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
 
-        let stream = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"stream data"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream = Object::stream(dict, bytes::Bytes::from_static(b"stream data"));
+        // ── end pdf_manipulator patch ──
 
         let result = s.serialize_to_string(&stream);
         assert!(result.contains("/Length 11"));

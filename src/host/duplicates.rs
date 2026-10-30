@@ -78,7 +78,7 @@ impl Fetched<'_> {
         match self {
             Fetched::Head(head) => Some((&head.dict, head.data_len)),
             other => match other.object()? {
-                Object::Stream { dict, data } => Some((dict, data.len() as u64)),
+                Object::Stream { dict, body } => Some((dict, body.inline().len() as u64)),
                 _ => None,
             },
         }
@@ -263,8 +263,8 @@ fn data_into(doc: &PdfDocument, id: u32, fetched: &Fetched<'_>, hasher: &mut Sha
                 let r = ObjectRef::new(id, 0);
                 let Ok(obj) = doc.load_object(r) else { return Ok(false) };
                 return match doc.decrypt_stream_for_copy(obj, r)? {
-                    Object::Stream { data, .. } => {
-                        hasher.update(&data);
+                    Object::Stream { body, .. } => {
+                        hasher.update(body.inline());
                         Ok(true)
                     },
                     _ => Ok(false),
@@ -285,7 +285,8 @@ fn data_into(doc: &PdfDocument, id: u32, fetched: &Fetched<'_>, hasher: &mut Sha
             Ok(true)
         },
         other => match other.object() {
-            Some(Object::Stream { data, .. }) => {
+            Some(Object::Stream { body, .. }) => {
+                let data = body.inline();
                 if doc.is_encrypted() && data.len() as u64 > MEMORY_STREAM {
                     return Ok(false);
                 }

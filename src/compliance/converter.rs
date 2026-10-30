@@ -482,10 +482,9 @@ impl PdfAConverter {
         stream_dict.insert("Type".to_string(), Object::Name("Metadata".to_string()));
         stream_dict.insert("Subtype".to_string(), Object::Name("XML".to_string()));
         stream_dict.insert("Length".to_string(), Object::Integer(xmp_bytes.len() as i64));
-        let xmp_stream = Object::Stream {
-            dict: stream_dict,
-            data: bytes::Bytes::from(xmp_bytes),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let xmp_stream = Object::stream(stream_dict, bytes::Bytes::from(xmp_bytes));
+        // ── end pdf_manipulator patch ──
 
         let xmp_id = editor.alloc_id();
         editor.insert_modified(xmp_id, xmp_stream);
@@ -530,8 +529,10 @@ impl PdfAConverter {
         let current_xml = match &current {
             Some(obj @ Object::Stream { .. }) => {
                 let decoded = obj.decode_stream_data().unwrap_or_else(|_| {
-                    if let Object::Stream { data, .. } = obj {
-                        data.to_vec()
+                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                    if let Object::Stream { body, .. } = obj {
+                        body.inline().to_vec()
+                        // ── end pdf_manipulator patch ──
                     } else {
                         vec![]
                     }
@@ -560,10 +561,9 @@ impl PdfAConverter {
 
         editor.insert_modified(
             metadata_ref.id,
-            Object::Stream {
-                dict: stream_dict,
-                data: bytes::Bytes::from(patched_bytes),
-            },
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::stream(stream_dict, bytes::Bytes::from(patched_bytes)),
+            // ── end pdf_manipulator patch ──
         );
 
         result.add_action(
@@ -623,10 +623,9 @@ impl PdfAConverter {
         let ff_id = editor.alloc_id();
         editor.insert_modified(
             ff_id,
-            Object::Stream {
-                dict: ff_dict,
-                data: bytes::Bytes::from(font_bytes),
-            },
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::stream(ff_dict, bytes::Bytes::from(font_bytes)),
+            // ── end pdf_manipulator patch ──
         );
 
         // Update every matching font object to reference a FontDescriptor with FontFile2.
@@ -714,10 +713,9 @@ impl PdfAConverter {
         let mut icc_dict = std::collections::HashMap::new();
         icc_dict.insert("N".to_string(), Object::Integer(icc_channel_count(&icc_bytes) as i64));
         icc_dict.insert("Length".to_string(), Object::Integer(icc_bytes.len() as i64));
-        let icc_stream = Object::Stream {
-            dict: icc_dict,
-            data: bytes::Bytes::from(icc_bytes),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let icc_stream = Object::stream(icc_dict, bytes::Bytes::from(icc_bytes));
+        // ── end pdf_manipulator patch ──
         let icc_id = editor.alloc_id();
         editor.insert_modified(icc_id, icc_stream);
 
@@ -1111,10 +1109,9 @@ impl PdfAConverter {
                 let img_id = editor.alloc_id();
                 editor.insert_modified(
                     img_id,
-                    Object::Stream {
-                        dict: img_dict,
-                        data: bytes::Bytes::from(raw_rgb),
-                    },
+                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                    Object::stream(img_dict, bytes::Bytes::from(raw_rgb)),
+                    // ── end pdf_manipulator patch ──
                 );
 
                 // Form XObject: content stream "q W 0 0 H cm /Im Do Q".
@@ -1140,10 +1137,9 @@ impl PdfAConverter {
                 let form_id = editor.alloc_id();
                 editor.insert_modified(
                     form_id,
-                    Object::Stream {
-                        dict: form_dict,
-                        data: bytes::Bytes::from(content.into_bytes()),
-                    },
+                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                    Object::stream(form_dict, bytes::Bytes::from(content.into_bytes())),
+                    // ── end pdf_manipulator patch ──
                 );
 
                 // /AP dict pointing to the Form XObject.

@@ -146,10 +146,9 @@ fn test_object_stream_decode_no_filter() {
     let mut dict = HashMap::new();
     dict.insert("Length".to_string(), Object::Integer(13));
 
-    let stream = Object::Stream {
-        dict,
-        data: Bytes::from_static(b"Hello, World!"),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let stream = Object::stream(dict, Bytes::from_static(b"Hello, World!"));
+    // ── end pdf_manipulator patch ──
 
     let decoded = stream.decode_stream_data().unwrap();
     assert_eq!(decoded, b"Hello, World!");
@@ -167,10 +166,9 @@ fn test_object_stream_decode_with_flate() {
     dict.insert("Length".to_string(), Object::Integer(compressed.len() as i64));
     dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
 
-    let stream = Object::Stream {
-        dict,
-        data: Bytes::from(compressed),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let stream = Object::stream(dict, Bytes::from(compressed));
+    // ── end pdf_manipulator patch ──
 
     let decoded = stream.decode_stream_data().unwrap();
     assert_eq!(decoded, original);
@@ -198,10 +196,9 @@ fn test_object_stream_decode_with_multiple_filters() {
         ]),
     );
 
-    let stream = Object::Stream {
-        dict,
-        data: Bytes::from(hex_encoded.into_bytes()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let stream = Object::stream(dict, Bytes::from(hex_encoded.into_bytes()));
+    // ── end pdf_manipulator patch ──
 
     let decoded = stream.decode_stream_data().unwrap();
     assert_eq!(decoded, original);

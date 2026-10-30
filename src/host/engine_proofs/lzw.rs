@@ -63,7 +63,7 @@ fn a_streams_early_change_entry_selects_the_switch() {
             p.insert(key.to_string(), Object::Integer(value));
             dict.insert("DecodeParms".to_string(), Object::Dictionary(p));
         }
-        Object::Stream { dict, data: bytes::Bytes::copy_from_slice(data) }
+        Object::stream(dict, bytes::Bytes::copy_from_slice(data))
     };
 
     let zero = stream(Some(("EarlyChange", 0)), &late);

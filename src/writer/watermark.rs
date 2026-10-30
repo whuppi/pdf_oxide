@@ -365,10 +365,9 @@ impl WatermarkAnnotation {
         let mut ap_dict = HashMap::new();
         ap_dict.insert(
             "N".to_string(),
-            Object::Stream {
-                dict: ap_stream_dict,
-                data: bytes::Bytes::from(ap_stream),
-            },
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::stream(ap_stream_dict, bytes::Bytes::from(ap_stream)),
+            // ── end pdf_manipulator patch ──
         );
 
         dict.insert("AP".to_string(), Object::Dictionary(ap_dict));

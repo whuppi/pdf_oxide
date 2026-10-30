@@ -127,7 +127,7 @@ pub(crate) fn object_stream(batch: Vec<(u32, Vec<u8>)>, deflate: Option<u32>) ->
     if deflate.is_some() {
         dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
     }
-    Object::Stream { dict, data: sink.finish().into() }
+    Object::stream(dict, sink.finish())
 }
 
 /// One cross-reference entry.
@@ -257,7 +257,7 @@ pub(crate) fn xref_stream(
         parms.insert("Columns".to_string(), Object::Integer(row_len as i64));
         trailer.insert("DecodeParms".to_string(), Object::Dictionary(parms));
     }
-    Object::Stream { dict: trailer, data: data.into() }
+    Object::stream(trailer, data)
 }
 
 /// The bytes of an xref stream as they are produced: raw, or deflated on

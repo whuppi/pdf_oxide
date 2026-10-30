@@ -1491,10 +1491,9 @@ mod tests {
             ]),
         );
 
-        let func_obj = Object::Stream {
-            dict: func_dict,
-            data: program.to_vec().into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let func_obj = Object::stream(func_dict, program.to_vec());
+        // ── end pdf_manipulator patch ──
 
         let arr = vec![
             Object::Name("Separation".into()),
@@ -1528,10 +1527,9 @@ mod tests {
         let program = b"{ 0.0 exch 0.0 0.0 }";
         let mut func_dict: HashMap<String, Object> = HashMap::new();
         func_dict.insert("FunctionType".into(), Object::Integer(4));
-        let func_obj = Object::Stream {
-            dict: func_dict,
-            data: program.to_vec().into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let func_obj = Object::stream(func_dict, program.to_vec());
+        // ── end pdf_manipulator patch ──
         let arr = vec![
             Object::Name("Separation".into()),
             Object::Name("MagentaSpot".into()),
@@ -1582,10 +1580,9 @@ mod tests {
             .insert("Range".into(), Object::Array(vec![Object::Integer(0), Object::Integer(1)]));
         func_dict.insert("Size".into(), Object::Array(vec![Object::Integer(3)]));
         func_dict.insert("BitsPerSample".into(), Object::Integer(8));
-        let func_obj = Object::Stream {
-            dict: func_dict,
-            data: vec![0u8, 128, 255].into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let func_obj = Object::stream(func_dict, vec![0u8, 128, 255]);
+        // ── end pdf_manipulator patch ──
         let out = super::evaluate_type0_sampled(&func_obj, &[0.25]).expect("in supported envelope");
         assert_eq!(out.len(), 1);
         let expected = 0.5 * (128.0 / 255.0);
@@ -1618,10 +1615,9 @@ mod tests {
             .insert("Size".into(), Object::Array(vec![Object::Integer(2), Object::Integer(2)]));
         func_dict.insert("BitsPerSample".into(), Object::Integer(8));
         // Sample order per SS 7.10.2 (dim 0 fastest): (0,0) (1,0) (0,1) (1,1).
-        let func_obj = Object::Stream {
-            dict: func_dict,
-            data: vec![0u8, 0, 0, 255].into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let func_obj = Object::stream(func_dict, vec![0u8, 0, 0, 255]);
+        // ── end pdf_manipulator patch ──
         let out =
             super::evaluate_type0_sampled(&func_obj, &[0.25, 0.75]).expect("in supported envelope");
         assert_eq!(out.len(), 1);
@@ -1677,10 +1673,9 @@ mod tests {
             0, 0, 0,       // (0,1)
             255, 0, 0,     // (1,1)
         ];
-        let func_obj = Object::Stream {
-            dict: func_dict,
-            data: samples.into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let func_obj = Object::stream(func_dict, samples);
+        // ── end pdf_manipulator patch ──
         let arr = vec![
             Object::Name("DeviceN".into()),
             Object::Array(vec![Object::Name("Alpha".into()), Object::Name("Beta".into())]),
@@ -1766,10 +1761,9 @@ mod tests {
         // inline behaviour at `page_renderer.rs:584-617`).
         let mut stream_dict: HashMap<String, Object> = HashMap::new();
         stream_dict.insert("N".into(), Object::Integer(4));
-        let icc_stream = Object::Stream {
-            dict: stream_dict,
-            data: Vec::new().into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let icc_stream = Object::stream(stream_dict, Vec::new());
+        // ── end pdf_manipulator patch ──
         let arr = vec![Object::Name("ICCBased".into()), icc_stream];
         let space = Object::Array(arr);
         let doc = fixture_doc();

@@ -1,6 +1,6 @@
 //! CancelCheck — the cancellation probe engine loops poll between pages.
 //!
-//! This file is a pdf_manipulator patch (NOT upstream).
+//! This file is fork-only code (NOT upstream).
 //!
 //! A loop that does CPU work between I/O calls (all-pages extract, search,
 //! image reduction, validation, conversion) calls [`CancelCheck::check`]

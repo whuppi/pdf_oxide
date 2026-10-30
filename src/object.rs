@@ -2,6 +2,36 @@
 
 use crate::error::{Error, Result};
 
+// ── pdf_manipulator patch: stream bodies are StreamBody ──
+/// The bytes of a stream as they sit in the file, before decryption and filters.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamBody {
+    /// Held in memory.
+    Inline(bytes::Bytes),
+}
+
+impl StreamBody {
+    /// The held bytes.
+    pub fn inline(&self) -> &bytes::Bytes {
+        match self {
+            StreamBody::Inline(bytes) => bytes,
+        }
+    }
+}
+
+impl From<bytes::Bytes> for StreamBody {
+    fn from(bytes: bytes::Bytes) -> Self {
+        StreamBody::Inline(bytes)
+    }
+}
+
+impl From<Vec<u8>> for StreamBody {
+    fn from(bytes: Vec<u8>) -> Self {
+        StreamBody::Inline(bytes.into())
+    }
+}
+// ── end pdf_manipulator patch ──
+
 /// PDF object representation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Object {
@@ -26,7 +56,9 @@ pub enum Object {
         /// Stream dictionary
         dict: std::collections::HashMap<String, Object>,
         /// Stream data
-        data: bytes::Bytes,
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        body: StreamBody,
+        // ── end pdf_manipulator patch ──
     },
     /// Indirect object reference
     Reference(ObjectRef),
@@ -135,6 +167,19 @@ impl Object {
     pub fn text_string(s: impl AsRef<str>) -> Self {
         Object::String(encode_pdf_text_string(s.as_ref()))
     }
+
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    /// Create a stream object holding `data` in memory.
+    pub fn stream(
+        dict: std::collections::HashMap<String, Object>,
+        data: impl Into<bytes::Bytes>,
+    ) -> Object {
+        Object::Stream {
+            dict,
+            body: StreamBody::Inline(data.into()),
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Get the type name of this object (without data).
     ///
@@ -270,7 +315,10 @@ impl Object {
         gen_num: u32,
     ) -> Result<Vec<u8>> {
         match self {
-            Object::Stream { dict, data } => {
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::Stream { dict, body } => {
+                let data = body.inline();
+                // ── end pdf_manipulator patch ──
                 // Step 1: Decrypt stream data BEFORE applying filters
                 // PDF Spec: Section 7.6.2 - Encryption must be applied before compression
                 //
@@ -597,10 +645,9 @@ mod tests {
     fn test_object_stream_dict_access() {
         let mut dict = HashMap::new();
         dict.insert("Length".to_string(), Object::Integer(100));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"stream data"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"stream data"));
+        // ── end pdf_manipulator patch ──
 
         // Stream objects should also be accessible as dictionaries
         let d = obj.as_dict().unwrap();
@@ -645,10 +692,9 @@ mod tests {
     fn test_decode_stream_no_filter() {
         let mut dict = HashMap::new();
         dict.insert("Length".to_string(), Object::Integer(5));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"Hello"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"Hello"));
+        // ── end pdf_manipulator patch ──
 
         let decoded = obj.decode_stream_data().unwrap();
         assert_eq!(decoded, b"Hello");
@@ -658,10 +704,9 @@ mod tests {
     fn test_decode_stream_single_filter() {
         let mut dict = HashMap::new();
         dict.insert("Filter".to_string(), Object::Name("ASCIIHexDecode".to_string()));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"48656C6C6F"), // "Hello" in hex
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"48656C6C6F")); // "Hello" in hex
+        // ── end pdf_manipulator patch ──
 
         let decoded = obj.decode_stream_data().unwrap();
         assert_eq!(decoded, b"Hello");
@@ -675,10 +720,9 @@ mod tests {
             "Filter".to_string(),
             Object::Array(vec![Object::Name("ASCIIHexDecode".to_string())]),
         );
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"48656C6C6F"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"48656C6C6F"));
+        // ── end pdf_manipulator patch ──
 
         let decoded = obj.decode_stream_data().unwrap();
         assert_eq!(decoded, b"Hello");
@@ -756,10 +800,9 @@ mod tests {
         assert_eq!(Object::Array(vec![]).type_name(), "Array");
         assert_eq!(Object::Dictionary(HashMap::new()).type_name(), "Dictionary");
         assert_eq!(
-            Object::Stream {
-                dict: HashMap::new(),
-                data: bytes::Bytes::new()
-            }
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::stream(HashMap::new(), bytes::Bytes::new())
+            // ── end pdf_manipulator patch ──
             .type_name(),
             "Stream"
         );
@@ -1094,10 +1137,9 @@ mod tests {
     fn test_decode_stream_with_decryption_no_decrypt() {
         let mut dict = HashMap::new();
         dict.insert("Length".to_string(), Object::Integer(5));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"Hello"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"Hello"));
+        // ── end pdf_manipulator patch ──
         let decoded = obj.decode_stream_data_with_decryption(None, 0, 0).unwrap();
         assert_eq!(decoded, b"Hello");
     }
@@ -1106,10 +1148,9 @@ mod tests {
     fn test_decode_stream_with_decryption_fn() {
         let mut dict = HashMap::new();
         dict.insert("Length".to_string(), Object::Integer(5));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"Hello"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"Hello"));
+        // ── end pdf_manipulator patch ──
         // Simple identity "decryption" function
         let decrypt_fn = |data: &[u8]| -> Result<Vec<u8>> { Ok(data.to_vec()) };
         let decoded = obj
@@ -1122,10 +1163,9 @@ mod tests {
     fn test_decode_stream_with_decryption_fn_that_transforms() {
         let mut dict = HashMap::new();
         dict.insert("Length".to_string(), Object::Integer(5));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"\x01\x02\x03"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"\x01\x02\x03"));
+        // ── end pdf_manipulator patch ──
         // "Decryption" that XOR-s with 0xFF
         let decrypt_fn =
             |data: &[u8]| -> Result<Vec<u8>> { Ok(data.iter().map(|b| b ^ 0xFF).collect()) };
@@ -1139,10 +1179,9 @@ mod tests {
     fn test_decode_stream_with_decryption_fn_error() {
         let mut dict = HashMap::new();
         dict.insert("Length".to_string(), Object::Integer(5));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"Hello"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"Hello"));
+        // ── end pdf_manipulator patch ──
         let decrypt_fn =
             |_data: &[u8]| -> Result<Vec<u8>> { Err(Error::InvalidPdf("decrypt fail".into())) };
         let result = obj.decode_stream_data_with_decryption(Some(&decrypt_fn), 1, 0);
@@ -1171,10 +1210,9 @@ mod tests {
     fn test_decode_stream_preserves_leading_cr_lf() {
         let mut dict = HashMap::new();
         dict.insert("Length".to_string(), Object::Integer(7));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"\r\nHello"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"\r\nHello"));
+        // ── end pdf_manipulator patch ──
         let decoded = obj.decode_stream_data().unwrap();
         assert_eq!(decoded, b"\r\nHello");
     }
@@ -1195,10 +1233,9 @@ mod tests {
         let mut decode_params = HashMap::new();
         decode_params.insert("Predictor".to_string(), Object::Integer(1));
         dict.insert("DecodeParms".to_string(), Object::Dictionary(decode_params));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b"48656C6C6F"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b"48656C6C6F"));
+        // ── end pdf_manipulator patch ──
         let decoded = obj.decode_stream_data().unwrap();
         assert_eq!(decoded, b"Hello");
     }
@@ -1231,10 +1268,9 @@ mod tests {
         let mut dict = HashMap::new();
         dict.insert("Type".to_string(), Object::Name("XObject".to_string()));
         dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
-        let obj = Object::Stream {
-            dict: dict.clone(),
-            data: bytes::Bytes::from_static(b"image data"),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict.clone(), bytes::Bytes::from_static(b"image data"));
+        // ── end pdf_manipulator patch ──
         let result_dict = obj.as_dict().unwrap();
         assert_eq!(result_dict.len(), 2);
         assert_eq!(result_dict.get("Type").unwrap().as_name(), Some("XObject"));

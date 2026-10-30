@@ -239,10 +239,9 @@ pub fn parse_object(input: &[u8]) -> IResult<&[u8], Object> {
 
                 return Ok((
                     final_input,
-                    Object::Stream {
-                        dict,
-                        data: bytes::Bytes::from(stream_data),
-                    },
+                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                    Object::stream(dict, bytes::Bytes::from(stream_data)),
+                    // ── end pdf_manipulator patch ──
                 ));
             }
 

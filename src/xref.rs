@@ -825,7 +825,9 @@ fn parse_xref_stream<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Cros
 
     // Extract the stream dict and data
     let (stream_dict, stream_data) = match obj {
-        Object::Stream { dict, data } => (dict, data),
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::Stream { dict, body } => (dict, body.inline().clone()),
+        // ── end pdf_manipulator patch ──
         _ => return Err(Error::InvalidPdf("xref stream is not a stream object".to_string())),
     };
 

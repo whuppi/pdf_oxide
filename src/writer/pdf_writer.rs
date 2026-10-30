@@ -1487,20 +1487,14 @@ impl PdfWriter {
                 }
                 image_objects.push((
                     img_id,
-                    Object::Stream {
-                        dict,
-                        data: bytes::Bytes::from(data.data.clone()),
-                    },
+                    Object::stream(dict, bytes::Bytes::from(data.data.clone())),
                     Vec::new(),
                 ));
                 if let (Some(sm_id), Some(sm_data)) = (soft_mask_id, &data.soft_mask) {
                     let sm_dict = data.build_soft_mask_dict().expect("soft mask present");
                     image_objects.push((
                         sm_id,
-                        Object::Stream {
-                            dict: sm_dict,
-                            data: bytes::Bytes::from(sm_data.clone()),
-                        },
+                        Object::stream(sm_dict, bytes::Bytes::from(sm_data.clone())),
                         Vec::new(),
                     ));
                 }
@@ -1650,10 +1644,7 @@ impl PdfWriter {
             page_objects.push((page_id, page_obj, Vec::new()));
             page_objects.push((
                 content_id,
-                Object::Stream {
-                    dict: content_dict,
-                    data: bytes::Bytes::from(content_bytes),
-                },
+                Object::stream(content_dict, bytes::Bytes::from(content_bytes)),
                 Vec::new(),
             ));
         }
@@ -1946,10 +1937,7 @@ impl PdfWriter {
             xmp_dict.insert("Length".to_string(), Object::Integer(xmp.len() as i64));
             self.objects.insert(
                 xmp_id,
-                Object::Stream {
-                    dict: xmp_dict,
-                    data: bytes::Bytes::from(xmp),
-                },
+                Object::stream(xmp_dict, bytes::Bytes::from(xmp)),
             );
             catalog_entries.push(("Metadata", ObjectSerializer::reference(xmp_id, 0)));
             Some(xmp_id)

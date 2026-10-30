@@ -125,10 +125,9 @@ mod tests {
     use std::collections::HashMap;
 
     fn stream(body: &[u8]) -> Object {
-        Object::Stream {
-            dict: HashMap::new(),
-            data: body.to_vec().into(),
-        }
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(HashMap::new(), body.to_vec())
+        // ── end pdf_manipulator patch ──
     }
     fn refr(id: u32) -> Object {
         Object::Reference(ObjectRef { id, gen: 0 })

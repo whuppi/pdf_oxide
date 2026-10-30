@@ -2016,10 +2016,10 @@ fn prepend_to_page_content(
     let mut content_dict = std::collections::HashMap::new();
     content_dict.insert("Length".into(), Object::Integer(stream_bytes.len() as i64));
     let content_id = editor.alloc_id();
-    editor.insert_modified(content_id, Object::Stream {
-        dict: content_dict,
-        data: bytes::Bytes::from(stream_bytes.to_vec()),
-    });
+    editor.insert_modified(content_id, Object::stream(
+        content_dict,
+        bytes::Bytes::from(stream_bytes.to_vec()),
+    ));
     let new_ref = Object::Reference(ObjectRef::new(content_id, 0));
 
     // /Contents = [new, ...existing]. A direct (non-reference) existing
@@ -2099,10 +2099,10 @@ pub fn edit_add_image_stamp(
         (img.build_soft_mask_dict(), img.soft_mask.clone())
     {
         let smask_id = editor.alloc_id();
-        editor.insert_modified(smask_id, Object::Stream {
-            dict: smask_dict,
-            data: bytes::Bytes::from(smask_data),
-        });
+        editor.insert_modified(smask_id, Object::stream(
+            smask_dict,
+            bytes::Bytes::from(smask_data),
+        ));
         img_dict.insert(
             "SMask".into(),
             Object::Reference(crate::object::ObjectRef::new(smask_id, 0)),
@@ -2110,10 +2110,7 @@ pub fn edit_add_image_stamp(
     }
 
     let img_id = editor.alloc_id();
-    editor.insert_modified(img_id, Object::Stream {
-        dict: img_dict,
-        data: bytes::Bytes::from(img.data),
-    });
+    editor.insert_modified(img_id, Object::stream(img_dict, bytes::Bytes::from(img.data)));
 
     // Form XObject (appearance stream) — draws the image scaled to rect
     let content = format!("q\n{} 0 0 {} 0 0 cm\n/Im0 Do\nQ\n", w, h);
@@ -2146,10 +2143,7 @@ pub fn edit_add_image_stamp(
     form_dict.insert("Length".into(), Object::Integer(content.len() as i64));
 
     let form_id = editor.alloc_id();
-    editor.insert_modified(form_id, Object::Stream {
-        dict: form_dict,
-        data: bytes::Bytes::from(content),
-    });
+    editor.insert_modified(form_id, Object::stream(form_dict, bytes::Bytes::from(content)));
 
     // Stamp annotation dict with appearance
     let mut ap = std::collections::HashMap::new();

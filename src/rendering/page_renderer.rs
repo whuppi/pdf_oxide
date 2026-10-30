@@ -3301,10 +3301,9 @@ impl PageRenderer {
                             .get("ImageMask")
                             .map(|o| matches!(o, Object::Boolean(true)))
                             .unwrap_or(false);
-                        let synthetic = Object::Stream {
-                            dict: expanded,
-                            data: bytes::Bytes::from(data.clone()),
-                        };
+                        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                        let synthetic = Object::stream(expanded, bytes::Bytes::from(data.clone()));
+                        // ── end pdf_manipulator patch ──
                         if is_image_mask {
                             if let Err(e) = self.render_image_mask(
                                 pixmap,
@@ -12401,10 +12400,9 @@ mod tests {
                 Object::Integer(1),
             ]),
         );
-        let func_obj = Object::Stream {
-            dict: func_dict,
-            data: program.to_vec().into(),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let func_obj = Object::stream(func_dict, program.to_vec());
+        // ── end pdf_manipulator patch ──
         Object::Array(vec![
             Object::Name("Separation".into()),
             Object::Name("MagentaSpot".into()),

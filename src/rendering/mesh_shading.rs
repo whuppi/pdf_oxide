@@ -1449,10 +1449,9 @@ mod tests {
         dict.insert("BitsPerSample".to_string(), Object::Integer(8));
         // Sample order: (0,0) (1,0) (0,1) (1,1).
         let samples: [u8; 12] = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
-        Object::Stream {
-            dict,
-            data: bytes::Bytes::copy_from_slice(&samples),
-        }
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(dict, bytes::Bytes::copy_from_slice(&samples))
+        // ── end pdf_manipulator patch ──
     }
 
     /// The prepared-bytes fast path and the per-call decode fallback must

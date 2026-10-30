@@ -151,6 +151,7 @@ impl DocumentInfo {
                 info.mod_date = crate::object::decode_pdf_text_string(s).into();
             }
         }
+        // ── end pdf_manipulator patch ──
 
         info
     }
@@ -1838,7 +1839,7 @@ impl DocumentEditor {
     /// dictionary with no data, so nothing large is ever loaded.
     fn load_dict_only(doc: &PdfDocument, r: ObjectRef) -> Result<Object> {
         match doc.stream_head(r)? {
-            Some(head) => Ok(Object::Stream { dict: head.dict, data: bytes::Bytes::new() }),
+            Some(head) => Ok(Object::stream(head.dict, bytes::Bytes::new())),
             None => doc.load_object(r),
         }
     }
@@ -2454,11 +2455,10 @@ impl DocumentEditor {
 
         let fields_to_flush: Vec<FieldFlush> = {
             let mut result = Vec::new();
-            // ── pdf_manipulator patch: name order, two fields on one widget object resolve the same way every save ──
+            // name order, two fields on one widget object resolve the same way every save
             let mut by_name: Vec<_> = self.modified_form_fields.iter().collect();
             by_name.sort_by(|a, b| a.0.cmp(b.0));
             for (_, wrapper) in by_name {
-            // ── end pdf_manipulator patch ──
                 if !wrapper.is_modified() || wrapper.is_new() {
                     continue;
                 }
@@ -2779,7 +2779,7 @@ impl DocumentEditor {
         let mut seen = vec![false; max_id];
         let mut queue: Vec<u32> = Vec::with_capacity(256);
         let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
-        // ── pdf_manipulator patch: an object stream is drained before the walk leaves it ──
+        // an object stream is drained before the walk leaves it
         // Ids whose objects sit in an object stream wait here by container;
         // the walk reads the members of one stream together, so the stream
         // is decoded once instead of once per member.
@@ -2801,7 +2801,6 @@ impl DocumentEditor {
                 }
             }
         };
-        // ── end pdf_manipulator patch ──
 
         if let Some((_, named)) = written {
             let named: Vec<u32> = named.iter().map(|&(target, _)| target).collect();
@@ -2829,7 +2828,7 @@ impl DocumentEditor {
         route(&prune.kept_pages, &seen, &mut queue, &mut by_stream);
 
         loop {
-            // ── pdf_manipulator patch: an object stream is drained before the walk leaves it ──
+            // an object stream is drained before the walk leaves it
             let id = match queue.pop() {
                 Some(id) => id,
                 None => {
@@ -2849,7 +2848,6 @@ impl DocumentEditor {
                     id
                 },
             };
-            // ── end pdf_manipulator patch ──
             let idx = id as usize;
             if idx >= max_id || seen[idx] || prune.excluded.contains(&id) {
                 continue;
@@ -2878,7 +2876,7 @@ impl DocumentEditor {
             .collect()
     }
 
-    // ── pdf_manipulator patch: the written objects are closed under reference ──
+    // the written objects are closed under reference
     /// The first `(referenced id, referencing id)` of `references` that
     /// names an object the save has on hand and did not write: a staged
     /// object, a source object in use, or an id the save allocated. A
@@ -2912,9 +2910,8 @@ impl DocumentEditor {
         }
         None
     }
-    // ── end pdf_manipulator patch ──
 
-    // ── pdf_manipulator patch: one copy of identical images, ICC profiles and font programs ──
+    // one copy of identical images, ICC profiles and font programs
     /// The duplicate-to-kept map of this save's `merge_duplicates` option
     /// (empty with the option off): every object the save writes, from this
     /// document and from each merged source, in the numbering of the output.
@@ -2979,9 +2976,8 @@ impl DocumentEditor {
         }
         find(&origins, cancel)
     }
-    // ── end pdf_manipulator patch ──
 
-    // ── pdf_manipulator patch: what only a dropped page reaches (#261) ──
+    // what only a dropped page reaches (#261)
     /// The objects reachable from the prune plan's excluded objects (dropped
     /// pages, inner /Pages nodes, dropped-page annotations) and from nothing
     /// the kept document reaches. A save without garbage collection writes
@@ -3021,7 +3017,6 @@ impl DocumentEditor {
         }
         only
     }
-    // ── end pdf_manipulator patch ──
 
     /// Load an object from `self.source` for copying into the output file,
     /// decrypting its stream data (if any) so it survives into an output
@@ -3036,7 +3031,7 @@ impl DocumentEditor {
         self.source.decrypt_stream_for_copy(obj, r)
     }
 
-    // ── pdf_manipulator patch: the page walk writes staged objects ──
+    // the page walk writes staged objects
     /// Like `load_source_object`, but a staged replacement wins: the
     /// resource walk writes XObjects and ExtGStates before the sweep, and
     /// the sweep skips ids already written, so a lookup that ignores
@@ -3047,9 +3042,8 @@ impl DocumentEditor {
             None => self.load_source_object(r),
         }
     }
-    // ── end pdf_manipulator patch ──
 
-    // ── pdf_manipulator patch: an unchanged source stream is copied, not loaded ──
+    // an unchanged source stream is copied, not loaded
     /// Writes unstaged source object `r` as a chunked copy of its stream
     /// data and returns `true`, or returns `false` having written nothing
     /// when the object cannot be copied raw (not a plain stream, an
@@ -3242,7 +3236,7 @@ impl DocumentEditor {
         let framed = serializer.serialize_indirect(
             out_id,
             0,
-            &Object::Stream { dict, data: bytes::Bytes::new() },
+            &Object::stream(dict, bytes::Bytes::new()),
         );
         let Some(prefix) = framed.strip_suffix(EMPTY_TAIL) else {
             return Ok(false);
@@ -3298,9 +3292,8 @@ impl DocumentEditor {
         }
         Ok(true)
     }
-    // ── end pdf_manipulator patch ──
 
-    // ── pdf_manipulator patch: queued objects become object streams ──
+    // queued objects become object streams
     /// Writes the objects the packer holds as object streams: every full
     /// batch, and with `rest` the last partial one too. The stream is an
     /// object of its own, encrypted as a stream when the save encrypts.
@@ -3334,7 +3327,6 @@ impl DocumentEditor {
         }
         Ok(())
     }
-    // ── end pdf_manipulator patch ──
 
     // ── end pdf_manipulator patch ──
 
@@ -3417,10 +3409,10 @@ impl DocumentEditor {
         fn deflate_stream(obj: Object, level: u32) -> Object {
             use crate::host::deflate::{encoding, smaller, Encoding};
             match obj {
-                Object::Stream { mut dict, data } => {
+                Object::Stream { mut dict, body } => {
                     let kind = encoding(&dict);
-                    let Some(compressed) = smaller(&data, kind, level) else {
-                        return Object::Stream { dict, data };
+                    let Some(compressed) = smaller(body.inline(), kind, level) else {
+                        return Object::Stream { dict, body };
                     };
                     if kind == Encoding::Raw {
                         dict.insert(
@@ -3432,10 +3424,7 @@ impl DocumentEditor {
                         "Length".to_string(),
                         Object::Integer(compressed.len() as i64),
                     );
-                    Object::Stream {
-                        dict,
-                        data: compressed.into(),
-                    }
+                    Object::stream(dict, compressed)
                 },
                 other => other,
             }
@@ -3877,10 +3866,9 @@ impl DocumentEditor {
 
                 // Build and write embedded file stream
                 let stream_dict = file.build_stream_dict();
-                let stream_obj = Object::Stream {
-                    dict: stream_dict,
-                    data: file.data.clone().into(),
-                };
+                // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                let stream_obj = Object::stream(stream_dict, file.data.clone());
+                // ── end pdf_manipulator patch ──
                 let offset = writer.position();
                 let bytes =
                     serialize_obj(&serializer, stream_id, 0, &stream_obj, &encryption_handler);
@@ -4916,10 +4904,12 @@ impl DocumentEditor {
                                             }
 
                                             // Create stream object for the content
-                                            let content_stream_obj = Object::Stream {
-                                                dict: HashMap::new(),
-                                                data: content_bytes.into(),
-                                            };
+                                            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                            let content_stream_obj = Object::stream(
+                                                HashMap::new(),
+                                                content_bytes,
+                                            );
+                                            // ── end pdf_manipulator patch ──
 
                                             // Use the pre-allocated content ID (page /Contents already updated)
                                             if let Some(content_id) = modified_content_id {
@@ -4961,10 +4951,12 @@ impl DocumentEditor {
                                                                 .unwrap();
                                                             match self.rewrite_content_stream_with_image_mods(&content_data, mods) {
                                                                 Ok(modified_content) => {
-                                                                    let modified_stream = Object::Stream {
-                                                                        dict: HashMap::new(),
-                                                                        data: modified_content.into(),
-                                                                    };
+                                                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                                                    let modified_stream = Object::stream(
+                                                                        HashMap::new(),
+                                                                        modified_content,
+                                                                    );
+                                                                    // ── end pdf_manipulator patch ──
                                                                     let offset = writer.position();
                                                                     let bytes = serialize_obj(&serializer,
                                                                         contents_ref.id,
@@ -5025,10 +5017,12 @@ impl DocumentEditor {
                                                                 {
                                                                     match self.rewrite_content_stream_with_image_mods(&content_data, mods) {
                                                                         Ok(modified_content) => {
-                                                                            let modified_stream = Object::Stream {
-                                                                                dict: HashMap::new(),
-                                                                                data: modified_content.into(),
-                                                                            };
+                                                                            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                                                            let modified_stream = Object::stream(
+                                                                                HashMap::new(),
+                                                                                modified_content,
+                                                                            );
+                                                                            // ── end pdf_manipulator patch ──
                                                                             let offset = writer.position();
                                                                             let bytes = serialize_obj(&serializer,
                                                                                 ref_obj.id,
@@ -5404,10 +5398,12 @@ impl DocumentEditor {
                                         self.generate_erase_overlay(source_page_index)
                                     {
                                         // Create stream object for the overlay
-                                        let overlay_stream = Object::Stream {
-                                            dict: HashMap::new(),
-                                            data: overlay_content.into(),
-                                        };
+                                        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                        let overlay_stream = Object::stream(
+                                            HashMap::new(),
+                                            overlay_content,
+                                        );
+                                        // ── end pdf_manipulator patch ──
                                         let offset = writer.position();
                                         let bytes = serialize_obj(
                                             &serializer,
@@ -5437,10 +5433,12 @@ impl DocumentEditor {
                                         if let Ok((content_bytes, _pending)) =
                                             self.generate_content_stream(&wrapper)
                                         {
-                                            let additions_stream = Object::Stream {
-                                                dict: HashMap::new(),
-                                                data: content_bytes.into(),
-                                            };
+                                            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                            let additions_stream = Object::stream(
+                                                HashMap::new(),
+                                                content_bytes,
+                                            );
+                                            // ── end pdf_manipulator patch ──
                                             let offset = writer.position();
                                             let bytes = serialize_obj(
                                                 &serializer,
@@ -5518,10 +5516,10 @@ impl DocumentEditor {
                                                                 let mut ap = HashMap::new();
                                                                 ap.insert(
                                                                     "N".to_string(),
-                                                                    Object::Stream {
-                                                                        dict: ap_dict,
-                                                                        data: bytes::Bytes::from(ap_data),
-                                                                    },
+                                                                    Object::stream(
+                                                                        ap_dict,
+                                                                        bytes::Bytes::from(ap_data),
+                                                                    ),
                                                                 );
                                                                 dict.insert(
                                                                     "AP".to_string(),
@@ -5571,7 +5569,6 @@ impl DocumentEditor {
                                         writer.write_all(&bytes)?;
                                         xref_entries.push((annot_id, offset, 0, true));
                                     }
-                                    // ── end pdf_manipulator patch ──
                                 }
 
                                 // Write new form field objects
@@ -5652,10 +5649,12 @@ impl DocumentEditor {
                                         }
 
                                         // Create stream object
-                                        let form_stream = Object::Stream {
-                                            dict: form_dict,
-                                            data: appearance.content.clone().into(),
-                                        };
+                                        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                        let form_stream = Object::stream(
+                                            form_dict,
+                                            appearance.content.clone(),
+                                        );
+                                        // ── end pdf_manipulator patch ──
 
                                         let offset = writer.position();
                                         let bytes = serialize_obj(
@@ -5690,10 +5689,12 @@ impl DocumentEditor {
                                     let overlay_content =
                                         self.generate_flatten_overlay(appearances, &xobj_names);
 
-                                    let overlay_stream = Object::Stream {
-                                        dict: HashMap::new(),
-                                        data: overlay_content.into(),
-                                    };
+                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                    let overlay_stream = Object::stream(
+                                        HashMap::new(),
+                                        overlay_content,
+                                    );
+                                    // ── end pdf_manipulator patch ──
 
                                     let offset = writer.position();
                                     let bytes = serialize_obj(
@@ -5712,10 +5713,12 @@ impl DocumentEditor {
                                     let overlay_content =
                                         self.generate_redaction_overlay(redactions);
 
-                                    let overlay_stream = Object::Stream {
-                                        dict: HashMap::new(),
-                                        data: overlay_content.into(),
-                                    };
+                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                    let overlay_stream = Object::stream(
+                                        HashMap::new(),
+                                        overlay_content,
+                                    );
+                                    // ── end pdf_manipulator patch ──
 
                                     let offset = writer.position();
                                     let bytes = serialize_obj(
@@ -5736,10 +5739,12 @@ impl DocumentEditor {
                                 // object above, orphaning the original.
                                 if let Some((redacted_bytes, redacted_id)) = &destructive_redaction
                                 {
-                                    let redacted_stream = Object::Stream {
-                                        dict: HashMap::new(),
-                                        data: redacted_bytes.clone().into(),
-                                    };
+                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                    let redacted_stream = Object::stream(
+                                        HashMap::new(),
+                                        redacted_bytes.clone(),
+                                    );
+                                    // ── end pdf_manipulator patch ──
                                     let offset = writer.position();
                                     let bytes = serialize_obj(
                                         &serializer,
@@ -5806,10 +5811,12 @@ impl DocumentEditor {
                                         }
 
                                         // Create stream object
-                                        let form_stream = Object::Stream {
-                                            dict: form_dict,
-                                            data: appearance.content.clone().into(),
-                                        };
+                                        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                        let form_stream = Object::stream(
+                                            form_dict,
+                                            appearance.content.clone(),
+                                        );
+                                        // ── end pdf_manipulator patch ──
 
                                         let offset = writer.position();
                                         let bytes = serialize_obj(
@@ -5846,10 +5853,12 @@ impl DocumentEditor {
                                     let overlay_content = self
                                         .generate_flatten_overlay(form_appearances, &xobj_names);
 
-                                    let overlay_stream = Object::Stream {
-                                        dict: HashMap::new(),
-                                        data: overlay_content.into(),
-                                    };
+                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                                    let overlay_stream = Object::stream(
+                                        HashMap::new(),
+                                        overlay_content,
+                                    );
+                                    // ── end pdf_manipulator patch ──
 
                                     let offset = writer.position();
                                     let bytes = serialize_obj(
@@ -6701,7 +6710,7 @@ impl DocumentEditor {
     ///
     /// Returns the effective rotation, considering any modifications.
     pub fn get_page_rotation(&mut self, index: usize) -> Result<i32> {
-        // ── pdf_manipulator patch: merged pages read their own document ──
+        // merged pages read their own document
         let source_index = match self.page_key(index) {
             PageKey::Source(source_index) => source_index,
             PageKey::Merged(merged) => {
@@ -6716,7 +6725,6 @@ impl DocumentEditor {
                     .unwrap_or(0));
             },
         };
-        // ── end pdf_manipulator patch ──
         // Check if we have a modified rotation
         if let Some(props) = self.modified_page_props.get(&source_index) {
             if let Some(rotation) = props.rotation {
@@ -6750,10 +6758,9 @@ impl DocumentEditor {
         }
 
         // Store the modified rotation keyed by source index so serialization can find it.
-        // ── pdf_manipulator patch: merged pages keep theirs by merged index ──
+        // merged pages keep theirs by merged index
         let props = self.page_props_mut(index);
         props.rotation = Some(degrees);
-        // ── end pdf_manipulator patch ──
 
         self.is_modified = true;
         Ok(())
@@ -6791,7 +6798,7 @@ impl DocumentEditor {
     ///
     /// Returns [llx, lly, urx, ury] (lower-left x, lower-left y, upper-right x, upper-right y).
     pub fn get_page_media_box(&mut self, index: usize) -> Result<[f32; 4]> {
-        // ── pdf_manipulator patch: merged pages read their own document ──
+        // merged pages read their own document
         let source_index = match self.page_key(index) {
             PageKey::Source(source_index) => source_index,
             PageKey::Merged(merged) => {
@@ -6802,7 +6809,6 @@ impl DocumentEditor {
                 return Ok(Self::box_of(&dict, "MediaBox").unwrap_or([0.0, 0.0, 612.0, 792.0]));
             },
         };
-        // ── end pdf_manipulator patch ──
         // Check if we have a modified MediaBox
         if let Some(props) = self.modified_page_props.get(&source_index) {
             if let Some(media_box) = props.media_box {
@@ -6855,7 +6861,7 @@ impl DocumentEditor {
         let page_refs = self.get_page_refs().unwrap_or_default();
         let mut result = Vec::with_capacity(count);
         for i in 0..count {
-            // ── pdf_manipulator patch: merged pages read their own document ──
+            // merged pages read their own document
             let source_index = match self.page_key(i) {
                 PageKey::Source(source_index) => source_index,
                 PageKey::Merged(_) => {
@@ -6863,7 +6869,6 @@ impl DocumentEditor {
                     continue;
                 },
             };
-            // ── end pdf_manipulator patch ──
             if let Some(props) = self.modified_page_props.get(&source_index) {
                 if let Some(media_box) = props.media_box {
                     result.push(media_box);
@@ -8482,7 +8487,7 @@ impl DocumentEditor {
             // /NeedAppearances true — which our save path sets whenever a value is
             // written, deliberately leaving the /AP a placeholder — take the parsed
             // /V instead and regenerate. Same regeneration block, two text sources.
-            // ── pdf_manipulator patch: buttons are not text (#215) ──
+            // buttons are not text (#215)
             // A button's /V is an appearance-state name, so the /NeedAppearances
             // fallback below would feed "Yes" in as a value to draw. It reaches
             // generate_widget_appearance, which ignores the text and emits its
@@ -8507,7 +8512,6 @@ impl DocumentEditor {
                     }
                 })
             };
-            // ── end pdf_manipulator patch ──
             if let Some(text) = regen_text {
                 // ── end pdf_manipulator patch ──
                 // Values with CJK/emoji glyphs the /DA font cannot render are
@@ -8707,6 +8711,7 @@ impl DocumentEditor {
     // via `self.source.*` (resolve_obj was reinventing PdfDocument::resolve_object
     // and is gone). The flatten path keeps the CJK/emoji embedded-font fallback
     // below; the shared Latin/`/DA` path is `self.source.regenerate_widget_appearance`. ──
+    // ── end pdf_manipulator patch ──
 
     /// Extract appearance stream from a widget annotation.
     fn extract_widget_appearance(
@@ -9719,7 +9724,9 @@ impl DocumentEditor {
         let mut bytes_removed: u64 = 0;
         let account = |obj: &Object, b: &mut u64| {
             *b += match obj {
-                Object::Stream { data, .. } => data.len() as u64 + 64,
+                // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                Object::Stream { body, .. } => body.inline().len() as u64 + 64,
+                // ── end pdf_manipulator patch ──
                 _ => 48,
             };
         };
@@ -10614,10 +10621,9 @@ impl DocumentEditor {
 
         dict.insert("Length".to_string(), Object::Integer(image.data.len() as i64));
 
-        Object::Stream {
-            dict,
-            data: image.data.clone().into(),
-        }
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(dict, image.data.clone())
+        // ── end pdf_manipulator patch ──
     }
 }
 
@@ -11040,6 +11046,7 @@ mod tests {
             0000000115 00000 n \n\
             trailer\n<< /Size 4 /Root 1 0 R >>\n\
             startxref\n186\n%%EOF\n";
+        // ── end pdf_manipulator patch ──
         pdf.to_vec()
     }
 
@@ -12021,10 +12028,9 @@ mod tests {
         let mut output = Vec::new();
         editor.serialize_object(
             &mut output,
-            &Object::Stream {
-                dict: HashMap::new(),
-                data: bytes::Bytes::from_static(b"data"),
-            },
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            &Object::stream(HashMap::new(), bytes::Bytes::from_static(b"data")),
+            // ── end pdf_manipulator patch ──
         );
         assert_eq!(&output, b"(stream)");
     }
@@ -12046,7 +12052,9 @@ mod tests {
         );
 
         let obj = DocumentEditor::build_image_xobject(&image);
-        if let Object::Stream { dict, data } = obj {
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        if let Object::Stream { dict, body: _ } = obj {
+            // ── end pdf_manipulator patch ──
             assert_eq!(dict.get("Type").unwrap(), &Object::Name("XObject".to_string()));
             assert_eq!(dict.get("Subtype").unwrap(), &Object::Name("Image".to_string()));
             assert_eq!(dict.get("Width").unwrap().as_integer().unwrap(), 100);
@@ -12251,13 +12259,13 @@ mod tests {
         );
 
         let obj = DocumentEditor::build_image_xobject(&image);
-        if let Object::Stream {
-            dict,
-            data: stream_data,
-        } = obj
-        {
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        if let Object::Stream { dict, body } = obj {
+            // ── end pdf_manipulator patch ──
             assert_eq!(dict.get("Length").unwrap().as_integer().unwrap(), 5);
-            assert_eq!(stream_data.as_ref(), &data[..]);
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            assert_eq!(body.inline().as_ref(), &data[..]);
+            // ── end pdf_manipulator patch ──
         } else {
             panic!("Expected Stream object");
         }

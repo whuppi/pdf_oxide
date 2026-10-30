@@ -150,10 +150,9 @@ pub fn build_embedded_font_objects(
     }
     out.push((
         font_file_id,
-        Object::Stream {
-            dict: ff_dict,
-            data: bytes::Bytes::from(font_bytes),
-        },
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(ff_dict, bytes::Bytes::from(font_bytes)),
+        // ── end pdf_manipulator patch ──
     ));
 
     // ── 2. FontDescriptor (§9.8.1, Table 122) ────────────────────────────
@@ -221,10 +220,9 @@ pub fn build_embedded_font_objects(
     cmap_dict.insert("Length".to_string(), ObjectSerializer::integer(cmap_bytes.len() as i64));
     out.push((
         tounicode_id,
-        Object::Stream {
-            dict: cmap_dict,
-            data: bytes::Bytes::from(cmap_bytes),
-        },
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Object::stream(cmap_dict, bytes::Bytes::from(cmap_bytes)),
+        // ── end pdf_manipulator patch ──
     ));
 
     // ── 5. Type 0 wrapper (§9.6.4, Table 110) ────────────────────────────

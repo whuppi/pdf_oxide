@@ -64,7 +64,7 @@ fn saved(source: Vec<u8>) -> PdfDocument {
 
 fn parts(object: &Object) -> (&std::collections::HashMap<String, Object>, &[u8]) {
     match object {
-        Object::Stream { dict, data } => (dict, data),
+        Object::Stream { dict, body } => (dict, body.inline()),
         other => panic!("not a stream: {other:?}"),
     }
 }

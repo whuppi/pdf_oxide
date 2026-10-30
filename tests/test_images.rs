@@ -250,10 +250,9 @@ fn test_extract_jpeg_image_from_xobject() {
 
     // Mock JPEG data (just header bytes for testing)
     let jpeg_data = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(jpeg_data.clone()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(jpeg_data.clone()));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 
@@ -285,10 +284,9 @@ fn test_extract_raw_rgb_image_from_xobject() {
         255, 0, 0, // Red pixel
         0, 0, 255, // Blue pixel
     ];
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(pixel_data.clone()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(pixel_data.clone()));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 
@@ -315,10 +313,9 @@ fn test_extract_raw_grayscale_image_from_xobject() {
     dict.insert("ColorSpace".to_string(), Object::Name("DeviceGray".to_string()));
 
     let pixel_data = vec![0, 85, 170, 255];
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(pixel_data.clone()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(pixel_data.clone()));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 
@@ -344,10 +341,9 @@ fn test_extract_raw_cmyk_image_from_xobject() {
     dict.insert("ColorSpace".to_string(), Object::Name("DeviceCMYK".to_string()));
 
     let pixel_data = vec![255, 0, 0, 0]; // Pure cyan
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(pixel_data.clone()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(pixel_data.clone()));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 
@@ -367,10 +363,9 @@ fn test_extract_image_error_cases() {
     // Test missing Subtype
     {
         let dict = HashMap::new();
-        let xobject = Object::Stream {
-            dict,
-            data: bytes::Bytes::from(vec![]),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let xobject = Object::stream(dict, bytes::Bytes::from(vec![]));
+        // ── end pdf_manipulator patch ──
         assert!(extract_image_from_xobject(None, &xobject, None, None).is_err());
     }
 
@@ -378,10 +373,9 @@ fn test_extract_image_error_cases() {
     {
         let mut dict = HashMap::new();
         dict.insert("Subtype".to_string(), Object::Name("Form".to_string()));
-        let xobject = Object::Stream {
-            dict,
-            data: bytes::Bytes::from(vec![]),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let xobject = Object::stream(dict, bytes::Bytes::from(vec![]));
+        // ── end pdf_manipulator patch ──
         assert!(extract_image_from_xobject(None, &xobject, None, None).is_err());
     }
 
@@ -391,10 +385,9 @@ fn test_extract_image_error_cases() {
         dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
         dict.insert("Height".to_string(), Object::Integer(100));
         dict.insert("ColorSpace".to_string(), Object::Name("DeviceRGB".to_string()));
-        let xobject = Object::Stream {
-            dict,
-            data: bytes::Bytes::from(vec![]),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let xobject = Object::stream(dict, bytes::Bytes::from(vec![]));
+        // ── end pdf_manipulator patch ──
         assert!(extract_image_from_xobject(None, &xobject, None, None).is_err());
     }
 
@@ -404,10 +397,9 @@ fn test_extract_image_error_cases() {
         dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
         dict.insert("Width".to_string(), Object::Integer(100));
         dict.insert("ColorSpace".to_string(), Object::Name("DeviceRGB".to_string()));
-        let xobject = Object::Stream {
-            dict,
-            data: bytes::Bytes::from(vec![]),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let xobject = Object::stream(dict, bytes::Bytes::from(vec![]));
+        // ── end pdf_manipulator patch ──
         assert!(extract_image_from_xobject(None, &xobject, None, None).is_err());
     }
 
@@ -417,10 +409,9 @@ fn test_extract_image_error_cases() {
         dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
         dict.insert("Width".to_string(), Object::Integer(100));
         dict.insert("Height".to_string(), Object::Integer(100));
-        let xobject = Object::Stream {
-            dict,
-            data: bytes::Bytes::from(vec![]),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let xobject = Object::stream(dict, bytes::Bytes::from(vec![]));
+        // ── end pdf_manipulator patch ──
         assert!(extract_image_from_xobject(None, &xobject, None, None).is_err());
     }
 }
@@ -437,10 +428,9 @@ fn test_jpeg_filter_array_detection() {
     dict.insert("Filter".to_string(), Object::Array(vec![Object::Name("DCTDecode".to_string())]));
 
     let jpeg_data = vec![0xFF, 0xD8, 0xFF, 0xE0];
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(jpeg_data.clone()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(jpeg_data.clone()));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 
@@ -462,10 +452,9 @@ fn test_bits_per_component_default() {
     dict.insert("ColorSpace".to_string(), Object::Name("DeviceRGB".to_string()));
     // No BitsPerComponent specified - should default to 8
 
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(vec![0; 300]), // 10x10 RGB
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(vec![0; 300])); // 10x10 RGB
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
     assert_eq!(image.bits_per_component(), 8); // Default value
@@ -497,10 +486,9 @@ fn test_large_image_dimensions() {
     dict.insert("Filter".to_string(), Object::Name("DCTDecode".to_string()));
 
     let jpeg_data = vec![0xFF, 0xD8, 0xFF, 0xE0];
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(jpeg_data),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(jpeg_data));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
     assert_eq!(image.width(), 4096);
@@ -548,10 +536,9 @@ fn test_jpeg_with_flatedecode_chain() {
         ]),
     );
 
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(compressed),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(compressed));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 
@@ -583,10 +570,9 @@ fn test_jpeg_single_dctdecode_passthrough() {
     // Single DCTDecode filter — raw pass-through
     dict.insert("Filter".to_string(), Object::Name("DCTDecode".to_string()));
 
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(jpeg_data.clone()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(jpeg_data.clone()));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 
@@ -613,10 +599,9 @@ fn test_jpeg_single_dctdecode_in_array_passthrough() {
     // DCTDecode in a single-element array
     dict.insert("Filter".to_string(), Object::Array(vec![Object::Name("DCTDecode".to_string())]));
 
-    let xobject = Object::Stream {
-        dict,
-        data: bytes::Bytes::from(jpeg_data.clone()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let xobject = Object::stream(dict, bytes::Bytes::from(jpeg_data.clone()));
+    // ── end pdf_manipulator patch ──
 
     let image = extract_image_from_xobject(None, &xobject, None, None).unwrap();
 

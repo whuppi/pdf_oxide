@@ -92,10 +92,12 @@ impl XfaExtractor {
         let xfa_obj = Self::resolve_object(doc, xfa_obj)?;
 
         match &xfa_obj {
-            Object::Stream { dict, data } => {
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::Stream { dict, body } => {
                 // Single stream containing complete XDP
-                Self::decode_stream_data(dict, data)
+                Self::decode_stream_data(dict, body.inline())
             },
+            // ── end pdf_manipulator patch ──
             Object::Array(arr) => {
                 // Array of name/stream pairs
                 // Combine all streams into single XFA document
@@ -129,11 +131,13 @@ impl XfaExtractor {
         let xfa_obj = Self::resolve_object(doc, xfa_obj)?;
 
         match &xfa_obj {
-            Object::Stream { dict, data } => {
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::Stream { dict, body } => {
                 // Single stream - return as single "xdp" packet
-                let decoded = Self::decode_stream_data(dict, data)?;
+                let decoded = Self::decode_stream_data(dict, body.inline())?;
                 Ok(vec![("xdp".to_string(), decoded)])
             },
+            // ── end pdf_manipulator patch ──
             Object::Array(arr) => {
                 // Array of name/stream pairs
                 Self::extract_xfa_packets_from_array(doc, arr)
@@ -195,8 +199,10 @@ impl XfaExtractor {
             // Skip the name, get the stream
             if i + 1 < arr.len() {
                 let stream_obj = Self::resolve_object(doc, &arr[i + 1])?;
-                if let Object::Stream { dict, data } = &stream_obj {
-                    let decoded = Self::decode_stream_data(dict, data)?;
+                // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                if let Object::Stream { dict, body } = &stream_obj {
+                    let decoded = Self::decode_stream_data(dict, body.inline())?;
+                    // ── end pdf_manipulator patch ──
                     combined.extend_from_slice(&decoded);
                 }
             }
@@ -226,8 +232,10 @@ impl XfaExtractor {
 
                 // Get the stream data
                 let stream_obj = Self::resolve_object(doc, &arr[i + 1])?;
-                if let Object::Stream { dict, data } = &stream_obj {
-                    let decoded = Self::decode_stream_data(dict, data)?;
+                // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                if let Object::Stream { dict, body } = &stream_obj {
+                    let decoded = Self::decode_stream_data(dict, body.inline())?;
+                    // ── end pdf_manipulator patch ──
                     packets.push((name, decoded));
                 }
             }

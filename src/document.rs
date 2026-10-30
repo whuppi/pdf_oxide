@@ -393,7 +393,9 @@ impl BoundedObjectCache {
             return std::mem::size_of::<Object>();
         }
         match obj {
-            Object::Stream { dict, data } => Self::dict_heap_size(dict, depth) + data.len(),
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            Object::Stream { dict, body } => Self::dict_heap_size(dict, depth) + body.inline().len(),
+            // ── end pdf_manipulator patch ──
             Object::Dictionary(d) => Self::dict_heap_size(d, depth),
             Object::Array(a) => {
                 a.capacity() * std::mem::size_of::<Object>()
@@ -1769,9 +1771,11 @@ impl PdfDocument {
         obj: Object,
         obj_ref: ObjectRef,
     ) -> Result<Object> {
-        let Object::Stream { mut dict, data } = obj else {
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let Object::Stream { mut dict, body } = obj else {
             return Ok(obj);
         };
+        // ── end pdf_manipulator patch ──
         // Per ISO 32000-2:2020 §7.6.3, object streams and cross-reference
         // streams are never encrypted — same exclusion as
         // `decode_stream_with_encryption` above.
@@ -1781,20 +1785,25 @@ impl PdfDocument {
             .map(|name| name == "ObjStm" || name == "XRef")
             .unwrap_or(false);
         if is_unencrypted_stream_type {
-            return Ok(Object::Stream { dict, data });
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            return Ok(Object::Stream { dict, body });
+            // ── end pdf_manipulator patch ──
         }
         let handler_ref = self.encryption_handler.lock_or_recover();
         let Some(handler) = handler_ref.as_ref() else {
             drop(handler_ref);
-            return Ok(Object::Stream { dict, data });
+            // ── pdf_manipulator patch: stream bodies are StreamBody ──
+            return Ok(Object::Stream { dict, body });
+            // ── end pdf_manipulator patch ──
         };
-        let decrypted = handler.decrypt_stream(&data, obj_ref.id, obj_ref.gen as u32)?;
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let decrypted = handler.decrypt_stream(body.inline(), obj_ref.id, obj_ref.gen as u32)?;
+        // ── end pdf_manipulator patch ──
         drop(handler_ref);
         dict.insert("Length".to_string(), Object::Integer(decrypted.len() as i64));
-        Ok(Object::Stream {
-            dict,
-            data: decrypted.into(),
-        })
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        Ok(Object::stream(dict, decrypted))
+        // ── end pdf_manipulator patch ──
     }
 
     /// Open with custom extraction profile.
@@ -21521,7 +21530,10 @@ impl PdfDocument {
             },
             _ => return,
         };
-        if let Object::Stream { data, .. } = stream {
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        if let Object::Stream { body, .. } = stream {
+            let data = body.inline();
+            // ── end pdf_manipulator patch ──
             (data.len() as u64).hash(hasher);
             data.as_ref().hash(hasher);
         }
@@ -25093,17 +25105,18 @@ impl PdfDocument {
 
                 let resolved_xobject;
                 let xobject_for_extract = if needs_cs_resolve {
-                    if let Object::Stream { dict, data } = &xobject {
+                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                    if let Object::Stream { dict, body } = &xobject {
+                        // ── end pdf_manipulator patch ──
                         let mut new_dict = dict.clone();
                         if let Some(Object::Reference(cs_ref)) = dict.get("ColorSpace") {
                             if let Ok(resolved_cs) = self.load_object(*cs_ref) {
                                 new_dict.insert("ColorSpace".to_string(), resolved_cs);
                             }
                         }
-                        resolved_xobject = Object::Stream {
-                            dict: new_dict,
-                            data: data.clone(),
-                        };
+                        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+                        resolved_xobject = Object::stream(new_dict, body.inline().clone());
+                        // ── end pdf_manipulator patch ──
                         &resolved_xobject
                     } else {
                         &xobject
@@ -25372,10 +25385,9 @@ impl PdfDocument {
         let expanded_dict = expand_inline_image_dict(dict.clone());
 
         // Build a temporary stream object from the dictionary and data
-        let stream_obj = Object::Stream {
-            dict: expanded_dict,
-            data: bytes::Bytes::copy_from_slice(data),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let stream_obj = Object::stream(expanded_dict, bytes::Bytes::copy_from_slice(data));
+        // ── end pdf_manipulator patch ──
 
         // Use existing extraction logic
         let mut image =
@@ -30152,10 +30164,9 @@ mod tests {
     fn test_find_references_stream() {
         let mut dict = std::collections::HashMap::new();
         dict.insert("Length".to_string(), Object::Reference(ObjectRef::new(10, 0)));
-        let obj = Object::Stream {
-            dict,
-            data: bytes::Bytes::from_static(b""),
-        };
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        let obj = Object::stream(dict, bytes::Bytes::from_static(b""));
+        // ── end pdf_manipulator patch ──
         let refs = PdfDocument::find_references(&obj);
         assert_eq!(refs.len(), 1);
     }

@@ -600,7 +600,9 @@ impl EncryptDictBuilder {
                     encrypt_metadata: self.encrypt_metadata,
                     owner_encryption: Some(owner_encryption),
                     user_encryption: Some(user_encryption),
-                    perms: Some(perms), // pdf_manipulator patch: R6 requires /Perms
+                    // ── pdf_manipulator patch: R6 requires /Perms ──
+                    perms: Some(perms),
+                    // ── end pdf_manipulator patch ──
                     stream_crypt_method: None,
                 },
                 // The key /UE and /OE wrap. Streams must use this one.

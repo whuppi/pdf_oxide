@@ -180,10 +180,7 @@ pub(crate) fn build_update(
             Object::Array(index.into_iter().map(Object::Integer).collect()),
         );
         trailer.insert("Length".into(), Object::Integer(data.len() as i64));
-        let stream = Object::Stream {
-            dict: trailer,
-            data: data.into(),
-        };
+        let stream = Object::stream(trailer, data);
         bytes.extend_from_slice(&serializer.serialize_indirect(stream_id, 0, &stream));
     }
     bytes.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());

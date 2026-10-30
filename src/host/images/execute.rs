@@ -39,9 +39,10 @@ pub fn reduce_images(
     let mut report = Report::default();
     cancel.each(entries, |entry| {
         let object = staged_or_source(editor, entry.object)?;
-        let Object::Stream { dict, data } = &object else {
+        let Object::Stream { dict, body } = &object else {
             return Ok(());
         };
+        let data = body.inline();
         let kind = classify(editor.source(), dict, data);
         let uses: Vec<Use> = entry.placements.iter().map(|&ctm| Use { ctm }).collect();
         let mask_before = match kind.masks.soft_mask {
@@ -117,7 +118,7 @@ fn staged_or_source(editor: &mut DocumentEditor, r: ObjectRef) -> Result<Object>
 
 fn stream_len(editor: &mut DocumentEditor, r: ObjectRef) -> Result<u64> {
     Ok(match staged_or_source(editor, r)? {
-        Object::Stream { data, .. } => data.len() as u64,
+        Object::Stream { body, .. } => body.inline().len() as u64,
         _ => 0,
     })
 }
@@ -209,10 +210,7 @@ fn apply(
     };
     new_dict.insert("Length".to_string(), Object::Integer(bytes.len() as i64));
     let mut total = bytes.len() as u64;
-    let parent = Object::Stream {
-        dict: new_dict,
-        data: Bytes::from(bytes),
-    };
+    let parent = Object::stream(new_dict, Bytes::from(bytes));
 
     let mask = match mask {
         Some((mask_ref, mask_obj)) => {
@@ -309,9 +307,10 @@ fn checked(s: Samples) -> Result<Samples> {
 /// returns 1 = black (0 = black when `/BlackIs1 true`), which is the
 /// complement of the filter's own output bits in both cases.
 fn decode_bilevel(doc: &PdfDocument, object: &Object, kind: &Kind) -> Result<Samples> {
-    let Object::Stream { dict, data } = object else {
+    let Object::Stream { dict, body } = object else {
         return Err(Error::Image("image XObject is not a stream".to_string()));
     };
+    let data = body.inline();
     let (width, height) = (kind.width, kind.height);
     let row_bytes = (width as usize).div_ceil(8);
     let (packed, complement) = match kind.encoding {
@@ -440,10 +439,7 @@ fn rewrite_soft_mask(
     new_dict.insert("Length".to_string(), Object::Integer(encoded.bytes.len() as i64));
     let len = encoded.bytes.len() as u64;
     Ok((
-        Object::Stream {
-            dict: new_dict,
-            data: Bytes::from(encoded.bytes),
-        },
+        Object::stream(new_dict, Bytes::from(encoded.bytes)),
         len,
     ))
 }

@@ -16,10 +16,9 @@ fn create_test_object_stream(n: i64, first: i64, data: &[u8]) -> Object {
     dict.insert("First".to_string(), Object::Integer(first));
     dict.insert("Length".to_string(), Object::Integer(data.len() as i64));
 
-    Object::Stream {
-        dict,
-        data: Bytes::from(data.to_vec()),
-    }
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    Object::stream(dict, Bytes::from(data.to_vec()))
+    // ── end pdf_manipulator patch ──
 }
 
 #[test]
@@ -132,10 +131,9 @@ fn test_parse_object_stream_missing_n() {
     dict.insert("Type".to_string(), Object::Name("ObjStm".to_string()));
     dict.insert("First".to_string(), Object::Integer(5));
 
-    let stream = Object::Stream {
-        dict,
-        data: Bytes::from(b"1 0 42".to_vec()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let stream = Object::stream(dict, Bytes::from(b"1 0 42".to_vec()));
+    // ── end pdf_manipulator patch ──
 
     let result = parse_object_stream(&stream);
     assert!(result.is_err());
@@ -147,10 +145,9 @@ fn test_parse_object_stream_missing_first() {
     dict.insert("Type".to_string(), Object::Name("ObjStm".to_string()));
     dict.insert("N".to_string(), Object::Integer(1));
 
-    let stream = Object::Stream {
-        dict,
-        data: Bytes::from(b"1 0 42".to_vec()),
-    };
+    // ── pdf_manipulator patch: stream bodies are StreamBody ──
+    let stream = Object::stream(dict, Bytes::from(b"1 0 42".to_vec()));
+    // ── end pdf_manipulator patch ──
 
     let result = parse_object_stream(&stream);
     assert!(result.is_err());
