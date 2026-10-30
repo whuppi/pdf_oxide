@@ -13,6 +13,7 @@ pub mod bridge_api;
 pub mod constants;
 pub(crate) mod deflate;
 pub mod dispatch;
+pub(crate) mod duplicates;
 #[cfg(test)]
 mod engine_proofs;
 pub mod fallback_fonts;

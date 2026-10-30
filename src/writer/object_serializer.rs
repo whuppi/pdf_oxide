@@ -32,6 +32,11 @@ pub struct ObjectSerializer {
     /// object that wrote it. `None` unless `recording_references` is set.
     reference_log: Option<std::sync::Arc<std::sync::Mutex<ReferenceLog>>>,
     // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch: references to a merged duplicate name its survivor ──
+    /// Object id to the id every reference to it is written as. `None`
+    /// unless `aliasing` is set.
+    aliases: Option<std::sync::Arc<HashMap<u32, u32>>>,
+    // ── end pdf_manipulator patch ──
 }
 
 // ── pdf_manipulator patch: the references a save wrote ──
@@ -59,6 +64,7 @@ impl ObjectSerializer {
             null_refs: Default::default(),
             zero_generations: false,
             reference_log: None,
+            aliases: None,
             // ── end pdf_manipulator patch ──
         }
     }
@@ -76,6 +82,15 @@ impl ObjectSerializer {
     /// save that writes every object at generation 0.
     pub(crate) fn zero_generations(mut self) -> Self {
         self.zero_generations = true;
+        self
+    }
+
+    /// This serializer, writing every reference to a key of `aliases` as a
+    /// reference to its value: a save that writes one copy of a set of
+    /// identical objects names that copy everywhere. The alias applies
+    /// before the null and recording checks, so the log names the copy.
+    pub(crate) fn aliasing(mut self, aliases: std::sync::Arc<HashMap<u32, u32>>) -> Self {
+        self.aliases = Some(aliases);
         self
     }
 
@@ -114,16 +129,22 @@ impl ObjectSerializer {
     }
 
     fn write_reference<W: Write>(&self, w: &mut W, r: &ObjectRef) -> std::io::Result<()> {
-        if self.null_refs.contains(&r.id) {
+        let id = self
+            .aliases
+            .as_ref()
+            .and_then(|aliases| aliases.get(&r.id))
+            .copied()
+            .unwrap_or(r.id);
+        if self.null_refs.contains(&id) {
             write!(w, "null")
         } else {
             if let Some(log) = &self.reference_log {
                 let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
                 let current = log.current;
-                log.first_writer.entry(r.id).or_insert(current);
+                log.first_writer.entry(id).or_insert(current);
             }
             let gen = if self.zero_generations { 0 } else { r.gen };
-            write!(w, "{} {} R", r.id, gen)
+            write!(w, "{} {} R", id, gen)
         }
     }
     // ── end pdf_manipulator patch ──

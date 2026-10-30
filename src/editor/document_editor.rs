@@ -206,6 +206,19 @@ pub struct SaveOptions {
     /// `Error::InvalidOperation`.
     pub deflate_level: u32,
     // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch: one copy of identical images, ICC profiles and font programs ──
+    /// Write one copy of each set of identical image XObjects, ICC profile
+    /// streams and embedded font programs (`/FontFile`, `/FontFile2`,
+    /// `/FontFile3`) of a full rewrite, across the document and every
+    /// merged source, and point every reference at it. Two streams are one
+    /// when their dictionaries (without `/Length`, every reference replaced
+    /// by the object it names) and their encoded bytes are equal; a stream
+    /// with `/OC`, `/StructParent` or `/StructParents` is never merged. A
+    /// stream of an encrypted source is merged only when its data is at
+    /// most 256 KiB, since it is decrypted to be compared. An incremental
+    /// save ignores it.
+    pub merge_duplicates: bool,
+    // ── end pdf_manipulator patch ──
 }
 
 // ── pdf_manipulator patch: Default is written out, object_streams defaults to true ──
@@ -219,6 +232,7 @@ impl Default for SaveOptions {
             keep_source_encryption: false,
             object_streams: true,
             deflate_level: 9,
+            merge_duplicates: false,
         }
     }
 }
@@ -605,6 +619,12 @@ impl XrefEntries {
 
     fn contains_id(&self, id: u32) -> bool {
         self.ids.contains(&id)
+    }
+
+    /// Counts `id` as written without an entry: a merged duplicate has no
+    /// object of its own, and every write loop skips an id that is written.
+    fn claim_id(&mut self, id: u32) {
+        self.ids.insert(id);
     }
 
     /// Frees the id set once nothing asks `contains_id` any more.
@@ -2736,10 +2756,14 @@ impl DocumentEditor {
     /// already names and never reads the source version of an object the
     /// save has written: a catalog that drops /AcroForm or a page that drops
     /// its widgets does not keep their objects alive.
+    ///
+    /// A reference to a key of `aliases` (a merged duplicate) is followed
+    /// as the reference to its value, which the save writes in its place.
     fn collect_reachable_ids(
         &self,
         prune: &crate::host::page_prune::PagePrune,
         written: Option<(&XrefEntries, &[(u32, u32)])>,
+        aliases: &HashMap<u32, u32>,
     ) -> std::collections::HashSet<u32> {
         fn push_refs(obj: &Object, out: &mut Vec<u32>) {
             match obj {
@@ -2767,6 +2791,7 @@ impl DocumentEditor {
                      queue: &mut Vec<u32>,
                      by_stream: &mut std::collections::BTreeMap<u32, Vec<u32>>| {
             for &id in ids {
+                let id = aliases.get(&id).copied().unwrap_or(id);
                 if seen.get(id as usize).copied() != Some(false) {
                     continue;
                 }
@@ -2889,6 +2914,73 @@ impl DocumentEditor {
     }
     // ── end pdf_manipulator patch ──
 
+    // ── pdf_manipulator patch: one copy of identical images, ICC profiles and font programs ──
+    /// The duplicate-to-kept map of this save's `merge_duplicates` option
+    /// (empty with the option off): every object the save writes, from this
+    /// document and from each merged source, in the numbering of the output.
+    fn duplicate_aliases(
+        &self,
+        prune: &crate::host::page_prune::PagePrune,
+        merged_left_out: &HashSet<u32>,
+        options: &SaveOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<HashMap<u32, u32>> {
+        use crate::host::duplicates::{find, Origin};
+
+        if !options.merge_duplicates {
+            return Ok(HashMap::new());
+        }
+        // The sweep's own rules decide which source objects are written,
+        // except that garbage collection is not asked: a duplicate that
+        // nothing reaches is never written, and one that something reaches
+        // is written as its kept twin, which the reachability walk follows
+        // through the alias map.
+        let dropped_only = if options.garbage_collect {
+            HashSet::new()
+        } else {
+            self.dropped_only_ids(prune)
+        };
+        let source_ids = self.source.all_object_ids();
+        let mut objects: Vec<(u32, u32)> = source_ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                id != 0
+                    && !self.source.is_free_entry(id)
+                    && !self.redacted_orphan_ids.contains(&id)
+                    && !prune.excluded.contains(&id)
+                    && !dropped_only.contains(&id)
+            })
+            .map(|id| (id, id))
+            .collect();
+        objects.extend(
+            self.modified_objects
+                .keys()
+                .copied()
+                .filter(|&id| {
+                    source_ids.binary_search(&id).is_err()
+                        && !prune.excluded.contains(&id)
+                        && !dropped_only.contains(&id)
+                })
+                .map(|id| (id, id)),
+        );
+        let mut origins =
+            vec![Origin { doc: &self.source, objects, staged: Some(&self.modified_objects) }];
+        for source in &self.merged_sources {
+            let mut objects: Vec<(u32, u32)> = source
+                .objects
+                .iter()
+                .copied()
+                .filter(|(out, _)| !merged_left_out.contains(out))
+                .collect();
+            objects.sort_unstable();
+            objects.dedup();
+            origins.push(Origin { doc: &source.doc, objects, staged: None });
+        }
+        find(&origins, cancel)
+    }
+    // ── end pdf_manipulator patch ──
+
     // ── pdf_manipulator patch: what only a dropped page reaches (#261) ──
     /// The objects reachable from the prune plan's excluded objects (dropped
     /// pages, inner /Pages nodes, dropped-page annotations) and from nothing
@@ -2912,7 +3004,7 @@ impl DocumentEditor {
         if prune.excluded.is_empty() {
             return only;
         }
-        let kept = self.collect_reachable_ids(prune, None);
+        let kept = self.collect_reachable_ids(prune, None, &HashMap::new());
         let mut queue: Vec<u32> = prune.excluded.iter().copied().collect();
         let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
         while let Some(id) = queue.pop() {
@@ -3308,6 +3400,14 @@ impl DocumentEditor {
         // ── pdf_manipulator patch: the merged pages and objects the save drops ──
         let (merged_kept, merged_left_out) = self.merged_prune()?;
         // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: one copy of identical images, ICC profiles and font programs ──
+        let aliases = std::sync::Arc::new(self.duplicate_aliases(
+            &prune,
+            &merged_left_out,
+            options,
+            cancel,
+        )?);
+        // ── end pdf_manipulator patch ──
 
         // ── pdf_manipulator patch: a loaded stream is deflated or re-deflated, kept only if smaller ──
         /// Deflate a stream object with no filter, or re-deflate one with a
@@ -3375,7 +3475,8 @@ impl DocumentEditor {
         let serializer = ObjectSerializer::compact()
             .nulling(prune.excluded.clone())
             .zero_generations()
-            .recording_references();
+            .recording_references()
+            .aliasing(aliases.clone());
         // ── end pdf_manipulator patch ──
 
         // Set up encryption if configured
@@ -3464,6 +3565,11 @@ impl DocumentEditor {
         };
 
         let mut xref_entries = XrefEntries::new();
+        // ── pdf_manipulator patch: a merged duplicate is never written ──
+        for &duplicate in aliases.keys() {
+            xref_entries.claim_id(duplicate);
+        }
+        // ── end pdf_manipulator patch ──
 
         // Object 0 is always free
         xref_entries.push((0, 65535, 65535, false));
@@ -5948,6 +6054,7 @@ impl DocumentEditor {
             Some(self.collect_reachable_ids(
                 &prune,
                 Some((&xref_entries, &serializer.written_references())),
+                &aliases,
             ))
         } else {
             None
@@ -9599,6 +9706,7 @@ impl DocumentEditor {
                 &self.page_order,
             ),
             None,
+            &HashMap::new(),
         );
         // ── end pdf_manipulator patch ──
 

@@ -7,6 +7,7 @@
 mod determinism;
 mod document_pages;
 mod editor_deflate;
+mod editor_duplicates;
 mod editor_merge;
 mod editor_nested;
 mod editor_objstm;

@@ -3647,6 +3647,9 @@ impl WasmPdfDocument {
             // ── pdf_manipulator patch: the Flate level ──
             deflate_level: 9,
             // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: merge duplicates ──
+            merge_duplicates: false,
+            // ── end pdf_manipulator patch ──
         };
         let editor_arc = self.ensure_editor()?;
         let mut editor = editor_arc

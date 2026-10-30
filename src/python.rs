@@ -1248,6 +1248,9 @@ impl PyPdfDocument {
                 // ── pdf_manipulator patch: the Flate level ──
                 deflate_level: 9,
                 // ── end pdf_manipulator patch ──
+                // ── pdf_manipulator patch: merge duplicates ──
+                merge_duplicates: false,
+                // ── end pdf_manipulator patch ──
             };
             editor
                 .save_with_options(path, options)
@@ -1288,6 +1291,9 @@ impl PyPdfDocument {
                 // ── end pdf_manipulator patch ──
                 // ── pdf_manipulator patch: the Flate level ──
                 deflate_level: 9,
+                // ── end pdf_manipulator patch ──
+                // ── pdf_manipulator patch: merge duplicates ──
+                merge_duplicates: false,
                 // ── end pdf_manipulator patch ──
             };
             let bytes = editor.save_to_bytes_with_options(options).map_err(|e| {
