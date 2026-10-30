@@ -11,9 +11,6 @@ pub mod parser;
 
 pub use graphics_state::{GraphicsState, GraphicsStateStack, Matrix};
 pub use operators::{Operator, TextElement};
-pub use parser::parse_and_execute_text_only;
+// ── pdf_manipulator patch: the byte-slice text, path and image parsers are gone ──
 pub use parser::parse_content_stream;
-pub use parser::parse_content_stream_images_only;
-pub use parser::parse_content_stream_paths_only;
-#[allow(deprecated)]
-pub use parser::parse_content_stream_text_only;
+// ── end pdf_manipulator patch ──

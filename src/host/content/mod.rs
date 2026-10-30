@@ -10,4 +10,4 @@ pub mod parts;
 pub use inline::Resolver;
 pub use parts::PartsReader;
 pub use lexer::{Lexer, TokenKind};
-pub use operators::{consumed_names, Damage, InlineImages, Mode, Operators};
+pub use operators::{consumed_names, Damage, InlineImages, Mode, OperatorStream, Operators};

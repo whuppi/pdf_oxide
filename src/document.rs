@@ -594,10 +594,9 @@ pub struct PdfDocument {
     pub(crate) erase_regions: Mutex<HashMap<usize, Vec<crate::geometry::Rect>>>,
     /// LRU cache of decompressed page content streams, keyed by page index.
     // ── pdf_manipulator patch: the whole-page cache outlives only its whole-bytes consumers ──
-    /// Whole pages are held here for the consumers that still take a page's
-    /// bytes; `page_operators` streams a page and holds none. It goes with
-    /// `cached_page_content` when the text, search and facts paths move to
-    /// operators.
+    /// Whole pages are held here for the renderers, which still take a
+    /// page's bytes; `page_operators` streams a page and holds none. It goes
+    /// with `cached_page_content` when the renderers move to operators.
     // ── end pdf_manipulator patch ──
     page_content_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<u8>>>>,
     /// LRU cache of postprocessed [`TextSpan`]s per page. `to_markdown`/`to_html`
@@ -2069,43 +2068,43 @@ impl PdfDocument {
         // ── content-stream ops: Tr-mode-3 ratio (cases C/C2) ──
         let mut invisible = 0usize;
         let mut glyph_bytes = 0usize;
-        if let Ok(data) = self.get_page_content_data(page) {
-            if let Ok(ops) = crate::content::parse_content_stream(&data) {
-                let mut rm: u8 = 0;
-                let mut stack: Vec<u8> = Vec::new();
-                for op in &ops {
-                    match op {
-                        Operator::SaveState => stack.push(rm),
-                        Operator::RestoreState => {
-                            if let Some(p) = stack.pop() {
-                                rm = p;
-                            }
-                        },
-                        Operator::Tr { render } => rm = *render,
-                        Operator::Tj { text } => {
-                            glyph_bytes += text.len();
-                            if rm == 3 {
-                                invisible += text.len();
-                            }
-                        },
-                        Operator::TJ { array } => {
-                            let g: usize = array
-                                .iter()
-                                .map(|e| match e {
-                                    TextElement::String(b) => b.len(),
-                                    TextElement::Offset(_) => 0,
-                                })
-                                .sum();
-                            glyph_bytes += g;
-                            if rm == 3 {
-                                invisible += g;
-                            }
-                        },
-                        _ => {},
-                    }
+        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        if let Ok(ops) = self.page_operators(page) {
+            let mut rm: u8 = 0;
+            let mut stack: Vec<u8> = Vec::new();
+            for op in ops.with_mode(crate::host::content::Mode::Text).flatten() {
+                match op {
+                    Operator::SaveState => stack.push(rm),
+                    Operator::RestoreState => {
+                        if let Some(p) = stack.pop() {
+                            rm = p;
+                        }
+                    },
+                    Operator::Tr { render } => rm = render,
+                    Operator::Tj { text } => {
+                        glyph_bytes += text.len();
+                        if rm == 3 {
+                            invisible += text.len();
+                        }
+                    },
+                    Operator::TJ { array } => {
+                        let g: usize = array
+                            .iter()
+                            .map(|e| match e {
+                                TextElement::String(b) => b.len(),
+                                TextElement::Offset(_) => 0,
+                            })
+                            .sum();
+                        glyph_bytes += g;
+                        if rm == 3 {
+                            invisible += g;
+                        }
+                    },
+                    _ => {},
                 }
             }
         }
+        // ── end pdf_manipulator patch ──
         let invisible_text_ratio = if glyph_bytes == 0 {
             0.0
         } else {
@@ -6743,11 +6742,11 @@ impl PdfDocument {
             let no_content_text = if self.page_cannot_have_text(page_dict) {
                 true
             } else {
-                // Also check content stream for BT/Do operators (SIMD-fast scan).
-                match self.get_page_content_data(page_index) {
-                    Ok(ref content_data) => !Self::may_contain_text(content_data),
-                    Err(_) => false, // Can't read content stream — be conservative
-                }
+                // ── pdf_manipulator patch: the page's operators are read for a BT or Do ──
+                // Also check the content stream for BT/Do operators; a content
+                // stream that cannot be read counts as text, to be conservative.
+                !self.page_may_contain_text(page_index)
+                // ── end pdf_manipulator patch ──
             };
             if no_content_text {
                 let mut text = String::new();
@@ -11637,10 +11636,9 @@ impl PdfDocument {
         // Probe content stream for text-showing operators. If we can't
         // read the content stream, be conservative and say yes (let
         // extraction try).
-        match self.get_page_content_data(page_index) {
-            Ok(content_data) => Ok(Self::may_contain_text(&content_data)),
-            Err(_) => Ok(true),
-        }
+        // ── pdf_manipulator patch: the page's operators are read for a BT or Do ──
+        Ok(self.page_may_contain_text(page_index))
+        // ── end pdf_manipulator patch ──
     }
 
     /// Returns the document's `/P` permission flags as a `PdfPermissions`
@@ -17804,8 +17802,9 @@ impl PdfDocument {
             return Ok(Vec::new());
         }
 
-        let content_data = match self.get_page_content_data(page_index) {
-            Ok(data) => data,
+        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        let source = match self.page_text_source(page_index) {
+            Ok(source) => source,
             Err(e) => {
                 log::warn!(
                     "Failed to decode content stream for page {}: {}, returning empty",
@@ -17815,10 +17814,7 @@ impl PdfDocument {
                 return Ok(Vec::new());
             },
         };
-
-        if !Self::may_contain_text(&content_data) {
-            return Ok(Vec::new());
-        }
+        // ── end pdf_manipulator patch ──
 
         let mut extractor = TextExtractor::with_config(config);
         // Stamp the page index so spans carry McidScope::Page(page_index)
@@ -17843,7 +17839,9 @@ impl PdfDocument {
             }
         }
 
-        let spans = extractor.extract_text_spans(&content_data)?;
+        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        let spans = extractor.extract_text_spans_from(source)?;
+        // ── end pdf_manipulator patch ──
         // Drain MCIDs whose in-stream /ActualText was applied during
         // extraction and stash on the document so the struct-tree-
         // scope applier honours MC-scope-wins precedence (§14.9.4).
@@ -18376,9 +18374,10 @@ impl PdfDocument {
             return Ok(Vec::new());
         }
 
-        // Get content stream data — skip page on decode failure (Annex I)
-        let content_data = match self.get_page_content_data(page_index) {
-            Ok(data) => data,
+        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        // Skip the page on a content stream that cannot be opened (Annex I)
+        let source = match self.page_text_source(page_index) {
+            Ok(source) => source,
             Err(e) => {
                 log::warn!(
                     "Failed to decode content stream for page {}: {}, returning empty",
@@ -18388,11 +18387,7 @@ impl PdfDocument {
                 return Ok(Vec::new());
             },
         };
-
-        // Early-out for pages with no text content (§9.4.3)
-        if !Self::may_contain_text(&content_data) {
-            return Ok(Vec::new());
-        }
+        // ── end pdf_manipulator patch ──
 
         // Create text extractor with merged configuration
         let mut extractor = TextExtractor::new().with_merging_config(config);
@@ -18413,7 +18408,9 @@ impl PdfDocument {
         }
 
         // Extract text spans
-        extractor.extract_text_spans(&content_data)
+        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        extractor.extract_text_spans_from(source)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Extract individual characters from a PDF page.
@@ -18618,8 +18615,9 @@ impl PdfDocument {
     /// surfacing their inks here would create plates that stay empty.
     pub fn get_page_inks_deep(&self, page_index: usize) -> Result<Vec<String>> {
         let resources = self.page_resources_for_inks(page_index)?;
-        let content_data = self.get_page_content_data(page_index)?;
-        let operators = crate::content::parser::parse_content_stream(&content_data)?;
+        // ── pdf_manipulator patch: the page's operators are read as its content is decoded ──
+        let operators = self.page_operators(page_index)?;
+        // ── end pdf_manipulator patch ──
 
         let mut ink_names: Vec<String> = Vec::new();
         let mut visited: std::collections::HashSet<crate::object::ObjectRef> =
@@ -18627,7 +18625,7 @@ impl PdfDocument {
 
         self.collect_inks_from_resources(&resources, &mut ink_names)?;
         self.walk_form_xobject_tree_for_inks(
-            &operators,
+            operators.flatten(),
             &resources,
             &mut ink_names,
             &mut visited,
@@ -18711,7 +18709,9 @@ impl PdfDocument {
     /// the depth limit is the backstop for any other malformed shape.
     fn walk_form_xobject_tree_for_inks(
         &self,
-        operators: &[crate::content::operators::Operator],
+        // ── pdf_manipulator patch: the operators are read as they are decoded ──
+        operators: impl Iterator<Item = crate::content::operators::Operator>,
+        // ── end pdf_manipulator patch ──
         parent_resources: &Object,
         out: &mut Vec<String>,
         visited: &mut std::collections::HashSet<crate::object::ObjectRef>,
@@ -18737,7 +18737,7 @@ impl PdfDocument {
                 crate::content::operators::Operator::Do { name } => name,
                 _ => continue,
             };
-            let xobj_entry = match xobj_dict.get(name) {
+            let xobj_entry = match xobj_dict.get(&name) {
                 Some(o) => o,
                 None => continue,
             };
@@ -18752,15 +18752,13 @@ impl PdfDocument {
                 Ok(o) => o,
                 Err(_) => continue,
             };
-            let (form_dict, form_stream) = match xobj {
+            // ── pdf_manipulator patch: the form's operators are read as its content is decoded ──
+            let form_dict = match xobj {
                 Object::Stream { ref dict, .. } => {
                     if dict.get("Subtype").and_then(Object::as_name) != Some("Form") {
                         continue;
                     }
-                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                    let data = xobj.decode_stream_data()?;
-                    // ── end pdf_manipulator patch ──
-                    (dict.clone(), data)
+                    dict.clone()
                 },
                 _ => continue,
             };
@@ -18775,12 +18773,26 @@ impl PdfDocument {
             // Recurse into the form's own content stream looking for nested
             // `Do`. Malformed streams are tolerated — we want graceful
             // degradation in a discovery API, not a hard error.
-            let form_ops = match crate::content::parser::parse_content_stream(&form_stream) {
-                Ok(ops) => ops,
-                Err(_) => continue,
-            };
+            let form_ops: Box<dyn Iterator<Item = crate::content::operators::Operator>> =
+                match xobj_ref {
+                    Some(r) => match self.form_operators(r) {
+                        Ok(ops) => Box::new(ops.flatten()),
+                        Err(_) => continue,
+                    },
+                    None => match crate::host::content::parts::decoded_reader(&xobj) {
+                        Ok(reader) => Box::new(
+                            crate::host::content::Operators::new(
+                                reader,
+                                crate::host::content::Mode::Full,
+                            )
+                            .flatten(),
+                        ),
+                        Err(_) => continue,
+                    },
+                };
+            // ── end pdf_manipulator patch ──
             self.walk_form_xobject_tree_for_inks(
-                &form_ops,
+                form_ops,
                 &form_resources,
                 out,
                 visited,
@@ -18850,8 +18862,9 @@ impl PdfDocument {
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        let content_data = match self.get_page_content_data(page_index) {
-            Ok(data) => data,
+        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        let source = match self.page_text_source(page_index) {
+            Ok(source) => source,
             Err(e) => {
                 log::warn!(
                     "Failed to decode content stream for page {}: {}, returning empty",
@@ -18861,10 +18874,7 @@ impl PdfDocument {
                 return Ok(Vec::new());
             },
         };
-
-        if !Self::may_contain_text(&content_data) {
-            return Ok(Vec::new());
-        }
+        // ── end pdf_manipulator patch ──
 
         let mut extractor = TextExtractor::new();
         // Stamp the page index the span path already stamps. The form /BBox
@@ -18894,7 +18904,9 @@ impl PdfDocument {
             }
         }
 
-        let mut chars = extractor.extract_owned(&content_data)?;
+        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        let mut chars = extractor.extract_owned_from(source)?;
+        // ── end pdf_manipulator patch ──
 
         chars.sort_by(|a, b| {
             let y_cmp = crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y);
@@ -19752,6 +19764,11 @@ impl PdfDocument {
     ///
     /// This returns the decoded content stream bytes for the specified page.
     /// The content stream contains PDF operators that define the page's appearance.
+    // ── pdf_manipulator patch: this and its cache stay for the renderers ──
+    ///
+    /// Reads the whole page. Only the renderers still call it; everything
+    /// else reads [`Self::page_operators`].
+    // ── end pdf_manipulator patch ──
     pub fn get_page_content_data(&self, page_index: usize) -> Result<Vec<u8>> {
         Ok((*self.cached_page_content(page_index)?).clone())
     }
@@ -19761,6 +19778,11 @@ impl PdfDocument {
     /// only ever reads the bytes, and a single `extract_words` page touches
     /// this twice (once for spans, once for chars), so handing back the `Arc`
     /// avoids copying the decompressed stream on every call.
+    // ── pdf_manipulator patch: this and its cache stay for the renderers ──
+    ///
+    /// Only the renderers read a page's bytes now; they move to
+    /// [`Self::page_operators`] in the render task, and this goes with them.
+    // ── end pdf_manipulator patch ──
     fn cached_page_content(&self, page_index: usize) -> Result<std::sync::Arc<Vec<u8>>> {
         {
             let mut cache = self.page_content_cache.lock_or_recover();
@@ -19981,17 +20003,44 @@ impl PdfDocument {
         Ok(Operators::new(source, Mode::Full))
     }
 
-    /// The whole decoded content of stream object `r` (`xobject`), from the
-    /// content cache or decoded and offered to it. For the consumers that
-    /// still take a form's bytes.
-    pub(crate) fn form_content(&self, r: ObjectRef, xobject: &Object) -> Result<Arc<Vec<u8>>> {
-        if let Some(hit) = self.content_cache.lock_or_recover().get(r) {
-            return Ok(hit);
-        }
-        let data = Arc::new(xobject.decode_stream_data()?);
-        self.content_cache.lock_or_recover().insert(r, Arc::clone(&data));
-        Ok(data)
+    /// The text operators of page `page_index` as a source text extraction
+    /// opens once, or a second time to count a `/PlacedPDF` region. Fails when
+    /// the page's content cannot be opened at all.
+    pub(crate) fn page_text_source(
+        &self,
+        page_index: usize,
+    ) -> Result<Arc<crate::extractors::text::OperatorSource<'_>>> {
+        use crate::host::content::Mode;
+
+        let source: Arc<crate::extractors::text::OperatorSource<'_>> = Arc::new(move || {
+            Ok(Box::new(self.page_operators(page_index)?.with_mode(Mode::Text))
+                as Box<dyn crate::host::content::OperatorStream>)
+        });
+        drop(source()?);
+        Ok(source)
     }
+
+    /// True when page `page_index` may show text: its content holds a `BT` or
+    /// a `Do`, which can invoke a form that does. Conservative: true when the
+    /// content cannot be opened.
+    pub(crate) fn page_may_contain_text(&self, page_index: usize) -> bool {
+        use crate::host::content::Mode;
+
+        use crate::content::Operator;
+
+        let Ok(operators) = self.page_operators(page_index) else {
+            return true;
+        };
+        for op in operators.with_mode(Mode::Text) {
+            match op {
+                Ok(Operator::BeginText | Operator::Do { .. }) => return true,
+                Ok(_) => {},
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+
     // ── end pdf_manipulator patch ──
 
     /// Extract path (vector graphics) content from a page.
@@ -20031,7 +20080,7 @@ impl PdfDocument {
     /// # }
     /// ```
     pub fn extract_paths(&self, page_index: usize) -> Result<Vec<crate::elements::PathContent>> {
-        use crate::content::{parse_content_stream_paths_only, Operator};
+        use crate::content::Operator;
         use crate::elements::{LineCap, LineJoin};
         use crate::extractors::paths::{FillRule, PathExtractor, PathGraphicsStateStack};
         use crate::layout::Color;
@@ -20043,9 +20092,10 @@ impl PdfDocument {
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        // Get content stream data — skip page on decode failure (Annex I)
-        let content_data = match self.get_page_content_data(page_index) {
-            Ok(data) => data,
+        // ── pdf_manipulator patch: the page's path operators are read as its content is decoded ──
+        // Skip the page on a content stream that cannot be opened (Annex I)
+        let operators = match self.page_operators(page_index) {
+            Ok(ops) => ops.with_mode(crate::host::content::Mode::Paths).flatten(),
             Err(e) => {
                 log::warn!(
                     "Failed to decode content stream for page {}: {}, returning empty paths",
@@ -20055,18 +20105,7 @@ impl PdfDocument {
                 return Ok(Vec::new());
             },
         };
-
-        let operators = match parse_content_stream_paths_only(&content_data) {
-            Ok(ops) => ops,
-            Err(e) => {
-                log::warn!(
-                    "Failed to parse content stream for page {}: {}, returning empty paths",
-                    page_index,
-                    e
-                );
-                return Ok(Vec::new());
-            },
-        };
+        // ── end pdf_manipulator patch ──
 
         let mut extractor = PathExtractor::new();
         let mut state_stack = PathGraphicsStateStack::new();
@@ -20536,7 +20575,7 @@ impl PdfDocument {
         extractor: &mut crate::extractors::paths::PathExtractor,
         state_stack: &mut crate::extractors::paths::PathGraphicsStateStack,
     ) -> Result<()> {
-        use crate::content::{parse_content_stream_paths_only, Matrix, Operator};
+        use crate::content::{Matrix, Operator};
         use crate::elements::{LineCap, LineJoin};
         use crate::extractors::paths::FillRule;
         use crate::layout::Color;
@@ -20591,24 +20630,15 @@ impl PdfDocument {
             },
         }
 
-        // Decode stream — reuse document-level cache shared with text extraction.
-        // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
-        let stream_data = match self.form_content(xobject_ref, &xobject) {
-            Ok(data) => data.as_ref().clone(),
+        // ── pdf_manipulator patch: the form's path operators are read as its content is decoded ──
+        let operators = match self.form_operators(xobject_ref) {
+            Ok(ops) => ops.with_mode(crate::host::content::Mode::Paths).flatten(),
             Err(e) => {
                 extractor.pop_xobject_failed();
                 return Err(e);
             },
         };
         // ── end pdf_manipulator patch ──
-
-        let operators = match parse_content_stream_paths_only(&stream_data) {
-            Ok(ops) => ops,
-            Err(e) => {
-                extractor.pop_xobject_failed();
-                return Err(e);
-            },
-        };
 
         // Get transformation matrix (default to identity)
         let matrix = if let Some(matrix_obj) = xobject_dict.get("Matrix") {
@@ -24490,7 +24520,6 @@ impl PdfDocument {
         &self,
         page_index: usize,
     ) -> Result<Vec<crate::extractors::images::PdfImageHandle<'_>>> {
-        use crate::content::parse_content_stream_images_only;
         use crate::content::Operator;
         use crate::extractors::images::image_handle_from_inline;
 
@@ -24502,7 +24531,12 @@ impl PdfDocument {
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        let content_data = self.get_page_content_data(page_index)?;
+        // ── pdf_manipulator patch: the page's image operators are read as its content is decoded ──
+        let operators = self
+            .page_operators(page_index)?
+            .with_mode(crate::host::content::Mode::Images)
+            .flatten();
+        // ── end pdf_manipulator patch ──
 
         let resources = match page_dict.get("Resources") {
             Some(res) => {
@@ -24513,11 +24547,6 @@ impl PdfDocument {
                 }
             },
             None => None,
-        };
-
-        let operators = match parse_content_stream_images_only(&content_data) {
-            Ok(ops) => ops,
-            Err(_) => return Ok(Vec::new()),
         };
 
         // Resource-name colour-space map for this page scope (§8.6.6 / §8.9.7).
@@ -24704,7 +24733,6 @@ impl PdfDocument {
         paint_order: &mut usize,
         xobject_stack: &mut Vec<crate::object::ObjectRef>,
     ) -> Result<Vec<crate::extractors::images::PdfImageHandle<'s>>> {
-        use crate::content::parse_content_stream_images_only;
         use crate::content::Operator;
         use crate::extractors::images::image_handle_from_inline;
 
@@ -24758,10 +24786,9 @@ impl PdfDocument {
             crate::content::Matrix::identity()
         };
 
-        // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
-        // Decode the Form stream (through the byte-budgeted content cache).
-        let stream_data = match self.form_content(xobject_ref, xobject) {
-            Ok(data) => data.as_ref().clone(),
+        // ── pdf_manipulator patch: the form's image operators are read as its content is decoded ──
+        let operators = match self.form_operators(xobject_ref) {
+            Ok(ops) => ops.with_mode(crate::host::content::Mode::Images).flatten(),
             Err(e) => {
                 log::warn!("Failed to decode Form XObject stream: {}, skipping", e);
                 xobject_stack.pop();
@@ -24769,15 +24796,6 @@ impl PdfDocument {
             },
         };
         // ── end pdf_manipulator patch ──
-
-        // Parse with the fast images-only parser (same as the materialised path).
-        let operators = match parse_content_stream_images_only(&stream_data) {
-            Ok(ops) => ops,
-            Err(_) => {
-                xobject_stack.pop();
-                return Ok(Vec::new());
-            },
-        };
 
         // Critical CTM composition:
         // Start the form's internal graphics state with `parent_ctm * form_matrix`.
@@ -24864,7 +24882,6 @@ impl PdfDocument {
         page_index: usize,
         filter: &ImageExtractFilter,
     ) -> Result<Vec<crate::extractors::PdfImage>> {
-        use crate::content::parse_content_stream_images_only;
         use crate::content::Operator;
 
         // Get page object and resources
@@ -24874,8 +24891,12 @@ impl PdfDocument {
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        // Get content stream
-        let content_data = self.get_page_content_data(page_index)?;
+        // ── pdf_manipulator patch: the page's image operators are read as its content is decoded ──
+        let operators = self
+            .page_operators(page_index)?
+            .with_mode(crate::host::content::Mode::Images)
+            .flatten();
+        // ── end pdf_manipulator patch ──
 
         // Resolve resources
         let resources = match page_dict.get("Resources") {
@@ -24887,15 +24908,6 @@ impl PdfDocument {
                 }
             },
             None => None,
-        };
-
-        // Parse content stream with image-only fast path (skips BT/ET text blocks)
-        let operators = match parse_content_stream_images_only(&content_data) {
-            Ok(ops) => ops,
-            Err(_) => {
-                // If content stream parsing fails, return empty
-                return Ok(Vec::new());
-            },
         };
 
         let mut images = Vec::new();
@@ -25155,7 +25167,6 @@ impl PdfDocument {
         xobject_stack: &mut Vec<ObjectRef>,
         filter: &ImageExtractFilter,
     ) -> Result<Vec<crate::extractors::PdfImage>> {
-        use crate::content::parse_content_stream_images_only;
         use crate::content::Operator;
 
         // Cycle detection
@@ -25227,10 +25238,9 @@ impl PdfDocument {
             crate::content::Matrix::identity()
         };
 
-        // Decode form stream — check cache first to avoid repeated decompression
-        // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
-        let stream_data = match self.form_content(xobject_ref, xobject) {
-            Ok(data) => data.as_ref().clone(),
+        // ── pdf_manipulator patch: the form's image operators are read as its content is decoded ──
+        let operators = match self.form_operators(xobject_ref) {
+            Ok(ops) => ops.with_mode(crate::host::content::Mode::Images).flatten(),
             Err(e) => {
                 log::warn!("Failed to decode Form XObject stream: {}, skipping", e);
                 xobject_stack.pop();
@@ -25238,15 +25248,6 @@ impl PdfDocument {
             },
         };
         // ── end pdf_manipulator patch ──
-
-        // Parse operators using fast image-only path (skips text operators)
-        let operators = match parse_content_stream_images_only(&stream_data) {
-            Ok(ops) => ops,
-            Err(_) => {
-                xobject_stack.pop();
-                return Ok(Vec::new());
-            },
-        };
 
         // Extract using only the Form's own Matrix (no parent_ctm yet).
         // This allows caching the results and applying different parent CTMs later.

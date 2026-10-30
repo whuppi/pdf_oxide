@@ -24,7 +24,7 @@
 //! `TJ` array, at most.
 
 use crate::object::Object;
-use crate::parser::parse_object;
+use crate::parser::{decode_literal_string_escapes, parse_object};
 use std::io::{self, Read};
 
 /// Starting size of the window, in bytes.
@@ -118,7 +118,8 @@ fn scan(b: &[u8], eof: bool) -> Scan {
         b'(' => {
             let mut depth = 1u32;
             let mut i = 1;
-            while i < len {
+            while let Some(p) = memchr::memchr3(b'\\', b'(', b')', &b[i..]) {
+                i += p;
                 match b[i] {
                     b'\\' => {
                         if i + 1 >= len {
@@ -128,13 +129,12 @@ fn scan(b: &[u8], eof: bool) -> Scan {
                         continue;
                     },
                     b'(' => depth += 1,
-                    b')' => {
+                    _ => {
                         depth -= 1;
                         if depth == 0 {
                             return Scan::Token(i + 1, Kind::Value);
                         }
                     },
-                    _ => {},
                 }
                 i += 1;
             }
@@ -151,7 +151,7 @@ fn scan(b: &[u8], eof: bool) -> Scan {
             if b[1] == b'<' {
                 return Scan::Token(2, Kind::DictStart);
             }
-            match b[1..].iter().position(|&c| c == b'>') {
+            match memchr::memchr(b'>', &b[1..]) {
                 Some(p) => Scan::Token(p + 2, Kind::Value),
                 None if eof => Scan::Token(1, Kind::Bad),
                 None => Scan::More,
@@ -178,6 +178,78 @@ fn scan(b: &[u8], eof: bool) -> Scan {
             }
         },
         _ => Scan::Token(1, Kind::Bad),
+    }
+}
+
+/// Powers of ten that `f64` holds exactly.
+const POW10: [f64; 16] = [
+    1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+];
+
+/// The bytes of the hex digits `digits` as `decode_hex` reads them: white-space
+/// is dropped, a character that is no hex digit counts as `0`, and an odd
+/// last digit is the high nibble.
+fn hex_bytes(digits: &[u8]) -> Vec<u8> {
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0,
+    };
+    let mut out = Vec::with_capacity(digits.len() / 2 + 1);
+    let mut high: Option<u8> = None;
+    for &c in digits.iter().filter(|c| !c.is_ascii_whitespace()) {
+        match high.take() {
+            Some(h) => out.push(h << 4 | nibble(c)),
+            None => high = Some(nibble(c)),
+        }
+    }
+    if let Some(h) = high {
+        out.push(h << 4);
+    }
+    out
+}
+
+/// What `parse_object` returns for the scanned value token `b`, for the
+/// shapes that dominate text and path content: a number of at most 15
+/// digits (an integer of at most 18), a literal string, a hex string.
+/// `None` leaves any other token to `parse_object`.
+///
+/// A real is its digits over a power of ten: both are exact in `f64`, so the
+/// division rounds as the decimal-to-binary conversion `parse_object` runs
+/// does.
+fn fast_value(b: &[u8]) -> Option<Object> {
+    match b[0] {
+        b'(' => Some(Object::String(decode_literal_string_escapes(&b[1..b.len() - 1]))),
+        b'<' => Some(Object::String(hex_bytes(&b[1..b.len() - 1]))),
+        b'/' => None,
+        _ => {
+            let (negative, digits) = match b[0] {
+                b'-' => (true, &b[1..]),
+                b'+' => (false, &b[1..]),
+                _ => (false, b),
+            };
+            let value = |run: &[u8], from: u64| {
+                run.iter().fold(from, |acc, &c| acc * 10 + u64::from(c - b'0'))
+            };
+            match digits.iter().position(|&c| c == b'.') {
+                None => {
+                    if digits.is_empty() || digits.len() > 18 {
+                        return None;
+                    }
+                    let n = value(digits, 0) as i64;
+                    Some(Object::Integer(if negative { -n } else { n }))
+                },
+                Some(dot) => {
+                    let (whole, fraction) = (&digits[..dot], &digits[dot + 1..]);
+                    if whole.len() + fraction.len() == 0 || whole.len() + fraction.len() > 15 {
+                        return None;
+                    }
+                    let n = value(fraction, value(whole, 0)) as f64 / POW10[fraction.len()];
+                    Some(Object::Real(if negative { -n } else { n }))
+                },
+            }
+        },
     }
 }
 
@@ -390,9 +462,12 @@ impl<R: Read> Lexer<R> {
                 Scan::Token(len, kind) => {
                     let bytes = &self.buf[self.start..self.start + len];
                     let token = match kind {
-                        Kind::Value => match parse_object(bytes) {
-                            Ok((_, object)) => Token::Value(object),
-                            Err(_) => Token::Bad,
+                        Kind::Value => match fast_value(bytes) {
+                            Some(object) => Token::Value(object),
+                            None => match parse_object(bytes) {
+                                Ok((_, object)) => Token::Value(object),
+                                Err(_) => Token::Bad,
+                            },
                         },
                         Kind::Word => Token::Word(String::from_utf8_lossy(bytes).into_owned()),
                         Kind::ArrayStart => Token::ArrayStart,
@@ -417,6 +492,70 @@ impl<R: Read> Lexer<R> {
                 },
             }
         }
+    }
+
+    /// Skips one path-building, painting, clipping or line-style operator and
+    /// its numbers, when the unread bytes start with exactly that: white-space,
+    /// numbers, then an operator word from that set. Reads no values, so
+    /// nothing is built; a number that is no number, a comment, more than
+    /// [`MAX_OPERANDS`] numbers, a run that reaches the window's end, or any
+    /// other word leaves the bytes where they are and returns false.
+    ///
+    /// `build_operator` returns the same path variant for these words whatever
+    /// the operands, so a mode that drops them drops this operator, and the
+    /// damage is the same as when the tokens are read one by one.
+    ///
+    /// [`MAX_OPERANDS`]: super::operators::MAX_OPERANDS
+    pub(super) fn skip_path_operator(&mut self) -> bool {
+        const WORDS: [&[u8]; 24] = [
+            b"m", b"l", b"c", b"v", b"y", b"h", b"re", b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b",
+            b"b*", b"n", b"W", b"W*", b"w", b"J", b"j", b"M", b"i",
+        ];
+        let b = &self.buf[self.start..self.end];
+        let mut i = 0;
+        let mut numbers = 0;
+        let end = loop {
+            while i < b.len() && is_space(b[i]) {
+                i += 1;
+            }
+            let Some(&first) = b.get(i) else {
+                return false;
+            };
+            match first {
+                b'0'..=b'9' | b'+' | b'-' | b'.' => {
+                    let digits = |from: usize| from + b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+                    let mut j = digits(i + usize::from(matches!(first, b'+' | b'-')));
+                    let mut seen = j - i - usize::from(matches!(first, b'+' | b'-'));
+                    if j < b.len() && b[j] == b'.' {
+                        let k = digits(j + 1);
+                        seen += k - j - 1;
+                        j = k;
+                    }
+                    if seen == 0 || (j == b.len() && !self.eof) {
+                        return false;
+                    }
+                    numbers += 1;
+                    if numbers > super::operators::MAX_OPERANDS {
+                        return false;
+                    }
+                    i = j;
+                },
+                c if c.is_ascii_alphabetic() || matches!(c, b'\'' | b'"' | b'*') => {
+                    let n = b[i..].iter().take_while(|&&c| is_word_byte(c)).count();
+                    if i + n == b.len() && !self.eof {
+                        return false;
+                    }
+                    if !WORDS.contains(&&b[i..i + n]) {
+                        return false;
+                    }
+                    break i + n;
+                },
+                _ => return false,
+            }
+        };
+        self.consume(end);
+        self.run = 0;
+        true
     }
 
     /// The kind of token the source ended inside of, if it did.
@@ -449,5 +588,48 @@ impl<R: Read> Lexer<R> {
     /// Reads once more into the window, dropping the bytes already discarded.
     pub(super) fn refill(&mut self) -> io::Result<()> {
         self.fill()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shape `fast_value` takes reads as `parse_object` reads it, bit
+    /// for bit: signs, leading zeros, bare and trailing points, 15 and 16
+    /// digits, escapes, hex with white-space and an odd digit.
+    #[test]
+    fn fast_value_is_parse_object() {
+        let mut tokens: Vec<Vec<u8>> = Vec::new();
+        let digits = ["0", "00", "7", "42", "007", "123456789012345", "1234567890123456", "999999999999999999", "9999999999999999999"];
+        for sign in ["", "+", "-"] {
+            for whole in digits {
+                tokens.push(format!("{sign}{whole}").into_bytes());
+                for frac in ["", "0", "5", "05", "000", "123456789", "999999999999999"] {
+                    tokens.push(format!("{sign}{whole}.{frac}").into_bytes());
+                }
+            }
+            for frac in ["", "5", "0", "25", "123456789012345", "1234567890123456"] {
+                tokens.push(format!("{sign}.{frac}").into_bytes());
+            }
+        }
+        for s in [
+            "()", "(abc)", "(a\\(b\\)c)", "(a(b)c)", "(\\101\\7\\n\\\r\n x)", "(é)", "<>", "<48656C6C6F>",
+            "<48 65\n6C>", "<4>", "<zz1>", "<ABCDEFabcdef>",
+        ] {
+            tokens.push(s.as_bytes().to_vec());
+        }
+        let mut checked = 0;
+        for token in &tokens {
+            if let Some(fast) = fast_value(token) {
+                let (_, slow) = parse_object(token).expect("parse_object reads what fast_value read");
+                match (&fast, &slow) {
+                    (Object::Real(a), Object::Real(b)) => assert_eq!(a.to_bits(), b.to_bits(), "{:?}", String::from_utf8_lossy(token)),
+                    _ => assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(token)),
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "{checked} tokens checked");
     }
 }

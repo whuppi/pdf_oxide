@@ -282,17 +282,15 @@ pub fn validate_colors(
     // Validate color spaces in content streams
     let page_count = document.page_count()?;
     for page_idx in 0..page_count {
-        let content_data = match document.get_page_content_data(page_idx) {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
-
-        let operators = match crate::content::parser::parse_content_stream(&content_data) {
+        // ── pdf_manipulator patch: the page's operators are read as its content is decoded ──
+        let operators = match document.page_operators(page_idx) {
             Ok(ops) => ops,
             Err(_) => continue,
         };
 
-        for op in &operators {
+        for op in operators.flatten() {
+            let op = &op;
+            // ── end pdf_manipulator patch ──
             let uses_device_color = matches!(
                 op,
                 crate::content::operators::Operator::SetFillRgb { .. }

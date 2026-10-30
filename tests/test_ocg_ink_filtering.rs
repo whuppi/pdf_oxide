@@ -282,7 +282,9 @@ fn test_ink_exclusion_restored_after_xobject() {
 }
 
 // ============================================================================
-// Bug 3: text-only parser skips color operators — ink filtering is inert
+// ── pdf_manipulator patch: the title named a parser that is gone ──
+// Bug 3: a reader that skips color operators makes ink filtering inert
+// ── end pdf_manipulator patch ──
 // ============================================================================
 
 /// Build a PDF with Separation ink color space directly in the page stream.
@@ -366,13 +368,15 @@ fn build_pdf_with_inline_separation() -> Vec<u8> {
 }
 
 #[test]
-fn test_ink_filtering_blocked_by_text_only_parser() {
-    // The text-only parser (parse_and_execute_text_only) skips color operators
-    // (cs, rg, g, k) for performance. This means the SetFillColorSpace handler
-    // never fires, and ink filtering is completely inert.
+// ── pdf_manipulator patch: the name described a parser that is gone ──
+fn test_ink_filtering_needs_color_operators_delivered() {
+    // A reader that skips color operators (cs, rg, g, k) for performance
+    // means the SetFillColorSpace handler never fires, and ink filtering is
+    // completely inert. The operators the text extractor reads keep them.
     //
-    // This test proves the bug: excluding "SpotRed" has no effect because the
-    // `cs` operator is never delivered to the extractor.
+    // This test proves the filter works: excluding "SpotRed" takes effect
+    // because the `cs` operator is delivered to the extractor.
+    // ── end pdf_manipulator patch ──
     let pdf_bytes = build_pdf_with_inline_separation();
     let doc = PdfDocument::from_bytes(pdf_bytes).expect("parse PDF");
 

@@ -11,10 +11,13 @@
 //!   cargo run --release --bin export_to_markdown
 //!   cargo run --release --bin export_to_markdown -- --output-dir custom/path
 
-use pdf_oxide::content::{parse_content_stream, Operator};
+// ── pdf_manipulator patch: operators are read through the streaming source ──
+use pdf_oxide::content::Operator;
 use pdf_oxide::converters::{ConversionOptions, MarkdownConverter};
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::extractors::forms::{FieldValue, FormExtractor};
+use pdf_oxide::host::content::Mode;
+// ── end pdf_manipulator patch ──
 use pdf_oxide::layout::{FontWeight, TextBlock, TextChar};
 use std::fs::{self, File};
 use std::io::Write;
@@ -135,14 +138,12 @@ fn extract_graphics_paths(
 ) -> Result<Vec<GraphicsPath>, Box<dyn std::error::Error>> {
     let mut paths = Vec::new();
 
-    // Get page content stream
-    let content_data = match pdf.get_page_content_data(page_num) {
-        Ok(data) => data,
+    // ── pdf_manipulator patch: the page's path operators are read as its content is decoded ──
+    let operators = match pdf.page_operators(page_num) {
+        Ok(ops) => ops.with_mode(Mode::Paths).flatten(),
         Err(_) => return Ok(paths), // No content stream
     };
-
-    // Parse operators
-    let operators = parse_content_stream(&content_data)?;
+    // ── end pdf_manipulator patch ──
 
     // Track graphics state
     let mut current_x = 0.0;

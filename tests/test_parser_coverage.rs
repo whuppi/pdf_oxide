@@ -6,13 +6,10 @@
 //! - xref_reconstruction.rs (49% → higher)
 //! - structure/parser.rs (6.6% → higher)
 
-// Some tests intentionally pin the deprecated `parse_content_stream_text_only`.
-#![allow(deprecated)]
-
+// ── pdf_manipulator patch: the byte-slice text and image parsers are gone ──
 use pdf_oxide::content::operators::Operator;
-use pdf_oxide::content::parser::{
-    parse_content_stream, parse_content_stream_images_only, parse_content_stream_text_only,
-};
+use pdf_oxide::content::parser::parse_content_stream;
+// ── end pdf_manipulator patch ──
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::xref::{CrossRefTable, XRefEntry};
 
@@ -179,73 +176,6 @@ fn test_parse_do_operator() {
     let ops = parse_content_stream(stream).unwrap();
     let has_do = ops.iter().any(|op| matches!(op, Operator::Do { .. }));
     assert!(has_do, "Should have Do operator");
-}
-
-// ===========================================================================
-// Tests: parse_content_stream_text_only
-// ===========================================================================
-
-#[test]
-fn test_parse_text_only_basic() {
-    let stream = b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET q 100 200 m 300 400 l S Q";
-    let ops = parse_content_stream_text_only(stream).unwrap();
-
-    // Text-only parser should get text operators
-    let has_tf = ops.iter().any(|op| matches!(op, Operator::Tf { .. }));
-    let has_tj = ops.iter().any(|op| matches!(op, Operator::Tj { .. }));
-    assert!(has_tf);
-    assert!(has_tj);
-}
-
-#[test]
-fn test_parse_text_only_skips_path() {
-    let stream = b"100 200 m 300 400 l S";
-    let ops = parse_content_stream_text_only(stream).unwrap();
-    // Should skip non-text operators
-    assert!(ops.is_empty() || ops.iter().all(|op| !matches!(op, Operator::Other { .. })));
-}
-
-#[test]
-fn test_parse_text_only_empty() {
-    let ops = parse_content_stream_text_only(b"").unwrap();
-    assert!(ops.is_empty());
-}
-
-// ===========================================================================
-// Tests: parse_content_stream_images_only
-// ===========================================================================
-
-#[test]
-fn test_parse_images_only_do() {
-    let stream = b"q 1 0 0 1 0 0 cm /Im1 Do Q";
-    let ops = parse_content_stream_images_only(stream).unwrap();
-    let has_do = ops.iter().any(|op| matches!(op, Operator::Do { .. }));
-    assert!(has_do, "Image parser should capture Do operator");
-}
-
-#[test]
-fn test_parse_images_only_cm_q() {
-    let stream = b"q 1 0 0 1 72 720 cm /Im1 Do Q";
-    let ops = parse_content_stream_images_only(stream).unwrap();
-    // Image-only parser should capture cm, q, Q, Do
-    let has_do = ops.iter().any(|op| matches!(op, Operator::Do { .. }));
-    assert!(has_do, "Should capture Do in image mode");
-    // Other operators may or may not be captured depending on implementation
-}
-
-#[test]
-fn test_parse_images_only_empty() {
-    let ops = parse_content_stream_images_only(b"").unwrap();
-    assert!(ops.is_empty());
-}
-
-#[test]
-fn test_parse_images_only_text_stream_ignored() {
-    let stream = b"BT /F1 12 Tf (Hello) Tj ET";
-    let ops = parse_content_stream_images_only(stream).unwrap();
-    // Should not have text operators in image-only mode
-    let has_tf = ops.iter().any(|op| matches!(op, Operator::Tf { .. }));
-    assert!(!has_tf, "Image parser should not capture Tf");
 }
 
 // ===========================================================================

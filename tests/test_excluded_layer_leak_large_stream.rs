@@ -3,25 +3,27 @@
 //!
 //! ISO 32000-1:2008 §8.11 lets a conforming reader choose whether to honour
 //! optional-content state, and explicitly blesses callers supplying their own
+// ── pdf_manipulator patch: the header described a mechanism that is gone ──
 //! — so returning hidden text *by default* is legitimate. What is not is
-//! offering that mechanism and then ignoring it: above a 256 KB stream size
-//! the extractor took a prescan route that keeps only `BT..ET`/`Do` regions
-//! and discards the `BDC`/`EMC` pairs carrying optional-content membership,
-//! so the exclusion silently did nothing. The caller asked, got no error, and
-//! got the content — and hidden layers routinely hold draft text and
-//! pre-redaction content.
+//! offering that mechanism and then ignoring it: a reader that keeps only
+//! `BT..ET`/`Do` regions of a long stream discards the `BDC`/`EMC` pairs
+//! carrying optional-content membership, so the exclusion silently does
+//! nothing. The caller asked, got no error, and got the content — and hidden
+//! layers routinely hold draft text and pre-redaction content.
 //!
-//! The gate that chose the parser tested excluded *inks* only. These tests
-//! pin both filters, on both sides of the threshold, so the next filter added
-//! cannot inherit the same hole unnoticed.
+//! These tests pin both filters, on both sides of a 256 KB stream size, so a
+//! reader added for long streams cannot inherit the same hole unnoticed.
+// ── end pdf_manipulator patch ──
 
 use std::collections::HashSet;
 
 use pdf_oxide::PdfDocument;
 
 /// One tagged-with-optional-content page. `padding_ops` no-op operators are
-/// appended so the caller can push the stream over the 256 KB prescan
-/// threshold without changing what the page says.
+// ── pdf_manipulator patch: the comment described a mechanism that is gone ──
+/// appended so the caller can push the stream over 256 KB
+/// without changing what the page says.
+// ── end pdf_manipulator patch ──
 fn ocg_pdf(padding_ops: usize) -> Vec<u8> {
     let mut content = String::new();
     content.push_str("BT /F1 12 Tf 1 0 0 1 72 700 Tm (VisibleBody) Tj ET\n");
@@ -29,7 +31,9 @@ fn ocg_pdf(padding_ops: usize) -> Vec<u8> {
     content.push_str("BT /F1 12 Tf 1 0 0 1 72 660 Tm (SecretDraft) Tj ET\n");
     content.push_str("EMC\n");
     // Padding that is legal, side-effect free, and outside any text object,
-    // so it is exactly the material the prescan discards.
+    // ── pdf_manipulator patch: the comment described a mechanism that is gone ──
+    // so it is exactly the material a text-region reader discards.
+    // ── end pdf_manipulator patch ──
     for _ in 0..padding_ops {
         content.push_str("q 1 0 0 1 0 0 cm Q\n");
     }
@@ -90,7 +94,9 @@ fn excluding_draft() -> HashSet<String> {
 /// Confirm the fixture really does straddle the threshold, so the two halves
 /// of this file are testing what they claim to.
 #[test]
-fn fixture_sizes_straddle_the_prescan_threshold() {
+// ── pdf_manipulator patch: the name described a mechanism that is gone ──
+fn fixture_sizes_straddle_256_kb() {
+    // ── end pdf_manipulator patch ──
     assert!(ocg_pdf(0).len() < 256 * 1024, "small fixture must be under 256 KB");
     assert!(ocg_pdf(OVER_THRESHOLD).len() > 256 * 1024, "large fixture must be over 256 KB");
 }

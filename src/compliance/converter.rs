@@ -836,7 +836,9 @@ impl PdfAConverter {
         result: &mut ConversionResult,
     ) -> Result<()> {
         // Probe: if we can read page content the source was decrypted.
-        if editor.source_mut().get_page_content_data(0).is_err() {
+        // ── pdf_manipulator patch: the probe opens the page's operators, which decodes its first chunk ──
+        if editor.source_mut().page_operators(0).is_err() {
+            // ── end pdf_manipulator patch ──
             result.add_error(ConversionError::new(
                 ErrorCode::EncryptionNotAllowed,
                 "Document content is inaccessible; cannot strip encryption safely",

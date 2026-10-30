@@ -1,28 +1,29 @@
-//! A region's own `q` must not swallow the save the prescan wrapped it in.
+// ── pdf_manipulator patch: the header described a mechanism that is gone ──
+//! A text region's own `q` must not swallow the graphics state around it.
 //!
-//! Above 256 KB the text extractor stops parsing sequentially and replays only
-//! the `BT..ET` regions, injecting the graphics state each one starts with.
-//! Each region is bracketed in SaveState/RestoreState precisely so that one
-//! region's state cannot leak into the next.
+//! A reader that handles a long stream's text regions one at a time brackets
+//! each in SaveState/RestoreState so that one region's state cannot leak into
+//! the next. The page's text must keep its scale however the stream nests its
+//! scopes.
 //!
 //! A content stream may open a `q` that it closes only at the very end of the
 //! page — CAD exporters routinely do, wrapping the whole drawing in one scope
-//! after a global `cm`. When such a `q` falls inside a replayed region it is
-//! forwarded verbatim, so the region's own RestoreState pops *that* save
-//! rather than the injected one, and the injected CTM stays on the stack. The
-//! next region's absolute CTM then concatenates onto it, and every region
-//! after the first is scaled by the leaked matrix — here 0.12 becomes
+//! after a global `cm`. If that `q` pops the wrong save, the CTM stays on the
+//! stack, the next region's absolute CTM concatenates onto it, and every
+//! region after the first is scaled by the leaked matrix — here 0.12 becomes
 //! 0.12 x 0.12 = 0.0144, so 52 pt type is reported at 0.75 pt.
 //!
 //! ISO 32000-1:2008 §8.4.2: `Q` restores the state saved by the matching `q`.
-//! A `Q` whose `q` was never replayed has no match inside the region and must
-//! not consume the caller's.
+//! A `Q` whose `q` was never seen has no match and must not consume another.
+// ── end pdf_manipulator patch ──
 //!
 //! Hand-built synthetic PDF; no third-party fixture.
 
 use pdf_oxide::document::PdfDocument;
 
-/// Comfortably over the 256 KB prescan threshold.
+// ── pdf_manipulator patch: the comment described a mechanism that is gone ──
+/// Filler between the two text runs, large enough to keep them apart.
+// ── end pdf_manipulator patch ──
 const FILLER_TARGET: usize = 300 * 1024;
 
 fn build_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
@@ -59,9 +60,11 @@ fn stream_obj(dict: &str, data: &[u8]) -> Vec<u8> {
     v
 }
 
+// ── pdf_manipulator patch: the comment described a mechanism that is gone ──
 /// A page whose content applies a global 0.12 scale, opens one `q` that is
 /// closed only at the very end, and then draws two text runs far apart, with
-/// enough filler path data between them to force the prescan route.
+/// enough filler path data between them to keep them in separate regions.
+// ── end pdf_manipulator patch ──
 fn scaled_page_with_one_outer_save() -> Vec<u8> {
     let mut c = String::new();
     c.push_str("0.12 0 0 0.12 0 0 cm\nq\n");
@@ -88,7 +91,9 @@ fn scaled_page_with_one_outer_save() -> Vec<u8> {
 #[test]
 fn test_regions_own_save_does_not_swallow_the_injected_one() {
     let pdf = scaled_page_with_one_outer_save();
-    assert!(pdf.len() > 256 * 1024, "fixture must exceed the prescan threshold");
+    // ── pdf_manipulator patch: the message described a mechanism that is gone ──
+    assert!(pdf.len() > 256 * 1024, "fixture must put the text runs far apart");
+    // ── end pdf_manipulator patch ──
     let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF parses");
     let spans = doc.extract_spans(0).expect("page extracts");
 

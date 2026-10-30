@@ -781,18 +781,17 @@ fn global_warning_sink_wired_into_log_warn_sites() {
         content_src.contains("OperatorCapExceeded"),
         "src/content/parser.rs op-cap site must push to global sink",
     );
-    // The 4 op-cap call sites are now wired through the shared
-    // `push_operator_cap_warning()` helper (refactored 2026-05-28 to
-    // collapse the four duplicated op-cap blocks and eliminate the
-    // exceeded-N-operators message divergence when the cap is
-    // overridden). Verify the helper exists and is invoked at least
-    // 4× across the module.
+    // ── pdf_manipulator patch: only `parse_content_stream` has an operator cap now ──
+    // The op-cap site is wired through the shared
+    // `push_operator_cap_warning()` helper. Verify the helper is invoked at
+    // least once across the module.
     let helper_calls = content_src.matches("push_operator_cap_warning()").count();
     assert!(
-        helper_calls >= 4,
-        "all 4 content-parser op-cap sites must call push_operator_cap_warning() (found {})",
+        helper_calls >= 1,
+        "the content-parser op-cap site must call push_operator_cap_warning() (found {})",
         helper_calls,
     );
+    // ── end pdf_manipulator patch ──
 }
 
 #[test]

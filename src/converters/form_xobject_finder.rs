@@ -20,7 +20,7 @@
 //! into the IR as an `Image`. Output: every Form XObject on the page
 //! becomes a positioned raster image at the source coordinates.
 
-use crate::content::{parse_content_stream, Operator};
+use crate::content::Operator;
 use crate::object::{Object, ObjectRef};
 use std::collections::HashMap;
 
@@ -49,14 +49,12 @@ pub fn find_inline_image_invocations(
     doc: &crate::document::PdfDocument,
     page_idx: usize,
 ) -> Vec<FormInvocation> {
-    let content_bytes = match doc.get_page_content_data(page_idx) {
-        Ok(b) => b,
+    // ── pdf_manipulator patch: the page's image operators are read as its content is decoded ──
+    let ops = match doc.page_operators(page_idx) {
+        Ok(ops) => ops.with_mode(crate::host::content::Mode::Images).flatten(),
         Err(_) => return Vec::new(),
     };
-    let ops = match parse_content_stream(&content_bytes) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+    // ── end pdf_manipulator patch ──
 
     let mut ctm: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut stack: Vec<[f32; 6]> = Vec::new();
@@ -122,16 +120,13 @@ pub fn find_form_xobject_invocations(
         return Vec::new();
     }
 
-    // Pull the page's content stream bytes. `get_page_content_data`
-    // joins all stream parts in order and decompresses them.
-    let content_bytes = match doc.get_page_content_data(page_idx) {
-        Ok(b) => b,
+    // ── pdf_manipulator patch: the page's image operators are read as its content is decoded ──
+    // Read the page's content parts in order, decompressed as they are read.
+    let ops = match doc.page_operators(page_idx) {
+        Ok(ops) => ops.with_mode(crate::host::content::Mode::Images).flatten(),
         Err(_) => return Vec::new(),
     };
-    let ops = match parse_content_stream(&content_bytes) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+    // ── end pdf_manipulator patch ──
 
     // Walk the operator stream tracking the CTM. PDF spec §8.3.4:
     //   - `q` saves graphics state; `Q` restores.

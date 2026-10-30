@@ -3,7 +3,9 @@
 //! ISO 32000-1:2008 Table 60: "**s** — Close and stroke the path. This
 //! operator shall have the same effect as the sequence `h S`."
 //!
-//! `parse_content_stream_paths_only` decomposed it into `ClosePath` + `Stroke`,
+// ── pdf_manipulator patch: the byte-slice path parser this names is gone ──
+//! Path extraction decomposes it into `ClosePath` + `Stroke`,
+// ── end pdf_manipulator patch ──
 //! but the main operator table — which the streaming parser, and therefore
 //! annotation appearance streams, go through — had no entry for it at all, so
 //! the operator was dropped and the path was never painted.

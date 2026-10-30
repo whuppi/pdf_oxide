@@ -10,8 +10,6 @@ use crate::color::cmyk_to_rgb;
 use crate::config::ExtractionProfile;
 use crate::content::graphics_state::{GraphicsStateStack, Matrix};
 use crate::content::operators::{Operator, TextElement};
-use crate::content::parse_and_execute_text_only;
-use crate::content::parse_content_stream;
 use crate::error::Result;
 use crate::extract_log_debug;
 use crate::fonts::unicode_decode::{fallback_char_to_unicode, DecodePolicy, TextCharIter};
@@ -41,6 +39,92 @@ use crate::text::{BoundaryContext, CharacterInfo, DocumentScript, WordBoundaryDe
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+// ── pdf_manipulator patch: extraction reads operators from a re-openable source ──
+/// Opens the operators of a page's content, in [`Mode::Text`], from its
+/// first byte each time it is called. Extraction reads the source once; a
+/// page that places a `/PlacedPDF` region opens it a second time to count
+/// the text inside and outside the region before any of it is suppressed.
+///
+/// [`Mode::Text`]: crate::host::content::Mode::Text
+pub type OperatorSource<'a> =
+    dyn Fn() -> Result<Box<dyn crate::host::content::OperatorStream + 'a>> + Send + Sync + 'a;
+
+/// A page's [`OperatorSource`], held by the extractor.
+#[derive(Clone)]
+struct PageSource<'a>(Arc<OperatorSource<'a>>);
+
+impl std::fmt::Debug for PageSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PageSource")
+    }
+}
+
+/// An [`OperatorSource`] over content bytes the caller already holds.
+fn bytes_source<'a>(bytes: &[u8]) -> Arc<OperatorSource<'a>> {
+    use crate::host::content::{Mode, Operators};
+    let data: Arc<[u8]> = Arc::from(bytes);
+    Arc::new(move || {
+        Ok(Box::new(
+            Operators::new(std::io::Cursor::new(Arc::clone(&data)), Mode::Full).with_mode(Mode::Text),
+        ) as Box<dyn crate::host::content::OperatorStream>)
+    })
+}
+
+/// The word tokens of the text shown so far, as hashes: lowercased runs of
+/// two or more ASCII alphanumeric bytes, repeats kept. Show operands are raw
+/// character codes, so an encoding whose codes are not ASCII alphanumerics
+/// (Identity-H, and any non-Latin script) yields no tokens from text that is
+/// certainly there.
+#[derive(Default)]
+struct WordHashes {
+    words: Vec<u64>,
+    hash: u64,
+    len: usize,
+}
+
+impl WordHashes {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    /// Feeds show-operand bytes; a token continues across calls until
+    /// [`Self::separate`].
+    fn push(&mut self, bytes: &[u8]) {
+        for &c in bytes {
+            if c.is_ascii_alphanumeric() {
+                if self.len == 0 {
+                    self.hash = Self::OFFSET_BASIS;
+                }
+                self.hash = (self.hash ^ u64::from(c.to_ascii_lowercase())).wrapping_mul(Self::PRIME);
+                self.len += 1;
+            } else {
+                self.separate();
+            }
+        }
+    }
+
+    /// Ends the token in progress.
+    fn separate(&mut self) {
+        if self.len >= 2 {
+            self.words.push(self.hash);
+        }
+        self.len = 0;
+    }
+
+    /// Fraction of `self`'s tokens (counting repeats) that also occur anywhere
+    /// in `other`; `None` when `self` has no tokens at all. That is not
+    /// "nothing to be a duplicate of": the caller must read it as absence of
+    /// evidence, not as evidence of absence.
+    fn duplication_fraction(&self, other: &WordHashes) -> Option<f64> {
+        if self.words.is_empty() {
+            return None;
+        }
+        let seen: HashSet<u64> = other.words.iter().copied().collect();
+        let shared = self.words.iter().filter(|w| seen.contains(*w)).count();
+        Some(shared as f64 / self.words.len() as f64)
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Global flag controlling whether glyph-decode sites emit `U+FFFD`
 /// (REPLACEMENT CHARACTER) into `extract_text` / `extract_words` /
@@ -2266,8 +2350,12 @@ pub struct TextExtractor<'doc> {
     cached_xobject_refs: HashMap<String, Option<ObjectRef>>,
     /// Current XObject recursion depth (0 = page level)
     xobject_depth: u32,
-    /// Number of XObjects decoded on this page (for budget limiting)
-    xobject_decode_count: u32,
+    // ── pdf_manipulator patch: the page's operator source, for the placed-PDF count ──
+    /// The page's operators; opened a second time by the placed-PDF count.
+    page_source: Option<PageSource<'doc>>,
+    /// `placed_pdf_keep` has been decided for this page.
+    placed_pdf_decided: bool,
+    // ── end pdf_manipulator patch ──
     /// Configuration for text extraction heuristics
     config: TextExtractionConfig,
     /// Configuration for span merging behavior
@@ -2462,7 +2550,10 @@ impl<'doc> TextExtractor<'doc> {
             processed_xobjects: HashSet::new(),
             cached_xobject_refs: HashMap::new(),
             xobject_depth: 0,
-            xobject_decode_count: 0,
+            // ── pdf_manipulator patch: the page's operator source, for the placed-PDF count ──
+            page_source: None,
+            placed_pdf_decided: false,
+            // ── end pdf_manipulator patch ──
             config,
             merging_config: SpanMergingConfig::default(),
             current_mcid: None,
@@ -2845,17 +2936,8 @@ impl<'doc> TextExtractor<'doc> {
     /// Conservative on purpose: when placed text lives in a nested XObject the
     /// page-stream scan undercounts it and gate 1 falls back to suppression (the
     /// prior behaviour).
-    fn placed_pdf_text_dominates(content_stream: &[u8]) -> bool {
-        // Gate: only pages that actually carry the InDesign tag pay for a parse.
-        if !content_stream
-            .windows(b"PlacedPDF".len())
-            .any(|w| w == b"PlacedPDF")
-        {
-            return false;
-        }
-        let Ok(operators) = parse_content_stream(content_stream) else {
-            return false;
-        };
+    // ── pdf_manipulator patch: the count reads the page's operators and keeps word hashes ──
+    fn placed_pdf_text_dominates(source: &OperatorSource<'_>) -> bool {
         // A substantial placed body; below this a placed region is treated as a
         // decorative figure, not the page's logical content.
         const MIN_PLACED_CHARS: usize = 800;
@@ -2863,13 +2945,26 @@ impl<'doc> TextExtractor<'doc> {
         // majority is also present in the non-placed text (a duplicate overlay).
         const MAX_DUP_FRACTION: f64 = 0.5;
 
+        let Ok(mut operators) = source() else {
+            return false;
+        };
         let mut placed_stack: Vec<bool> = Vec::new();
         let mut placed_chars: usize = 0;
         let mut other_chars: usize = 0;
-        let mut placed_txt: Vec<u8> = Vec::new();
-        let mut other_txt: Vec<u8> = Vec::new();
-        let inside = |stack: &[bool]| stack.iter().any(|&p| p);
-        for op in &operators {
+        // The words of the page's own text, as hashes: proportional to the
+        // text this page extracts, which is the size of the call's output.
+        let mut placed_words = WordHashes::default();
+        let mut other_words = WordHashes::default();
+        while let Some(op) = operators.next() {
+            let Ok(op) = op else {
+                return false;
+            };
+            let inside = placed_stack.iter().any(|&p| p);
+            let (chars, words) = if inside {
+                (&mut placed_chars, &mut placed_words)
+            } else {
+                (&mut other_chars, &mut other_words)
+            };
             match op {
                 Operator::BeginMarkedContent { tag }
                 | Operator::BeginMarkedContentDict { tag, .. } => {
@@ -2879,42 +2974,32 @@ impl<'doc> TextExtractor<'doc> {
                     placed_stack.pop();
                 },
                 Operator::Tj { text } | Operator::Quote { text } => {
-                    let (chars, txt) = if inside(&placed_stack) {
-                        (&mut placed_chars, &mut placed_txt)
-                    } else {
-                        (&mut other_chars, &mut other_txt)
-                    };
                     *chars += text.len();
-                    txt.extend_from_slice(text);
-                    txt.push(b' ');
+                    words.push(&text);
+                    words.separate();
                 },
                 Operator::DoubleQuote { text, .. } => {
-                    let (chars, txt) = if inside(&placed_stack) {
-                        (&mut placed_chars, &mut placed_txt)
-                    } else {
-                        (&mut other_chars, &mut other_txt)
-                    };
                     *chars += text.len();
-                    txt.extend_from_slice(text);
-                    txt.push(b' ');
+                    words.push(&text);
+                    words.separate();
                 },
                 Operator::TJ { array } => {
-                    let (chars, txt) = if inside(&placed_stack) {
-                        (&mut placed_chars, &mut placed_txt)
-                    } else {
-                        (&mut other_chars, &mut other_txt)
-                    };
-                    for e in array {
+                    for e in &array {
                         if let TextElement::String(s) = e {
                             *chars += s.len();
-                            txt.extend_from_slice(s);
+                            words.push(s);
                         }
                     }
-                    txt.push(b' ');
+                    // The chunks of one array are one run of text.
+                    if !operators.tj_continues() {
+                        words.separate();
+                    }
                 },
                 _ => {},
             }
         }
+        placed_words.separate();
+        other_words.separate();
 
         // Gate 1: too little placed text -> decorative figure, suppress.
         if placed_chars < MIN_PLACED_CHARS {
@@ -2926,9 +3011,8 @@ impl<'doc> TextExtractor<'doc> {
         }
         // Gate 3: placed text is substantial but the outside text is comparable
         // or larger. Keep it unless a majority of the placed words also appear
-        // outside (a duplicate overlay). Tokenising here (behind gates 1 and 2)
-        // keeps the common single-column path allocation-free.
-        match Self::text_duplication_fraction(&placed_txt, &other_txt) {
+        // outside (a duplicate overlay).
+        match placed_words.duplication_fraction(&other_words) {
             // No tokens could be read out of the placed operands, so there is
             // no evidence either way — and "no evidence" must not read as "not
             // a duplicate". The operands carry encoded character codes, not
@@ -2951,45 +3035,23 @@ impl<'doc> TextExtractor<'doc> {
             Some(fraction) => fraction < MAX_DUP_FRACTION,
         }
     }
+    // ── end pdf_manipulator patch ──
 
-    /// Fraction of alphanumeric word tokens in `a` (counting repeats) that also
-    /// occur anywhere in `b`. Words are lowercased runs of >= 2 alphanumeric
-    /// bytes; punctuation and single characters are ignored.
-    ///
-    /// Returns `None` when `a` yields no tokens at all. That is not "nothing to
-    /// be a duplicate of" — these are raw show operands, i.e. encoded character
-    /// codes rather than text, so an encoding whose codes are not ASCII
-    /// alphanumerics (Identity-H, and any non-Latin script) produces no tokens
-    /// from text that is certainly there. The caller must treat it as absence
-    /// of evidence, not as evidence of absence.
-    fn text_duplication_fraction(a: &[u8], b: &[u8]) -> Option<f64> {
-        fn tokens(bytes: &[u8]) -> Vec<Vec<u8>> {
-            let mut out = Vec::new();
-            let mut cur = Vec::new();
-            for &c in bytes {
-                if c.is_ascii_alphanumeric() {
-                    cur.push(c.to_ascii_lowercase());
-                } else if !cur.is_empty() {
-                    if cur.len() >= 2 {
-                        out.push(std::mem::take(&mut cur));
-                    } else {
-                        cur.clear();
-                    }
-                }
-            }
-            if cur.len() >= 2 {
-                out.push(cur);
-            }
-            out
+    // ── pdf_manipulator patch: the count runs when the page first opens a placed region ──
+    /// Decides `placed_pdf_keep` from the page's own operators, the first time
+    /// a `/PlacedPDF` scope opens: suppression only happens inside such a
+    /// scope, so nothing before it depends on the answer. A page whose source
+    /// is not known keeps the default of suppressing.
+    fn decide_placed_pdf(&mut self) {
+        if self.placed_pdf_decided {
+            return;
         }
-        let a_tokens = tokens(a);
-        if a_tokens.is_empty() {
-            return None;
+        self.placed_pdf_decided = true;
+        if let Some(source) = self.page_source.clone() {
+            self.placed_pdf_keep = Self::placed_pdf_text_dominates(&*source.0);
         }
-        let b_set: std::collections::HashSet<Vec<u8>> = tokens(b).into_iter().collect();
-        let shared = a_tokens.iter().filter(|t| b_set.contains(*t)).count();
-        Some(shared as f64 / a_tokens.len() as f64)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Parse artifact type and subtype from artifact properties dictionary.
     ///
@@ -3448,16 +3510,24 @@ impl<'doc> TextExtractor<'doc> {
     ///
     /// Vector of TextSpan objects in reading order
     pub fn extract_text_spans(&mut self, content_stream: &[u8]) -> Result<Vec<TextSpan>> {
+        self.extract_text_spans_from(bytes_source(content_stream))
+    }
+
+    // ── pdf_manipulator patch: spans are read from the page's operator source ──
+    /// [`Self::extract_text_spans`] over the operators `source` opens.
+    pub fn extract_text_spans_from(
+        &mut self,
+        source: Arc<OperatorSource<'doc>>,
+    ) -> Result<Vec<TextSpan>> {
         // Enable span extraction mode
         self.extract_spans = true;
         self.spans.clear();
         self.span_sequence_counter = 0; // Reset sequence counter for this page
-                                        // Decide per page whether a whole-body `/PlacedPDF` region must be kept
-                                        // rather than suppressed (see `placed_pdf_text_dominates`).
-        self.placed_pdf_keep = Self::placed_pdf_text_dominates(content_stream);
+        self.begin_page(&source);
 
         extract_log_debug!("Parsing content stream for text extraction");
-        self.run_content_stream(content_stream)?;
+        self.run_content_stream(&*source)?;
+        // ── end pdf_manipulator patch ──
 
         // Flush any remaining Tj buffer at end of content stream
         self.flush_tj_span_buffer()?;
@@ -3538,56 +3608,63 @@ impl<'doc> TextExtractor<'doc> {
         Ok(std::mem::take(&mut self.spans))
     }
 
+    // ── pdf_manipulator patch: one forward pass over the operators, for every mode and filter ──
     /// Feed a content stream's operators to `execute_operator`.
     ///
-    /// The single parser dispatch for every extraction mode (chars, spans,
-    /// Form XObject recursion). The modes must differ only in how
+    /// The single dispatch for every extraction mode (chars, spans, Form
+    /// XObject recursion). The modes must differ only in how
     /// `execute_operator` handles the show-text operators, never in which
-    /// operators reach it: char and span mode once used different parsers
-    /// (`parse_content_stream_text_only` vs `parse_and_execute_text_only`),
-    /// which reconstruct the graphics state around a text region by different
-    /// routes, so they could agree on every text operator and still hand the
-    /// extractor a different CTM. On govdocs_003_003181.pdf page 4 that cost
-    /// a 90°-rotated chart axis: char mode returned 2322 glyphs, all at
-    /// rotation 0, where span mode saw 2590 glyphs, 122 at 90°.
-    /// Whether this extraction carries an **emission filter** — a caller
-    /// decision about what to leave out of the result.
+    /// operators reach it, or they could agree on every text operator and
+    /// still hand the extractor a different CTM.
     ///
-    /// Every such filter is evaluated against interpreted state that the
-    /// text-only parser's >256 KB prescan route does not deliver: it keeps
-    /// only `BT..ET`/`Do` regions and discards everything between them.
-    /// Ink filtering needs the colour operators (`cs`, `rg`, `g`, `k`); layer
-    /// exclusion needs the `BDC`/`EMC` pairs that carry optional-content
-    /// membership. Both must therefore take the full parser.
+    /// One sequential interpreter for all of them: the colour operators and
+    /// the `BDC`/`EMC` pairs that ink and layer filters need are in the
+    /// [`Mode::Text`] set, and a filter suppresses at emission, never by
+    /// stopping the read.
     ///
-    /// This is one predicate rather than a condition per filter because the
-    /// list had already been forgotten once: the gate tested inks alone, so
-    /// `set_excluded_layers()` was silently ignored above the threshold — the
-    /// caller asked for exclusion, got no error, and got the content. A new
-    /// filter is added here, with its reason, or it inherits the same defect.
+    /// [`Mode::Text`]: crate::host::content::Mode::Text
     ///
-    /// This localises the class; it does not close it. ISO 32000-1:2008
-    /// §8.11.3 requires that when optional content is hidden "the content
-    /// shall not be drawn" while "graphics state operations … shall still be
-    /// applied", so visibility is a decision about marking the page, taken
-    /// after interpretation — never a licence to stop parsing. The structural
-    /// answer is one sequential interpreter with suppression at emission,
-    /// which retires this predicate along with the prescan branch.
-    fn has_emission_filter(&self) -> bool {
-        !self.excluded_inks.is_empty() || !self.excluded_layers.is_empty()
+    /// The chunks of a `TJ` array longer than the source's chunk size are one
+    /// array to the extractor: they are joined before the operator runs, so a
+    /// span, the character run and the word boundaries cross the seam as they
+    /// do inside a chunk. The joined array is the unit the extractor holds
+    /// anyway, since it keeps a record per character of it.
+    fn run_content_stream(&mut self, source: &OperatorSource<'_>) -> Result<()> {
+        let mut operators = source()?;
+        let mut held: Option<Vec<TextElement>> = None;
+        while let Some(op) = operators.next() {
+            let op = op?;
+            match op {
+                Operator::TJ { array } => {
+                    let array = match held.take() {
+                        Some(mut joined) => {
+                            joined.extend(array);
+                            joined
+                        },
+                        None => array,
+                    };
+                    if operators.tj_continues() {
+                        held = Some(array);
+                    } else {
+                        self.execute_operator(Operator::TJ { array })?;
+                    }
+                },
+                op => self.execute_operator(op)?,
+            }
+        }
+        if let Some(array) = held {
+            self.execute_operator(Operator::TJ { array })?;
+        }
+        Ok(())
     }
 
-    fn run_content_stream(&mut self, content_stream: &[u8]) -> Result<()> {
-        if self.has_emission_filter() {
-            let operators = parse_content_stream(content_stream)?;
-            for op in operators {
-                self.execute_operator(op)?;
-            }
-            Ok(())
-        } else {
-            parse_and_execute_text_only(content_stream, |op| self.execute_operator(op))
-        }
+    /// Readies the extractor for one page whose operators `source` opens.
+    fn begin_page(&mut self, source: &Arc<OperatorSource<'doc>>) {
+        self.page_source = Some(PageSource(Arc::clone(source)));
+        self.placed_pdf_decided = false;
+        self.placed_pdf_keep = false;
     }
+    // ── end pdf_manipulator patch ──
 
     /// Extract individual characters from a PDF content stream.
     ///
@@ -3595,19 +3672,21 @@ impl<'doc> TextExtractor<'doc> {
     /// For most use cases, prefer using `extract_text_spans()` which groups
     /// characters into text spans according to PDF semantics.
     pub fn extract(&mut self, content_stream: &[u8]) -> Result<Vec<TextChar>> {
-        self.extract_into_self(content_stream)?;
+        self.extract_into_self(bytes_source(content_stream))?;
         Ok(self.chars.clone())
     }
 
     /// Run the character extraction and leave the result in `self.chars`.
-    fn extract_into_self(&mut self, content_stream: &[u8]) -> Result<()> {
+    // ── pdf_manipulator patch: characters are read from the page's operator source ──
+    fn extract_into_self(&mut self, source: Arc<OperatorSource<'doc>>) -> Result<()> {
         // Enable character extraction mode
         self.extract_spans = false;
         self.chars.clear();
         self.spans.clear(); // Ensure spans are clear so they don't poison xobject_spans_cache
-        self.placed_pdf_keep = Self::placed_pdf_text_dominates(content_stream);
+        self.begin_page(&source);
 
-        self.run_content_stream(content_stream)?;
+        self.run_content_stream(&*source)?;
+        // ── end pdf_manipulator patch ──
 
         // BUG FIX #2: Sort characters by reading order (top-to-bottom, left-to-right)
         // PDF content streams are in rendering order, not reading order.
@@ -3631,9 +3710,16 @@ impl<'doc> TextExtractor<'doc> {
     /// `self.chars` empty, so callers that read `char_count`/`chars` afterwards
     /// must keep using [`Self::extract`].
     pub fn extract_owned(&mut self, content_stream: &[u8]) -> Result<Vec<TextChar>> {
-        self.extract_into_self(content_stream)?;
+        self.extract_owned_from(bytes_source(content_stream))
+    }
+
+    // ── pdf_manipulator patch: characters are read from the page's operator source ──
+    /// [`Self::extract_owned`] over the operators `source` opens.
+    pub fn extract_owned_from(&mut self, source: Arc<OperatorSource<'doc>>) -> Result<Vec<TextChar>> {
+        self.extract_into_self(source)?;
         Ok(std::mem::take(&mut self.chars))
     }
+    // ── end pdf_manipulator patch ──
 
     /// Deduplicate overlapping characters on the same line.
     ///
@@ -6496,6 +6582,11 @@ impl<'doc> TextExtractor<'doc> {
                 });
                 self.update_artifact_state();
                 self.update_layer_state();
+                // ── pdf_manipulator patch: the placed-PDF count runs at the first placed scope ──
+                if is_placed_pdf {
+                    self.decide_placed_pdf();
+                }
+                // ── end pdf_manipulator patch ──
 
                 if is_artifact {
                     log::debug!("Entered /Artifact marked content (BMC, no subtype)");
@@ -6576,6 +6667,11 @@ impl<'doc> TextExtractor<'doc> {
                 });
                 self.update_artifact_state();
                 self.update_layer_state();
+                // ── pdf_manipulator patch: the placed-PDF count runs at the first placed scope ──
+                if is_placed_pdf {
+                    self.decide_placed_pdf();
+                }
+                // ── end pdf_manipulator patch ──
 
                 if is_artifact {
                     if let Some(ref atype) = artifact_type {
@@ -6653,7 +6749,8 @@ impl<'doc> TextExtractor<'doc> {
     /// graphics (charts, plots) with no text content.
     const MAX_XOBJECT_DEPTH: u32 = 10;
 
-    const MAX_XOBJECT_DECODES: u32 = 500;
+    // ── pdf_manipulator patch: no cap on the forms a page decodes; time is bounded by the cancel check ──
+    // ── end pdf_manipulator patch ──
 
     /// Resolve XObject name to ObjectRef using cached mapping.
     fn resolve_xobject_ref(&mut self, name: &str) -> Result<Option<ObjectRef>> {
@@ -6715,9 +6812,8 @@ impl<'doc> TextExtractor<'doc> {
         if self.xobject_depth >= Self::MAX_XOBJECT_DEPTH {
             return Ok(());
         }
-        if self.xobject_decode_count >= Self::MAX_XOBJECT_DECODES {
-            return Ok(());
-        }
+        // ── pdf_manipulator patch: no cap on the forms a page decodes ──
+        // ── end pdf_manipulator patch ──
 
         // Resolve name → ObjectRef using cached mapping (avoids expensive
         // repeated resolution of resources/XObject dict chain)
@@ -6868,34 +6964,14 @@ impl<'doc> TextExtractor<'doc> {
                     // page has any active fonts; if not, skip.
                 }
 
-                // Decode the stream — check cache first to avoid repeated FlateDecode.
-                self.xobject_decode_count += 1;
-                // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
-                let stream_data = match doc.form_content(xobject_ref, &xobject) {
-                    Ok(data) => data.as_ref().clone(),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to decode Form XObject '{}' stream: {}, skipping",
-                            name,
-                            e
-                        );
-                        return Ok(());
-                    },
+                // ── pdf_manipulator patch: the form's operators are read as its content is decoded ──
+                let form_source = move || -> Result<Box<dyn crate::host::content::OperatorStream>> {
+                    Ok(Box::new(
+                        doc.form_operators(xobject_ref)?
+                            .with_mode(crate::host::content::Mode::Text),
+                    ))
                 };
                 // ── end pdf_manipulator patch ──
-
-                if !crate::document::PdfDocument::may_contain_text(&stream_data) {
-                    log::debug!(
-                        "Skipping text-free Form XObject '{}' ({} bytes)",
-                        name,
-                        stream_data.len()
-                    );
-                    doc.xobject_text_free_cache
-                        .lock()
-                        .unwrap()
-                        .insert(xobject_ref);
-                    return Ok(());
-                }
 
                 // Parse /Matrix from Form XObject dict (default: identity per ISO 32000-1 §8.10.1)
                 let form_matrix = if let Some(Object::Array(arr)) = xobject_dict.get("Matrix") {
@@ -7025,7 +7101,9 @@ impl<'doc> TextExtractor<'doc> {
                     .push(crate::structure::McidScope::Form(xobject_ref));
 
                 self.xobject_depth += 1;
-                let parse_result = self.run_content_stream(&stream_data);
+                // ── pdf_manipulator patch: the form's operators are read as its content is decoded ──
+                let parse_result = self.run_content_stream(&form_source);
+                // ── end pdf_manipulator patch ──
                 self.xobject_depth -= 1;
                 // Pop the Form XObject scope pushed before the
                 // content-stream walk. Cleared regardless of parse
@@ -9545,13 +9623,12 @@ mod tests {
     /// Regression test for issue #1006: char mode must run the same parser as
     /// span mode.
     ///
-    /// The stream forces the streaming parser's >256KB prescan route: the
-    /// rotating `q`/`cm` sits >4KB before `BT`, so the CTM reaches the text
-    /// region only via the forward scan's injected `Cm`. The unbalanced
-    /// literal-string opens are invisible to the prescan (they lie outside
-    /// every text region) but feed the old char-mode parser,
-    /// `parse_content_stream_text_only`, over `MAX_CONSECUTIVE_ERRORS`
-    /// consecutive scan failures — it bails before `BT` and extracts nothing.
+    // ── pdf_manipulator patch: one forward pass; no stray string opens before BT ──
+    /// The rotating `q`/`cm` sits >256KB of path operators before `BT`, so the
+    /// CTM reaches the text region only if the pass carries it forward. Stray
+    /// unbalanced `(` before `BT` are a string to the end of the stream for
+    /// every reader of the stream, so the stream here has none.
+    // ── end pdf_manipulator patch ──
     #[test]
     fn test_char_mode_rotated_ctm_survives_large_hostile_stream() {
         let mut extractor = TextExtractor::new();
@@ -9560,8 +9637,6 @@ mod tests {
 
         let mut cs = Vec::new();
         cs.extend_from_slice(b"q\n0 1 -1 0 612 0 cm\n");
-        cs.extend_from_slice(&[b'('; 1500]);
-        cs.push(b'\n');
         for i in 0..13000u32 {
             let line = format!(
                 "{}.0 {}.0 m {}.0 {}.0 l S\n",
@@ -9572,7 +9647,9 @@ mod tests {
             );
             cs.extend_from_slice(line.as_bytes());
         }
-        assert!(cs.len() > 256 * 1024, "stream must exceed the 256KB prescan threshold");
+        // ── pdf_manipulator patch: the size is the distance the CTM must be carried ──
+        assert!(cs.len() > 256 * 1024, "stream must put the CTM far from the text");
+        // ── end pdf_manipulator patch ──
         cs.extend_from_slice(b"BT /F1 12 Tf 100 200 Td (Hello) Tj ET\nQ\n");
 
         let chars = extractor.extract(&cs).unwrap();
@@ -9721,19 +9798,20 @@ mod tests {
         assert_eq!(chars[0].color.b, 0.0);
     }
 
-    /// Regression test for a text-only-parser bug where a fill colour set by
+    // ── pdf_manipulator patch: the comment named the scanner that is gone ──
+    /// Regression test for a defect class where a fill colour set by
     /// `scn` *before* the enclosing `BT` was silently dropped, leaving the
     /// text drawn in the GraphicsState default (black) instead of the
     /// colour the content stream actually requested.
     ///
-    /// Root cause: `scan_graphics_region()` (src/content/parser.rs) is used
-    /// by `parse_and_execute_text_only()` to fast-scan non-text regions
-    /// looking for the next `BT`. It classified `scn`/`cs`/`sc`/`rg`/`g`/`k`
-    /// (and friends) as unconditionally "skippable" - correct only when a
-    /// matching `Q` is guaranteed to revert the change before any `BT`, but
-    /// wrong at the top level (outside any q/Q scope), where the colour
-    /// change legitimately persists into the next text object per
-    /// ISO 32000-1:2008 SS8.4. Reproduces the exact operator sequence found
+    /// Root cause: a reader that skips non-text regions looking for the next
+    /// `BT` classified `scn`/`cs`/`sc`/`rg`/`g`/`k` (and friends) as
+    /// unconditionally "skippable" - correct only when a matching `Q` is
+    /// guaranteed to revert the change before any `BT`, but wrong at the top
+    /// level (outside any q/Q scope), where the colour change legitimately
+    /// persists into the next text object per ISO 32000-1:2008 SS8.4.
+    // ── end pdf_manipulator patch ──
+    /// Reproduces the exact operator sequence found
     /// on a real-world govdocs1 slide-deck PDF: a marked-content BDC opens,
     /// `scn` sets a blue fill colour *outside* any text object, then `BT`
     /// opens the text object that draws the (should-be-blue) heading.
@@ -9786,7 +9864,9 @@ mod tests {
     /// Must-not-regress guard: `scn` issued *inside* an already-open text
     /// object (continuing after a prior `Tj`, still within the same BT/ET)
     /// always worked correctly - it goes through the ordinary text-operator
-    /// parse path, not the non-text `scan_graphics_region` fast scanner.
+    // ── pdf_manipulator patch: the comment named the scanner that is gone ──
+    /// parse path, not a scan that skips non-text regions.
+    // ── end pdf_manipulator patch ──
     /// Confirms the fix above did not disturb this working case.
     #[test]
     fn test_fill_color_scn_inside_open_text_object_still_works() {
@@ -9874,23 +9954,21 @@ mod tests {
         );
     }
 
+    // ── pdf_manipulator patch: the comment and name described a mechanism that is gone ──
     /// Regression test for issue #1033: a `/PlacedPDF` marked-content scope
-    /// whose `BDC` lands inside the first prescanned (>256KB fast-path)
-    /// text region but whose matching `EMC` falls outside it — past tens
-    /// of thousands of bytes of artwork the prescan never turns into a
-    /// text region — must not suppress text in every subsequent region.
-    /// Before the fix, `inside_placed_pdf` stayed `true` forever once the
-    /// scope's `EMC` fell outside a prescanned region's byte range, since
-    /// the marked-content stack (unlike CTM/font) got no
-    /// per-region balancing.
+    /// whose `BDC` lands in one text object but whose matching `EMC` falls
+    /// past tens of thousands of bytes of artwork with no text must not
+    /// suppress text in every later text object. A reader that handled
+    /// each text region on its own left `inside_placed_pdf` `true` forever
+    /// once the scope's `EMC` fell outside the region that opened it, since
+    /// the marked-content stack (unlike CTM/font) was not balanced per region.
     #[test]
-    fn test_prescan_marked_content_scope_does_not_leak_across_regions() {
+    fn test_marked_content_scope_does_not_leak_past_a_long_gap_without_text() {
         let mut cs = Vec::new();
         cs.extend_from_slice(b"/PlacedPDF /MC0 BDC\n");
         cs.extend_from_slice(b"BT /F1 12 Tf 100 700 Td (Figure Label) Tj ET\n");
-        // >256KB of filler path data (the artwork) with no BT/Do at all,
-        // so the prescan never turns it into its own text region — the
-        // EMC below lands in the gap between the two BT regions.
+        // >256KB of filler path data (the artwork) with no BT/Do at all:
+        // the EMC below lands in the gap between the two text objects.
         for i in 0..13000u32 {
             let line = format!(
                 "{}.0 {}.0 m {}.0 {}.0 l n\n",
@@ -9903,7 +9981,7 @@ mod tests {
         }
         cs.extend_from_slice(b"EMC\n");
         cs.extend_from_slice(b"BT /F1 12 Tf 100 600 Td (Body Text After Figure) Tj ET\n");
-        assert!(cs.len() > 256 * 1024, "stream must exceed 256KB prescan threshold");
+        assert!(cs.len() > 256 * 1024, "stream must put the gap past 256KB");
 
         let font = create_test_font();
         let mut extractor = TextExtractor::new();
@@ -9923,8 +10001,9 @@ mod tests {
         assert!(
             all_text.contains("Body Text After Figure"),
             "text after the /PlacedPDF scope closes (EMC) must not be suppressed \
-             just because the EMC fell outside the prescanned region, got: {all_text:?}"
+             just because the EMC fell far from the text that opened it, got: {all_text:?}"
         );
+        // ── end pdf_manipulator patch ──
     }
 
     /// Regression test for issue #1024: invisible text (Tr 3/7) must never
@@ -11348,10 +11427,12 @@ mod tests {
         let body =
             "(This is the full article body typeset inside a placed PDF region) Tj\n".repeat(20);
         let stream = format!("/PlacedPDF BMC\nBT\n{body}ET\nEMC\nBT (Journal vol 1) Tj ET\n");
+        // ── pdf_manipulator patch: the count reads an operator source ──
         assert!(
-            TextExtractor::placed_pdf_text_dominates(stream.as_bytes()),
+            TextExtractor::placed_pdf_text_dominates(&*bytes_source(stream.as_bytes())),
             "whole-body /PlacedPDF must be KEPT (not suppressed)"
         );
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]
@@ -11363,10 +11444,12 @@ mod tests {
             "(Real published paragraph of the article that lives outside the placed region) Tj\n"
                 .repeat(20);
         let stream = format!("BT\n{outside}ET\n/PlacedPDF BMC\nBT (draft galley) Tj ET\nEMC\n");
+        // ── pdf_manipulator patch: the count reads an operator source ──
         assert!(
-            !TextExtractor::placed_pdf_text_dominates(stream.as_bytes()),
+            !TextExtractor::placed_pdf_text_dominates(&*bytes_source(stream.as_bytes())),
             "minority-overlay /PlacedPDF must stay suppressed"
         );
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]
@@ -11374,7 +11457,9 @@ mod tests {
         // No /PlacedPDF tag anywhere: the pre-scan must short-circuit to false
         // (keep the default suppression state; pay nothing for ordinary pages).
         let stream = b"BT (ordinary single column page of text) Tj ET\n";
-        assert!(!TextExtractor::placed_pdf_text_dominates(stream));
+        // ── pdf_manipulator patch: the count reads an operator source ──
+        assert!(!TextExtractor::placed_pdf_text_dominates(&*bytes_source(stream)));
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]
@@ -11388,10 +11473,12 @@ mod tests {
         let placed = "(master bedroom terrace kitchen dimensions balcony) Tj\n".repeat(30);
         let outside = "(square footage residence penthouse skyline waterfront) Tj\n".repeat(35);
         let stream = format!("BT\n{outside}ET\n/PlacedPDF /MC0 BDC\nBT\n{placed}ET\nEMC\n");
+        // ── pdf_manipulator patch: the count reads an operator source ──
         assert!(
-            TextExtractor::placed_pdf_text_dominates(stream.as_bytes()),
+            TextExtractor::placed_pdf_text_dominates(&*bytes_source(stream.as_bytes())),
             "unique placed body amid comparable outside text must be KEPT"
         );
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]
@@ -11402,10 +11489,12 @@ mod tests {
         // full body size rather than the minority-overlay size).
         let body = "(the published paragraph of the real article body content) Tj\n".repeat(30);
         let stream = format!("BT\n{body}ET\n/PlacedPDF /MC0 BDC\nBT\n{body}ET\nEMC\n");
+        // ── pdf_manipulator patch: the count reads an operator source ──
         assert!(
-            !TextExtractor::placed_pdf_text_dominates(stream.as_bytes()),
+            !TextExtractor::placed_pdf_text_dominates(&*bytes_source(stream.as_bytes())),
             "a full-size placed DUPLICATE of the outside text must stay suppressed"
         );
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]

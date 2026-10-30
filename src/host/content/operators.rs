@@ -59,11 +59,100 @@ pub const MAX_OPERANDS: usize = 33;
 /// Operators between two polls of the cancel check.
 const CANCEL_EVERY: u32 = 4096;
 
-/// Which operators to produce.
+/// Which operators to produce. Every mode lexes and assembles each operator
+/// the same way, so damage is the same in all of them; the modes differ only
+/// in which finished operators the iterator hands out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// Every operator.
     Full,
+    /// What text extraction reads: everything except path construction,
+    /// painting and clipping, line style (`w J j M d i`), `ri`, `sh` and inline
+    /// images. Colour operators stay, since text takes the colour in force.
+    Text,
+    /// Path operators for path extraction: no text operators (nothing between
+    /// `BT` and `ET`), no `ET`, `Tf`-class state, colour-space and `sc`-family
+    /// operators, `ri` or `sh`. `s` comes out as `h` then `S`.
+    Paths,
+    /// `Do`, inline images and the graphics state that places them:
+    /// `q`, `Q` and `cm`.
+    Images,
+}
+
+impl Mode {
+    /// True when this mode hands out `op`; `in_text` is true between `BT` and `ET`.
+    fn wants(self, op: &Operator, in_text: bool) -> bool {
+        use Operator as O;
+        match self {
+            Mode::Full => true,
+            Mode::Text => !matches!(
+                op,
+                O::MoveTo { .. }
+                    | O::LineTo { .. }
+                    | O::CurveTo { .. }
+                    | O::CurveToV { .. }
+                    | O::CurveToY { .. }
+                    | O::ClosePath
+                    | O::Rectangle { .. }
+                    | O::Stroke
+                    | O::Fill
+                    | O::FillEvenOdd
+                    | O::CloseAndStroke
+                    | O::CloseFillStroke
+                    | O::FillStroke
+                    | O::FillStrokeEvenOdd
+                    | O::CloseFillStrokeEvenOdd
+                    | O::EndPath
+                    | O::ClipNonZero
+                    | O::ClipEvenOdd
+                    | O::SetLineWidth { .. }
+                    | O::SetDash { .. }
+                    | O::SetLineCap { .. }
+                    | O::SetLineJoin { .. }
+                    | O::SetMiterLimit { .. }
+                    | O::SetRenderingIntent { .. }
+                    | O::SetFlatness { .. }
+                    | O::PaintShading { .. }
+                    | O::InlineImage { .. }
+            ),
+            Mode::Paths => {
+                !in_text
+                    && !matches!(
+                        op,
+                        O::BeginText
+                            | O::EndText
+                            | O::Td { .. }
+                            | O::TD { .. }
+                            | O::Tm { .. }
+                            | O::TStar
+                            | O::Tj { .. }
+                            | O::TJ { .. }
+                            | O::Quote { .. }
+                            | O::DoubleQuote { .. }
+                            | O::Tc { .. }
+                            | O::Tw { .. }
+                            | O::Tz { .. }
+                            | O::TL { .. }
+                            | O::Tf { .. }
+                            | O::Tr { .. }
+                            | O::Ts { .. }
+                            | O::SetFillColorSpace { .. }
+                            | O::SetStrokeColorSpace { .. }
+                            | O::SetFillColor { .. }
+                            | O::SetStrokeColor { .. }
+                            | O::SetFillColorN { .. }
+                            | O::SetStrokeColorN { .. }
+                            | O::SetRenderingIntent { .. }
+                            | O::SetFlatness { .. }
+                            | O::PaintShading { .. }
+                    )
+            },
+            Mode::Images => matches!(
+                op,
+                O::Do { .. } | O::InlineImage { .. } | O::Cm { .. } | O::SaveState | O::RestoreState
+            ),
+        }
+    }
 }
 
 /// What an inline image operator carries as its data.
@@ -124,6 +213,10 @@ pub struct Operators<R: Read> {
     active: bool,
     /// A `TJ` chunk of the current operator's array already went out.
     chunked: bool,
+    /// The `TJ` handed out last is not the first chunk of its array.
+    tj_continued: bool,
+    /// More chunks of the `TJ` array handed out last follow.
+    tj_continues: bool,
     dropped_operands: u64,
     tj_misreads: u64,
     images: InlineImages,
@@ -139,6 +232,12 @@ pub struct Operators<R: Read> {
     done: bool,
     /// Counts the parts of a page's `/Contents` the source skipped.
     parts_unreadable: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Between `BT` and `ET` ([`Mode::Paths`] drops what lies there).
+    in_text: bool,
+    /// The second operator of a `s` read in [`Mode::Paths`].
+    queued: Option<Operator>,
+    /// The mode drops every path operator, so the lexer skips them unread.
+    skip_paths: bool,
 }
 
 impl<R: Read> Operators<R> {
@@ -159,6 +258,8 @@ impl<R: Read> Operators<R> {
             in_inline_dict: false,
             active: false,
             chunked: false,
+            tj_continued: false,
+            tj_continues: false,
             dropped_operands: 0,
             tj_misreads: 0,
             images: InlineImages::Collect,
@@ -171,7 +272,21 @@ impl<R: Read> Operators<R> {
             since_check: 0,
             done: false,
             parts_unreadable: None,
+            in_text: false,
+            queued: None,
+            skip_paths: matches!(mode, Mode::Text | Mode::Images),
         }
+    }
+
+    /// Hands out only the operators `mode` wants. [`Mode::Text`] also stops
+    /// inline image data from being held, since it hands none out.
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self.skip_paths = matches!(mode, Mode::Text | Mode::Images);
+        if mode == Mode::Text {
+            self.images = InlineImages::Skip;
+        }
+        self
     }
 
     /// Reports `counter` as [`Damage::parts_unreadable`]: the source adds to
@@ -247,6 +362,16 @@ impl<R: Read> Operators<R> {
 
     fn advance(&mut self) -> Result<Option<Operator>> {
         self.names.clear();
+        if self.skip_paths
+            && !self.active
+            && self.stack.is_empty()
+            && self.pending.is_empty()
+            && !self.in_inline_dict
+        {
+            while self.lexer.skip_path_operator() {
+                self.poll_cancel()?;
+            }
+        }
         loop {
             let token = match self.lexer.next_token() {
                 Ok(Some(token)) => token,
@@ -338,6 +463,8 @@ impl<R: Read> Operators<R> {
                     let chunk = std::mem::take(items);
                     items.push(object);
                     self.lexer.anchor_here();
+                    self.tj_continued = self.chunked;
+                    self.tj_continues = true;
                     self.chunked = true;
                     return self.emit(build_operator("TJ", smallvec![Object::Array(chunk)]), false);
                 }
@@ -376,6 +503,8 @@ impl<R: Read> Operators<R> {
         if self.chunked && word != "TJ" {
             self.tj_misreads += 1;
         }
+        self.tj_continued = self.chunked && word == "TJ";
+        self.tj_continues = false;
         self.starts.clear();
         let operands = std::mem::take(&mut self.pending);
         self.emit(build_operator(&word, operands), true)
@@ -425,6 +554,13 @@ impl<R: Read> Operators<R> {
             self.chunked = false;
             self.lexer.release_anchor();
         }
+        self.poll_cancel()?;
+        Ok(Some(op))
+    }
+
+    /// Counts one operator read and polls the cancel check every
+    /// [`CANCEL_EVERY`] of them, those skipped unread included.
+    fn poll_cancel(&mut self) -> Result<()> {
         self.since_check += 1;
         if self.since_check >= CANCEL_EVERY {
             self.since_check = 0;
@@ -432,7 +568,7 @@ impl<R: Read> Operators<R> {
                 cancel.check()?;
             }
         }
-        Ok(Some(op))
+        Ok(())
     }
 
     fn damaged(&mut self) -> Result<Option<Operator>> {
@@ -451,6 +587,28 @@ impl<R: Read> Operators<R> {
         self.chunked = false;
         self.names.truncate(self.names_mark);
         self.lexer.skip_first_byte();
+    }
+}
+
+/// Operators that tell a consumer which `TJ` operators are chunks of one
+/// array (see [`TJ_CHUNK`]); `Mode` filtering and other layers keep the answer.
+pub trait OperatorStream: Iterator<Item = Result<Operator>> {
+    /// True when the `TJ` just yielded continues the array of the `TJ` before
+    /// it. Valid right after a `TJ` is yielded.
+    fn tj_continued(&self) -> bool;
+
+    /// True when more chunks of the array of the `TJ` just yielded follow.
+    /// Valid right after a `TJ` is yielded.
+    fn tj_continues(&self) -> bool;
+}
+
+impl<R: Read> OperatorStream for Operators<R> {
+    fn tj_continued(&self) -> bool {
+        self.tj_continued
+    }
+
+    fn tj_continues(&self) -> bool {
+        self.tj_continues
     }
 }
 
@@ -512,19 +670,208 @@ impl<R: Read> Iterator for Operators<R> {
     type Item = Result<Operator>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(op) = self.queued.take() {
+            return Some(Ok(op));
+        }
         if self.done {
             return None;
         }
-        match self.advance() {
-            Ok(Some(op)) => Some(Ok(op)),
-            Ok(None) => {
-                self.done = true;
-                None
+        loop {
+            match self.advance() {
+                Ok(Some(op)) => {
+                    if self.mode == Mode::Full {
+                        return Some(Ok(op));
+                    }
+                    if matches!(op, Operator::BeginText) {
+                        self.in_text = true;
+                    }
+                    let wanted = self.mode.wants(&op, self.in_text);
+                    if matches!(op, Operator::EndText) {
+                        self.in_text = false;
+                    }
+                    if !wanted {
+                        continue;
+                    }
+                    if self.mode == Mode::Paths && matches!(op, Operator::CloseAndStroke) {
+                        self.queued = Some(Operator::Stroke);
+                        return Some(Ok(Operator::ClosePath));
+                    }
+                    return Some(Ok(op));
+                },
+                Ok(None) => {
+                    self.done = true;
+                    return None;
+                },
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    const STREAM: &[u8] = b"q 1 0 0 1 5 5 cm 0.5 g 10 10 m 20 20 l S 2 w [3] 0 d \
+        /GS0 gs 1 0 0 rg BT /F1 12 Tf 10 20 Td (Hi) Tj 3 0 0 1 re f ET 0 1 0 RG \
+        /Cs0 cs 0 0 1 sc 1 i /Sh0 sh /Im0 Do /Tag BMC EMC /P /MC0 BDC EMC \
+        BI /W 1 /H 1 /BPC 8 /CS /G ID \x80 EI 1 0 0 1 0 0 cm 5 6 d1 h s Q";
+
+    fn names(mode: Mode) -> Vec<String> {
+        Operators::new(STREAM, Mode::Full)
+            .with_mode(mode)
+            .map(|op| {
+                let text = format!("{:?}", op.unwrap());
+                text.split([' ', '{', '(']).next().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Text keeps everything but path building and painting, clipping, line
+    /// style, `ri`, `sh` and inline images, so the colour state and the
+    /// marked-content scopes reach the extractor.
+    #[test]
+    fn text_mode_drops_paths_line_style_shading_and_inline_images() {
+        assert_eq!(
+            names(Mode::Text),
+            words(&[
+                "SaveState", "Cm", "SetFillGray", "SetExtGState", "SetFillRgb", "BeginText", "Tf", "Td",
+                "Tj", "EndText", "SetStrokeRgb", "SetFillColorSpace", "SetFillColor", "Do",
+                "BeginMarkedContent", "EndMarkedContent", "BeginMarkedContentDict", "EndMarkedContent",
+                "Cm", "Other", "RestoreState",
+            ])
+        );
+    }
+
+    /// Paths drops everything between `BT` and `ET`, the text and colour-space
+    /// operators outside it, `i` and `sh`; `s` comes out as `h` then `S`.
+    #[test]
+    fn paths_mode_drops_text_and_reads_s_as_close_then_stroke() {
+        assert_eq!(
+            names(Mode::Paths),
+            words(&[
+                "SaveState", "Cm", "SetFillGray", "MoveTo", "LineTo", "Stroke", "SetLineWidth", "SetDash",
+                "SetExtGState", "SetFillRgb", "SetStrokeRgb", "Do", "BeginMarkedContent",
+                "EndMarkedContent", "BeginMarkedContentDict", "EndMarkedContent", "InlineImage", "Cm",
+                "Other", "ClosePath", "ClosePath", "Stroke", "RestoreState",
+            ])
+        );
+    }
+
+    /// Images keeps `Do`, inline images and the state that places them.
+    #[test]
+    fn images_mode_keeps_do_inline_images_and_placement() {
+        assert_eq!(
+            names(Mode::Images),
+            words(&["SaveState", "Cm", "Do", "InlineImage", "Cm", "RestoreState"])
+        );
+    }
+
+    /// Text drops inline images, so their data is not held either.
+    #[test]
+    fn text_mode_reads_inline_image_data_past_without_holding_it() {
+        let ops = Operators::new(STREAM, Mode::Full).with_mode(Mode::Text);
+        assert_eq!(ops.images, InlineImages::Skip);
+        assert_eq!(Operators::new(STREAM, Mode::Full).with_mode(Mode::Paths).images, InlineImages::Collect);
+    }
+
+    /// A source that returns at most `n` bytes per read.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        n: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let take = self.n.min(out.len()).min(self.data.len());
+            out[..take].copy_from_slice(&self.data[..take]);
+            self.data = &self.data[take..];
+            Ok(take)
+        }
+    }
+
+    /// An operator as text; an inline image's dictionary in key order.
+    fn show(op: &Operator) -> String {
+        match op {
+            Operator::InlineImage { dict, data } => {
+                let sorted: std::collections::BTreeMap<_, _> = dict.iter().collect();
+                format!("InlineImage {sorted:?} {data:?}")
             },
-            Err(e) => {
-                self.done = true;
-                Some(Err(e))
-            },
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// The lexer skips the path operators of a mode that drops them unread,
+    /// and the result is the full read with those operators filtered out,
+    /// at every read size and window, with the run split at any byte.
+    #[test]
+    fn skipped_path_operators_match_the_filtered_full_read() {
+        let mut stream = STREAM.to_vec();
+        stream.extend_from_slice(b" 1.5 -2 +.5 m 0 0 1 1 re W n 12 w 5. 6 l\n%c\n 1 2 m 1.2.3 l 7 \x00 8 l ");
+        stream.extend_from_slice(b"- m . m 1 2 3 4 5 6 7 8 9 1 2 3 4 5 6 7 8 9 1 2 3 4 5 6 7 8 9 1 2 3 4 5 6 7 8 9 re S");
+        for mode in [Mode::Text, Mode::Images] {
+            let full: Vec<String> = Operators::new(&stream[..], Mode::Full)
+                .map(|op| op.unwrap())
+                .filter(|op| mode.wants(op, false))
+                .map(|op| show(&op))
+                .collect();
+            for n in [1, 2, 3, 7, 1024] {
+                for window in [8, 16, 64, 65536] {
+                    let lexer = Lexer::with_window(Trickle { data: &stream, n }, window);
+                    let got: Vec<String> = Operators::from_lexer(lexer, Mode::Full)
+                        .with_mode(mode)
+                        .map(|op| show(&op.unwrap()))
+                        .collect();
+                    assert_eq!(got, full, "{mode:?} at {n} bytes a read, window {window}");
+                }
+            }
+        }
+    }
+
+    /// The chunks of a long `TJ` array say they continue and are continued;
+    /// the `TJ` before and after it are whole.
+    #[test]
+    fn tj_chunks_are_marked_as_one_array() {
+        let mut stream = b"[(a)] TJ [".to_vec();
+        for _ in 0..10_000 {
+            stream.extend_from_slice(b"(x) ");
+        }
+        stream.extend_from_slice(b"] TJ [(b)] TJ");
+        let mut ops = Operators::new(&stream[..], Mode::Full);
+        let mut seen = Vec::new();
+        while let Some(op) = ops.next() {
+            if let Operator::TJ { array } = op.unwrap() {
+                seen.push((array.len(), ops.tj_continued(), ops.tj_continues()));
+            }
+        }
+        assert_eq!(
+            seen,
+            [(1, false, false), (4096, false, true), (4096, true, true), (1808, true, false), (1, false, false)]
+        );
+    }
+
+    /// A mode only chooses which finished operators come out: what the
+    /// source loses is the same in every mode.
+    #[test]
+    fn damage_is_the_same_in_every_mode() {
+        let damaged: &[u8] = b"q ] 1 0 0 1 0 0 cm >> (open BT /F1 12 Tf (x) Tj ET 1 2 m 3 4 l S";
+        let damage = |mode| {
+            let mut ops = Operators::new(damaged, Mode::Full).with_mode(mode);
+            for _ in ops.by_ref() {}
+            ops.damage()
+        };
+        let full = damage(Mode::Full);
+        assert!(!full.is_clean());
+        for mode in [Mode::Text, Mode::Paths, Mode::Images] {
+            assert_eq!(damage(mode), full, "{mode:?}");
         }
     }
 }

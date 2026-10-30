@@ -4,8 +4,6 @@ document::cached_page_content
 document::compute_output_intent_cmyk_profile
 document::extract_embedded_files
 document::extract_text_from_ap_stream
-document::form_content
-document::walk_form_xobject_tree_for_inks
 editor::document_editor::deflate_stream
 editor::document_editor::extract_widget_appearance
 editor::document_editor::get_annotation_appearances
