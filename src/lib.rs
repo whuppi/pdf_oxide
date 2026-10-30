@@ -911,7 +911,19 @@ pub(crate) mod utils {
         // not just the seed's, because the run it collides with may have joined
         // the row later.
         let mut rows: Vec<usize> = Vec::new();
-        let mut members: Vec<Vec<usize>> = Vec::new();
+        // ── pdf_manipulator patch: a row finds the members that share a span's space by search ──
+        use crate::host::row_space::RowSpace;
+        let mut members: Vec<RowSpace> = Vec::new();
+        // The extent a span claims on its row: `None` for a blank run or one
+        // without a finite width, neither of which competes for space.
+        let claim = |i: usize| -> Option<(f32, f32)> {
+            if all_spans[i].text.trim().is_empty() {
+                return None;
+            }
+            let (l, r) = x_extent(i);
+            (l.is_finite() && r.is_finite() && r > l).then_some((l, r))
+        };
+        // ── end pdf_manipulator patch ──
         let mut row_of: Vec<Option<usize>> = vec![None; indices.len()];
         // Seeded rows indexed by their seed's baseline, ascending, so the
         // nearest-row search reads a window instead of every row on the page.
@@ -923,6 +935,10 @@ pub(crate) mod utils {
         // Every row that could win is inside that window; the ones outside it
         // could only lose, and a loss and an absence take the same branch.
         let mut rows_by_baseline: Vec<(f32, usize)> = Vec::new();
+        // ── pdf_manipulator patch: rows of one signature are searched as one ──
+        let mut seen_signatures: std::collections::HashSet<(u32, u32, i32)> =
+            std::collections::HashSet::new();
+        // ── end pdf_manipulator patch ──
         let h_max = indices
             .iter()
             .map(|&i| {
@@ -969,18 +985,39 @@ pub(crate) mod utils {
                 // whose space it can be competing for. A run vetoed there opens
                 // a row of its own, which is what it needs.
                 match best {
+                    // ── pdf_manipulator patch: a row finds the members that share a span's space by search ──
                     Some((d, r, seed))
                         if d <= ROW_BAND_TOLERANCE_PT
-                            && !members[r].iter().any(|&m| occupies_the_same_space(i, m)) =>
+                            && !claim(i).is_some_and(|(l, rt)| {
+                                members[r].any_sharing(l, rt, |m| occupies_the_same_space(i, m))
+                            }) =>
                     {
                         row_of[pos] = Some(seed);
-                        members[r].push(i);
+                        if let Some((l, rt)) = claim(i) {
+                            members[r].insert(i, l, rt);
+                        }
                     },
+                    // ── end pdf_manipulator patch ──
                     _ => {
-                        let at = rows_by_baseline.partition_point(|&(b, _)| b <= base_i);
-                        rows_by_baseline.insert(at, (base_i, rows.len()));
+                        // ── pdf_manipulator patch: rows of one signature are searched as one ──
+                        // Rows seeded at the same baseline and top edge are
+                        // the same distance from every run, so the first of
+                        // them wins every comparison and is the only one the
+                        // search needs to hold; a page of overprinted runs on
+                        // one baseline would otherwise search them all.
+                        if seen_signatures.insert((base_i.to_bits(), top_i.to_bits(), q)) {
+                            let at = rows_by_baseline.partition_point(|&(b, _)| b <= base_i);
+                            rows_by_baseline.insert(at, (base_i, rows.len()));
+                        }
+                        // ── end pdf_manipulator patch ──
                         rows.push(i);
-                        members.push(vec![i]);
+                        // ── pdf_manipulator patch: a row finds the members that share a span's space by search ──
+                        let mut space = RowSpace::default();
+                        if let Some((l, rt)) = claim(i) {
+                            space.insert(i, l, rt);
+                        }
+                        members.push(space);
+                        // ── end pdf_manipulator patch ──
                         row_of[pos] = Some(i);
                     },
                 }

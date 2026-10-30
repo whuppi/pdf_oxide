@@ -23,12 +23,14 @@ pub mod lane_state;
 pub mod ops;
 pub(crate) mod page_prune;
 pub(crate) mod resource_prune;
+pub(crate) mod row_space;
 #[cfg(feature = "test-support")]
 pub mod probe;
 pub mod positioned_write;
 pub mod font_optimizer;
 pub mod images;
 pub(crate) mod incremental;
+pub(crate) mod ink_index;
 pub(crate) mod object_streams;
 #[cfg(feature = "signatures")]
 pub mod sign;

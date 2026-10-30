@@ -30,5 +30,6 @@ mod source_trips;
 mod stream_extent;
 mod stream_head;
 mod support;
+mod text_dense_baseline;
 mod text_tj_chunks;
 mod whole_reads;

@@ -13906,6 +13906,11 @@ impl PdfDocument {
             .iter()
             .map(|&i| accurate[i as usize].origin_y)
             .collect();
+        // ── pdf_manipulator patch: the spans of one baseline share its sorted line ──
+        let mut lines: std::collections::HashMap<(u32, u32), Vec<u32>> =
+            std::collections::HashMap::new();
+        let mut kept = 0usize;
+        // ── end pdf_manipulator patch ──
 
         for span in spans.iter_mut() {
             // Rotated-content spans are in the displayed frame (mapped on 90/270)
@@ -13933,26 +13938,46 @@ impl PdfDocument {
             // bracket keeps that range a superset. Ordering by
             // (origin_x, source index) reproduces the previous stable
             // filter-then-sort: ties on origin_x keep their `accurate` order.
-            let bracket = baseline_tol + baseline_tol.abs() * 1e-6 + f32::EPSILON;
-            let lo = ys.partition_point(|&y| y < span.bbox.y - bracket);
-            let hi = ys.partition_point(|&y| y <= span.bbox.y + bracket);
-            let mut idx: Vec<u32> = by_y[lo..hi]
-                .iter()
-                .copied()
-                .filter(|&i| (accurate[i as usize].origin_y - span.bbox.y).abs() <= baseline_tol)
-                .collect();
+            // ── pdf_manipulator patch: the spans of one baseline share its sorted line ──
+            // The line depends only on the span's baseline and tolerance, so
+            // the spans that share both (every span of a text line) build it
+            // once: sorting it per span made a page of one dense baseline
+            // O(spans x characters).
+            let key = (span.bbox.y.to_bits(), baseline_tol.to_bits());
+            if !lines.contains_key(&key) {
+                let bracket = baseline_tol + baseline_tol.abs() * 1e-6 + f32::EPSILON;
+                let lo = ys.partition_point(|&y| y < span.bbox.y - bracket);
+                let hi = ys.partition_point(|&y| y <= span.bbox.y + bracket);
+                let mut idx: Vec<u32> = by_y[lo..hi]
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        (accurate[i as usize].origin_y - span.bbox.y).abs() <= baseline_tol
+                    })
+                    .collect();
+                idx.sort_by(|&a, &b| {
+                    crate::utils::safe_float_cmp(
+                        accurate[a as usize].origin_x,
+                        accurate[b as usize].origin_x,
+                    )
+                    .then(a.cmp(&b))
+                });
+                // Lines are kept for the spans that follow; the kept total is
+                // bounded by a small multiple of the page's characters.
+                if kept + idx.len() > 4 * accurate.len() {
+                    lines.clear();
+                    kept = 0;
+                }
+                kept += idx.len();
+                lines.insert(key, idx);
+            }
+            let idx = &lines[&key];
             if idx.is_empty() {
                 continue;
             }
-            idx.sort_by(|&a, &b| {
-                crate::utils::safe_float_cmp(
-                    accurate[a as usize].origin_x,
-                    accurate[b as usize].origin_x,
-                )
-                .then(a.cmp(&b))
-            });
-            let line: Vec<&crate::layout::TextChar> =
-                idx.iter().map(|&i| &accurate[i as usize]).collect();
+            let line_len = idx.len();
+            let at = |j: usize| &accurate[idx[j] as usize];
+            // ── end pdf_manipulator patch ──
 
             // Greedy per-glyph alignment. Anchor the scan cursor at the accurate
             // char nearest this span's left edge, then walk the span's glyphs,
@@ -13961,18 +13986,23 @@ impl PdfDocument {
             // unmatched glyph (an inserted word-boundary space, a ligature split,
             // a combining mark) no longer discards the whole span — such glyphs
             // are interpolated below so `char_x_offsets` still fills every index.
-            let start = line
-                .iter()
-                .position(|c| c.origin_x >= span.bbox.x - 0.5)
-                .unwrap_or(0);
+            // ── pdf_manipulator patch: the first char at or right of the span's edge, by search ──
+            // The line is sorted by `origin_x` with NaN last, so the chars left
+            // of the edge are a prefix; with none at or right of it (a NaN
+            // edge, or only NaN origins past it) the walk starts at the line's
+            // start.
+            let edge = span.bbox.x - 0.5;
+            let first = idx.partition_point(|&i| accurate[i as usize].origin_x < edge);
+            let start = if first < line_len && at(first).origin_x >= edge { first } else { 0 };
+            // ── end pdf_manipulator patch ──
             let mut assigned: Vec<Option<f32>> = vec![None; n];
             let mut li = start;
             for (k, &g) in glyphs.iter().enumerate() {
                 let mut j = li;
                 let mut steps = 0;
-                while j < line.len() && steps < 6 {
-                    if line[j].char == g {
-                        assigned[k] = Some(line[j].origin_x);
+                while j < line_len && steps < 6 {
+                    if at(j).char == g {
+                        assigned[k] = Some(at(j).origin_x);
                         li = j + 1;
                         break;
                     }

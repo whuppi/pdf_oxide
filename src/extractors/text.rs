@@ -1247,7 +1247,12 @@ pub(crate) fn strip_prime_decimal_boundary_spaces(text: &str) -> String {
 /// matter where in the content stream it was drawn. The pair's own boxes
 /// bound the gap exactly, so a small epsilon keeps them (and touching
 /// neighbours) from counting as intruders.
-fn decimal_gap_has_ink(ink_boxes: &[Rect], left: &Rect, right: &Rect) -> bool {
+// ── pdf_manipulator patch: the boxes are searched by region, not scanned ──
+fn decimal_gap_has_ink(
+    ink_boxes: &(impl crate::host::ink_index::InkBoxes + ?Sized),
+    left: &Rect,
+    right: &Rect,
+) -> bool {
     const EPS: f32 = 0.01;
     let gap_start = left.x + left.width;
     let gap_end = right.x;
@@ -1256,13 +1261,14 @@ fn decimal_gap_has_ink(ink_boxes: &[Rect], left: &Rect, right: &Rect) -> bool {
     }
     let band_bottom = left.y.min(right.y);
     let band_top = (left.y + left.height).max(right.y + right.height);
-    ink_boxes.iter().any(|b| {
+    ink_boxes.any_near(gap_start, gap_end, band_bottom, band_top, &|b| {
         b.x + b.width > gap_start + EPS
             && b.x < gap_end - EPS
             && b.y < band_top
             && b.y + b.height > band_bottom
     })
 }
+// ── end pdf_manipulator patch ──
 
 /// True when a *full intervening glyph* occupies the horizontal gap between
 /// `left` and `right` — e.g. a subscript drawn between a variable and the next
@@ -1273,7 +1279,12 @@ fn decimal_gap_has_ink(ink_boxes: &[Rect], left: &Rect, right: &Rect) -> bool {
 /// count. Used by the #847 narrow-word-gap rescue to suppress splitting a math
 /// sub/superscript from its base while still recovering ordinary prose word
 /// gaps (whose gaps are empty of intervening ink).
-fn gap_has_intervening_glyph(ink_boxes: &[Rect], left: &Rect, right: &Rect) -> bool {
+// ── pdf_manipulator patch: the boxes are searched by region, not scanned ──
+fn gap_has_intervening_glyph(
+    ink_boxes: &(impl crate::host::ink_index::InkBoxes + ?Sized),
+    left: &Rect,
+    right: &Rect,
+) -> bool {
     let gap_start = left.x + left.width;
     let gap_end = right.x;
     let gap_w = gap_end - gap_start;
@@ -1282,11 +1293,12 @@ fn gap_has_intervening_glyph(ink_boxes: &[Rect], left: &Rect, right: &Rect) -> b
     }
     let band_bottom = left.y.min(right.y);
     let band_top = (left.y + left.height).max(right.y + right.height);
-    ink_boxes.iter().any(|b| {
+    ink_boxes.any_near(gap_start, gap_end, band_bottom, band_top, &|b| {
         let overlap = (b.x + b.width).min(gap_end) - b.x.max(gap_start);
         overlap > gap_w * 0.35 && b.y < band_top && b.y + b.height > band_bottom
     })
 }
+// ── end pdf_manipulator patch ──
 
 fn should_insert_space(
     preceding_text: &str,
@@ -3859,6 +3871,74 @@ impl<'doc> TextExtractor<'doc> {
         by_order.sort_by(|&a, &b| crate::utils::safe_float_cmp(snapshot[a].1, snapshot[b].1));
         let ys_sorted: Vec<f32> = by_order.iter().map(|&idx| snapshot[idx].1).collect();
 
+        // ── pdf_manipulator patch: bases are found by cell, not by a scan of the baseline ──
+        // The Y-window above holds every span of a page set on one baseline, so
+        // scanning it per span was quadratic in the spans. A base also has to
+        // sit just left of the span, within a font size of it; a grid of cells
+        // one font size wide (and half a font size tall) over the bases' right
+        // edges and baselines holds every base that can pass, a few cells per
+        // span. Spans with a coordinate or size that is not finite make some
+        // gates pass vacuously (NaN compares false), so they are tried against
+        // every span instead and keep the scan's result exactly.
+        let regular = |s: &(f32, f32, f32, f32)| {
+            s.0.is_finite() && s.1.is_finite() && s.2.is_finite() && s.3.is_finite()
+        };
+        // Whether base `j` is a super/subscript base for span `i`, with its
+        // distance below the span and its baseline.
+        let consider = |i: usize, j: usize| -> Option<(f32, f32)> {
+            if i == j {
+                return None;
+            }
+            let (sx, sy, _sw, sfs) = snapshot[i];
+            let (bx, by, bw, bfs) = snapshot[j];
+            if bfs <= sfs * 1.15 {
+                return None;
+            }
+            let y_offset = sy - by;
+            let half_em = bfs * 0.5;
+            if y_offset.abs() > half_em {
+                return None;
+            }
+            // Skip subscripts (lowered glyphs). The document-level
+            // pass `apply_super_sub_script_substitutions` needs to
+            // see them at their original lowered baseline so it can
+            // substitute ASCII digits with U+2080..U+2089 (e.g.
+            // H2O -> H\u{2082}O). Snapping them onto the base
+            // baseline would defeat that substitution.
+            if y_offset < 0.0 {
+                return None;
+            }
+            // X adjacency: the candidate's left edge must sit
+            // near the base's right edge — within one base
+            // font_size to the right and a small slack to the
+            // left for kerning. Combining diacritics are
+            // excluded by the size-ratio gate above (they
+            // typically share font_size with their base
+            // letter, failing `bfs > sfs * 1.15`).
+            let base_right = bx + bw;
+            let dx = sx - base_right;
+            if dx < -bfs * 0.25 || dx > bfs {
+                return None;
+            }
+            Some((y_offset.abs(), by))
+        };
+        let use_grid = max_fs.is_finite() && max_fs > 0.0;
+        let cell_of = |x: f32, y: f32| -> (i64, i64) {
+            ((x / max_fs).floor() as i64, (y / max_half_em).floor() as i64)
+        };
+        let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut irregular: Vec<usize> = Vec::new();
+        if use_grid {
+            for (j, s) in snapshot.iter().enumerate() {
+                if regular(s) {
+                    grid.entry(cell_of(s.0 + s.2, s.1)).or_default().push(j);
+                } else {
+                    irregular.push(j);
+                }
+            }
+        }
+
         for i in 0..n {
             let (sx, sy, _sw, sfs) = snapshot[i];
             if sfs <= 0.0 {
@@ -3867,57 +3947,53 @@ impl<'doc> TextExtractor<'doc> {
             // Find the closest base candidate (in Y) that satisfies
             // the super/subscript geometry. Pick the smallest |y_offset|
             // tie-breaker so a candidate sandwiched between two body
-            // lines snaps onto the nearer one.
-            let mut best_base_y: Option<f32> = None;
-            let mut best_abs_offset = f32::MAX;
-            // Candidates have `by ∈ [sy - max_half_em, sy]`; restrict the scan
-            // to that contiguous slice of the Y-sorted index.
-            let lo = ys_sorted.partition_point(|&y| y < sy - max_half_em);
-            let hi = ys_sorted.partition_point(|&y| y <= sy);
-            for &j in &by_order[lo..hi] {
-                if i == j {
-                    continue;
+            // lines snaps onto the nearer one; of bases at the same
+            // offset, the first in (baseline, index) order.
+            let mut best: Option<(f32, f32, usize)> = None;
+            let mut offer = |j: usize| {
+                if let Some((abs_off, by)) = consider(i, j) {
+                    let better = match best {
+                        None => abs_off < f32::MAX,
+                        Some((best_off, best_by, best_j)) => {
+                            abs_off < best_off
+                                || (abs_off == best_off
+                                    && crate::utils::safe_float_cmp(by, best_by)
+                                        .then(j.cmp(&best_j))
+                                        .is_lt())
+                        },
+                    };
+                    if better {
+                        best = Some((abs_off, by, j));
+                    }
                 }
-                let (bx, by, bw, bfs) = snapshot[j];
-                if bfs <= sfs * 1.15 {
-                    continue;
+            };
+            if use_grid && regular(&snapshot[i]) {
+                let (x0, y0) = cell_of(sx - max_fs, sy - max_half_em);
+                let (x1, y1) = cell_of(sx + max_fs * 0.25, sy);
+                for cx in x0.saturating_sub(1)..=x1.saturating_add(1) {
+                    for cy in y0.saturating_sub(1)..=y1.saturating_add(1) {
+                        for &j in grid.get(&(cx, cy)).into_iter().flatten() {
+                            offer(j);
+                        }
+                    }
                 }
-                let y_offset = sy - by;
-                let half_em = bfs * 0.5;
-                if y_offset.abs() > half_em {
-                    continue;
+                for &j in &irregular {
+                    offer(j);
                 }
-                // Skip subscripts (lowered glyphs). The document-level
-                // pass `apply_super_sub_script_substitutions` needs to
-                // see them at their original lowered baseline so it can
-                // substitute ASCII digits with U+2080..U+2089 (e.g.
-                // H2O -> H\u{2082}O). Snapping them onto the base
-                // baseline would defeat that substitution.
-                if y_offset < 0.0 {
-                    continue;
-                }
-                // X adjacency: the candidate's left edge must sit
-                // near the base's right edge — within one base
-                // font_size to the right and a small slack to the
-                // left for kerning. Combining diacritics are
-                // excluded by the size-ratio gate above (they
-                // typically share font_size with their base
-                // letter, failing `bfs > sfs * 1.15`).
-                let base_right = bx + bw;
-                let dx = sx - base_right;
-                if dx < -bfs * 0.25 || dx > bfs {
-                    continue;
-                }
-                let abs_off = y_offset.abs();
-                if abs_off < best_abs_offset {
-                    best_abs_offset = abs_off;
-                    best_base_y = Some(by);
+            } else {
+                // Candidates have `by ∈ [sy - max_half_em, sy]`; restrict the scan
+                // to that contiguous slice of the Y-sorted index.
+                let lo = ys_sorted.partition_point(|&y| y < sy - max_half_em);
+                let hi = ys_sorted.partition_point(|&y| y <= sy);
+                for &j in &by_order[lo..hi] {
+                    offer(j);
                 }
             }
-            if let Some(by) = best_base_y {
+            if let Some((_, by, _)) = best {
                 self.spans[i].bbox.y = by;
             }
         }
+        // ── end pdf_manipulator patch ──
     }
 
     /// Sort extracted text spans by reading order (top-to-bottom, left-to-right).
@@ -4528,21 +4604,43 @@ impl<'doc> TextExtractor<'doc> {
         // in the content stream, so the fold sees the digits as adjacent
         // and only a geometric test over ALL runs can spot the ink sitting
         // in the gap.
-        let ink_boxes: Vec<Rect> = spans
-            .iter()
-            .filter(|s| !s.text.trim().is_empty())
-            .map(|s| s.bbox)
-            .collect();
+        // ── pdf_manipulator patch: the boxes are searched by region, not scanned ──
+        let ink_boxes = crate::host::ink_index::InkIndex::new(
+            spans
+                .iter()
+                .filter(|s| !s.text.trim().is_empty())
+                .map(|s| s.bbox)
+                .collect(),
+        );
+        // ── end pdf_manipulator patch ──
         // #847 M2: per-line bimodal word-gap thresholds, indexed to `spans`,
         // used below to rescue a narrow word gap the fixed kerning guard
         // suppressed. Computed before the fold consumes the list.
         let line_thresholds = Self::bimodal_line_gap_thresholds(&spans);
         let mut merged = Vec::with_capacity(old_len);
         let mut current_span: Option<TextSpan> = None;
+        // ── pdf_manipulator patch: the open span's character count and script are kept, not recounted ──
+        // The span being folded into grows with every merge; counting its
+        // characters, or scanning it for Arabic, on each step made a line of
+        // many small runs quadratic in its characters.
+        let touches_arabic = |t: &str| {
+            t.chars().any(|c| {
+                ('\u{0600}'..='\u{06FF}').contains(&c)
+                    || ('\u{0750}'..='\u{077F}').contains(&c)
+                    || ('\u{08A0}'..='\u{08FF}').contains(&c)
+            })
+        };
+        let mut current_chars = 0usize;
+        let mut current_arabic = false;
+        // ── end pdf_manipulator patch ──
 
         for (span_idx, span) in spans.into_iter().enumerate() {
             if current_span.is_none() {
                 // First span — move, no clone needed
+                // ── pdf_manipulator patch: the open span's character count and script are kept, not recounted ──
+                current_chars = span.text.chars().count();
+                current_arabic = touches_arabic(&span.text);
+                // ── end pdf_manipulator patch ──
                 current_span = Some(span);
                 continue;
             }
@@ -4726,7 +4824,9 @@ impl<'doc> TextExtractor<'doc> {
                 && !crosses_cjk_boundary
                 && prev_tail_char.is_some_and(|c| c.is_alphabetic())
                 && curr_head_char.is_some_and(|c| c.is_alphabetic())
-                && (current.text.chars().count() == 1 || span.text.chars().count() == 1);
+                // ── pdf_manipulator patch: the open span's character count is kept ──
+                && (current_chars == 1 || span.text.chars().count() == 1);
+                // ── end pdf_manipulator patch ──
 
             // Small-caps / drop-cap glue: same base font and same
             // weight/italic flags but different font_size, adjacent
@@ -4834,7 +4934,10 @@ impl<'doc> TextExtractor<'doc> {
             // span`, so each contribution's widths must land at the same
             // position its chars occupy. (Captured before any branch mutates
             // `current.text` / `current.bbox`.)
-            let current_chars_before = current.text.chars().count();
+            // ── pdf_manipulator patch: the open span's character count is kept ──
+            let current_chars_before = current_chars;
+            let text_len_before = current.text.len();
+            // ── end pdf_manipulator patch ──
             let span_char_count = span.text.chars().count();
 
             if decimal_merge {
@@ -5066,7 +5169,10 @@ impl<'doc> TextExtractor<'doc> {
                 //    separator's own position: the real geometric gap the
                 //    separator stands in for, with the legacy pad as the
                 //    fallback for overlapping/degenerate layouts.
-                let merged_char_count = current.text.chars().count();
+                // ── pdf_manipulator patch: only the appended text is counted ──
+                let merged_char_count =
+                    current_chars_before + current.text[text_len_before..].chars().count();
+                // ── end pdf_manipulator patch ──
                 let separator_count =
                     merged_char_count.saturating_sub(current_chars_before + span_char_count);
                 if separator_count > 0 {
@@ -5108,19 +5214,15 @@ impl<'doc> TextExtractor<'doc> {
                 // stretch the advance leading into the merged-in span's LAST glyph so
                 // `to_chars()` reconstructs it at `span.bbox.x`. Gated to Arabic so
                 // Latin/CJK output stays byte-identical.
-                let touches_arabic = |t: &str| {
-                    t.chars().any(|c| {
-                        ('\u{0600}'..='\u{06FF}').contains(&c)
-                            || ('\u{0750}'..='\u{077F}').contains(&c)
-                            || ('\u{08A0}'..='\u{08FF}').contains(&c)
-                    })
-                };
+                // ── pdf_manipulator patch: the open span's script is kept, not rescanned ──
+                let span_arabic = touches_arabic(&span.text);
+                // ── end pdf_manipulator patch ──
                 let n = current.char_widths.len();
                 let span_chars = span.text.chars().count();
                 if n >= 2
                     && span_chars >= 1
                     && span_chars < n
-                    && (touches_arabic(&current.text) || touches_arabic(&span.text))
+                    && (current_arabic || span_arabic)
                 {
                     // Index of the merged-in span's FIRST glyph in the (possibly
                     // space-inserted) merged text, and its target relative x.
@@ -5140,7 +5242,9 @@ impl<'doc> TextExtractor<'doc> {
                 // style should win.
                 if cross_font_word_glue {
                     let span_chars = span.text.chars().count();
-                    let current_chars_before = current.text.chars().count() - span_chars;
+                    // ── pdf_manipulator patch: the merged character count is already known ──
+                    let current_chars_before = merged_char_count - span_chars;
+                    // ── end pdf_manipulator patch ──
                     if span_chars > current_chars_before {
                         current.font_name = span.font_name.clone();
                         current.font_weight = span.font_weight;
@@ -5156,6 +5260,10 @@ impl<'doc> TextExtractor<'doc> {
                 );
 
                 // Put modified current back
+                // ── pdf_manipulator patch: the open span's character count and script are kept ──
+                current_chars = merged_char_count;
+                current_arabic |= span_arabic;
+                // ── end pdf_manipulator patch ──
                 current_span = Some(current);
             } else {
                 // Not mergeable: save current and start new span
@@ -5176,6 +5284,10 @@ impl<'doc> TextExtractor<'doc> {
                     }
                 }
                 merged.push(current);
+                // ── pdf_manipulator patch: the open span's character count and script are kept ──
+                current_chars = span_char_count;
+                current_arabic = touches_arabic(&span.text);
+                // ── end pdf_manipulator patch ──
                 current_span = Some(span);
             }
         }
