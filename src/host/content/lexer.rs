@@ -181,35 +181,13 @@ fn scan(b: &[u8], eof: bool) -> Scan {
     }
 }
 
-/// Where the end of an inline image's data is, in a window.
-enum EndOfImage {
-    /// The white-space byte before `EI` is at this offset.
-    Found(usize),
-    /// Undecided until more bytes arrive; the next search starts here.
-    Need(usize),
-    NotFound,
-}
-
-/// The first white-space byte followed by `EI` and then white-space, a
-/// delimiter or the end of the source, from offset `from`.
-fn find_end_of_image(b: &[u8], from: usize, eof: bool) -> EndOfImage {
-    let mut i = from;
-    while i + 3 <= b.len() {
-        if is_space(b[i]) && b[i + 1] == b'E' && b[i + 2] == b'I' {
-            if i + 3 == b.len() {
-                return if eof { EndOfImage::Found(i) } else { EndOfImage::Need(i) };
-            }
-            if is_space(b[i + 3]) || is_delim(b[i + 3]) {
-                return EndOfImage::Found(i);
-            }
-        }
-        i += 1;
-    }
-    if eof {
-        EndOfImage::NotFound
-    } else {
-        EndOfImage::Need(i)
-    }
+/// The kind of token a source ended inside of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenKind {
+    /// A `(` string with no closing `)`.
+    LiteralString,
+    /// A `<` string with no closing `>`.
+    HexString,
 }
 
 /// Streaming tokenizer; see the module docs.
@@ -229,6 +207,7 @@ pub struct Lexer<R: Read> {
     skipped: u64,
     run: u32,
     gave_up_at: Option<u64>,
+    unterminated: Option<TokenKind>,
 }
 
 impl<R: Read> Lexer<R> {
@@ -252,6 +231,7 @@ impl<R: Read> Lexer<R> {
             skipped: 0,
             run: 0,
             gave_up_at: None,
+            unterminated: None,
         }
     }
 
@@ -419,7 +399,17 @@ impl<R: Read> Lexer<R> {
                         Kind::ArrayEnd => Token::ArrayEnd,
                         Kind::DictStart => Token::DictStart,
                         Kind::DictEnd => Token::DictEnd,
-                        Kind::Bad => Token::Bad,
+                        Kind::Bad => {
+                            let open = match self.buf[self.start] {
+                                b'(' => Some(TokenKind::LiteralString),
+                                b'<' => Some(TokenKind::HexString),
+                                _ => None,
+                            };
+                            if self.unterminated.is_none() {
+                                self.unterminated = open;
+                            }
+                            Token::Bad
+                        },
                     };
                     self.token_idx = self.start;
                     self.consume(len);
@@ -429,42 +419,35 @@ impl<R: Read> Lexer<R> {
         }
     }
 
-    /// The data of an inline image, read after its `ID`: the bytes up to the
-    /// first white-space, `EI`, white-space-or-delimiter sequence, with that
-    /// sequence consumed. Leading space, tab, CR and LF bytes belong to the
-    /// `ID` and are dropped. `None` when the source ends first; nothing but
-    /// those leading bytes is consumed then.
-    ///
-    /// The data is held whole: it is the operator's payload.
-    pub(crate) fn read_inline_data(&mut self) -> io::Result<Option<Vec<u8>>> {
-        loop {
-            if self.start == self.end {
-                if self.eof {
-                    return Ok(None);
-                }
-                self.fill()?;
-                continue;
-            }
-            if matches!(self.buf[self.start], b' ' | b'\t' | b'\r' | b'\n') {
-                self.consume(1);
-            } else {
-                break;
-            }
+    /// The kind of token the source ended inside of, if it did.
+    pub fn unterminated(&self) -> Option<TokenKind> {
+        self.unterminated
+    }
+
+    /// The unread bytes in the window.
+    pub(super) fn window(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+
+    /// True once the reader has returned 0; the window may still hold bytes.
+    pub(super) fn at_eof(&self) -> bool {
+        self.eof
+    }
+
+    /// Drops one white-space byte from the front of the window, if it is one.
+    pub(super) fn skip_one_space(&mut self) {
+        if self.start < self.end && is_space(self.buf[self.start]) {
+            self.consume(1);
         }
-        let mut from = 0;
-        loop {
-            match find_end_of_image(&self.buf[self.start..self.end], from, self.eof) {
-                EndOfImage::Found(at) => {
-                    let data = self.buf[self.start..self.start + at].to_vec();
-                    self.consume(at + 3);
-                    return Ok(Some(data));
-                },
-                EndOfImage::NotFound => return Ok(None),
-                EndOfImage::Need(resume) => {
-                    from = resume;
-                    self.fill()?;
-                },
-            }
-        }
+    }
+
+    /// Drops `n` bytes from the front of the window.
+    pub(super) fn discard(&mut self, n: usize) {
+        self.consume(n);
+    }
+
+    /// Reads once more into the window, dropping the bytes already discarded.
+    pub(super) fn refill(&mut self) -> io::Result<()> {
+        self.fill()
     }
 }

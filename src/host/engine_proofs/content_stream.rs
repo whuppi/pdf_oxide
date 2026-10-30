@@ -15,7 +15,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 const CHUNKS: [usize; 7] = [1, 2, 3, 7, 64, 1024, 65536];
-const WINDOWS: [usize; 2] = [16, 64 * 1024];
+pub(super) const WINDOWS: [usize; 2] = [16, 64 * 1024];
 /// Runs on the first 64 KiB of a corpus stream: the chunk sizes that read a byte or two at a time.
 const HEAD_RUNS: [(usize, usize); 4] = [(1, 16), (1, 65536), (2, 16), (2, 65536)];
 /// Runs on a whole corpus stream: every other chunk size once, the windows alternating.
@@ -23,9 +23,9 @@ const WHOLE_RUNS: [(usize, usize); 5] = [(3, 16), (7, 65536), (64, 16), (1024, 6
 const CORPUS_HEAD: usize = 64 * 1024;
 
 /// A source that returns at most `n` bytes per read.
-struct Trickle<'a> {
-    data: &'a [u8],
-    n: usize,
+pub(super) struct Trickle<'a> {
+    pub(super) data: &'a [u8],
+    pub(super) n: usize,
 }
 
 impl Read for Trickle<'_> {
@@ -98,6 +98,11 @@ struct Totals {
 fn known_divergence(data: &[u8]) -> Option<&'static str> {
     if data.iter().any(|&b| matches!(b, b'%' | 0x00 | 0x0C)) {
         return Some("comment, NUL or form feed read as white-space");
+    }
+    let mut ops = Operators::new(data, Mode::Full);
+    ops.by_ref().for_each(drop);
+    if ops.damage().inline_unended {
+        return Some("an inline image that never ends ends the stream; its data is not read again");
     }
     let (expected, _) = reference(data);
     let text = format!("{expected:?}");
@@ -565,10 +570,10 @@ fn damaged_streams_are_skipped_the_way_parse_content_stream_skips_them() {
 }
 
 /// A source of `lines` repetitions of one line, never held.
-struct Repeat {
-    line: &'static [u8],
-    at: usize,
-    lines: u64,
+pub(super) struct Repeat {
+    pub(super) line: &'static [u8],
+    pub(super) at: usize,
+    pub(super) lines: u64,
 }
 
 impl Read for Repeat {

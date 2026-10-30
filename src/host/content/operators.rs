@@ -16,9 +16,18 @@
 //!   a comment's words as operators.
 //! - The byte after an inline image's `EI` is not read as an operator `I`.
 //!
-//! Inline images are delimited the way `parse_content_stream` delimits them
-//! (the first white-space, `EI`, white-space-or-delimiter sequence) and
-//! their data is held whole in the operator.
+//! Inline images differ too: `parse_content_stream` ends the data at the
+//! first white-space, `EI`, white-space-or-delimiter, which cuts a binary
+//! image at any ` EI ` inside it. Here the end comes from the dictionary's
+//! length, the computed size, or the filter's own end before that rule
+//! applies (see [`super::inline`]). The data streams past and the operator
+//! carries it only under [`InlineImages::Collect`]. An image that never ends
+//! ends the stream and sets [`Damage::inline_unended`]; nothing can be read
+//! again from its start, since its data was not kept.
+//!
+//! [`Operators::damage`] reports everything that was skipped, dropped or
+//! cut. [`Operators::pending_names`] and [`consumed_names`] let a consumer
+//! tell which names an operator used.
 //!
 //! An operator keeps its [`MAX_OPERANDS`] newest operands; an older one is
 //! dropped and counted ([`Operators::dropped_operands`]), so the window
@@ -28,7 +37,8 @@
 //! being read is dropped, its first byte is skipped, and reading goes on
 //! from the next byte (see [`Lexer::skip_first_byte`]).
 
-use super::lexer::{Lexer, Token};
+use super::inline::{ImageSpec, Resolver};
+use super::lexer::{Lexer, Token, TokenKind};
 use crate::cancel::CancelCheck;
 use crate::content::operators::Operator;
 use crate::content::parser::build_operator;
@@ -56,6 +66,41 @@ pub enum Mode {
     Full,
 }
 
+/// What an inline image operator carries as its data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineImages {
+    /// Nothing: `data` is empty and the bytes are never held.
+    Skip,
+    /// The image's bytes, held for the one operator (its own size).
+    Collect,
+}
+
+/// Everything the source lost: bytes skipped, operands dropped, text cut.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Damage {
+    /// Bytes skipped to read on after a malformed operator.
+    pub skipped: u64,
+    /// Operands dropped because an operator held more than [`MAX_OPERANDS`].
+    pub dropped_operands: u64,
+    /// Operators that followed a long array already sent out as `TJ` chunks.
+    pub tj_misreads: u64,
+    /// Where the source was given up on after 1024 skipped bytes in a row.
+    pub gave_up_at: Option<u64>,
+    /// The first string the source ended inside of.
+    pub unterminated: Option<TokenKind>,
+    /// An inline image reached the end of the source without its end.
+    pub inline_unended: bool,
+    /// The error the reader returned, which ended the iterator.
+    pub read_error: Option<String>,
+}
+
+impl Damage {
+    /// True when nothing was lost.
+    pub fn is_clean(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// An array or dictionary being assembled.
 enum Frame {
     Array(Vec<Object>),
@@ -79,6 +124,14 @@ pub struct Operators<R: Read> {
     chunked: bool,
     dropped_operands: u64,
     tj_misreads: u64,
+    images: InlineImages,
+    resolver: Option<Resolver>,
+    inline_unended: bool,
+    read_error: Option<String>,
+    /// Names lexed since the previous operator was handed out.
+    names: Vec<String>,
+    /// `names.len()` when the operator being assembled began.
+    names_mark: usize,
     cancel: Option<CancelCheck>,
     since_check: u32,
     done: bool,
@@ -104,6 +157,12 @@ impl<R: Read> Operators<R> {
             chunked: false,
             dropped_operands: 0,
             tj_misreads: 0,
+            images: InlineImages::Collect,
+            resolver: None,
+            inline_unended: false,
+            read_error: None,
+            names: Vec::new(),
+            names_mark: 0,
             cancel: None,
             since_check: 0,
             done: false,
@@ -114,6 +173,38 @@ impl<R: Read> Operators<R> {
     pub fn with_cancel(mut self, cancel: CancelCheck) -> Self {
         self.cancel = Some(cancel);
         self
+    }
+
+    /// What inline image operators carry as data; `Collect` by default.
+    pub fn with_inline_images(mut self, images: InlineImages) -> Self {
+        self.images = images;
+        self
+    }
+
+    /// Resolves a named colour space of an inline image to its component
+    /// count, which an unfiltered image's size depends on.
+    pub fn with_resolver(mut self, resolver: Resolver) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Every name lexed for the operator just handed out, in order,
+    /// operands and nested ones alike. The next call to `next` clears it.
+    pub fn pending_names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// What the source lost so far; final once the iterator has ended.
+    pub fn damage(&self) -> Damage {
+        Damage {
+            skipped: self.lexer.skipped(),
+            dropped_operands: self.dropped_operands,
+            tj_misreads: self.tj_misreads,
+            gave_up_at: self.lexer.gave_up_at(),
+            unterminated: self.lexer.unterminated(),
+            inline_unended: self.inline_unended,
+            read_error: self.read_error.clone(),
+        }
     }
 
     /// The mode the operators were asked for.
@@ -139,19 +230,28 @@ impl<R: Read> Operators<R> {
     }
 
     fn advance(&mut self) -> Result<Option<Operator>> {
+        self.names.clear();
         loop {
-            let Some(token) = self.lexer.next_token()? else {
-                if self.active {
-                    self.fail();
-                    continue;
-                }
-                return Ok(None);
+            let token = match self.lexer.next_token() {
+                Ok(Some(token)) => token,
+                Ok(None) => {
+                    if self.active {
+                        self.fail();
+                        continue;
+                    }
+                    return Ok(None);
+                },
+                Err(e) => {
+                    self.read_error = Some(e.to_string());
+                    return Ok(None);
+                },
             };
             if self.stack.is_empty() {
                 self.operand_start = self.lexer.last_token_offset();
             }
             if !self.active {
                 self.active = true;
+                self.names_mark = self.names.len();
                 self.lexer.anchor_last_token();
             }
             if let Some(op) = self.step(token)? {
@@ -186,6 +286,9 @@ impl<R: Read> Operators<R> {
 
     /// Adds an operand: to the open array or dictionary, else to the operator.
     fn push(&mut self, object: Object) -> Result<Option<Operator>> {
+        if let Object::Name(name) = &object {
+            self.names.push(name.clone());
+        }
         // A lone array operand that reaches a chunk is taken to be a TJ array.
         let lone_array = self.stack.len() == 1 && self.pending.is_empty() && !self.in_inline_dict;
         match self.stack.last_mut() {
@@ -277,9 +380,23 @@ impl<R: Read> Operators<R> {
                 dict.insert(name, value);
             }
         }
-        match self.lexer.read_inline_data()? {
-            Some(data) => self.emit(Operator::InlineImage { dict: Box::new(dict), data }, true),
-            None => self.damaged(),
+        let spec = ImageSpec::from_dict(&dict, self.resolver.as_ref());
+        // The data streams past from here, so the operator cannot be read
+        // again from its first byte.
+        self.lexer.release_anchor();
+        self.active = false;
+        self.lexer.skip_one_space();
+        let collect = self.images == InlineImages::Collect;
+        match self.lexer.read_inline_data(&spec, collect) {
+            Ok(Some(data)) => self.emit(Operator::InlineImage { dict: Box::new(dict), data }, true),
+            Ok(None) => {
+                self.inline_unended = true;
+                Ok(None)
+            },
+            Err(e) => {
+                self.read_error = Some(e.to_string());
+                Ok(None)
+            },
         }
     }
 
@@ -316,8 +433,63 @@ impl<R: Read> Operators<R> {
         self.in_inline_dict = false;
         self.active = false;
         self.chunked = false;
+        self.names.truncate(self.names_mark);
         self.lexer.skip_first_byte();
     }
+}
+
+/// The names `op` looked up in the page's resources, one arm per operator:
+/// `Tf`, `Do`, `cs`, `CS`, `gs` and `sh` their name operand; `scn` and `SCN`
+/// their last operand when it is a name; `BDC` and `DP` their property list
+/// when that is a name, never the tag; an inline image the names in its `/CS` value.
+/// `DP` (an `Other`, since it has no variant) reads like `BDC`. `BMC`, `MP`,
+/// `d0`, `d1` and every other `Other` use none.
+///
+/// The names the operator was built from are the ones `build_operator`
+/// kept: a `Do` with stray operands before it uses its last.
+pub fn consumed_names(op: &Operator) -> SmallVec<[&str; 2]> {
+    fn add<'a>(names: &mut SmallVec<[&'a str; 2]>, name: &'a str) {
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    let mut names: SmallVec<[&str; 2]> = SmallVec::new();
+    match op {
+        Operator::Tf { font: name, .. }
+        | Operator::Do { name }
+        | Operator::SetFillColorSpace { name }
+        | Operator::SetStrokeColorSpace { name }
+        | Operator::PaintShading { name }
+        | Operator::SetExtGState { dict_name: name } => add(&mut names, name),
+        Operator::SetFillColorN { name: Some(name), .. }
+        | Operator::SetStrokeColorN { name: Some(name), .. } => add(&mut names, name),
+        Operator::BeginMarkedContentDict { properties, .. } => {
+            if let Object::Name(name) = &**properties {
+                add(&mut names, name);
+            }
+        },
+        // `DP` has no operator of its own; it reads like `BDC`.
+        Operator::Other { name, operands } if name == "DP" => {
+            if let Some(Object::Name(properties)) = operands.get(1) {
+                add(&mut names, properties);
+            }
+        },
+        Operator::InlineImage { dict, .. } => {
+            match dict.get("CS").or_else(|| dict.get("ColorSpace")) {
+                Some(Object::Name(name)) => add(&mut names, name),
+                Some(Object::Array(items)) => {
+                    for item in items {
+                        if let Object::Name(name) = item {
+                            add(&mut names, name);
+                        }
+                    }
+                },
+                _ => {},
+            }
+        },
+        _ => {},
+    }
+    names
 }
 
 impl<R: Read> Iterator for Operators<R> {
