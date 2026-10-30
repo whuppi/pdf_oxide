@@ -6870,47 +6870,19 @@ impl<'doc> TextExtractor<'doc> {
 
                 // Decode the stream — check cache first to avoid repeated FlateDecode.
                 self.xobject_decode_count += 1;
-                let cached_stream = {
-                    doc.xobject_stream_cache
-                        .lock()
-                        .unwrap()
-                        .get(&xobject_ref)
-                        .cloned()
+                // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
+                let stream_data = match doc.form_content(xobject_ref, &xobject) {
+                    Ok(data) => data.as_ref().clone(),
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to decode Form XObject '{}' stream: {}, skipping",
+                            name,
+                            e
+                        );
+                        return Ok(());
+                    },
                 };
-                let stream_data = if let Some(cached) = cached_stream {
-                    cached.as_ref().clone()
-                } else {
-                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                    match xobject.decode_stream_data() {
-                    // ── end pdf_manipulator patch ──
-                        Ok(data) => {
-                            // Cache if under 50MB total
-                            const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
-                            let current = doc
-                                .xobject_stream_cache_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            if current + data.len() <= MAX_STREAM_CACHE_BYTES {
-                                doc.xobject_stream_cache_bytes.store(
-                                    current + data.len(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                doc.xobject_stream_cache
-                                    .lock()
-                                    .unwrap()
-                                    .insert(xobject_ref, std::sync::Arc::new(data.clone()));
-                            }
-                            data
-                        },
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to decode Form XObject '{}' stream: {}, skipping",
-                                name,
-                                e
-                            );
-                            return Ok(());
-                        },
-                    }
-                };
+                // ── end pdf_manipulator patch ──
 
                 if !crate::document::PdfDocument::may_contain_text(&stream_data) {
                     log::debug!(

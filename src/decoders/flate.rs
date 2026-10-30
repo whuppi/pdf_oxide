@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 // ── pdf_manipulator patch: FlateDecode is a reader that recovers from damage in a probe window ──
-use crate::decoders::stream::{decode_slice, failure};
+use crate::decoders::stream::{decode_slice, failure, Origin};
 use crate::decoders::StreamDecoder;
 use crate::error::{Error, Result};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -447,14 +447,17 @@ pub(crate) struct FlateReader<'a> {
     first: Option<Box<dyn Read + 'a>>,
     reopen: Box<dyn Fn() -> Result<Box<dyn Read + 'a>> + 'a>,
     state: State<'a>,
+    /// Names the stream in what the reader reports.
+    origin: Option<Origin>,
 }
 
 impl<'a> FlateReader<'a> {
     pub(crate) fn new(
         first: Box<dyn Read + 'a>,
         reopen: Box<dyn Fn() -> Result<Box<dyn Read + 'a>> + 'a>,
+        origin: Option<Origin>,
     ) -> Self {
-        Self { first: Some(first), reopen, state: State::Start }
+        Self { first: Some(first), reopen, state: State::Start, origin }
     }
 
     /// A decoder for `way` over a reopened input, or `None` when the input
@@ -677,17 +680,21 @@ impl Read for FlateReader<'_> {
                                 // Adler-32 failed, the one thing the other ways
                                 // of reading the stream never check: every byte
                                 // is there, and every way would return them.
-                                crate::extractors::warnings::push_global_warning(
-                                    crate::extractors::warnings::Warning {
-                                        category:
-                                            crate::extractors::warnings::WarningCategory::SpecViolation,
-                                        page: None,
-                                        message: format!(
-                                            "FlateDecode: checksum mismatch, data kept ({total} bytes)"
-                                        ),
-                                        spec_section: Some("7.4.4"),
-                                    },
+                                let message = format!(
+                                    "FlateDecode: checksum mismatch, data kept ({total} bytes)"
                                 );
+                                match &self.origin {
+                                    // The document's sink, against the stream.
+                                    Some(origin) => origin.warn(message),
+                                    None => crate::extractors::warnings::push_global_warning(
+                                        crate::extractors::warnings::Warning {
+                                            category: crate::extractors::warnings::WarningCategory::SpecViolation,
+                                            page: None,
+                                            message,
+                                            spec_section: Some("7.4.4"),
+                                        },
+                                    ),
+                                }
                             }
                             let kept = checksum_only
                                 || !live.judge

@@ -1,7 +1,7 @@
 //! The wall around whole reads of a stream.
 //!
-//! `read_whole_raw(` and `decode_stream_data(` hold a stream's data in one
-//! buffer. Every caller in the engine is named in `whole_reads.txt`, one
+//! `read_whole_raw(`, `read_whole(` and `decode_stream_data(` hold a stream's
+//! data in one buffer. Every caller in the engine is named in `whole_reads.txt`, one
 //! `module::function` a line; a call from anywhere else fails this proof,
 //! and a listed caller that no longer calls fails it too, so the list only
 //! shrinks as the callers move to readers.
@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-const NEEDLES: [&str; 2] = ["read_whole_raw(", "decode_stream_data("];
+const NEEDLES: [&str; 3] = ["read_whole_raw(", "read_whole(", "decode_stream_data("];
 
 /// The first line of a `#[cfg(test)]` module: everything after it is test code.
 fn code_end(lines: &[&str]) -> usize {
@@ -29,16 +29,23 @@ fn code_end(lines: &[&str]) -> usize {
     lines.len()
 }
 
-/// The name of the function whose body holds line `at`.
-fn enclosing_fn(lines: &[&str], at: usize) -> String {
-    for line in lines[..=at].iter().rev() {
+/// The name of the function whose body holds line `at`; `None` for a function
+/// that exists only in a test build (`#[cfg(test)]`).
+fn enclosing_fn(lines: &[&str], at: usize) -> Option<String> {
+    for (index, line) in lines[..=at].iter().enumerate().rev() {
         let mut rest = line.trim();
         for prefix in ["pub(crate) ", "pub(super) ", "pub ", "const ", "async ", "unsafe ", "extern \"C\" "] {
             rest = rest.trim_start_matches(prefix);
         }
         if let Some(after) = rest.strip_prefix("fn ") {
             let end = after.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(after.len());
-            return after[..end].to_string();
+            let test_only = lines[..index]
+                .iter()
+                .rev()
+                .map(|l| l.trim())
+                .take_while(|l| l.starts_with("#[") || l.starts_with("///") || l.starts_with("//"))
+                .any(|l| l == "#[cfg(test)]");
+            return (!test_only).then(|| after[..end].to_string());
         }
     }
     panic!("no enclosing fn above line {at}");
@@ -67,7 +74,9 @@ fn callers_under(dir: &Path, root: &Path, out: &mut BTreeSet<String>) {
                 if line.starts_with("//") || defines || !NEEDLES.iter().any(|n| line.contains(n)) {
                     continue;
                 }
-                out.insert(format!("{module}::{}", enclosing_fn(&lines, at)));
+                if let Some(name) = enclosing_fn(&lines, at) {
+                    out.insert(format!("{module}::{name}"));
+                }
             }
         }
     }

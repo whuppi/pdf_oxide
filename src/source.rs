@@ -10,6 +10,7 @@
 use crate::cache::MutexExt;
 use crate::encryption::EncryptionHandler;
 use crate::error::Result;
+use crate::extractors::warnings::WarningSink;
 use crate::object::ObjectRef;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -92,15 +93,23 @@ pub(crate) struct Source {
     /// The `/Encrypt` dictionary's own reference: its strings are key
     /// material, never ciphertext.
     encrypt_dict_ref: Mutex<Option<ObjectRef>>,
+    /// The document's structured warnings: a stream that reads itself
+    /// reports what it recovered from here.
+    warnings: Arc<WarningSink>,
 }
 
 impl Source {
-    pub(crate) fn new(reader: PdfReader) -> Self {
+    pub(crate) fn new(reader: PdfReader, warnings: Arc<WarningSink>) -> Self {
         Self {
             reader: Mutex::new(reader),
             encryption: Mutex::new(None),
             encrypt_dict_ref: Mutex::new(None),
+            warnings,
         }
+    }
+
+    pub(crate) fn warnings(&self) -> &Arc<WarningSink> {
+        &self.warnings
     }
 
     /// The reader, locked. Hold the guard for one seek-and-read only.
@@ -176,6 +185,30 @@ impl Read for SourceRead<'_> {
         }
         self.at += n as u64;
         Ok(n)
+    }
+}
+
+/// [`SourceRead`] that owns its source, so the reader outlives the borrow it
+/// was made from: a content stream read operator by operator, from a function
+/// that returns while the stream is still being read.
+pub(crate) struct OwnedSourceRead {
+    source: Arc<Source>,
+    at: u64,
+    end: u64,
+}
+
+impl OwnedSourceRead {
+    pub(crate) fn new(source: Arc<Source>, at: u64, len: u64) -> Self {
+        Self { source, at, end: at + len }
+    }
+}
+
+impl Read for OwnedSourceRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        SourceRead::new(&self.source, self.at, self.end - self.at).read(buf).map(|n| {
+            self.at += n as u64;
+            n
+        })
     }
 }
 

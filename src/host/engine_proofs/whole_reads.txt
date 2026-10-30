@@ -1,11 +1,10 @@
 compliance::converter::add_pdfa_identification
+decoders::stream::decode_slice
 document::cached_page_content
-document::collect_image_handles_from_form_xobject
 document::compute_output_intent_cmyk_profile
 document::extract_embedded_files
-document::extract_images_from_form_xobject
 document::extract_text_from_ap_stream
-document::process_form_xobject_paths
+document::form_content
 document::walk_form_xobject_tree_for_inks
 editor::document_editor::deflate_stream
 editor::document_editor::extract_widget_appearance
@@ -18,7 +17,6 @@ extractors::images::decode_jpx_image
 extractors::images::extract_image_from_xobject_at
 extractors::images::resolve_icc_profile_from_obj
 extractors::images::resolve_indexed_palette
-extractors::text::process_xobject
 extractors::xmp::extract
 fonts::font_dict::extract_embedded_font_from_descriptor
 fonts::font_dict::extract_truetype_cmap_from_descriptor
@@ -29,6 +27,7 @@ host::attachments::attachment_bytes
 host::images::execute::decode_bilevel
 host::images::execute::reduce_images
 object::decode_stream_data
+object::read_whole_raw
 objstm::decode_object_stream
 objstm::parse_object_stream
 rendering::mesh_shading::eval_pdf_function

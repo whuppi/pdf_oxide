@@ -92,6 +92,8 @@ pub struct Damage {
     pub inline_unended: bool,
     /// The error the reader returned, which ended the iterator.
     pub read_error: Option<String>,
+    /// Parts of a page's `/Contents` that could not be decoded and were skipped.
+    pub parts_unreadable: u64,
 }
 
 impl Damage {
@@ -135,6 +137,8 @@ pub struct Operators<R: Read> {
     cancel: Option<CancelCheck>,
     since_check: u32,
     done: bool,
+    /// Counts the parts of a page's `/Contents` the source skipped.
+    parts_unreadable: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl<R: Read> Operators<R> {
@@ -166,7 +170,15 @@ impl<R: Read> Operators<R> {
             cancel: None,
             since_check: 0,
             done: false,
+            parts_unreadable: None,
         }
+    }
+
+    /// Reports `counter` as [`Damage::parts_unreadable`]: the source adds to
+    /// it for each part it skips.
+    pub fn with_parts_counter(mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.parts_unreadable = Some(counter);
+        self
     }
 
     /// Polls `cancel` every 4,096 operators.
@@ -204,6 +216,10 @@ impl<R: Read> Operators<R> {
             unterminated: self.lexer.unterminated(),
             inline_unended: self.inline_unended,
             read_error: self.read_error.clone(),
+            parts_unreadable: self
+                .parts_unreadable
+                .as_ref()
+                .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed)),
         }
     }
 

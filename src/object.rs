@@ -88,6 +88,23 @@ impl Extent {
             },
         }
     }
+
+    /// [`Self::raw_reader`] that owns what it reads from, so it can outlive
+    /// the borrow of the object it was made from.
+    fn owned_reader(&self) -> Result<Box<dyn Read>> {
+        let stored =
+            crate::source::OwnedSourceRead::new(Arc::clone(&self.source), self.start, self.len);
+        if self.exempt {
+            return Ok(Box::new(stored));
+        }
+        match self.source.handler() {
+            None => Ok(Box::new(stored)),
+            Some(handler) => {
+                let cipher = handler.cipher_for(self.obj.id, self.obj.gen as u32)?;
+                Ok(Box::new(cipher.decrypting(stored)?))
+            },
+        }
+    }
 }
 
 impl PartialEq for Extent {
@@ -133,6 +150,27 @@ impl StreamBody {
         match self {
             StreamBody::Inline(bytes) => Ok(Box::new(&bytes[..])),
             StreamBody::Extent(extent) => extent.raw_reader(),
+        }
+    }
+
+    /// [`Self::raw_reader`] that owns what it reads from: it can be returned
+    /// from the function that opened it and read later.
+    pub fn owned_reader(&self) -> Result<Box<dyn Read>> {
+        match self {
+            StreamBody::Inline(bytes) => Ok(Box::new(std::io::Cursor::new(bytes.clone()))),
+            StreamBody::Extent(extent) => extent.owned_reader(),
+        }
+    }
+
+    /// Where the data sits, for the warnings its decoding raises; `None` for
+    /// a body held in memory.
+    pub fn origin(&self) -> Option<crate::decoders::stream::Origin> {
+        match self {
+            StreamBody::Inline(_) => None,
+            StreamBody::Extent(extent) => Some(crate::decoders::stream::Origin {
+                label: format!("object {} {}", extent.obj.id, extent.obj.gen),
+                sink: Arc::clone(extent.source.warnings()),
+            }),
         }
     }
 
@@ -451,7 +489,9 @@ impl Object {
                     body.read_whole_raw()
                 } else {
                     crate::decoders::stream::read_whole(
-                        crate::decoders::stream::reader(dict, || body.raw_reader())?,
+                        crate::decoders::stream::reader_in(dict, body.origin(), || {
+                            body.raw_reader()
+                        })?,
                         0,
                     )
                 }

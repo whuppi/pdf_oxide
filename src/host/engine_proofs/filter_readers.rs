@@ -17,8 +17,8 @@ const PIECES: [usize; 7] = [1, 2, 3, 7, 64, 1024, 65536];
 /// Counts the bytes the process holds and the most it ever held, so a test can say how far a read grew it.
 struct Tracking;
 
-static HELD: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+pub(super) static HELD: AtomicUsize = AtomicUsize::new(0);
+pub(super) static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 // SAFETY: every call is forwarded to the system allocator unchanged; only counters are added.
 unsafe impl GlobalAlloc for Tracking {

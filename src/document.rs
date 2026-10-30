@@ -572,10 +572,11 @@ pub struct PdfDocument {
     /// shared graphics-only XObjects (watermarks, logos, chart elements) are
     /// decompressed and scanned at most once across the entire document.
     pub(crate) xobject_text_free_cache: Mutex<HashSet<ObjectRef>>,
-    /// Cache of decompressed Form XObject streams. Bounded at 50MB total.
-    /// Avoids repeated FlateDecode decompression of shared Form XObjects.
-    pub(crate) xobject_stream_cache: Mutex<HashMap<ObjectRef, std::sync::Arc<Vec<u8>>>>,
-    pub(crate) xobject_stream_cache_bytes: AtomicUsize,
+    // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
+    /// Decoded content of Form XObjects, patterns and glyph procedures, in a
+    /// byte budget. Avoids repeated decompression of shared forms.
+    pub(crate) content_cache: Arc<Mutex<crate::host::content::cache::ContentCache>>,
+    // ── end pdf_manipulator patch ──
     /// Cache of extracted TextSpan results from self-contained Form XObjects
     /// (those with own /Resources/Font). None = processed but no spans.
     /// Key is `(ObjectRef, [i64; 6])` where the array encodes the caller's CTM
@@ -592,6 +593,12 @@ pub struct PdfDocument {
     /// Regions marked for erasure per page. Mutex for `&self` write-path methods (#398).
     pub(crate) erase_regions: Mutex<HashMap<usize, Vec<crate::geometry::Rect>>>,
     /// LRU cache of decompressed page content streams, keyed by page index.
+    // ── pdf_manipulator patch: the whole-page cache outlives only its whole-bytes consumers ──
+    /// Whole pages are held here for the consumers that still take a page's
+    /// bytes; `page_operators` streams a page and holds none. It goes with
+    /// `cached_page_content` when the text, search and facts paths move to
+    /// operators.
+    // ── end pdf_manipulator patch ──
     page_content_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<u8>>>>,
     /// LRU cache of postprocessed [`TextSpan`]s per page. `to_markdown`/`to_html`
     /// reach `extract_spans` twice per page — once directly, once via
@@ -655,7 +662,9 @@ pub struct PdfDocument {
     /// (via [`PdfDocument::structured_warnings`]) instead of parsing
     /// stderr text. The existing String-list `accumulated_warnings`
     /// stays for back-compat.
-    warning_sink: crate::extractors::warnings::WarningSink,
+    // ── pdf_manipulator patch: the Source reports to the document's warning sink ──
+    warning_sink: Arc<crate::extractors::warnings::WarningSink>,
+    // ── end pdf_manipulator patch ──
 }
 
 // Compile-time verification that PdfDocument is Send + Sync.
@@ -1383,9 +1392,12 @@ impl PdfDocument {
         // ── end pdf_manipulator patch ──
         // only has &self access which prevents initialization.
         // We now initialize eagerly to ensure the handler is ready when needed.
+        // ── pdf_manipulator patch: the Source reports to the document's warning sink ──
+        let warnings = Arc::new(crate::extractors::warnings::WarningSink::new());
+        // ── end pdf_manipulator patch ──
         let document = Self {
             // ── pdf_manipulator patch: the reader and the encryption handler live in the Source ──
-            source: Arc::new(Source::new(reader)),
+            source: Arc::new(Source::new(reader, Arc::clone(&warnings))),
             // ── end pdf_manipulator patch ──
             load_lock: Mutex::new(()),
             version,
@@ -1420,8 +1432,9 @@ impl PdfDocument {
             // ── end pdf_manipulator patch ──
             image_xobject_cache: Mutex::new(HashSet::new()),
             xobject_text_free_cache: Mutex::new(HashSet::new()),
-            xobject_stream_cache: Mutex::new(HashMap::new()),
-            xobject_stream_cache_bytes: AtomicUsize::new(0),
+            // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
+            content_cache: Arc::new(Mutex::new(crate::host::content::cache::ContentCache::new())),
+            // ── end pdf_manipulator patch ──
             xobject_spans_cache: Mutex::new(BoundedEntryCache::new(
                 DEFAULT_XOBJECT_CACHE_MAX_ENTRIES,
             )),
@@ -1439,7 +1452,9 @@ impl PdfDocument {
             article_threads_cache: Mutex::new(None),
             output_intent_cmyk_profile_cache: Mutex::new(None),
             accumulated_warnings: Mutex::new(Vec::new()),
-            warning_sink: crate::extractors::warnings::WarningSink::new(),
+            // ── pdf_manipulator patch: the Source reports to the document's warning sink ──
+            warning_sink: warnings,
+            // ── end pdf_manipulator patch ──
         };
 
         // Seed any SYNTHETIC recovery objects (a Catalog / page-tree root rebuilt
@@ -19873,6 +19888,112 @@ impl PdfDocument {
         Ok(content_data)
     }
 
+    // ── pdf_manipulator patch: content streams are read as operators ──
+    /// The operators of page `page_index`, read from its `/Contents` as the
+    /// parts are decoded: one stream, or an array of them each followed by a
+    /// newline, as `cached_page_content` joins them. A part that cannot be
+    /// decoded is skipped and counted in [`Damage::parts_unreadable`]; a page
+    /// without `/Contents` has no operators, and a single stream that cannot
+    /// be decoded is an error, as it is for `cached_page_content`.
+    ///
+    /// [`Damage::parts_unreadable`]: crate::host::content::Damage::parts_unreadable
+    pub fn page_operators(
+        &self,
+        page_index: usize,
+    ) -> Result<crate::host::content::Operators<crate::host::content::PartsReader>> {
+        use crate::host::content::{Mode, Operators, PartsReader};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        self.ensure_encryption_initialized()?;
+        let page = self.get_page(page_index)?;
+        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
+            offset: 0,
+            reason: "Page is not a dictionary".to_string(),
+        })?;
+        let unreadable = Arc::new(AtomicU64::new(0));
+
+        // The parts of an array: a reference that cannot be loaded is skipped
+        // like a part that cannot be decoded.
+        let array_parts = |items: &[Object]| -> Vec<Object> {
+            let mut parts = Vec::new();
+            for item in items {
+                if matches!(item, Object::Null) {
+                    continue;
+                }
+                match item.as_reference() {
+                    Some(r) => match self.load_object(r) {
+                        Ok(part) => parts.push(part),
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to decode content stream element on page {}: {}, skipping",
+                                page_index,
+                                e
+                            );
+                            unreadable.fetch_add(1, Ordering::Relaxed);
+                        },
+                    },
+                    None => parts.push(item.clone()),
+                }
+            }
+            parts
+        };
+
+        let source = match page_dict.get("Contents") {
+            Some(Object::Null) | None => PartsReader::of_array(Vec::new(), Arc::clone(&unreadable)),
+            Some(contents) => {
+                let loaded = match contents.as_reference() {
+                    Some(r) => Some(self.load_object(r)?),
+                    None => None,
+                };
+                let object = loaded.as_ref().unwrap_or(contents);
+                match object.as_array() {
+                    Some(items) => PartsReader::of_array(array_parts(items), Arc::clone(&unreadable)),
+                    None => PartsReader::of_one(
+                        crate::host::content::parts::decoded_reader(object)?,
+                        Arc::clone(&unreadable),
+                    ),
+                }
+            },
+        };
+        Ok(Operators::new(source, Mode::Full).with_parts_counter(unreadable))
+    }
+
+    /// The operators of the content of stream object `r`: a Form XObject, a
+    /// Type 3 glyph procedure, a tiling pattern or a soft-mask group. Content
+    /// that fits the cache is served from it; otherwise it is decoded as it is
+    /// read, and kept for next time if it ended within the cache's budget.
+    pub fn form_operators(
+        &self,
+        r: ObjectRef,
+    ) -> Result<crate::host::content::Operators<Box<dyn std::io::Read>>> {
+        use crate::host::content::parts::{decoded_reader, SharedBytes, Tee};
+        use crate::host::content::{Mode, Operators};
+
+        let hit = self.content_cache.lock_or_recover().get(r);
+        let source: Box<dyn std::io::Read> = match hit {
+            Some(data) => Box::new(std::io::Cursor::new(SharedBytes(data))),
+            None => {
+                let object = self.load_object(r)?;
+                let decoded = decoded_reader(&object)?;
+                Box::new(Tee::new(decoded, Arc::clone(&self.content_cache), r))
+            },
+        };
+        Ok(Operators::new(source, Mode::Full))
+    }
+
+    /// The whole decoded content of stream object `r` (`xobject`), from the
+    /// content cache or decoded and offered to it. For the consumers that
+    /// still take a form's bytes.
+    pub(crate) fn form_content(&self, r: ObjectRef, xobject: &Object) -> Result<Arc<Vec<u8>>> {
+        if let Some(hit) = self.content_cache.lock_or_recover().get(r) {
+            return Ok(hit);
+        }
+        let data = Arc::new(xobject.decode_stream_data()?);
+        self.content_cache.lock_or_recover().insert(r, Arc::clone(&data));
+        Ok(data)
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Extract path (vector graphics) content from a page.
     ///
     /// This extracts all vector graphics operations from the page's content stream,
@@ -20471,36 +20592,15 @@ impl PdfDocument {
         }
 
         // Decode stream — reuse document-level cache shared with text extraction.
-        let cached_stream = {
-            self.xobject_stream_cache
-                .lock_or_recover()
-                .get(&xobject_ref)
-                .cloned()
+        // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
+        let stream_data = match self.form_content(xobject_ref, &xobject) {
+            Ok(data) => data.as_ref().clone(),
+            Err(e) => {
+                extractor.pop_xobject_failed();
+                return Err(e);
+            },
         };
-        let stream_data = if let Some(cached) = cached_stream {
-            cached.as_ref().clone()
-        } else {
-            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-            match xobject.decode_stream_data() {
-            // ── end pdf_manipulator patch ──
-                Ok(data) => {
-                    const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
-                    let current = self.xobject_stream_cache_bytes.load(Ordering::Relaxed);
-                    if current + data.len() <= MAX_STREAM_CACHE_BYTES {
-                        self.xobject_stream_cache_bytes
-                            .store(current + data.len(), Ordering::Relaxed);
-                        self.xobject_stream_cache
-                            .lock_or_recover()
-                            .insert(xobject_ref, std::sync::Arc::new(data.clone()));
-                    }
-                    data
-                },
-                Err(e) => {
-                    extractor.pop_xobject_failed();
-                    return Err(e);
-                },
-            }
-        };
+        // ── end pdf_manipulator patch ──
 
         let operators = match parse_content_stream_paths_only(&stream_data) {
             Ok(ops) => ops,
@@ -24585,8 +24685,10 @@ impl PdfDocument {
     /// This is the handles-side equivalent of `extract_images_from_form_xobject`.
     /// It uses the same cycle detection (ObjectRef stack + depth 100), the same
     /// Form Resources fallback rules, the same Form /Matrix handling, and reuses
-    /// the document's xobject_stream_cache (50 MiB bound) for decompressed Form
+    // ── pdf_manipulator patch: the cache is the byte-budgeted content cache ──
+    /// the document's content cache (4 MiB bound) for decompressed Form
     /// content.
+    // ── end pdf_manipulator patch ──
     ///
     /// Unlike the materialised path, we do not cache "raw" handles — we compose
     /// the full CTM (`parent_ctm * form_matrix`) at entry and let every inner
@@ -24656,37 +24758,17 @@ impl PdfDocument {
             crate::content::Matrix::identity()
         };
 
-        // Decode the Form stream (respecting the 50 MiB document-level cache).
-        let cached_stream = self
-            .xobject_stream_cache
-            .lock_or_recover()
-            .get(&xobject_ref)
-            .cloned();
-        let stream_data = if let Some(cached) = cached_stream {
-            cached.as_ref().clone()
-        } else {
-            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-            match xobject.decode_stream_data() {
-            // ── end pdf_manipulator patch ──
-                Ok(data) => {
-                    const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
-                    let current_bytes = self.xobject_stream_cache_bytes.load(Ordering::Relaxed);
-                    if current_bytes + data.len() <= MAX_STREAM_CACHE_BYTES {
-                        self.xobject_stream_cache_bytes
-                            .store(current_bytes + data.len(), Ordering::Relaxed);
-                        self.xobject_stream_cache
-                            .lock_or_recover()
-                            .insert(xobject_ref, std::sync::Arc::new(data.clone()));
-                    }
-                    data
-                },
-                Err(e) => {
-                    log::warn!("Failed to decode Form XObject stream: {}, skipping", e);
-                    xobject_stack.pop();
-                    return Ok(Vec::new());
-                },
-            }
+        // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
+        // Decode the Form stream (through the byte-budgeted content cache).
+        let stream_data = match self.form_content(xobject_ref, xobject) {
+            Ok(data) => data.as_ref().clone(),
+            Err(e) => {
+                log::warn!("Failed to decode Form XObject stream: {}, skipping", e);
+                xobject_stack.pop();
+                return Ok(Vec::new());
+            },
         };
+        // ── end pdf_manipulator patch ──
 
         // Parse with the fast images-only parser (same as the materialised path).
         let operators = match parse_content_stream_images_only(&stream_data) {
@@ -25146,36 +25228,16 @@ impl PdfDocument {
         };
 
         // Decode form stream — check cache first to avoid repeated decompression
-        let cached_stream = self
-            .xobject_stream_cache
-            .lock_or_recover()
-            .get(&xobject_ref)
-            .cloned();
-        let stream_data = if let Some(cached) = cached_stream {
-            cached.as_ref().clone()
-        } else {
-            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-            match xobject.decode_stream_data() {
-            // ── end pdf_manipulator patch ──
-                Ok(data) => {
-                    const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
-                    let current_bytes = self.xobject_stream_cache_bytes.load(Ordering::Relaxed);
-                    if current_bytes + data.len() <= MAX_STREAM_CACHE_BYTES {
-                        self.xobject_stream_cache_bytes
-                            .store(current_bytes + data.len(), Ordering::Relaxed);
-                        self.xobject_stream_cache
-                            .lock_or_recover()
-                            .insert(xobject_ref, std::sync::Arc::new(data.clone()));
-                    }
-                    data
-                },
-                Err(e) => {
-                    log::warn!("Failed to decode Form XObject stream: {}, skipping", e);
-                    xobject_stack.pop();
-                    return Ok(Vec::new());
-                },
-            }
+        // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
+        let stream_data = match self.form_content(xobject_ref, xobject) {
+            Ok(data) => data.as_ref().clone(),
+            Err(e) => {
+                log::warn!("Failed to decode Form XObject stream: {}, skipping", e);
+                xobject_stack.pop();
+                return Ok(Vec::new());
+            },
         };
+        // ── end pdf_manipulator patch ──
 
         // Parse operators using fast image-only path (skips text operators)
         let operators = match parse_content_stream_images_only(&stream_data) {

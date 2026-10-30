@@ -334,7 +334,9 @@ fn structured_warnings_accessors_present() {
     // satisfies the contract: the document owns a thread-safe sink
     // that the structured_warnings accessors can drain through.
     assert!(
-        source.contains("warning_sink: crate::extractors::warnings::WarningSink")
+        // ── pdf_manipulator patch: the sink is shared with the document's Source (stream warnings name their object) ──
+        source.contains("warning_sink: Arc<crate::extractors::warnings::WarningSink>")
+            // ── end pdf_manipulator patch ──
             || source.contains("structured_warnings: Mutex"),
         "PdfDocument must own a WarningSink (or compatible Mutex<Vec<Warning>>) field",
     );

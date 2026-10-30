@@ -43,6 +43,28 @@ enum Stage {
 struct Spec<'a> {
     stages: Vec<Stage>,
     open: Box<Open<'a>>,
+    origin: Option<Origin>,
+}
+
+/// Where a stream comes from, for the warnings its decoding raises.
+#[derive(Clone)]
+pub struct Origin {
+    /// Names the stream in a warning ("object 12 0").
+    pub label: String,
+    /// The document's structured warnings.
+    pub sink: std::sync::Arc<crate::extractors::warnings::WarningSink>,
+}
+
+impl Origin {
+    /// Records `message` against the stream.
+    pub(crate) fn warn(&self, message: String) {
+        self.sink.push(crate::extractors::warnings::Warning {
+            category: crate::extractors::warnings::WarningCategory::SpecViolation,
+            page: None,
+            message: format!("{} ({})", message, self.label),
+            spec_section: Some("7.4.4"),
+        });
+    }
 }
 
 /// The decoded data of the stream described by `dict`, read from `open`.
@@ -50,12 +72,22 @@ pub fn reader<'a>(
     dict: &HashMap<String, Object>,
     open: impl Fn() -> Result<Box<dyn Read + 'a>> + 'a,
 ) -> Result<Box<dyn Read + 'a>> {
+    reader_in(dict, None, open)
+}
+
+/// [`reader`] for a stream whose origin is known, so that what its decoding
+/// recovers from is reported against it.
+pub fn reader_in<'a>(
+    dict: &HashMap<String, Object>,
+    origin: Option<Origin>,
+    open: impl Fn() -> Result<Box<dyn Read + 'a>> + 'a,
+) -> Result<Box<dyn Read + 'a>> {
     let filters = dict
         .get("Filter")
         .map(crate::object::extract_filter_names)
         .unwrap_or_default();
     let params = crate::object::extract_decode_params(dict.get("DecodeParms"));
-    chain(&filters, params.as_ref(), open)
+    chain_in(&filters, params.as_ref(), origin, open)
 }
 
 /// The filters `filters`, in order, over the data `open` yields, then the
@@ -64,6 +96,16 @@ pub fn reader<'a>(
 pub fn chain<'a>(
     filters: &[String],
     params: Option<&DecodeParams>,
+    open: impl Fn() -> Result<Box<dyn Read + 'a>> + 'a,
+) -> Result<Box<dyn Read + 'a>> {
+    chain_in(filters, params, None, open)
+}
+
+/// [`chain`] for a stream whose origin is known.
+pub fn chain_in<'a>(
+    filters: &[String],
+    params: Option<&DecodeParams>,
+    origin: Option<Origin>,
     open: impl Fn() -> Result<Box<dyn Read + 'a>> + 'a,
 ) -> Result<Box<dyn Read + 'a>> {
     let mut stages = Vec::with_capacity(filters.len());
@@ -78,7 +120,7 @@ pub fn chain<'a>(
             _ => Stage::Codec,
         });
     }
-    let spec = Rc::new(Spec { stages, open: Box::new(open) });
+    let spec = Rc::new(Spec { stages, open: Box::new(open), origin });
     let decoded = build(&spec, spec.stages.len())?;
     match params {
         Some(p) if p.predictor != 1 => predictor_reader(decoded, p),
@@ -95,7 +137,11 @@ fn build<'a>(spec: &Rc<Spec<'a>>, upto: usize) -> Result<Box<dyn Read + 'a>> {
     Ok(match spec.stages[upto - 1] {
         Stage::Flate => {
             let again = Rc::clone(spec);
-            Box::new(FlateReader::new(up, Box::new(move || build(&again, upto - 1))))
+            Box::new(FlateReader::new(
+                up,
+                Box::new(move || build(&again, upto - 1)),
+                spec.origin.clone(),
+            ))
         },
         Stage::Hex => Box::new(Pulled::new(Hex { up, high: None })),
         Stage::Ascii85 => Box::new(Pulled::new(Ascii85 { up, acc: 0, count: 0 })),

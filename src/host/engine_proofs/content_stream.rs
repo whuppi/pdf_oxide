@@ -42,7 +42,7 @@ fn operators_of(data: &[u8], n: usize, window: usize) -> Vec<Operator> {
     Operators::from_lexer(lexer, Mode::Full).map(|op| op.unwrap()).collect()
 }
 
-fn merge_tj(ops: Vec<Operator>) -> Vec<Operator> {
+pub(super) fn merge_tj(ops: Vec<Operator>) -> Vec<Operator> {
     let mut out: Vec<Operator> = Vec::with_capacity(ops.len());
     for op in ops {
         if let (Operator::TJ { array }, Some(Operator::TJ { array: last })) = (&op, out.last_mut())
@@ -61,7 +61,7 @@ fn is_stray_i(op: &Operator) -> bool {
 
 /// `parse_content_stream` as the reference: TJ merged, the stray `I` after
 /// each inline image dropped. Returns the operators and how many `I` it dropped.
-fn reference(data: &[u8]) -> (Vec<Operator>, usize) {
+pub(super) fn reference(data: &[u8]) -> (Vec<Operator>, usize) {
     let mut out: Vec<Operator> = Vec::new();
     let mut dropped = 0;
     for op in parse_content_stream(data).unwrap() {
@@ -74,7 +74,7 @@ fn reference(data: &[u8]) -> (Vec<Operator>, usize) {
     (merge_tj(out), dropped)
 }
 
-fn short(op: &Operator) -> String {
+pub(super) fn short(op: &Operator) -> String {
     let mut text = format!("{op:?}");
     if text.len() > 160 {
         text.truncate(160);
@@ -95,7 +95,12 @@ struct Totals {
 
 /// Why `Operators` is meant to differ from `parse_content_stream` on this
 /// input, if it is (the module docs list each divergence; a fixture pins it).
-fn known_divergence(data: &[u8]) -> Option<&'static str> {
+pub(super) fn known_divergence(data: &[u8]) -> Option<&'static str> {
+    known_divergence_given(data, &reference(data).0)
+}
+
+/// [`known_divergence`] for a caller that already has the reference.
+pub(super) fn known_divergence_given(data: &[u8], expected: &[Operator]) -> Option<&'static str> {
     if data.iter().any(|&b| matches!(b, b'%' | 0x00 | 0x0C)) {
         return Some("comment, NUL or form feed read as white-space");
     }
@@ -104,7 +109,6 @@ fn known_divergence(data: &[u8]) -> Option<&'static str> {
     if ops.damage().inline_unended {
         return Some("an inline image that never ends ends the stream; its data is not read again");
     }
-    let (expected, _) = reference(data);
     let text = format!("{expected:?}");
     if text.contains("Reference(") {
         return Some("n n R inside an array or dictionary is not a reference");
