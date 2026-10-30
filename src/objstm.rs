@@ -33,8 +33,10 @@ use std::collections::HashMap;
 
 /// Parse an object stream and extract all objects.
 ///
-/// This is a convenience method that calls `parse_object_stream_with_decryption`
-/// with no encryption parameters.
+// ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+/// The stream's own extent decides whether its data is decrypted (an object
+/// stream is not, per ISO 32000-2 §7.6.3).
+// ── end pdf_manipulator patch ──
 ///
 /// # Arguments
 ///
@@ -44,6 +46,17 @@ use std::collections::HashMap;
 ///
 /// A HashMap mapping object numbers to their parsed objects.
 ///
+// ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+/// # Errors
+///
+/// Returns an error if:
+/// - The object is not a stream
+/// - The stream is not a valid object stream (/Type /ObjStm)
+/// - Required dictionary entries (/N, /First) are missing
+/// - Stream decoding/decryption fails
+/// - Object parsing fails
+///
+// ── end pdf_manipulator patch ──
 /// # Example
 ///
 /// ```ignore
@@ -56,39 +69,6 @@ use std::collections::HashMap;
 /// # Ok::<(), pdf_oxide::error::Error>(())
 /// ```
 pub fn parse_object_stream(stream_obj: &Object) -> Result<HashMap<u32, Object>> {
-    parse_object_stream_with_decryption(stream_obj, None, 0, 0)
-}
-
-/// Parse an object stream with optional decryption.
-///
-/// PDF Spec: Object streams (PDF 1.5+) can be encrypted like any other stream.
-/// The encryption must be applied before decompression.
-///
-/// # Arguments
-///
-/// * `stream_obj` - The object stream object (must be a Stream with /Type /ObjStm)
-/// * `decryption_fn` - Optional decryption function (from EncryptionHandler)
-/// * `obj_num` - Object number (for encryption key derivation)
-/// * `gen_num` - Generation number (for encryption key derivation)
-///
-/// # Returns
-///
-/// A HashMap mapping object numbers to their parsed objects.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The object is not a stream
-/// - The stream is not a valid object stream (/Type /ObjStm)
-/// - Required dictionary entries (/N, /First) are missing
-/// - Stream decoding/decryption fails
-/// - Object parsing fails
-pub fn parse_object_stream_with_decryption(
-    stream_obj: &Object,
-    decryption_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
-    obj_num: u32,
-    gen_num: u32,
-) -> Result<HashMap<u32, Object>> {
     // Extract stream dictionary and data
     let dict = match stream_obj {
         Object::Stream { dict, .. } => dict,
@@ -130,9 +110,10 @@ pub fn parse_object_stream_with_decryption(
     let n = n as usize;
     let first = first as usize;
 
-    // Decode the stream data (with decryption if provided)
-    let decoded_data =
-        stream_obj.decode_stream_data_with_decryption(decryption_fn, obj_num, gen_num)?;
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+    // Decode the stream data
+    let decoded_data = stream_obj.decode_stream_data()?;
+    // ── end pdf_manipulator patch ──
 
     // Validate decoded data size
     if decoded_data.len() < first {
@@ -326,13 +307,8 @@ impl DecodedObjStm {
 }
 
 /// Decodes an object stream and reads its offset table, parsing no member.
-/// The arguments and errors are those of `parse_object_stream_with_decryption`.
-pub fn decode_object_stream(
-    stream_obj: &Object,
-    decryption_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
-    obj_num: u32,
-    gen_num: u32,
-) -> Result<DecodedObjStm> {
+/// The argument and errors are those of `parse_object_stream`.
+pub fn decode_object_stream(stream_obj: &Object) -> Result<DecodedObjStm> {
     let dict = match stream_obj {
         Object::Stream { dict, .. } => dict,
         _ => return Err(Error::InvalidPdf("object stream is not a Stream object".to_string())),
@@ -361,7 +337,7 @@ pub fn decode_object_stream(
     }
     let first = first as usize;
 
-    let data = stream_obj.decode_stream_data_with_decryption(decryption_fn, obj_num, gen_num)?;
+    let data = stream_obj.decode_stream_data()?;
     if data.len() < first {
         return Err(Error::InvalidPdf(format!(
             "object stream data too short: {} bytes, expected at least {}",

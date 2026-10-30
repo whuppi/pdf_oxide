@@ -37,13 +37,18 @@ mod algorithms;
 mod certificate;
 mod handler;
 pub mod permissions;
+// ── pdf_manipulator patch: the provider builds the cipher as a keystream ──
 // `pub(crate)` so the `crypto::RustCryptoProvider::SymmetricCipher`
-// impl in `src/crypto/rust_provider.rs` can call
-// `rc4::rc4_crypt_impl` (the cipher-only entry point that does NOT
-// re-route through the active provider, breaking the
-// `provider.rc4() → rc4_crypt → provider.rc4()` cycle). RC4 is
-// required by PDF Standard Security Handler R≤4 (ISO 32000-1 §7.6.3).
+// impl in `src/crypto/rust_provider.rs` can build `rc4::Rc4Cipher`
+// (the cipher-only type that does NOT re-route through the active
+// provider, breaking the `provider.rc4() → rc4_crypt → provider.rc4()`
+// cycle). RC4 is required by PDF Standard Security Handler R≤4
+// (ISO 32000-1 §7.6.3).
+// ── end pdf_manipulator patch ──
 pub(crate) mod rc4;
+// ── pdf_manipulator patch: stream bodies decrypt and encrypt in pieces ──
+pub(crate) mod stream;
+// ── end pdf_manipulator patch ──
 mod write_handler;
 
 pub use algorithms::{

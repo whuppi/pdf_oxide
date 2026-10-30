@@ -174,6 +174,9 @@ pub mod parser;
 pub mod parser_config;
 pub mod xref;
 pub mod xref_reconstruction;
+// ── pdf_manipulator patch: a stream reads itself from its document's bytes ──
+pub(crate) mod source;
+// ── end pdf_manipulator patch ──
 
 // Stream decoders
 pub mod decoders;

@@ -223,11 +223,9 @@ pub(crate) fn rasterize_music_regions(
     // Re-open the source bytes as a mutable doc — `render_page`
     // takes `&mut PdfDocument` because rendering mutates internal
     // caches. Same pattern as the form-xobject rasterizer.
-    let bytes = doc.source_bytes.clone();
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-    let doc_mut = match crate::document::PdfDocument::from_bytes(bytes) {
+    // ── pdf_manipulator patch: the second document reads the source in windows ──
+    let doc_mut = match doc.reopen() {
+        // ── end pdf_manipulator patch ──
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };

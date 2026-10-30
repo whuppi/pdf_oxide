@@ -15,7 +15,9 @@ use crate::xref::{find_xref_offset, parse_xref, CrossRefTable};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
+// ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+// ── end pdf_manipulator patch ──
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -60,75 +62,10 @@ pub enum ReadingOrder {
     Structure,
 }
 
-/// In-memory reader used by `open()` and `from_bytes()`. Wrapping in an enum
-/// is kept (rather than using `BufReader<Cursor<Vec<u8>>>` directly) so a
-/// future file-backed variant can be re-introduced without touching call
-/// sites.
-// ── pdf_manipulator patch: External reader variant for O(1)-memory I/O ──
-// The External variant enables on-demand random-access reading via a
-// callback-backed Read+Seek (condvar on native, SAB/Asyncify on web).
-// The source file is never fully buffered in memory.
-
-/// Trait alias for Read + Seek + Send — trait objects allow only one
-/// non-auto trait, so the bound needs a single name.
-pub(crate) trait ReadSeek: Read + Seek + Send {}
-impl<T: Read + Seek + Send> ReadSeek for T {}
-
-enum PdfReader {
-    Memory(BufReader<Cursor<Vec<u8>>>),
-    External(BufReader<Box<dyn ReadSeek>>),
-}
-
-impl Read for PdfReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            PdfReader::Memory(r) => r.read(buf),
-            PdfReader::External(r) => r.read(buf),
-        }
-    }
-}
-
-impl Seek for PdfReader {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match self {
-            PdfReader::Memory(r) => r.seek(pos),
-            PdfReader::External(r) => r.seek(pos),
-        }
-    }
-}
-
-impl PdfReader {
-    /// Moves to absolute `offset`. A target inside the bytes already
-    /// buffered keeps them, so objects read one after another cost one
-    /// read of the source, not one each.
-    fn seek_keeping_buffer(&mut self, offset: u64) -> std::io::Result<()> {
-        let here = match self {
-            PdfReader::Memory(r) => r.stream_position()?,
-            PdfReader::External(r) => r.stream_position()?,
-        };
-        let by = offset as i64 - here as i64;
-        match self {
-            PdfReader::Memory(r) => r.seek_relative(by),
-            PdfReader::External(r) => r.seek_relative(by),
-        }
-    }
-}
-
-impl BufRead for PdfReader {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        match self {
-            PdfReader::Memory(r) => r.fill_buf(),
-            PdfReader::External(r) => r.fill_buf(),
-        }
-    }
-
-    fn consume(&mut self, amt: usize) {
-        match self {
-            PdfReader::Memory(r) => r.consume(amt),
-            PdfReader::External(r) => r.consume(amt),
-        }
-    }
-}
+// ── pdf_manipulator patch: the reader lives in the document's Source ──
+pub(crate) use crate::source::{PdfReader, ReadSeek, Source};
+use crate::object::{Extent, StreamBody};
+use crate::source::Window;
 // ── end pdf_manipulator patch ──
 
 /// Maximum recursion depth for object resolution
@@ -150,8 +87,14 @@ pub struct PageInfo {
 /// A stream object's dictionary and where its data sits in the source.
 pub(crate) struct StreamHead {
     pub dict: HashMap<String, Object>,
-    pub data_start: u64,
-    pub data_len: u64,
+    pub extent: Extent,
+}
+
+impl StreamHead {
+    /// The stored length of the data (a repaired /Length is the repair).
+    pub fn data_len(&self) -> u64 {
+        self.extent.len()
+    }
 }
 // ── end pdf_manipulator patch ──
 
@@ -394,7 +337,10 @@ impl BoundedObjectCache {
         }
         match obj {
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            Object::Stream { dict, body } => Self::dict_heap_size(dict, depth) + body.inline().len(),
+            // An extent holds the document's bytes, not a copy of them.
+            Object::Stream { dict, body } => {
+                Self::dict_heap_size(dict, depth) + body.inline().map_or(0, |data| data.len())
+            },
             // ── end pdf_manipulator patch ──
             Object::Dictionary(d) => Self::dict_heap_size(d, depth),
             Object::Array(a) => {
@@ -472,13 +418,15 @@ struct RunningArtifactSignature {
 /// uses FIFO eviction to prevent unbounded heap growth when processing
 /// many pages sequentially.
 pub struct PdfDocument {
-    /// PDF reader — file-backed on native, memory-backed on WASM.
+    // ── pdf_manipulator patch: the reader and the encryption handler live in the Source ──
+    /// The document's bytes and its encryption state, shared with every
+    /// stream extent the document loads.
     ///
     /// # Thread Safety
     /// All interior-mutable fields use `Mutex` / `AtomicUsize`, making
     /// `PdfDocument` both `Send` and `Sync`.
-    /// Wrapped in RefCell for interior mutability (seek/read require &mut).
-    reader: Mutex<PdfReader>,
+    source: Arc<Source>,
+    // ── end pdf_manipulator patch ──
     /// Serializes concurrent *cold* (uncached) object loads on a shared
     /// handle. A single logical load makes many separate `reader` lock
     /// scopes (header, /Length resolution, stream bytes, nested refs);
@@ -491,8 +439,6 @@ pub struct PdfDocument {
     /// double-checked cache, so warm cache hits stay fully parallel
     /// same-thread recursion never re-acquires (no self-deadlock). #507.
     load_lock: Mutex<()>,
-    /// Raw bytes of the document (kept for duplication/editing)
-    pub source_bytes: Vec<u8>,
     /// PDF version (major, minor)
     version: (u8, u8),
     /// Cross-reference table mapping object IDs to byte offsets
@@ -503,15 +449,6 @@ pub struct PdfDocument {
     /// Bounded at [`DEFAULT_OBJECT_CACHE_MAX_BYTES`] with FIFO eviction to
     /// prevent unbounded heap growth during multi-page extraction.
     object_cache: Mutex<BoundedObjectCache>,
-    /// Encryption handler (if PDF is encrypted).
-    /// Wrapped in RefCell for interior mutability (lazy initialization from &self).
-    encryption_handler: Mutex<Option<EncryptionHandler>>,
-    /// ObjectRef of the /Encrypt dictionary, cached so its strings are
-    /// skipped during per-object string decryption. The entries in the
-    /// encryption dict (/O, /U, /OE, /UE, /Perms, …) are key material used
-    /// to derive the encryption key, not ciphertext, and must never be
-    /// passed through `decrypt_string`.
-    encrypt_dict_ref: Mutex<Option<ObjectRef>>,
     /// Parser configuration options for error handling and recovery
     #[allow(dead_code)]
     options: ParserOptions,
@@ -1225,11 +1162,10 @@ impl PdfDocument {
     ///
     /// Returns an error if the PDF data is invalid, unsupported, or cannot be parsed.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
-        let source_bytes = data.clone();
+        // ── pdf_manipulator patch: the bytes are held once, in the Source ──
         let reader = PdfReader::Memory(BufReader::new(Cursor::new(data)));
-        let mut doc = Self::open_from_reader(reader)?;
-        doc.source_bytes = source_bytes;
-        Ok(doc)
+        Self::open_from_reader(reader)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Deprecated alias for `from_bytes`.
@@ -1302,16 +1238,13 @@ impl PdfDocument {
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        // Read once and route through `from_bytes` so the in-memory
-        // `source_bytes` field is populated. Path-loaded documents that
-        // skip this lose access to APIs that re-read the bytes
-        // (notably `compliance::convert_to_pdf_a`, which constructs a
-        // `DocumentEditor` from `source_bytes` — an empty Vec breaks
-        // it with `"Invalid PDF header: ... File is empty"`).
-        // issue #456.
-        //
+        // ── pdf_manipulator patch: the bytes are held once, in the Source ──
+        // Read once and route through `from_bytes`: the source then holds
+        // the whole file, so APIs that re-read the bytes (notably
+        // `compliance::convert_to_pdf_a`) work on a path-loaded document.
         // The doc comment on this function already promised "Reads the
         // entire file into memory"; this is making it true.
+        // ── end pdf_manipulator patch ──
         let data = std::fs::read(path.as_ref())?;
         Self::from_bytes(data)
     }
@@ -1443,19 +1376,20 @@ impl PdfDocument {
             None
         };
 
-        // Note: Encryption initialization was originally lazy, but decode_stream_with_encryption
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        // Note: Encryption initialization was originally lazy, but decoding a stream
+        // ── end pdf_manipulator patch ──
         // only has &self access which prevents initialization.
         // We now initialize eagerly to ensure the handler is ready when needed.
         let document = Self {
-            reader: Mutex::new(reader),
+            // ── pdf_manipulator patch: the reader and the encryption handler live in the Source ──
+            source: Arc::new(Source::new(reader)),
+            // ── end pdf_manipulator patch ──
             load_lock: Mutex::new(()),
-            source_bytes: Vec::new(),
             version,
             xref,
             trailer,
             object_cache: Mutex::new(BoundedObjectCache::new(DEFAULT_OBJECT_CACHE_MAX_BYTES)),
-            encryption_handler: Mutex::new(None),
-            encrypt_dict_ref: Mutex::new(None),
             options: ParserOptions::default(),
             header_offset,
             // ── pdf_manipulator patch: the incremental save refuses a repaired file ──
@@ -1572,7 +1506,9 @@ impl PdfDocument {
     /// the document is fully constructed and can load objects.
     fn ensure_encryption_initialized(&self) -> Result<()> {
         // Already initialized?
-        if self.encryption_handler.lock_or_recover().is_some() {
+        // ── pdf_manipulator patch: the handler lives in the Source ──
+        if self.source.handler().is_some() {
+            // ── end pdf_manipulator patch ──
             return Ok(());
         }
 
@@ -1628,7 +1564,9 @@ impl PdfDocument {
                 log::debug!("Loading /Encrypt object reference {} {}", obj_ref.id, obj_ref.gen);
                 // Remember which object holds the /Encrypt dict so its own
                 // strings are skipped during per-object string decryption.
-                *self.encrypt_dict_ref.lock_or_recover() = Some(obj_ref);
+                // ── pdf_manipulator patch: the handler lives in the Source ──
+                self.source.set_encrypt_dict_ref(Some(obj_ref));
+                // ── end pdf_manipulator patch ──
                 self.load_object(obj_ref)?
             },
             _ => {
@@ -1684,125 +1622,11 @@ impl PdfDocument {
             },
         }
 
-        *self.encryption_handler.lock_or_recover() = Some(handler);
+        // ── pdf_manipulator patch: the handler lives in the Source ──
+        self.source.set_handler(Some(Arc::new(handler)));
+        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
         Ok(())
-    }
-
-    /// Decode stream data with encryption support.
-    ///
-    /// This is a helper method that decodes stream data using the PDF's encryption handler
-    /// if the document is encrypted. It automatically handles object-specific key derivation.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream_obj` - The stream object to decode
-    /// * `obj_ref` - The object reference (for encryption key derivation)
-    ///
-    /// # Returns
-    ///
-    /// The decoded (and decrypted if needed) stream data.
-    ///
-    /// # PDF Spec Reference
-    ///
-    /// ISO 32000-1:2008, Section 7.6.2 - Streams must be decrypted BEFORE applying filters.
-    pub(crate) fn decode_stream_with_encryption(
-        &self,
-        stream_obj: &Object,
-        obj_ref: ObjectRef,
-    ) -> Result<Vec<u8>> {
-        if matches!(stream_obj, Object::Null) {
-            return Ok(Vec::new());
-        }
-
-        // Per ISO 32000-2:2020 Section 7.6.3, object streams (/Type /ObjStm)
-        // and cross-reference streams (/Type /XRef) shall NOT be encrypted.
-        // Skip decryption for these stream types to avoid AES block-size errors
-        // on data that was never encrypted in the first place.
-        let is_unencrypted_stream_type = if let Object::Stream { dict, .. } = stream_obj {
-            dict.get("Type")
-                .and_then(|t| t.as_name())
-                .map(|name| name == "ObjStm" || name == "XRef")
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        let handler_ref = self.encryption_handler.lock_or_recover();
-        if let Some(handler) = handler_ref.as_ref() {
-            if is_unencrypted_stream_type {
-                // These stream types are never encrypted per spec
-                drop(handler_ref);
-                return stream_obj.decode_stream_data();
-            }
-            // Create decryption closure for this specific object
-            let decrypt_fn = |data: &[u8]| -> Result<Vec<u8>> {
-                handler.decrypt_stream(data, obj_ref.id, obj_ref.gen as u32)
-            };
-            stream_obj.decode_stream_data_with_decryption(
-                Some(&decrypt_fn),
-                obj_ref.id,
-                obj_ref.gen as u32,
-            )
-        } else {
-            drop(handler_ref);
-            // No encryption, use regular decoding
-            stream_obj.decode_stream_data()
-        }
-    }
-
-    /// Decrypt a stream object's raw bytes for re-serialization elsewhere,
-    /// **without** decompressing it — unlike [`Self::decode_stream_with_encryption`],
-    /// which both decrypts and applies `/Filter` (needed by extraction, which
-    /// wants the final bytes). A writer that re-emits the object verbatim
-    /// (same `/Filter`, e.g. FlateDecode) wants the opposite: decrypt only,
-    /// leave the filter's compressed bytes alone, so the `/Filter` entry it
-    /// copies stays valid.
-    ///
-    /// A no-op when the document isn't encrypted or the object isn't a
-    /// stream, so callers can apply it unconditionally to every object they
-    /// copy out of `self` — e.g. every write path that copies objects from
-    /// an already-open, possibly-encrypted source document into a new
-    /// output file with no `/Encrypt` dictionary of its own (issue #1032:
-    /// those paths were re-serializing the source's raw ciphertext
-    /// verbatim, producing a structurally valid but unreadable PDF with no
-    /// error or warning).
-    pub(crate) fn decrypt_stream_for_copy(
-        &self,
-        obj: Object,
-        obj_ref: ObjectRef,
-    ) -> Result<Object> {
-        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-        let Object::Stream { mut dict, body } = obj else {
-            return Ok(obj);
-        };
-        // ── end pdf_manipulator patch ──
-        // Per ISO 32000-2:2020 §7.6.3, object streams and cross-reference
-        // streams are never encrypted — same exclusion as
-        // `decode_stream_with_encryption` above.
-        let is_unencrypted_stream_type = dict
-            .get("Type")
-            .and_then(|t| t.as_name())
-            .map(|name| name == "ObjStm" || name == "XRef")
-            .unwrap_or(false);
-        if is_unencrypted_stream_type {
-            // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            return Ok(Object::Stream { dict, body });
-            // ── end pdf_manipulator patch ──
-        }
-        let handler_ref = self.encryption_handler.lock_or_recover();
-        let Some(handler) = handler_ref.as_ref() else {
-            drop(handler_ref);
-            // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            return Ok(Object::Stream { dict, body });
-            // ── end pdf_manipulator patch ──
-        };
-        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-        let decrypted = handler.decrypt_stream(body.inline(), obj_ref.id, obj_ref.gen as u32)?;
-        // ── end pdf_manipulator patch ──
-        drop(handler_ref);
-        dict.insert("Length".to_string(), Object::Integer(decrypted.len() as i64));
-        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-        Ok(Object::stream(dict, decrypted))
         // ── end pdf_manipulator patch ──
     }
 
@@ -1838,19 +1662,17 @@ impl PdfDocument {
         // at the `handler.is_authenticated()` guard), so a cache hit after
         // authentication would return those stale values forever — issue
         // #323.
-        let was_authenticated = self
-            .encryption_handler
-            .lock_or_recover()
-            .as_ref()
-            .map(|h| h.is_authenticated())
-            .unwrap_or(true);
-
-        let result = match self.encryption_handler.lock_or_recover().as_mut() {
-            Some(handler) => handler.authenticate(password),
-            None => return Ok(true), // Not encrypted, always "authenticated"
+        // ── pdf_manipulator patch: the handler lives in the Source, shared and replaced whole ──
+        let Some(current) = self.source.handler() else {
+            return Ok(true); // Not encrypted, always "authenticated"
         };
+        let was_authenticated = current.is_authenticated();
 
+        let mut handler = (*current).clone();
+        let result = handler.authenticate(password);
         if let Ok(true) = result {
+            self.source.set_handler(Some(Arc::new(handler)));
+            // ── end pdf_manipulator patch ──
             if !was_authenticated {
                 // Transitioned from "encrypted, not authenticated" to
                 // "authenticated". Drop every cached object so subsequent
@@ -1891,8 +1713,8 @@ impl PdfDocument {
         };
 
         let (file_key, algorithm) = {
-            let guard = self.encryption_handler.lock_or_recover();
-            match guard.as_ref().and_then(|h| h.encryption_key().map(|k| (k.to_vec(), h.algorithm())))
+            let handler = self.source.handler();
+            match handler.as_ref().and_then(|h| h.encryption_key().map(|k| (k.to_vec(), h.algorithm())))
             {
                 Some(pair) => pair,
                 None => return refuse("the source is not authenticated"),
@@ -2014,7 +1836,9 @@ impl PdfDocument {
     /// ```
     pub fn is_encrypted(&self) -> bool {
         // Check if encryption handler is already initialized
-        if self.encryption_handler.lock_or_recover().is_some() {
+        // ── pdf_manipulator patch: the handler lives in the Source ──
+        if self.source.handler().is_some() {
+            // ── end pdf_manipulator patch ──
             return true;
         }
         // Check trailer for /Encrypt entry without initializing
@@ -2441,7 +2265,9 @@ impl PdfDocument {
     /// yet been provided. Extraction methods use this to return a clear error
     /// instead of silently producing empty output.
     fn is_encrypted_and_unauthenticated(&self) -> bool {
-        if let Some(handler) = self.encryption_handler.lock_or_recover().as_ref() {
+        // ── pdf_manipulator patch: the handler lives in the Source ──
+        if let Some(handler) = self.source.handler() {
+            // ── end pdf_manipulator patch ──
             !handler.is_authenticated()
         } else {
             // Handler not yet initialized — check if /Encrypt exists
@@ -2547,24 +2373,31 @@ impl PdfDocument {
     // ── pdf_manipulator patch: raw source access for the incremental save ──
     /// The source's length in bytes.
     pub(crate) fn source_len(&self) -> Result<u64> {
-        let mut r = self.reader.lock_or_recover();
-        Ok(r.seek(SeekFrom::End(0))?)
+        self.source.len()
     }
 
     /// Fills `buf` from the source at `offset`; returns the bytes read,
     /// fewer than `buf.len()` only at the end of the source.
     pub(crate) fn read_source_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut r = self.reader.lock_or_recover();
-        r.seek_keeping_buffer(offset)?;
-        let mut filled = 0;
-        while filled < buf.len() {
-            let n = r.read(&mut buf[filled..])?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
-        }
-        Ok(filled)
+        self.source.read_at(offset, buf)
+    }
+
+    /// A second document over the same bytes, read through the source in
+    /// windows: nothing is copied. For work that mutates a document's caches
+    /// while the first one stays as it is.
+    pub(crate) fn reopen(&self) -> Result<Self> {
+        Self::from_external_reader(Box::new(crate::source::SourceCursor::new(Arc::clone(
+            &self.source,
+        ))))
+    }
+
+    /// The whole source in one buffer: a named whole read, for the upstream
+    /// surfaces (`ffi.rs`, `python.rs`, the integration tests) the host never
+    /// routes to.
+    pub fn source_bytes_whole(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        crate::source::SourceCursor::new(Arc::clone(&self.source)).read_to_end(&mut out)?;
+        Ok(out)
     }
 
     /// Where the header was found; not 0 when bytes precede `%PDF`.
@@ -2639,131 +2472,20 @@ impl PdfDocument {
 
     // ── pdf_manipulator patch: stream extent without loading the data ──
     /// Where the data of stream object `r` sits in the source, and its
-    /// dictionary, read without loading the data or touching the object
-    /// cache. `Ok(None)` when the object is not a plain uncompressed
-    /// stream whose /Length is trustworthy; the caller then loads it whole,
-    /// which also repairs a wrong /Length.
+    /// dictionary: the object as the loader returns it (cached, its
+    /// dictionary only). `Ok(None)` when the object is not an uncompressed
+    /// stream. A wrong /Length has been repaired by the load.
     pub(crate) fn stream_head(&self, r: ObjectRef) -> Result<Option<StreamHead>> {
-        // The header and dictionary of a stream are usually under a
-        // kilobyte; a read that grows from there costs a fraction of a
-        // 64 KiB read per stream on a file of thousands of them.
-        const FIRST_READ: usize = 1024;
-        const CHUNK: usize = 64 * 1024;
-        const HEAD_MAX: usize = 1024 * 1024;
-
-        let entry = match self.xref.get(r.id) {
-            Some(e) if e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed => {
-                e.clone()
+        match self.xref.get(r.id) {
+            Some(e) if e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed => {},
+            _ => return Ok(None),
+        }
+        match self.load_object(r)? {
+            Object::Stream { dict, body: StreamBody::Extent(extent) } => {
+                Ok(Some(StreamHead { dict, extent }))
             },
-            _ => return Ok(None),
-        };
-        let is_space = |b: u8| b.is_ascii_whitespace() || b == 0;
-
-        // Read until the buffer holds the header, a dictionary, `stream`
-        // and the end-of-line after it.
-        let mut buf: Vec<u8> = Vec::new();
-        let mut want = FIRST_READ;
-        let mut chunk = vec![0u8; want];
-        let (dict_start, stream_kw) = loop {
-            chunk.resize(want, 0);
-            let n = self.read_source_at(entry.offset + buf.len() as u64, &mut chunk)?;
-            buf.extend_from_slice(&chunk[..n]);
-            let at_end = n < want;
-            want = (want * 2).min(CHUNK);
-
-            let Some(obj_pos) = find_substring(&buf[..buf.len().min(64)], b"obj") else {
-                if at_end || buf.len() >= 64 {
-                    return Ok(None);
-                }
-                continue;
-            };
-            let found = (obj_pos + 3..buf.len().saturating_sub(5)).find(|&i| {
-                &buf[i..i + 6] == b"stream"
-                    && buf[..i]
-                        .iter()
-                        .rev()
-                        .find(|&&b| !is_space(b))
-                        .is_some_and(|&b| b == b'>')
-            });
-            // An object that ends before any `stream` is not a stream.
-            if let Some(end) = find_substring(&buf[obj_pos + 3..], b"endobj") {
-                if found.map_or(true, |i| obj_pos + 3 + end < i) {
-                    return Ok(None);
-                }
-            }
-            if let Some(i) = found {
-                if buf.len() >= i + 8 || at_end {
-                    break (obj_pos + 3, i);
-                }
-            }
-            if at_end || buf.len() > HEAD_MAX {
-                return Ok(None);
-            }
-        };
-
-        // The header must name this object.
-        let header = String::from_utf8_lossy(&buf[..dict_start - 3]);
-        let mut parts = header.split_whitespace();
-        let id_ok = parts.next().and_then(|p| p.parse::<u32>().ok()) == Some(r.id);
-        let gen_ok = parts.next().and_then(|p| p.parse::<u16>().ok()).is_some();
-        if !id_ok || !gen_ok || parts.next().is_some() {
-            return Ok(None);
+            _ => Ok(None),
         }
-
-        let mut dict = match parse_object(&buf[dict_start..stream_kw]) {
-            Ok((rest, Object::Dictionary(d))) if rest.iter().all(|&b| is_space(b)) => d,
-            _ => return Ok(None),
-        };
-
-        let after = stream_kw + 6;
-        let data_start = if buf[after..].starts_with(b"\r\n") {
-            after + 2
-        } else if buf[after..].starts_with(b"\n") {
-            after + 1
-        } else {
-            return Ok(None);
-        } as u64
-            + entry.offset;
-
-        let data_len = match dict.get("Length") {
-            Some(Object::Integer(n)) if *n >= 0 => *n as u64,
-            Some(Object::Reference(lr)) => match self.load_object(*lr)? {
-                Object::Integer(n) if n >= 0 => n as u64,
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-
-        // The data must be followed by `endstream`, else /Length is wrong.
-        let mut tail = [0u8; 13];
-        let n = self.read_source_at(data_start + data_len, &mut tail)?;
-        let tail = &tail[..n];
-        let skip = tail.iter().take(4).take_while(|&&b| is_space(b)).count();
-        if !tail[skip..].starts_with(b"endstream") {
-            return Ok(None);
-        }
-
-        let is_encrypt_dict = *self.encrypt_dict_ref.lock_or_recover() == Some(r);
-        if !is_encrypt_dict {
-            let guard = self.encryption_handler.lock_or_recover();
-            if let Some(handler) = guard.as_ref() {
-                if handler.is_authenticated() {
-                    let mut wrapped = Object::Dictionary(dict);
-                    Self::decrypt_strings_in_object(
-                        handler,
-                        &mut wrapped,
-                        r.id,
-                        entry.generation as u32,
-                    );
-                    dict = match wrapped {
-                        Object::Dictionary(d) => d,
-                        _ => return Ok(None),
-                    };
-                }
-            }
-        }
-
-        Ok(Some(StreamHead { dict, data_start, data_len }))
     }
     // ── end pdf_manipulator patch ──
 
@@ -2860,7 +2582,9 @@ impl PdfDocument {
         let mut content = Vec::new();
         {
             // Hold one guard for seek+read to prevent split-lock race (#398 Race A).
-            let mut reader = self.reader.lock_or_recover();
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            let mut reader = self.source.lock_reader();
+            // ── end pdf_manipulator patch ──
             reader.seek(SeekFrom::Start(0))?;
             reader.read_to_end(&mut content)?;
         }
@@ -2952,7 +2676,9 @@ impl PdfDocument {
     /// Runs at most once per document — guarded by `objstm_recovery_done`.
     /// Cost is amortised across every recovered object.
     fn recover_from_object_streams(&self) {
-        use crate::objstm::parse_object_stream_with_decryption;
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        use crate::objstm::parse_object_stream;
+        // ── end pdf_manipulator patch ──
 
         {
             let done = self.objstm_recovery_done.lock_or_recover();
@@ -2976,7 +2702,9 @@ impl PdfDocument {
         // pass; a transient seek/read failure should leave the flag unset
         // so a later retry can still attempt recovery.
         let file_bytes = {
-            let mut r = self.reader.lock_or_recover();
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            let mut r = self.source.lock_reader();
+            // ── end pdf_manipulator patch ──
             if r.seek(SeekFrom::Start(0)).is_err() {
                 return;
             }
@@ -3011,7 +2739,9 @@ impl PdfDocument {
             // Parse the stream body. ISO 32000-2:2020 §7.6.3 says ObjStm
             // shall NOT be individually encrypted, so skip decryption here
             // — mirrors the default branch in `load_compressed_object`.
-            let objects_map = match parse_object_stream_with_decryption(&stream_obj, None, 0, 0) {
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            let objects_map = match parse_object_stream(&stream_obj) {
+            // ── end pdf_manipulator patch ──
                 Ok(m) => m,
                 Err(e) => {
                     log::debug!(
@@ -3438,7 +3168,9 @@ impl PdfDocument {
         }
 
         // Seek + read under a SINGLE lock guard. Splitting the seek
-        // the read across two `self.reader.lock_or_recover()` acquisitions
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        // the read across two `self.source.lock_reader()` acquisitions
+        // ── end pdf_manipulator patch ──
         // is the #398 Race A split-lock bug (same one already fixed in
         // `load_uncompressed_object_impl`): a concurrent thread can
         // re-seek the shared reader between our seek() and read(), so we
@@ -3448,7 +3180,9 @@ impl PdfDocument {
         let offset = entry.offset;
         let mut buf = [0u8; 1024];
         let n = {
-            let mut reader = self.reader.lock_or_recover();
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            let mut reader = self.source.lock_reader();
+            // ── end pdf_manipulator patch ──
             if reader.seek(SeekFrom::Start(offset)).is_err() {
                 return true;
             }
@@ -4023,19 +3757,18 @@ impl PdfDocument {
         offset: u64,
         already_corrected: bool,
     ) -> Result<Object> {
-        // --- Phase 1: read the object header under a single lock guard ---
-        // Holding one guard for seek+read prevents the split-lock race (#398 Race A)
-        // where a concurrent thread can re-seek the shared BufReader between our
-        // seek() and read_until() calls.
-        let (header_bytes, full_header) = {
-            let mut reader = self.reader.lock_or_recover();
-            reader.seek_keeping_buffer(offset)?;
-
+        // ── pdf_manipulator patch: the object is read through a growing window, never line by line ──
+        // --- Phase 1: the object header, from a window that grows from the offset ---
+        // Each growth is one seek and one read of the source, so a concurrent
+        // thread can never re-seek the shared reader between the two (#398
+        // Race A); the cold-load lock keeps another load off the source.
+        let mut window = Window::new(&self.source, offset);
+        // (start of the header's last line, end of it, the header text)
+        let (last_line_start, last_line_end, full_header) = {
             // Read bytes for object header (e.g., "1 0 obj")
-            let mut header_bytes = Vec::new();
-            let bytes_read = reader.read_until(b'\n', &mut header_bytes)?;
+            let first_end = window.line_end(0)?;
 
-            if bytes_read == 0 {
+            if first_end == 0 {
                 let msg = format!("Unexpected EOF while reading object {} header", obj_ref.id);
                 log::warn!("{}", msg);
                 // also push into structured sink so
@@ -4049,27 +3782,25 @@ impl PdfDocument {
                 return Err(Error::UnexpectedEof);
             }
 
-            let line = String::from_utf8_lossy(&header_bytes);
-
             // Issue #45: Handle multi-line object headers
-            let mut full_header = line.to_string();
+            let mut full_header = String::from_utf8_lossy(&window.buf[..first_end]).to_string();
             let max_header_lines = 5;
             let mut lines_read = 1;
+            let (mut line_start, mut line_end) = (0, first_end);
 
             while !has_standalone_obj_keyword(&full_header) && lines_read < max_header_lines {
-                let mut next_bytes = Vec::new();
-                let next_read = reader.read_until(b'\n', &mut next_bytes)?;
-                if next_read == 0 {
+                let next_end = window.line_end(line_end)?;
+                if next_end == line_end {
                     break;
                 }
-                let next_line = String::from_utf8_lossy(&next_bytes);
                 full_header.push(' ');
-                full_header.push_str(&next_line);
+                full_header.push_str(&String::from_utf8_lossy(&window.buf[line_end..next_end]));
+                (line_start, line_end) = (line_end, next_end);
                 lines_read += 1;
             }
-            // Reader guard drops here — before any recursive fallback calls.
-            (header_bytes, full_header)
+            (line_start, line_end, full_header)
         };
+        // ── end pdf_manipulator patch ──
 
         // Verify object header format
         // Split by whitespace to handle various formats (single-line or multi-line)
@@ -4162,133 +3893,132 @@ impl PdfDocument {
 
         // Check if there's content after "obj" on the same line
         // Some PDFs have "N G obj\n<<..." while others have "N G obj<<..." on one line
-        let mut data = Vec::new();
-
-        // Find where "obj" ends in the original bytes
-        // We need to include anything after "obj" in the header line
-        if let Some(obj_keyword_pos) = header_bytes.windows(3).position(|w| w == b"obj") {
-            let after_obj_pos = obj_keyword_pos + 3; // "obj" is 3 bytes
-
-            // Skip whitespace after "obj"
-            let mut content_start = after_obj_pos;
-            while content_start < header_bytes.len()
-                && (header_bytes[content_start] == b' '
-                    || header_bytes[content_start] == b'\t'
-                    || header_bytes[content_start] == b'\r')
-            {
-                content_start += 1;
-            }
-
-            // If there's a newline, skip it (normal case: "N G obj\n")
-            // If there's content (like "<<"), include it (malformed case: "N G obj<<...")
-            if content_start < header_bytes.len() && header_bytes[content_start] != b'\n' {
-                // There's content on the same line after "obj" - include it
-                data.extend_from_slice(&header_bytes[content_start..]);
-                log::debug!(
-                    "Object {} has content after 'obj' on header line ({} bytes)",
-                    obj_ref.id,
-                    header_bytes.len() - content_start
-                );
-            }
-        }
-
-        // --- Phase 2: read body under a single lock guard (#398 Race A) ---
-        // Use byte limit instead of line count — large uncompressed streams can have
-        // hundreds of thousands of short lines (e.g., vector path drawing commands).
-        const MAX_BYTES: usize = 100 * 1024 * 1024; // 100 MB safety limit
-
+        // ── pdf_manipulator patch: the object is read through a growing window, never line by line ──
+        // Where the content begins in the window: on the line after the
+        // header, or on the header's own line when text follows "obj" there.
+        let mut content_start = last_line_end;
         {
-            let mut reader = self.reader.lock_or_recover();
-            loop {
-                let mut chunk = Vec::new();
-                let bytes_read = reader.read_until(b'\n', &mut chunk)?;
+            let header_bytes = &window.buf[last_line_start..last_line_end];
 
-                // ── pdf_manipulator patch: an oversized object fails instead of truncating ──
-                if data.len() > MAX_BYTES {
-                    return Err(Error::InvalidPdf(format!(
-                        "object {} is larger than {} bytes; it cannot be loaded whole",
-                        obj_ref.id, MAX_BYTES
-                    )));
+            // Find where "obj" ends in the original bytes
+            // We need to include anything after "obj" in the header line
+            if let Some(obj_keyword_pos) = header_bytes.windows(3).position(|w| w == b"obj") {
+                let after_obj_pos = obj_keyword_pos + 3; // "obj" is 3 bytes
+
+                // Skip whitespace after "obj"
+                let mut skipped = after_obj_pos;
+                while skipped < header_bytes.len()
+                    && (header_bytes[skipped] == b' '
+                        || header_bytes[skipped] == b'\t'
+                        || header_bytes[skipped] == b'\r')
+                {
+                    skipped += 1;
                 }
-                // ── end pdf_manipulator patch ──
 
-                if bytes_read == 0 {
-                    let msg = format!(
-                        "Unexpected EOF while reading object {} (no endobj found after {} bytes)",
+                // If there's a newline, skip it (normal case: "N G obj\n")
+                // If there's content (like "<<"), include it (malformed case: "N G obj<<...")
+                if skipped < header_bytes.len() && header_bytes[skipped] != b'\n' {
+                    // There's content on the same line after "obj" - include it
+                    content_start = last_line_start + skipped;
+                    log::debug!(
+                        "Object {} has content after 'obj' on header line ({} bytes)",
                         obj_ref.id,
-                        data.len()
+                        header_bytes.len() - skipped
                     );
-                    log::warn!("{}", msg);
-                    // structured-warnings sink.
-                    self.push_structured_warning(crate::extractors::warnings::Warning {
-                        category: crate::extractors::warnings::WarningCategory::EofPremature,
-                        page: None,
-                        message: msg,
-                        spec_section: Some("7.5"),
-                    });
-                    // Don't fail - try to parse what we have
-                    break;
                 }
-
-                // Check if we reached endobj
-                if chunk.contains(&b'e') {
-                    // Find "endobj" in the chunk (working with bytes, not chars)
-                    if let Some(endobj_pos) = find_substring(&chunk, b"endobj") {
-                        // Include everything before "endobj" but not "endobj" itself
-                        data.extend_from_slice(&chunk[..endobj_pos]);
-                        break;
-                    }
-                }
-
-                data.extend_from_slice(&chunk);
             }
         }
+        // ── end pdf_manipulator patch ──
 
-        // Parse the object data
-        log::debug!(
-            "About to parse object {} gen {} ({} bytes)",
-            obj_ref.id,
-            obj_ref.gen,
-            data.len()
-        );
+        // ── pdf_manipulator patch: the object is read through a growing window, never line by line ──
+        // --- Phase 2: grow the window until the body ends ---
+        // The body ends at `endobj`, or, for a stream, at the end of the line
+        // after the `stream` keyword: the data is never read here, only
+        // located. There is no size limit; an object is as large as it is.
+        let mut scanned = content_start;
+        let end = loop {
+            if let Some(end) = find_body_end(&window.buf, content_start, &mut scanned) {
+                break Some(end);
+            }
+            if !window.grow()? {
+                break None;
+            }
+        };
 
         // Corrupted objects degrade to Null so extraction can continue on
         // partial PDFs rather than aborting.
-        let mut obj = match parse_object(&data) {
-            Ok((_, parsed_obj)) => parsed_obj,
-            Err(e) => {
-                let error_kind = match &e {
-                    nom::Err::Incomplete(_) => "Incomplete data",
-                    nom::Err::Error(err) | nom::Err::Failure(err) => match err.code {
-                        nom::error::ErrorKind::Eof => "Unexpected EOF",
-                        nom::error::ErrorKind::Tag => "Expected tag not found",
-                        nom::error::ErrorKind::Fail => "Parse failed",
-                        _ => "Parse error",
-                    },
-                };
-                log::warn!(
-                    "Object {} at offset {} is corrupted ({}), using Null placeholder. \
-                     This may result in missing content from the PDF.",
+        let parse_or_null = |data: &[u8]| -> Object {
+            // Parse the object data
+            log::debug!(
+                "About to parse object {} gen {} ({} bytes)",
+                obj_ref.id,
+                obj_ref.gen,
+                data.len()
+            );
+            match parse_object(data) {
+                Ok((_, parsed_obj)) => parsed_obj,
+                Err(e) => {
+                    let error_kind = match &e {
+                        nom::Err::Incomplete(_) => "Incomplete data",
+                        nom::Err::Error(err) | nom::Err::Failure(err) => match err.code {
+                            nom::error::ErrorKind::Eof => "Unexpected EOF",
+                            nom::error::ErrorKind::Tag => "Expected tag not found",
+                            nom::error::ErrorKind::Fail => "Parse failed",
+                            _ => "Parse error",
+                        },
+                    };
+                    log::warn!(
+                        "Object {} at offset {} is corrupted ({}), using Null placeholder. \
+                         This may result in missing content from the PDF.",
+                        obj_ref.id,
+                        offset,
+                        error_kind
+                    );
+                    Object::Null
+                },
+            }
+        };
+
+        let mut obj = match end {
+            Some(BodyEnd::EndObj(at)) => parse_or_null(&window.buf[content_start..at]),
+            Some(BodyEnd::Stream(keyword)) => {
+                self.load_stream_object(obj_ref, offset, &mut window, content_start, keyword)?
+            },
+            None => {
+                let msg = format!(
+                    "Unexpected EOF while reading object {} (no endobj found after {} bytes)",
                     obj_ref.id,
-                    offset,
-                    error_kind
+                    window.buf.len() - content_start
                 );
-                Object::Null
+                log::warn!("{}", msg);
+                // structured-warnings sink.
+                self.push_structured_warning(crate::extractors::warnings::Warning {
+                    category: crate::extractors::warnings::WarningCategory::EofPremature,
+                    page: None,
+                    message: msg,
+                    spec_section: Some("7.5"),
+                });
+                // Don't fail - try to parse what we have
+                parse_or_null(&window.buf[content_start..])
             },
         };
+        // ── end pdf_manipulator patch ──
 
         // Decrypt string values inside this uncompressed object before
         // caching. Skip the /Encrypt dict (its entries are key material)
         // and the non-authenticated case (no key derived yet). Strings
         // inside compressed objects ride along with the ObjStm payload
         // and are already in clear text per ISO 32000-1:2008 §7.6.2.
-        let is_encrypt_dict = *self.encrypt_dict_ref.lock_or_recover() == Some(obj_ref);
+        // ── pdf_manipulator patch: the handler lives in the Source ──
+        let is_encrypt_dict = self.source.encrypt_dict_ref() == Some(obj_ref);
         if !is_encrypt_dict {
-            let handler_guard = self.encryption_handler.lock_or_recover();
-            if let Some(handler) = handler_guard.as_ref() {
+            if let Some(handler) = self.source.handler() {
+                // ── end pdf_manipulator patch ──
                 if handler.is_authenticated() {
                     Self::decrypt_strings_in_object(
-                        handler,
+                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                        &handler,
+                        // ── end pdf_manipulator patch ──
                         &mut obj,
                         obj_ref.id,
                         obj_ref.gen as u32,
@@ -4304,6 +4034,140 @@ impl PdfDocument {
 
         Ok(obj)
     }
+
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent, never its data ──
+    /// The stream object whose dictionary is `window.buf[content_start..keyword]`
+    /// and whose `stream` keyword sits at `keyword`: the dictionary parsed, and
+    /// the data located, never read. `/Length` is trusted only when `endstream`
+    /// follows the data it names; otherwise (or when it is missing or cannot be
+    /// resolved) the data ends at the first `endstream` of the source, found by
+    /// a windowed scan, less the end of line before it.
+    fn load_stream_object(
+        &self,
+        obj_ref: ObjectRef,
+        offset: u64,
+        window: &mut Window<'_>,
+        content_start: usize,
+        keyword: usize,
+    ) -> Result<Object> {
+        let is_space = |b: u8| b.is_ascii_whitespace() || b == 0;
+        let spec_violation = |message: &str| {
+            log::warn!("{}", message);
+            crate::extractors::warnings::push_global_warning(
+                crate::extractors::warnings::Warning {
+                    category: crate::extractors::warnings::WarningCategory::SpecViolation,
+                    page: None,
+                    message: message.to_string(),
+                    spec_section: Some("7.3.8.1"),
+                },
+            );
+        };
+
+        let mut dict = match parse_object(&window.buf[content_start..keyword]) {
+            Ok((rest, Object::Dictionary(d))) if rest.iter().all(|&b| is_space(b)) => d,
+            _ => {
+                log::warn!(
+                    "Object {} at offset {} is corrupted (stream dictionary), using Null \
+                     placeholder. This may result in missing content from the PDF.",
+                    obj_ref.id,
+                    offset
+                );
+                return Ok(Object::Null);
+            },
+        };
+
+        // Exactly one end of line follows `stream` (ISO 32000-1:2008
+        // §7.3.8.1); CR alone and none at all are accepted as the parser did.
+        let after = keyword + 6;
+        window.ensure(after + 2)?;
+        let tail = &window.buf[after..];
+        let eol = if tail.starts_with(b"\r\n") {
+            2
+        } else if tail.starts_with(b"\n") {
+            1
+        } else if tail.starts_with(b"\r") {
+            spec_violation(
+                "SPEC VIOLATION: Stream keyword followed by CR alone (should be CRLF or LF). \
+                 Accepting in lenient mode for compatibility. \
+                 PDF Spec: ISO 32000-1:2008, Section 7.3.8.1",
+            );
+            1
+        } else {
+            spec_violation(
+                "SPEC VIOLATION: No newline after stream keyword (should be CRLF or LF). \
+                 PDF Spec: ISO 32000-1:2008, Section 7.3.8.1",
+            );
+            0
+        };
+        let start = window.offset_of(after + eol);
+
+        let declared = match dict.get("Length") {
+            Some(Object::Integer(n)) if *n >= 0 => Some(*n as u64),
+            Some(Object::Reference(length_ref)) => match self.load_object(*length_ref) {
+                Ok(Object::Integer(n)) if n >= 0 => Some(n as u64),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        // The data must be followed by `endstream`, else /Length is wrong.
+        let holds = |len: u64| -> Result<bool> {
+            let mut tail = [0u8; 20];
+            let n = self.source.read_at(start.saturating_add(len), &mut tail)?;
+            let tail = &tail[..n];
+            let skip = tail.iter().take_while(|&&b| is_space(b)).count();
+            Ok(tail[skip..].starts_with(b"endstream"))
+        };
+        let len = match declared {
+            Some(len) if holds(len)? => len,
+            _ => {
+                let Some(found) = self.source.find(start, b"endstream")? else {
+                    log::warn!(
+                        "Object {} at offset {} has no endstream, using Null placeholder.",
+                        obj_ref.id,
+                        offset
+                    );
+                    return Ok(Object::Null);
+                };
+                let mut end = found;
+                let mut before = [0u8; 2];
+                let back = (end - start).min(2) as usize;
+                self.source.read_at(end - back as u64, &mut before[2 - back..])?;
+                if back >= 1 && before[1] == b'\n' {
+                    end -= 1;
+                    if back == 2 && before[0] == b'\r' {
+                        end -= 1;
+                    }
+                } else if back >= 1 && before[1] == b'\r' {
+                    end -= 1;
+                }
+                let len = end - start;
+                let msg = match declared {
+                    Some(declared) => format!(
+                        "Stream /Length {declared} is incorrect, repaired to {len} by an \
+                         endstream scan"
+                    ),
+                    None => format!(
+                        "Stream /Length is missing or unresolvable, repaired to {len} by an \
+                         endstream scan"
+                    ),
+                };
+                log::warn!("{}", msg);
+                self.push_structured_warning(crate::extractors::warnings::Warning {
+                    category: crate::extractors::warnings::WarningCategory::SpecViolation,
+                    page: None,
+                    message: msg,
+                    spec_section: Some("7.3.8.2"),
+                });
+                dict.insert("Length".to_string(), Object::Integer(len as i64));
+                len
+            },
+        };
+
+        let extent = Extent::new(Arc::clone(&self.source), start, len, obj_ref, &dict);
+        Ok(Object::Stream { dict, body: StreamBody::Extent(extent) })
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Load a compressed object from an object stream (Type 2 xref entry).
     ///
@@ -4423,24 +4287,24 @@ impl PdfDocument {
         // (non-standard), the unencrypted decode will fail and we fall back to
         // trying with decryption.
         self.objstm_inflations.fetch_add(1, Ordering::Relaxed);
-        let handler_ref = self.encryption_handler.lock_or_recover();
-        let decoded = if handler_ref.is_some() {
-            // First try without decryption (spec-compliant path)
-            match decode_object_stream(&stream_obj, None, 0, 0) {
-                Ok(decoded) => decoded,
-                Err(_no_decrypt_err) => {
-                    // Fallback: try with decryption for non-standard producers
-                    let handler = handler_ref.as_ref().unwrap();
-                    let decrypt_fn = |data: &[u8]| -> Result<Vec<u8>> {
-                        handler.decrypt_stream(data, stream_obj_num, 0)
+        // The extent of an object stream reads as it is stored (spec-compliant
+        // path); only when that fails on an encrypted document is it read as
+        // an enciphered stream, for non-standard producers.
+        let decoded = match decode_object_stream(&stream_obj) {
+            Ok(decoded) => decoded,
+            Err(stored_err) => match &stream_obj {
+                Object::Stream { dict, body: StreamBody::Extent(extent) }
+                    if self.source.handler().is_some() =>
+                {
+                    let enciphered = Object::Stream {
+                        dict: dict.clone(),
+                        body: StreamBody::Extent(extent.enciphered()),
                     };
-                    decode_object_stream(&stream_obj, Some(&decrypt_fn), stream_obj_num, 0)?
+                    decode_object_stream(&enciphered)?
                 },
-            }
-        } else {
-            decode_object_stream(&stream_obj, None, 0, 0)?
+                _ => return Err(stored_err),
+            },
         };
-        drop(handler_ref);
 
         let decoded = Arc::new(decoded);
         *self.objstm_memo.lock_or_recover() = Some((stream_obj_num, Arc::clone(&decoded)));
@@ -4486,6 +4350,12 @@ impl PdfDocument {
         self.object_cache.lock_or_recover().get(&r).is_some()
     }
 
+    /// The bytes the object cache charges for what it holds.
+    #[cfg(test)]
+    pub(crate) fn object_cache_bytes(&self) -> usize {
+        self.object_cache.lock_or_recover().current_bytes
+    }
+
     /// Walks the page tree once and indexes every page.
     #[cfg(test)]
     pub(crate) fn index_all_pages(&self) -> Result<()> {
@@ -4517,7 +4387,9 @@ impl PdfDocument {
         // Read the search region under one lock guard (#398 Race A).
         let mut buffer = vec![0u8; search_distance as usize + 100]; // Extra bytes to read full line
         let bytes_read = {
-            let mut reader = self.reader.lock_or_recover();
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            let mut reader = self.source.lock_reader();
+            // ── end pdf_manipulator patch ──
             reader.seek(SeekFrom::Start(search_start))?;
             reader.read(&mut buffer)?
         };
@@ -11304,8 +11176,9 @@ impl PdfDocument {
 
         // Get /N (Normal appearance) — can be a stream ref or a dictionary of states
         let n_obj = ap_dict.get("N")?;
-        let (n_stream, n_ref) = match n_obj {
-            Object::Reference(r) => (self.load_object(*r).ok()?, *r),
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        let n_stream = match n_obj {
+            Object::Reference(r) => self.load_object(*r).ok()?,
             _ => return None, // N must be a reference to a stream
         };
 
@@ -11313,7 +11186,8 @@ impl PdfDocument {
         let n_dict = n_stream.as_dict()?;
 
         // Decode the AP/N stream
-        let stream_data = match self.decode_stream_with_encryption(&n_stream, n_ref) {
+        let stream_data = match n_stream.decode_stream_data() {
+        // ── end pdf_manipulator patch ──
             Ok(data) => data,
             Err(_) => return None,
         };
@@ -11768,8 +11642,9 @@ impl PdfDocument {
         // ensure_encryption_initialized may fail on malformed Encrypt
         // dicts — that's fine, no permissions surface for those.
         let _ = self.ensure_encryption_initialized();
-        let handler = self.encryption_handler.lock_or_recover();
-        let handler = handler.as_ref()?;
+        // ── pdf_manipulator patch: the handler lives in the Source ──
+        let handler = self.source.handler()?;
+        // ── end pdf_manipulator patch ──
         Some(crate::encryption::PdfPermissions::from_p_flag(handler.raw_permissions()))
     }
 
@@ -18865,10 +18740,9 @@ impl PdfDocument {
                     if dict.get("Subtype").and_then(Object::as_name) != Some("Form") {
                         continue;
                     }
-                    let data = match xobj_ref {
-                        Some(r) => self.decode_stream_with_encryption(&xobj, r)?,
-                        None => xobj.decode_stream_data()?,
-                    };
+                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                    let data = xobj.decode_stream_data()?;
+                    // ── end pdf_manipulator patch ──
                     (dict.clone(), data)
                 },
                 _ => continue,
@@ -19914,7 +19788,9 @@ impl PdfDocument {
                     match (|| -> Result<Vec<u8>> {
                         if let Some(ref_val) = content_item.as_reference() {
                             let content_obj = self.load_object(ref_val)?;
-                            self.decode_stream_with_encryption(&content_obj, ref_val)
+                            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                            content_obj.decode_stream_data()
+                            // ── end pdf_manipulator patch ──
                         } else {
                             content_item.decode_stream_data()
                         }
@@ -19937,7 +19813,9 @@ impl PdfDocument {
             } else {
                 // The reference pointed to a single stream
                 // Decode with encryption support, using the object reference
-                self.decode_stream_with_encryption(&contents, contents_ref_val)?
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                contents.decode_stream_data()?
+                // ── end pdf_manipulator patch ──
             }
         } else if let Some(contents_array) = contents_ref.as_array() {
             // Array of streams - can be references or direct objects
@@ -19950,7 +19828,9 @@ impl PdfDocument {
                 match (|| -> Result<Vec<u8>> {
                     if let Some(ref_val) = content_item.as_reference() {
                         let content_obj = self.load_object(ref_val)?;
-                        self.decode_stream_with_encryption(&content_obj, ref_val)
+                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                        content_obj.decode_stream_data()
+                        // ── end pdf_manipulator patch ──
                     } else {
                         content_item.decode_stream_data()
                     }
@@ -20598,7 +20478,9 @@ impl PdfDocument {
         let stream_data = if let Some(cached) = cached_stream {
             cached.as_ref().clone()
         } else {
-            match self.decode_stream_with_encryption(&xobject, xobject_ref) {
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            match xobject.decode_stream_data() {
+            // ── end pdf_manipulator patch ──
                 Ok(data) => {
                     const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
                     let current = self.xobject_stream_cache_bytes.load(Ordering::Relaxed);
@@ -21532,10 +21414,15 @@ impl PdfDocument {
         };
         // ── pdf_manipulator patch: stream bodies are StreamBody ──
         if let Object::Stream { body, .. } = stream {
-            let data = body.inline();
+            (body.len()).hash(hasher);
+            // The data is folded in pieces: a stream of any size is never held.
+            if let Ok(mut data) = body.raw_reader() {
+                let mut piece = [0u8; 8192];
+                while let Ok(n @ 1..) = data.read(&mut piece) {
+                    hasher.write(&piece[..n]);
+                }
+            }
             // ── end pdf_manipulator patch ──
-            (data.len() as u64).hash(hasher);
-            data.as_ref().hash(hasher);
         }
     }
 
@@ -24372,7 +24259,9 @@ impl PdfDocument {
                 continue;
             };
             if let Ok(stream_obj) = self.load_object(stream_ref) {
-                if let Ok(bytes) = self.decode_stream_with_encryption(&stream_obj, stream_ref) {
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                if let Ok(bytes) = stream_obj.decode_stream_data() {
+                // ── end pdf_manipulator patch ──
                     out.push((filename, bytes));
                 }
             }
@@ -24774,7 +24663,9 @@ impl PdfDocument {
         let stream_data = if let Some(cached) = cached_stream {
             cached.as_ref().clone()
         } else {
-            match self.decode_stream_with_encryption(xobject, xobject_ref) {
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            match xobject.decode_stream_data() {
+            // ── end pdf_manipulator patch ──
                 Ok(data) => {
                     const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
                     let current_bytes = self.xobject_stream_cache_bytes.load(Ordering::Relaxed);
@@ -25115,7 +25006,7 @@ impl PdfDocument {
                             }
                         }
                         // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                        resolved_xobject = Object::stream(new_dict, body.inline().clone());
+                        resolved_xobject = Object::Stream { dict: new_dict, body: body.clone() };
                         // ── end pdf_manipulator patch ──
                         &resolved_xobject
                     } else {
@@ -25261,7 +25152,9 @@ impl PdfDocument {
         let stream_data = if let Some(cached) = cached_stream {
             cached.as_ref().clone()
         } else {
-            match self.decode_stream_with_encryption(xobject, xobject_ref) {
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            match xobject.decode_stream_data() {
+            // ── end pdf_manipulator patch ──
                 Ok(data) => {
                     const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
                     let current_bytes = self.xobject_stream_cache_bytes.load(Ordering::Relaxed);
@@ -26107,6 +26000,43 @@ fn validate_root_loadable<R: Read + Seek>(
     };
     validate_object_at_offset(reader, xref, root_ref)
 }
+
+// ── pdf_manipulator patch: a stream is its dictionary and an extent, never its data ──
+/// Where an object's body ends in the window the loader reads.
+enum BodyEnd {
+    /// The `endobj` keyword at this index.
+    EndObj(usize),
+    /// The `stream` keyword at this index: the body is a dictionary, then data.
+    Stream(usize),
+}
+
+/// The first `endobj`, or `stream` after a dictionary's `>>`, in
+/// `buf[*scanned..]`, judged only where the whole six-byte keyword is in
+/// the window. `*scanned` moves past the bytes judged, so a window that grows
+/// is never rescanned; `content_start` bounds the look back from `stream`.
+fn find_body_end(buf: &[u8], content_start: usize, scanned: &mut usize) -> Option<BodyEnd> {
+    let last = buf.len().checked_sub(6)?;
+    let mut i = *scanned;
+    while i <= last {
+        match buf[i] {
+            b'e' if buf[i..].starts_with(b"endobj") => return Some(BodyEnd::EndObj(i)),
+            b's' if buf[i..].starts_with(b"stream")
+                && buf[content_start..i]
+                    .iter()
+                    .rev()
+                    .find(|&&b| !(b.is_ascii_whitespace() || b == 0))
+                    == Some(&b'>') =>
+            {
+                return Some(BodyEnd::Stream(i));
+            },
+            _ => {},
+        }
+        i += 1;
+    }
+    *scanned = i;
+    None
+}
+// ── end pdf_manipulator patch ──
 
 /// Check if a string contains the standalone "obj" keyword (not "endobj").
 ///
@@ -30741,11 +30671,9 @@ mod tests {
 
     #[test]
     fn test_decode_stream_with_encryption_null_object() {
-        let pdf = build_minimal_pdf(b"");
-        let doc = PdfDocument::from_bytes(pdf).unwrap();
-        let result = doc
-            .decode_stream_with_encryption(&Object::Null, ObjectRef::new(1, 0))
-            .unwrap();
+        // ── pdf_manipulator patch: decryption belongs to the stream's extent ──
+        let result = Object::Null.decode_stream_data().unwrap();
+        // ── end pdf_manipulator patch ──
         assert!(result.is_empty());
     }
 
@@ -32590,9 +32518,9 @@ mod tests {
         let pdf = build_minimal_pdf(b"BT (Hello) Tj ET");
         let doc = PdfDocument::from_bytes(pdf).unwrap();
         let stream_obj = doc.load_object(ObjectRef::new(4, 0)).unwrap();
-        assert!(doc
-            .decode_stream_with_encryption(&stream_obj, ObjectRef::new(4, 0))
-            .is_ok());
+        // ── pdf_manipulator patch: decryption belongs to the stream's extent ──
+        assert!(stream_obj.decode_stream_data().is_ok());
+        // ── end pdf_manipulator patch ──
     }
 
     #[test]

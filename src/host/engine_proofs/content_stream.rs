@@ -10,9 +10,9 @@ use crate::content::{parse_content_stream, Operator};
 use crate::document::PdfDocument;
 use crate::host::content::operators::TJ_CHUNK;
 use crate::host::content::{Lexer, Mode, Operators};
+use super::support::corpus_pdfs;
 use crate::object::Object;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
 
 const CHUNKS: [usize; 7] = [1, 2, 3, 7, 64, 1024, 65536];
 pub(super) const WINDOWS: [usize; 2] = [16, 64 * 1024];
@@ -181,32 +181,6 @@ fn assert_parity(label: &str, data: &[u8]) {
     let mut totals = Totals::default();
     totals.compare(label, data);
     assert!(totals.mismatches.is_empty(), "{:#?}", totals.mismatches);
-}
-
-fn pdfs_under(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            pdfs_under(&path, out);
-        } else if path.extension().is_some_and(|e| e == "pdf") {
-            out.push(path);
-        }
-    }
-}
-
-fn corpus_pdfs() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
-    for dir in [root.join("tests/fixtures"), root.join("../../tool/bench/.corpus")] {
-        if dir.is_dir() {
-            pdfs_under(&dir, &mut out);
-        } else {
-            println!("skipped, absent: {}", dir.display());
-        }
-    }
-    out
 }
 
 /// The `b"..."` literals of the parser's own test module.

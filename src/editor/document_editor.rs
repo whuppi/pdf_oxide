@@ -10,6 +10,9 @@ use crate::error::{Error, Result};
 use crate::extractors::HierarchicalExtractor;
 use crate::geometry::Rect;
 use crate::object::{Object, ObjectRef};
+// ── pdf_manipulator patch: stream bodies are StreamBody ──
+use crate::object::StreamBody;
+// ── end pdf_manipulator patch ──
 use crate::writer::{hoist_appearance_streams, ContentStreamBuilder, ObjectSerializer};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -1755,7 +1758,7 @@ impl DocumentEditor {
         page_id: u32,
         source_pages: &[u32],
     ) -> Result<MergedPageImport> {
-        let mut page = Self::load_dict_only(&merged.doc, page_ref)?;
+        let mut page = merged.doc.load_object(page_ref)?;
         let first = merged.objects.len();
         // The page tree is never followed: the save sets /Parent. What the
         // page inherits from it is imported with the page instead.
@@ -1824,7 +1827,7 @@ impl DocumentEditor {
     /// the page's own entries plus the inheritable ones it lacks, with no
     /// /Parent.
     fn merged_page_object(source: &MergedSource, page_ref: ObjectRef) -> Result<Object> {
-        let mut page = Self::load_dict_only(&source.doc, page_ref)?;
+        let mut page = source.doc.load_object(page_ref)?;
         if let Object::Dictionary(dict) = &mut page {
             if let Some(Object::Reference(parent)) = dict.remove("Parent") {
                 for (key, value) in source.inherited.get(&parent.id).into_iter().flatten() {
@@ -1833,15 +1836,6 @@ impl DocumentEditor {
             }
         }
         Ok(page)
-    }
-
-    /// An object as the walk and the save read it: a stream is its
-    /// dictionary with no data, so nothing large is ever loaded.
-    fn load_dict_only(doc: &PdfDocument, r: ObjectRef) -> Result<Object> {
-        match doc.stream_head(r)? {
-            Some(head) => Ok(Object::stream(head.dict, bytes::Bytes::new())),
-            None => doc.load_object(r),
-        }
     }
 
     /// Gives every object reachable from `root` a new id, once, pushing
@@ -1868,7 +1862,7 @@ impl DocumentEditor {
             let new_id = self.allocate_object_id();
             id_map.insert(r.id, new_id);
             out.push((new_id, r.id));
-            Self::push_walk_refs(&Self::load_dict_only(doc, r)?, &mut pending);
+            Self::push_walk_refs(&doc.load_object(r)?, &mut pending);
         }
         Ok(())
     }
@@ -1943,7 +1937,7 @@ impl DocumentEditor {
                 if imported.contains(&r.id) || !reached.insert(new_id) {
                     continue;
                 }
-                Self::push_walk_refs(&Self::load_dict_only(&source.doc, r)?, &mut pending);
+                Self::push_walk_refs(&source.doc.load_object(r)?, &mut pending);
             }
             source.doc.clear_object_cache();
             for page in &source.pages {
@@ -3018,17 +3012,16 @@ impl DocumentEditor {
         only
     }
 
-    /// Load an object from `self.source` for copying into the output file,
-    /// decrypting its stream data (if any) so it survives into an output
-    /// with no `/Encrypt` dictionary of its own (#1032). A no-op beyond the
-    /// plain load when the source isn't encrypted. Every `self.source.load_object`
-    /// call in `write_full_to_writer` whose result can reach the output
-    /// writer goes through this instead of the raw accessor — the one
-    /// exception is `collect_reachable_ids`'s graph walk just above, which
-    /// only inspects references and never emits bytes.
+    /// Load an object from `self.source` for copying into the output file.
+    /// A stream's data is an extent that decrypts itself when it is read, so
+    /// it survives into an output with no `/Encrypt` dictionary of its own
+    /// (#1032). Every `self.source.load_object` call in
+    /// `write_full_to_writer` whose result can reach the output writer goes
+    /// through this instead of the raw accessor — the one exception is
+    /// `collect_reachable_ids`'s graph walk just above, which only inspects
+    /// references and never emits bytes.
     fn load_source_object(&self, r: ObjectRef) -> Result<Object> {
-        let obj = self.source.load_object(r)?;
-        self.source.decrypt_stream_for_copy(obj, r)
+        self.source.load_object(r)
     }
 
     // the page walk writes staged objects
@@ -3151,10 +3144,10 @@ impl DocumentEditor {
         deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
-        use crate::host::deflate::{self, Counter, Encoding, SourceRead, MEMORY_STREAM};
+        use crate::host::deflate::{self, Encoding, MEMORY_STREAM};
+        use crate::source::Counter;
 
         const CHUNK: usize = 64 * 1024;
-        const EMPTY_TAIL: &[u8] = b"\nstream\n\nendstream\nendobj\n";
 
         /// How the data is written: as the source holds it, as an in-memory
         /// re-encoding, or deflated while streaming (the level).
@@ -3164,7 +3157,7 @@ impl DocumentEditor {
             Streamed(u32),
         }
 
-        if encrypting_output || source.is_encrypted() {
+        if encrypting_output {
             return Ok(false);
         }
         let Some(head) = source.stream_head(r)? else {
@@ -3176,18 +3169,18 @@ impl DocumentEditor {
         ) {
             return Ok(false);
         }
+        // The data as the output holds it is the decrypted data: a source
+        // that is encrypted is read through its extent's decrypting reader.
+        let stored = StreamBody::Extent(head.extent.clone());
+        let data_len = stored.decrypted_len()?;
 
         // A re-encoding is kept only when strictly smaller than the source
         // data; a stream that does not inflate keeps its source bytes.
         let encoding = deflate::encoding(&head.dict);
         let body = match deflate.filter(|_| encoding != Encoding::Other) {
             None => Body::Copy,
-            Some(level) if head.data_len <= MEMORY_STREAM => {
-                let mut raw = vec![0u8; head.data_len as usize];
-                std::io::Read::read_exact(
-                    &mut SourceRead::new(source, head.data_start, head.data_len),
-                    &mut raw,
-                )?;
+            Some(level) if data_len <= MEMORY_STREAM => {
+                let raw = stored.read_whole_raw()?;
                 match deflate::smaller(&raw, encoding, level) {
                     Some(encoded) => Body::Memory(encoded),
                     None => Body::Copy,
@@ -3196,12 +3189,12 @@ impl DocumentEditor {
             Some(level) => {
                 let mut counter = Counter::default();
                 let counted = deflate::recode(
-                    SourceRead::new(source, head.data_start, head.data_len),
+                    stored.raw_reader()?,
                     encoding == Encoding::Flate,
                     level,
                     &mut counter,
                 );
-                if counted.is_ok() && counter.0 < head.data_len {
+                if counted.is_ok() && counter.0 < data_len {
                     Body::Streamed(level)
                 } else {
                     Body::Copy
@@ -3218,7 +3211,7 @@ impl DocumentEditor {
         }
         let length_id = match &body {
             Body::Copy => {
-                dict.insert("Length".to_string(), Object::Integer(head.data_len as i64));
+                dict.insert("Length".to_string(), Object::Integer(data_len as i64));
                 None
             },
             Body::Memory(encoded) => {
@@ -3233,38 +3226,22 @@ impl DocumentEditor {
             },
         };
 
-        let framed = serializer.serialize_indirect(
-            out_id,
-            0,
-            &Object::stream(dict, bytes::Bytes::new()),
-        );
-        let Some(prefix) = framed.strip_suffix(EMPTY_TAIL) else {
-            return Ok(false);
-        };
-
         let offset = writer.position();
-        writer.write_all(prefix)?;
-        writer.write_all(b"\nstream\n")?;
-
-        let mut buf = vec![0u8; CHUNK];
-        let mut copy = |out: &mut dyn Write| -> Result<()> {
-            let mut at = head.data_start;
-            let end = head.data_start + head.data_len;
-            while at < end {
-                let want = ((end - at) as usize).min(CHUNK);
-                let n = source.read_source_at(at, &mut buf[..want])?;
-                if n == 0 {
-                    return Err(Error::UnexpectedEof);
-                }
-                out.write_all(&buf[..n])?;
-                at += n as u64;
-            }
-            Ok(())
-        };
+        serializer.write_stream_open(&mut *writer, out_id, 0, &dict)?;
 
         let compressed_len = match body {
             Body::Copy => {
-                copy(&mut *writer)?;
+                let mut data = stored.raw_reader()?;
+                let mut buf = vec![0u8; CHUNK];
+                loop {
+                    let n = data
+                        .read(&mut buf)
+                        .map_err(crate::encryption::stream::from_io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    writer.write_all(&buf[..n])?;
+                }
                 None
             },
             Body::Memory(encoded) => {
@@ -3274,7 +3251,7 @@ impl DocumentEditor {
             Body::Streamed(level) => {
                 let start = writer.position();
                 deflate::recode(
-                    SourceRead::new(source, head.data_start, head.data_len),
+                    stored.raw_reader()?,
                     encoding == Encoding::Flate,
                     level,
                     &mut *writer,
@@ -3411,7 +3388,12 @@ impl DocumentEditor {
             match obj {
                 Object::Stream { mut dict, body } => {
                     let kind = encoding(&dict);
-                    let Some(compressed) = smaller(body.inline(), kind, level) else {
+                    // A stream the streaming copy declined is read whole. A
+                    // read that fails keeps the stream; the write reports it.
+                    let Ok(raw) = body.read_whole_raw() else {
+                        return Object::Stream { dict, body };
+                    };
+                    let Some(compressed) = smaller(&raw, kind, level) else {
                         return Object::Stream { dict, body };
                     };
                     if kind == Encoding::Raw {
@@ -3533,25 +3515,26 @@ impl DocumentEditor {
         let packer = crate::host::object_streams::ObjectPacker::new(options.object_streams);
         // ── end pdf_manipulator patch ──
 
-        // Helper to serialize with or without encryption
-        let serialize_obj = |s: &ObjectSerializer,
-                             id: u32,
-                             gen: u16,
-                             obj: &Object,
-                             handler: &Option<EncryptionWriteHandler>|
-         -> Vec<u8> {
-            // ── pdf_manipulator patch: non-stream objects wait in the packer ──
+        // ── pdf_manipulator patch: an object is written to the output, its stream data in pieces; non-stream objects wait in the packer ──
+        // Helper to write with or without encryption
+        let write_obj = |out: &mut dyn Write,
+                         s: &ObjectSerializer,
+                         id: u32,
+                         gen: u16,
+                         obj: &Object,
+                         handler: &Option<EncryptionWriteHandler>|
+         -> Result<()> {
             if gen == 0 && packer.takes(obj) {
                 packer.add(id, s.serialize_member(id, obj));
-                return Vec::new();
+                return Ok(());
             }
-            // ── end pdf_manipulator patch ──
-            if let Some(ref h) = handler {
-                s.serialize_indirect_encrypted(id, gen, obj, h)
-            } else {
-                s.serialize_indirect(id, gen, obj)
+            match handler {
+                Some(h) => s.write_indirect_encrypted(out, id, gen, obj, h),
+                None => s.write_indirect(out, id, gen, obj),
             }
+            .map_err(crate::encryption::stream::from_io)
         };
+        // ── end pdf_manipulator patch ──
 
         let mut xref_entries = XrefEntries::new();
         // ── pdf_manipulator patch: a merged duplicate is never written ──
@@ -3870,9 +3853,16 @@ impl DocumentEditor {
                 let stream_obj = Object::stream(stream_dict, file.data.clone());
                 // ── end pdf_manipulator patch ──
                 let offset = writer.position();
-                let bytes =
-                    serialize_obj(&serializer, stream_id, 0, &stream_obj, &encryption_handler);
-                writer.write_all(&bytes)?;
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                write_obj(
+                    &mut *writer,
+                    &serializer,
+                    stream_id,
+                    0,
+                    &stream_obj,
+                    &encryption_handler,
+                )?;
+                // ── end pdf_manipulator patch ──
                 xref_entries.push((stream_id, offset, 0, true));
 
                 // Build and write filespec dictionary
@@ -3883,9 +3873,16 @@ impl DocumentEditor {
                 let filespec_dict = file.build_filespec(stream_ref);
                 let filespec_obj = Object::Dictionary(filespec_dict);
                 let offset = writer.position();
-                let bytes =
-                    serialize_obj(&serializer, filespec_id, 0, &filespec_obj, &encryption_handler);
-                writer.write_all(&bytes)?;
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                write_obj(
+                    &mut *writer,
+                    &serializer,
+                    filespec_id,
+                    0,
+                    &filespec_obj,
+                    &encryption_handler,
+                )?;
+                // ── end pdf_manipulator patch ──
                 xref_entries.push((filespec_id, offset, 0, true));
 
                 embedded_file_refs.push((
@@ -3934,9 +3931,9 @@ impl DocumentEditor {
         // ── end pdf_manipulator patch ──
 
         let offset = writer.position();
-        let bytes =
-            serialize_obj(&serializer, catalog_ref.id, 0, &catalog_obj, &encryption_handler);
-        writer.write_all(&bytes)?;
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        write_obj(&mut *writer, &serializer, catalog_ref.id, 0, &catalog_obj, &encryption_handler)?;
+        // ── end pdf_manipulator patch ──
         xref_entries.push((catalog_ref.id, offset, 0, true));
 
         // ── pdf_manipulator patch: merged page ids were allocated by the merge ──
@@ -4027,14 +4024,16 @@ impl DocumentEditor {
                 };
 
                 let offset = writer.position();
-                let bytes = serialize_obj(
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                write_obj(
+                    &mut *writer,
                     &serializer,
                     pages_ref.id,
                     0,
                     &final_pages_obj,
                     &encryption_handler,
-                );
-                writer.write_all(&bytes)?;
+                )?;
+                // ── end pdf_manipulator patch ──
                 xref_entries.push((pages_ref.id, offset, 0, true));
                 drop(final_pages_obj);
 
@@ -4846,14 +4845,16 @@ impl DocumentEditor {
                                 }
 
                                 let offset = writer.position();
-                                let bytes = serialize_obj(
+                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                write_obj(
+                                    &mut *writer,
                                     &serializer,
                                     page_ref.id,
                                     0,
                                     &final_page_obj,
                                     &encryption_handler,
-                                );
-                                writer.write_all(&bytes)?;
+                                )?;
+                                // ── end pdf_manipulator patch ──
                                 xref_entries.push((page_ref.id, offset, 0, true));
                                 // ── pdf_manipulator patch: a repeated page is copied from this final dictionary ──
                                 if let Some(copy_ids) = copies_of.get(&page_ref.id) {
@@ -4887,14 +4888,16 @@ impl DocumentEditor {
                                                 let xobj_stream =
                                                     Self::build_image_xobject(&pending_image.image);
                                                 let offset = writer.position();
-                                                let bytes = serialize_obj(
+                                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                                write_obj(
+                                                    &mut *writer,
                                                     &serializer,
                                                     xobj_id,
                                                     0,
                                                     &xobj_stream,
                                                     &encryption_handler,
-                                                );
-                                                writer.write_all(&bytes)?;
+                                                )?;
+                                                // ── end pdf_manipulator patch ──
                                                 xref_entries.push((xobj_id, offset, 0, true));
 
                                                 xobject_refs.push((
@@ -4914,14 +4917,16 @@ impl DocumentEditor {
                                             // Use the pre-allocated content ID (page /Contents already updated)
                                             if let Some(content_id) = modified_content_id {
                                                 let offset = writer.position();
-                                                let bytes = serialize_obj(
+                                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                                write_obj(
+                                                    &mut *writer,
                                                     &serializer,
                                                     content_id,
                                                     0,
                                                     &content_stream_obj,
                                                     &encryption_handler,
-                                                );
-                                                writer.write_all(&bytes)?;
+                                                )?;
+                                                // ── end pdf_manipulator patch ──
                                                 xref_entries.push((content_id, offset, 0, true));
                                             }
 
@@ -4958,25 +4963,28 @@ impl DocumentEditor {
                                                                     );
                                                                     // ── end pdf_manipulator patch ──
                                                                     let offset = writer.position();
-                                                                    let bytes = serialize_obj(&serializer,
+                                                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                                                    write_obj(
+                                                                        &mut *writer,
+                                                                        &serializer,
                                                                         contents_ref.id,
                                                                         0,
                                                                         &modified_stream,
                                                                         &encryption_handler,
-                                                                    );
-                                                                    writer.write_all(&bytes)?;
+                                                                    )?;
                                                                     xref_entries.push((contents_ref.id, offset, 0, true));
                                                                 }
                                                                 Err(_) => {
                                                                     // Fallback to original content on error
                                                                     let offset = writer.position();
-                                                                    let bytes = serialize_obj(&serializer,
+                                                                    write_obj(
+                                                                        &mut *writer,
+                                                                        &serializer,
                                                                         contents_ref.id,
                                                                         0,
                                                                         &contents_obj,
                                                                         &encryption_handler,
-                                                                    );
-                                                                    writer.write_all(&bytes)?;
+                                                                    )?;
                                                                     xref_entries.push((contents_ref.id, offset, 0, true));
                                                                 }
                                                             }
@@ -4984,14 +4992,15 @@ impl DocumentEditor {
                                                             // Can't decode, write original
                                                             let offset =
                                                                 writer.position();
-                                                            let bytes = serialize_obj(
+                                                            write_obj(
+                                                                &mut *writer,
                                                                 &serializer,
                                                                 contents_ref.id,
                                                                 0,
                                                                 &contents_obj,
                                                                 &encryption_handler,
-                                                            );
-                                                            writer.write_all(&bytes)?;
+                                                            )?;
+                                                                    // ── end pdf_manipulator patch ──
                                                             xref_entries.push((
                                                                 contents_ref.id,
                                                                 offset,
@@ -5024,38 +5033,42 @@ impl DocumentEditor {
                                                                             );
                                                                             // ── end pdf_manipulator patch ──
                                                                             let offset = writer.position();
-                                                                            let bytes = serialize_obj(&serializer,
+                                                                            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                                                            write_obj(
+                                                                                &mut *writer,
+                                                                                &serializer,
                                                                                 ref_obj.id,
                                                                                 0,
                                                                                 &modified_stream,
                                                                                 &encryption_handler,
-                                                                            );
-                                                                            writer.write_all(&bytes)?;
+                                                                            )?;
                                                                             xref_entries.push((ref_obj.id, offset, 0, true));
                                                                         }
                                                                         Err(_) => {
                                                                             let offset = writer.position();
-                                                                            let bytes = serialize_obj(&serializer,
+                                                                            write_obj(
+                                                                                &mut *writer,
+                                                                                &serializer,
                                                                                 ref_obj.id,
                                                                                 0,
                                                                                 &stream_obj,
                                                                                 &encryption_handler,
-                                                                            );
-                                                                            writer.write_all(&bytes)?;
+                                                                            )?;
                                                                             xref_entries.push((ref_obj.id, offset, 0, true));
                                                                         }
                                                                     }
                                                                 } else {
                                                                     let offset =
                                                                         writer.position();
-                                                                    let bytes = serialize_obj(
+                                                                    write_obj(
+                                                                        &mut *writer,
                                                                         &serializer,
                                                                         ref_obj.id,
                                                                         0,
                                                                         &stream_obj,
                                                                         &encryption_handler,
-                                                                    );
-                                                                    writer.write_all(&bytes)?;
+                                                                    )?;
+                                                                            // ── end pdf_manipulator patch ──
                                                                     xref_entries.push((
                                                                         ref_obj.id, offset, 0, true,
                                                                     ));
@@ -5107,14 +5120,14 @@ impl DocumentEditor {
                                                         self.load_source_object(contents_ref)?
                                                     };
                                                     let offset = writer.position();
-                                                    let bytes = serialize_obj(
+                                                    write_obj(
+                                                        &mut *writer,
                                                         &serializer,
                                                         contents_ref.id,
                                                         0,
                                                         &contents_obj,
                                                         &encryption_handler,
-                                                    );
-                                                    writer.write_all(&bytes)?;
+                                                    )?;
                                                     xref_entries.push((
                                                         contents_ref.id,
                                                         offset,
@@ -5165,14 +5178,16 @@ impl DocumentEditor {
                                         }
 
                                         let offset = writer.position();
-                                        let bytes = serialize_obj(
+                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                        write_obj(
+                                            &mut *writer,
                                             &serializer,
                                             resources_ref.id,
                                             0,
                                             &resources_obj,
                                             &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
+                                        )?;
+                                        // ── end pdf_manipulator patch ──
                                         xref_entries.push((resources_ref.id, offset, 0, true));
                                     } else if !new_xobject_refs.is_empty() {
                                         // Resources is inline (not a reference) — new XObject refs
@@ -5230,14 +5245,16 @@ impl DocumentEditor {
                                                                 if let Ok(font_obj) = font_obj {
                                                                     let offset =
                                                                         writer.position();
-                                                                    let bytes = serialize_obj(
+                                                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                                                    write_obj(
+                                                                        &mut *writer,
                                                                         &serializer,
                                                                         ref_obj.id,
                                                                         0,
                                                                         &font_obj,
                                                                         &encryption_handler,
-                                                                    );
-                                                                    writer.write_all(&bytes)?;
+                                                                    )?;
+                                                                    // ── end pdf_manipulator patch ──
                                                                     xref_entries.push((
                                                                         ref_obj.id, offset, 0, true,
                                                                     ));
@@ -5260,14 +5277,14 @@ impl DocumentEditor {
                                                         let obj = self.staged_or_source_object(*r)?;
                                                         if !xref_entries.contains_id(r.id) {
                                                             let offset = writer.position();
-                                                            let bytes = serialize_obj(
+                                                            write_obj(
+                                                                &mut *writer,
                                                                 &serializer,
                                                                 r.id,
                                                                 0,
                                                                 &obj,
                                                                 &encryption_handler,
-                                                            );
-                                                            writer.write_all(&bytes)?;
+                                                            )?;
                                                             xref_entries.push((r.id, offset, 0, true));
                                                         }
                                                         obj.as_dict().cloned()
@@ -5300,14 +5317,14 @@ impl DocumentEditor {
                                                                         self.staged_or_source_object(ref_obj)?;
                                                                     let offset =
                                                                         writer.position();
-                                                                    let bytes = serialize_obj(
+                                                                    write_obj(
+                                                                        &mut *writer,
                                                                         &serializer,
                                                                         ref_obj.id,
                                                                         0,
                                                                         &xobj_obj,
                                                                         &encryption_handler,
-                                                                    );
-                                                                    writer.write_all(&bytes)?;
+                                                                    )?;
                                                                     xref_entries.push((
                                                                         ref_obj.id, offset, 0, true,
                                                                     ));
@@ -5331,14 +5348,14 @@ impl DocumentEditor {
                                                         let obj = self.staged_or_source_object(*r)?;
                                                         if !xref_entries.contains_id(r.id) {
                                                             let offset = writer.position();
-                                                            let bytes = serialize_obj(
+                                                            write_obj(
+                                                                &mut *writer,
                                                                 &serializer,
                                                                 r.id,
                                                                 0,
                                                                 &obj,
                                                                 &encryption_handler,
-                                                            );
-                                                            writer.write_all(&bytes)?;
+                                                            )?;
                                                             xref_entries.push((r.id, offset, 0, true));
                                                         }
                                                         obj.as_dict().cloned()
@@ -5370,14 +5387,14 @@ impl DocumentEditor {
                                                                         self.staged_or_source_object(ref_obj)?;
                                                                     let offset =
                                                                         writer.position();
-                                                                    let bytes = serialize_obj(
+                                                                    write_obj(
+                                                                        &mut *writer,
                                                                         &serializer,
                                                                         ref_obj.id,
                                                                         0,
                                                                         &obj,
                                                                         &encryption_handler,
-                                                                    );
-                                                                    writer.write_all(&bytes)?;
+                                                                    )?;
                                                                     xref_entries.push((
                                                                         ref_obj.id, offset, 0, true,
                                                                     ));
@@ -5405,14 +5422,16 @@ impl DocumentEditor {
                                         );
                                         // ── end pdf_manipulator patch ──
                                         let offset = writer.position();
-                                        let bytes = serialize_obj(
+                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                        write_obj(
+                                            &mut *writer,
                                             &serializer,
                                             overlay_obj_id,
                                             0,
                                             &overlay_stream,
                                             &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
+                                        )?;
+                                        // ── end pdf_manipulator patch ──
                                         xref_entries.push((overlay_obj_id, offset, 0, true));
                                     }
                                 }
@@ -5440,14 +5459,16 @@ impl DocumentEditor {
                                             );
                                             // ── end pdf_manipulator patch ──
                                             let offset = writer.position();
-                                            let bytes = serialize_obj(
+                                            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                            write_obj(
+                                                &mut *writer,
                                                 &serializer,
                                                 additions_id,
                                                 0,
                                                 &additions_stream,
                                                 &encryption_handler,
-                                            );
-                                            writer.write_all(&bytes)?;
+                                            )?;
+                                            // ── end pdf_manipulator patch ──
                                             xref_entries.push((additions_id, offset, 0, true));
                                         }
                                     }
@@ -5474,14 +5495,16 @@ impl DocumentEditor {
                                     );
                                     let font_obj = Object::Dictionary(font_obj_dict);
                                     let offset = writer.position();
-                                    let bytes = serialize_obj(
+                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                    write_obj(
+                                        &mut *writer,
                                         &serializer,
                                         *font_id,
                                         0,
                                         &font_obj,
                                         &encryption_handler,
-                                    );
-                                    writer.write_all(&bytes)?;
+                                    )?;
+                                    // ── end pdf_manipulator patch ──
                                     xref_entries.push((*font_id, offset, 0, true));
                                 }
 
@@ -5546,27 +5569,29 @@ impl DocumentEditor {
                                         );
                                         for (stream_id, stream_obj) in hoisted {
                                             let offset = writer.position();
-                                            let bytes = serialize_obj(
+                                            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                            write_obj(
+                                                &mut *writer,
                                                 &serializer,
                                                 stream_id,
                                                 0,
                                                 &stream_obj,
                                                 &encryption_handler,
-                                            );
-                                            writer.write_all(&bytes)?;
+                                            )?;
                                             xref_entries.push((stream_id, offset, 0, true));
                                         }
 
                                         // Write the annotation object
                                         let offset = writer.position();
-                                        let bytes = serialize_obj(
+                                        write_obj(
+                                            &mut *writer,
                                             &serializer,
                                             annot_id,
                                             0,
                                             &Object::Dictionary(annot_dict),
                                             &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
+                                        )?;
+                                            // ── end pdf_manipulator patch ──
                                         xref_entries.push((annot_id, offset, 0, true));
                                     }
                                 }
@@ -5585,14 +5610,16 @@ impl DocumentEditor {
 
                                         // Write the form field object
                                         let offset = writer.position();
-                                        let bytes = serialize_obj(
+                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                        write_obj(
+                                            &mut *writer,
                                             &serializer,
                                             *field_id,
                                             0,
                                             &Object::Dictionary(field_dict),
                                             &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
+                                        )?;
+                                        // ── end pdf_manipulator patch ──
                                         xref_entries.push((*field_id, offset, 0, true));
                                     }
                                 }
@@ -5657,28 +5684,30 @@ impl DocumentEditor {
                                         // ── end pdf_manipulator patch ──
 
                                         let offset = writer.position();
-                                        let bytes = serialize_obj(
+                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                        write_obj(
+                                            &mut *writer,
                                             &serializer,
                                             *obj_id,
                                             0,
                                             &form_stream,
                                             &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
+                                        )?;
                                         xref_entries.push((*obj_id, offset, 0, true));
 
                                         // Write any indirect objects this appearance depends
                                         // on (e.g. an embedded fallback-font graph).
                                         for (extra_id, extra_obj) in &appearance.extra_objects {
                                             let off = writer.position();
-                                            let b = serialize_obj(
+                                            write_obj(
+                                                &mut *writer,
                                                 &serializer,
                                                 *extra_id,
                                                 0,
                                                 extra_obj,
                                                 &encryption_handler,
-                                            );
-                                            writer.write_all(&b)?;
+                                            )?;
+                                        // ── end pdf_manipulator patch ──
                                             xref_entries.push((*extra_id, off, 0, true));
                                         }
                                     }
@@ -5697,14 +5726,16 @@ impl DocumentEditor {
                                     // ── end pdf_manipulator patch ──
 
                                     let offset = writer.position();
-                                    let bytes = serialize_obj(
+                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                    write_obj(
+                                        &mut *writer,
                                         &serializer,
                                         overlay_id,
                                         0,
                                         &overlay_stream,
                                         &encryption_handler,
-                                    );
-                                    writer.write_all(&bytes)?;
+                                    )?;
+                                    // ── end pdf_manipulator patch ──
                                     xref_entries.push((overlay_id, offset, 0, true));
                                 }
 
@@ -5721,14 +5752,16 @@ impl DocumentEditor {
                                     // ── end pdf_manipulator patch ──
 
                                     let offset = writer.position();
-                                    let bytes = serialize_obj(
+                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                    write_obj(
+                                        &mut *writer,
                                         &serializer,
                                         redact_overlay_id,
                                         0,
                                         &overlay_stream,
                                         &encryption_handler,
-                                    );
-                                    writer.write_all(&bytes)?;
+                                    )?;
+                                    // ── end pdf_manipulator patch ──
                                     xref_entries.push((redact_overlay_id, offset, 0, true));
                                 }
 
@@ -5746,14 +5779,16 @@ impl DocumentEditor {
                                     );
                                     // ── end pdf_manipulator patch ──
                                     let offset = writer.position();
-                                    let bytes = serialize_obj(
+                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                    write_obj(
+                                        &mut *writer,
                                         &serializer,
                                         *redacted_id,
                                         0,
                                         &redacted_stream,
                                         &encryption_handler,
-                                    );
-                                    writer.write_all(&bytes)?;
+                                    )?;
+                                    // ── end pdf_manipulator patch ──
                                     xref_entries.push((*redacted_id, offset, 0, true));
                                 }
 
@@ -5819,28 +5854,30 @@ impl DocumentEditor {
                                         // ── end pdf_manipulator patch ──
 
                                         let offset = writer.position();
-                                        let bytes = serialize_obj(
+                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                        write_obj(
+                                            &mut *writer,
                                             &serializer,
                                             *obj_id,
                                             0,
                                             &form_stream,
                                             &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
+                                        )?;
                                         xref_entries.push((*obj_id, offset, 0, true));
 
                                         // Write any indirect objects this appearance depends
                                         // on (e.g. an embedded fallback-font graph).
                                         for (extra_id, extra_obj) in &appearance.extra_objects {
                                             let off = writer.position();
-                                            let b = serialize_obj(
+                                            write_obj(
+                                                &mut *writer,
                                                 &serializer,
                                                 *extra_id,
                                                 0,
                                                 extra_obj,
                                                 &encryption_handler,
-                                            );
-                                            writer.write_all(&b)?;
+                                            )?;
+                                        // ── end pdf_manipulator patch ──
                                             xref_entries.push((*extra_id, off, 0, true));
                                         }
                                     }
@@ -5861,14 +5898,16 @@ impl DocumentEditor {
                                     // ── end pdf_manipulator patch ──
 
                                     let offset = writer.position();
-                                    let bytes = serialize_obj(
+                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                    write_obj(
+                                        &mut *writer,
                                         &serializer,
                                         form_overlay_id,
                                         0,
                                         &overlay_stream,
                                         &encryption_handler,
-                                    );
-                                    writer.write_all(&bytes)?;
+                                    )?;
+                                    // ── end pdf_manipulator patch ──
                                     xref_entries.push((form_overlay_id, offset, 0, true));
                                 }
 
@@ -5904,9 +5943,14 @@ impl DocumentEditor {
                     }
 
                     let offset = writer.position();
-                    let bytes =
-                        serialize_obj(&serializer, page.page_id, 0, &page_obj, &encryption_handler);
-                    writer.write_all(&bytes)?;
+                    write_obj(
+                        &mut *writer,
+                        &serializer,
+                        page.page_id,
+                        0,
+                        &page_obj,
+                        &encryption_handler,
+                    )?;
                     xref_entries.push((page.page_id, offset, 0, true));
                     if let Some(copy_ids) = copies_of.get(&page.page_id) {
                         page_copies.push((copy_ids.clone(), page_obj));
@@ -5944,13 +5988,10 @@ impl DocumentEditor {
                         continue;
                     }
                     let src_ref = ObjectRef::new(src_id, 0);
-                    let mut obj = source
-                        .doc
-                        .decrypt_stream_for_copy(source.doc.load_object(src_ref)?, src_ref)?;
+                    let mut obj = source.doc.load_object(src_ref)?;
                     Self::remap_refs(&mut obj, &source.id_map, page.page_id);
                     let offset = writer.position();
-                    let bytes = serialize_obj(&serializer, new_id, 0, &obj, &encryption_handler);
-                    writer.write_all(&bytes)?;
+                    write_obj(&mut *writer, &serializer, new_id, 0, &obj, &encryption_handler)?;
                     xref_entries.push((new_id, offset, 0, true));
                 }
                 // Each object was read once; the cache would only sit full.
@@ -5971,8 +6012,7 @@ impl DocumentEditor {
             let copy = Object::Dictionary(dict);
             for copy_id in copy_ids {
                 let offset = writer.position();
-                let bytes = serialize_obj(&serializer, copy_id, 0, &copy, &encryption_handler);
-                writer.write_all(&bytes)?;
+                write_obj(&mut *writer, &serializer, copy_id, 0, &copy, &encryption_handler)?;
                 xref_entries.push((copy_id, offset, 0, true));
             }
         }
@@ -5987,14 +6027,16 @@ impl DocumentEditor {
 
                 // Write the parent field object
                 let offset = writer.position();
-                let bytes = serialize_obj(
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                write_obj(
+                    &mut *writer,
                     &serializer,
                     *field_id,
                     0,
                     &Object::Dictionary(field_dict),
                     &encryption_handler,
-                );
-                writer.write_all(&bytes)?;
+                )?;
+                // ── end pdf_manipulator patch ──
                 xref_entries.push((*field_id, offset, 0, true));
             }
         }
@@ -6022,8 +6064,9 @@ impl DocumentEditor {
             // ── end pdf_manipulator patch ──
             let info_obj = info.to_object();
             let offset = writer.position();
-            let bytes = serialize_obj(&serializer, info_id, 0, &info_obj, &encryption_handler);
-            writer.write_all(&bytes)?;
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            write_obj(&mut *writer, &serializer, info_id, 0, &info_obj, &encryption_handler)?;
+            // ── end pdf_manipulator patch ──
             xref_entries.push((info_id, offset, 0, true));
             Some(ObjectRef::new(info_id, 0))
         } else {
@@ -6165,8 +6208,9 @@ impl DocumentEditor {
                         None => obj,
                     };
                     let offset = writer.position();
-                    let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
-                    writer.write_all(&bytes)?;
+                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                    write_obj(&mut *writer, &serializer, obj_id, 0, &obj, &encryption_handler)?;
+                    // ── end pdf_manipulator patch ──
                     xref_entries.push((obj_id, offset, 0, true));
                 },
                 // ── pdf_manipulator patch: an unreadable in-use object fails the save ──
@@ -6209,8 +6253,9 @@ impl DocumentEditor {
                 }
                 // ── end pdf_manipulator patch ──
                 let offset = writer.position();
-                let bytes = serialize_obj(&serializer, obj_id, 0, &obj, &encryption_handler);
-                writer.write_all(&bytes)?;
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                write_obj(&mut *writer, &serializer, obj_id, 0, &obj, &encryption_handler)?;
+                // ── end pdf_manipulator patch ──
                 xref_entries.push((obj_id, offset, 0, true));
             }
         }
@@ -9725,7 +9770,7 @@ impl DocumentEditor {
         let account = |obj: &Object, b: &mut u64| {
             *b += match obj {
                 // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                Object::Stream { body, .. } => body.inline().len() as u64 + 64,
+                Object::Stream { body, .. } => body.len() + 64,
                 // ── end pdf_manipulator patch ──
                 _ => 48,
             };
@@ -12264,7 +12309,7 @@ mod tests {
             // ── end pdf_manipulator patch ──
             assert_eq!(dict.get("Length").unwrap().as_integer().unwrap(), 5);
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            assert_eq!(body.inline().as_ref(), &data[..]);
+            assert_eq!(body.inline().expect("an inline body").as_ref(), &data[..]);
             // ── end pdf_manipulator patch ──
         } else {
             panic!("Expected Stream object");

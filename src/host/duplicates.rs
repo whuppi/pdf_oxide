@@ -21,11 +21,12 @@
 
 use crate::cancel::CancelCheck;
 use crate::document::{PdfDocument, StreamHead};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::host::deflate::MEMORY_STREAM;
-use crate::object::{Object, ObjectRef};
+use crate::object::{Object, ObjectRef, StreamBody};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 
 const CHUNK: usize = 64 * 1024;
 
@@ -76,9 +77,9 @@ impl Fetched<'_> {
     /// The dictionary and the data length of a stream.
     fn stream(&self) -> Option<(&HashMap<String, Object>, u64)> {
         match self {
-            Fetched::Head(head) => Some((&head.dict, head.data_len)),
+            Fetched::Head(head) => Some((&head.dict, head.data_len())),
             other => match other.object()? {
-                Object::Stream { dict, body } => Some((dict, body.inline().len() as u64)),
+                Object::Stream { dict, body } => Some((dict, body.len())),
                 _ => None,
             },
         }
@@ -93,8 +94,20 @@ fn fetch<'a>(origin: &Origin<'a>, id: u32) -> Result<Fetched<'a>> {
     if let Some(head) = origin.doc.stream_head(r)? {
         return Ok(Fetched::Head(head));
     }
-    let obj = origin.doc.load_object(r)?;
-    Ok(Fetched::Loaded(origin.doc.decrypt_stream_for_copy(obj, r)?))
+    Ok(Fetched::Loaded(origin.doc.load_object(r)?))
+}
+
+/// Feeds the decrypted data of `body` to `hasher` in pieces.
+fn hash_body(body: &StreamBody, hasher: &mut Sha256) -> Result<()> {
+    let mut data = body.raw_reader()?;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = data.read(&mut buf).map_err(crate::encryption::stream::from_io)?;
+        if n == 0 {
+            return Ok(());
+        }
+        hasher.update(&buf[..n]);
+    }
 }
 
 /// A stream the merge never touches: it names a layer or a structure.
@@ -204,7 +217,7 @@ fn shared_plain(origins: &[Origin<'_>], plain: Vec<Plain>, cancel: &CancelCheck)
             let id = fetch_id(origin, p.out, p.src);
             let Ok(fetched) = fetch(origin, id) else { continue };
             let mut hasher = Sha256::new();
-            if data_into(origin.doc, id, &fetched, &mut hasher)? {
+            if data_into(origin.doc, &fetched, &mut hasher)? {
                 by_data.entry((p.len, hasher.finalize().into())).or_default().push(index);
             }
         }
@@ -253,44 +266,24 @@ fn fits(doc: &PdfDocument, len: u64) -> bool {
 
 /// Feeds the encoded data of stream `id`, read in pieces; `false` when it
 /// cannot be read in full or is too large to decrypt in memory.
-fn data_into(doc: &PdfDocument, id: u32, fetched: &Fetched<'_>, hasher: &mut Sha256) -> Result<bool> {
+fn data_into(doc: &PdfDocument, fetched: &Fetched<'_>, hasher: &mut Sha256) -> Result<bool> {
     match fetched {
         Fetched::Head(head) => {
-            if doc.is_encrypted() {
-                if head.data_len > MEMORY_STREAM {
-                    return Ok(false);
-                }
-                let r = ObjectRef::new(id, 0);
-                let Ok(obj) = doc.load_object(r) else { return Ok(false) };
-                return match doc.decrypt_stream_for_copy(obj, r)? {
-                    Object::Stream { body, .. } => {
-                        hasher.update(body.inline());
-                        Ok(true)
-                    },
-                    _ => Ok(false),
-                };
+            if doc.is_encrypted() && head.data_len() > MEMORY_STREAM {
+                return Ok(false);
             }
-            let mut buf = vec![0u8; CHUNK];
-            let mut at = head.data_start;
-            let end = head.data_start + head.data_len;
-            while at < end {
-                let want = ((end - at) as usize).min(CHUNK);
-                let n = doc.read_source_at(at, &mut buf[..want])?;
-                if n == 0 {
-                    return Ok(false);
-                }
-                hasher.update(&buf[..n]);
-                at += n as u64;
+            match hash_body(&StreamBody::Extent(head.extent.clone()), hasher) {
+                Ok(()) => Ok(true),
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+                Err(e) => Err(e),
             }
-            Ok(true)
         },
         other => match other.object() {
             Some(Object::Stream { body, .. }) => {
-                let data = body.inline();
-                if doc.is_encrypted() && data.len() as u64 > MEMORY_STREAM {
+                if doc.is_encrypted() && body.len() > MEMORY_STREAM {
                     return Ok(false);
                 }
-                hasher.update(data);
+                hash_body(body, hasher)?;
                 Ok(true)
             },
             _ => Ok(false),
@@ -318,7 +311,7 @@ impl Hashing<'_, '_> {
         hasher.update([c.kind as u8]);
         let mut path = vec![c.src];
         self.met_cycle = false;
-        if !self.stream_into(c.origin, id, &fetched, &mut path, &mut hasher)? {
+        if !self.stream_into(c.origin, &fetched, &mut path, &mut hasher)? {
             return Ok(None);
         }
         Ok(Some(hasher.finalize().into()))
@@ -328,7 +321,6 @@ impl Hashing<'_, '_> {
     fn stream_into(
         &mut self,
         o: usize,
-        id: u32,
         fetched: &Fetched<'_>,
         path: &mut Vec<u32>,
         hasher: &mut Sha256,
@@ -338,7 +330,7 @@ impl Hashing<'_, '_> {
             return Ok(false);
         }
         hasher.update(len.to_le_bytes());
-        data_into(self.origins[o].doc, id, fetched, hasher)
+        data_into(self.origins[o].doc, fetched, hasher)
     }
 
     fn dict_into(
@@ -456,7 +448,7 @@ impl Hashing<'_, '_> {
         hasher: &mut Sha256,
     ) -> Result<bool> {
         let mut inner = Sha256::new();
-        if !self.stream_into(o, id, fetched, path, &mut inner)? {
+        if !self.stream_into(o, fetched, path, &mut inner)? {
             return Ok(false);
         }
         let digest: Digest32 = inner.finalize().into();

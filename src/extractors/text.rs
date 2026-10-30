@@ -6880,7 +6880,9 @@ impl<'doc> TextExtractor<'doc> {
                 let stream_data = if let Some(cached) = cached_stream {
                     cached.as_ref().clone()
                 } else {
-                    match doc.decode_stream_with_encryption(&xobject, xobject_ref) {
+                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                    match xobject.decode_stream_data() {
+                    // ── end pdf_manipulator patch ──
                         Ok(data) => {
                             // Cache if under 50MB total
                             const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;

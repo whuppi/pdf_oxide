@@ -529,11 +529,9 @@ fn scan_operators_for_inks(
                             if let Object::Stream { ref dict, .. } = xobj {
                                 let subtype = dict.get("Subtype").and_then(|o| o.as_name());
                                 if subtype == Some("Form") {
-                                    let stream_data = if let Some(r) = xobj_ref_obj.as_reference() {
-                                        doc.decode_stream_with_encryption(&xobj, r)?
-                                    } else {
-                                        xobj.decode_stream_data()?
-                                    };
+                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                    let stream_data = xobj.decode_stream_data()?;
+                                    // ── end pdf_manipulator patch ──
                                     let form_resources = if let Some(res) = dict.get("Resources") {
                                         doc.resolve_object(res)?
                                     } else {
@@ -2323,12 +2321,9 @@ fn execute_separation_operators(
                                             target_inks,
                                         )?;
                                     } else if subtype == "Form" {
-                                        let xobj_ref = xobj_ref_obj.as_reference();
-                                        let stream_data = if let Some(r) = xobj_ref {
-                                            ctx.doc.decode_stream_with_encryption(&xobj, r)?
-                                        } else {
-                                            xobj.decode_stream_data()?
-                                        };
+                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                        let stream_data = xobj.decode_stream_data()?;
+                                        // ── end pdf_manipulator patch ──
 
                                         let form_resources =
                                             if let Some(res) = dict.get("Resources") {
@@ -2907,7 +2902,6 @@ fn paint_image_to_plates(
             pixmaps,
             name,
             xobject,
-            obj_ref,
             base_transform,
             gs_stack,
             color_state,
@@ -3144,7 +3138,6 @@ fn paint_image_mask_to_plates(
     pixmaps: &mut [Pixmap],
     name: &str,
     xobject: &Object,
-    obj_ref: Option<crate::object::ObjectRef>,
     base_transform: Transform,
     gs_stack: &GraphicsStateStack,
     color_state: Option<&SeparationColorState>,
@@ -3182,11 +3175,9 @@ fn paint_image_mask_to_plates(
         return Ok(());
     }
 
-    let packed = if let Some(r) = obj_ref {
-        ctx.doc.decode_stream_with_encryption(xobject, r)?
-    } else {
-        xobject.decode_stream_data()?
-    };
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+    let packed = xobject.decode_stream_data()?;
+    // ── end pdf_manipulator patch ──
     // Checked before expanding, because `expand_1bpc_to_8bpc` zero-pads and
     // would size the buffer from the declaration: `/Width 2147483648 /Height
     // 2147483648` is representable and asks for 2^62 bytes.

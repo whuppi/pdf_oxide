@@ -12,7 +12,9 @@
 /// Simple RC4 cipher implementation.
 ///
 /// RC4 is a stream cipher that generates a pseudorandom keystream based on the key.
-struct Rc4Cipher {
+// ── pdf_manipulator patch: the provider builds the cipher as a keystream ──
+pub(crate) struct Rc4Cipher {
+    // ── end pdf_manipulator patch ──
     s: [u8; 256],
     i: u8,
     j: u8,
@@ -23,7 +25,9 @@ impl Rc4Cipher {
     /// Initialize RC4 cipher with a key.
     ///
     /// PDF Spec: RC4 key length is 5-16 bytes (40-128 bits)
-    fn new(key: &[u8]) -> Self {
+    // ── pdf_manipulator patch: the provider builds the cipher as a keystream ──
+    pub(crate) fn new(key: &[u8]) -> Self {
+        // ── end pdf_manipulator patch ──
         let mut s = [0u8; 256];
         for (i, val) in s.iter_mut().enumerate() {
             *val = i as u8;
@@ -55,21 +59,17 @@ impl Rc4Cipher {
     }
 }
 
-/// Pure RC4 cipher entry point.
-///
-/// `pub(crate)` — only the [`crate::crypto::RustCryptoProvider`]
-/// implementation calls this directly, to avoid the
-/// `provider.rc4() → rc4_crypt → provider.rc4()` cycle that would
-/// arise if both went through the trait. PDF callers go through
-/// [`rc4_crypt`] (which routes through the active provider so a
-/// FIPS provider can reject it).
+// ── pdf_manipulator patch: the provider builds the cipher as a keystream ──
+/// Only the [`crate::crypto::RustCryptoProvider`] builds this directly; PDF
+/// callers go through [`rc4_crypt`] or `rc4_stream` on the active provider,
+/// so a FIPS provider can reject them.
 #[cfg(feature = "legacy-crypto")]
-pub(crate) fn rc4_crypt_impl(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut cipher = Rc4Cipher::new(key);
-    let mut result = data.to_vec();
-    cipher.apply_keystream(&mut result);
-    result
+impl crate::crypto::StreamCipher for Rc4Cipher {
+    fn apply(&mut self, data: &mut [u8]) {
+        self.apply_keystream(data);
+    }
 }
+// ── end pdf_manipulator patch ──
 
 /// Encrypt or decrypt data using RC4 via the active
 /// [`CryptoProvider`].
@@ -92,29 +92,46 @@ pub fn rc4_crypt(key: &[u8], data: &[u8]) -> crate::Result<Vec<u8>> {
     crate::crypto::active()
         .symmetric()
         .rc4(key, data)
-        .map_err(|e| match &e {
-            crate::crypto::Error::AlgorithmNotPermitted { .. } => {
-                crate::Error::InvalidPdf(format!(
-                    "RC4 rejected by active CryptoProvider '{}': {}. \
-                     RC4 is required for PDF Standard Security R≤4. \
-                     Re-encrypt at R=6 (AES-256) or build pdf_oxide \
-                     without the 'fips' feature so the default \
-                     'rust-crypto' provider stays active.",
-                    crate::crypto::active().name(),
-                    e
-                ))
-            },
-            crate::crypto::Error::InvalidInput(s) => {
-                crate::Error::InvalidPdf(format!("RC4 invalid input: {s}"))
-            },
-            crate::crypto::Error::Backend(s) => {
-                crate::Error::InvalidPdf(format!("RC4 backend error: {s}"))
-            },
-            crate::crypto::Error::Verification(s) => {
-                crate::Error::InvalidPdf(format!("RC4 verification error: {s}"))
-            },
-        })
+        // ── pdf_manipulator patch: RC4 as a keystream, for readers that decrypt in pieces ──
+        .map_err(refusal)
 }
+
+/// RC4 as a keystream from the active [`CryptoProvider`]; refused exactly
+/// as [`rc4_crypt`] is.
+///
+/// [`CryptoProvider`]: crate::crypto::CryptoProvider
+pub(crate) fn rc4_stream(key: &[u8]) -> crate::Result<Box<dyn crate::crypto::StreamCipher>> {
+    crate::crypto::active()
+        .symmetric()
+        .rc4_stream(key)
+        .map_err(refusal)
+}
+
+fn refusal(e: crate::crypto::Error) -> crate::Error {
+    match &e {
+        crate::crypto::Error::AlgorithmNotPermitted { .. } => {
+            crate::Error::InvalidPdf(format!(
+                "RC4 rejected by active CryptoProvider '{}': {}. \
+                 RC4 is required for PDF Standard Security R≤4. \
+                 Re-encrypt at R=6 (AES-256) or build pdf_oxide \
+                 without the 'fips' feature so the default \
+                 'rust-crypto' provider stays active.",
+                crate::crypto::active().name(),
+                e
+            ))
+        },
+        crate::crypto::Error::InvalidInput(s) => {
+            crate::Error::InvalidPdf(format!("RC4 invalid input: {s}"))
+        },
+        crate::crypto::Error::Backend(s) => {
+            crate::Error::InvalidPdf(format!("RC4 backend error: {s}"))
+        },
+        crate::crypto::Error::Verification(s) => {
+            crate::Error::InvalidPdf(format!("RC4 verification error: {s}"))
+        },
+    }
+}
+// ── end pdf_manipulator patch ──
 
 #[cfg(all(test, feature = "legacy-crypto"))]
 mod tests {

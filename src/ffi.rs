@@ -3653,10 +3653,19 @@ pub extern "C" fn pdf_document_sign(
         }
         let doc = handle_mut(document_handle as *mut PdfDocument);
         let creds = handle_ref(certificate_handle as *const crate::signatures::SigningCredentials);
-        if doc.source_bytes.is_empty() {
-            set_error(error_code, ERR_INVALID_ARG);
-            return -1;
-        }
+        // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+        let source_bytes = match doc.source_bytes_whole() {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => {
+                set_error(error_code, ERR_INVALID_ARG);
+                return -1;
+            },
+            Err(e) => {
+                set_error(error_code, classify_error(&e));
+                return -1;
+            },
+        };
+        // ── end pdf_manipulator patch ──
         let reason_str = c_str_lossy(reason);
         let location_str = c_str_lossy(location);
         let opts = SignOptions {
@@ -3664,12 +3673,22 @@ pub extern "C" fn pdf_document_sign(
             location: location_str,
             ..Default::default()
         };
-        match sign_pdf_bytes(&doc.source_bytes.clone(), creds, opts) {
-            Ok(signed) => {
-                doc.source_bytes = signed;
-                set_error(error_code, ERR_SUCCESS);
-                0
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        match sign_pdf_bytes(&source_bytes, creds, opts) {
+        // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: the signed bytes become the document ──
+            Ok(signed) => match PdfDocument::from_bytes(signed) {
+                Ok(signed_doc) => {
+                    *doc = signed_doc;
+                    set_error(error_code, ERR_SUCCESS);
+                    0
+                },
+                Err(e) => {
+                    set_error(error_code, classify_error(&e));
+                    -1
+                },
             },
+            // ── end pdf_manipulator patch ──
             Err(e) => {
                 set_error(error_code, classify_error(&e));
                 -1
@@ -4575,7 +4594,16 @@ pub extern "C" fn pdf_document_has_timestamp(
         }
         let doc = handle_ref(document_handle as *const PdfDocument);
         set_error(error_code, ERR_SUCCESS);
-        i32::from(crate::signatures::has_document_timestamp(&doc.source_bytes))
+        // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+        let source_bytes = match doc.source_bytes_whole() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                set_error(error_code, classify_error(&e));
+                return -1;
+            },
+        };
+        i32::from(crate::signatures::has_document_timestamp(&source_bytes))
+        // ── end pdf_manipulator patch ──
     }
     #[cfg(not(feature = "signatures"))]
     {
@@ -7654,7 +7682,15 @@ pub extern "C" fn pdf_document_get_source_bytes(
         return ptr::null_mut();
     }
     let doc = handle_mut(document);
-    let bytes = doc.source_bytes.clone();
+    // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+    let bytes = match doc.source_bytes_whole() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            set_error(error_code, classify_error(&e));
+            return ptr::null_mut();
+        },
+    };
+    // ── end pdf_manipulator patch ──
     set_error(error_code, ERR_SUCCESS);
     write_out(out_len, bytes.len());
     vec_to_ffi_bytes(bytes)

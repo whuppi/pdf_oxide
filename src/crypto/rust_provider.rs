@@ -20,6 +20,9 @@ use super::error::{Error, Result};
 use super::provider::{
     CryptoProvider, Hasher, SignatureVerifier, Signer, SigningKeyMaterial, SymmetricCipher,
 };
+// ── pdf_manipulator patch: RC4 as a keystream, for readers that decrypt in pieces ──
+use super::provider::StreamCipher;
+// ── end pdf_manipulator patch ──
 use super::types::{AesKeySize, EcCurve, HashAlgorithm, Padding, RsaPublicKey};
 #[cfg(feature = "signatures")]
 use super::types::{AsymmetricAlgorithm, RsaScheme, SigningAlgorithm};
@@ -255,8 +258,16 @@ impl SymmetricCipher for RustSymmetric {
         }
     }
 
-    #[cfg_attr(not(feature = "legacy-crypto"), allow(unused_variables))]
+    // ── pdf_manipulator patch: the one-shot RC4 is the keystream plus one apply ──
     fn rc4(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+        let mut cipher = self.rc4_stream(key)?;
+        let mut out = data.to_vec();
+        cipher.apply(&mut out);
+        Ok(out)
+    }
+
+    #[cfg_attr(not(feature = "legacy-crypto"), allow(unused_variables))]
+    fn rc4_stream(&self, key: &[u8]) -> Result<Box<dyn StreamCipher>> {
         #[cfg(not(feature = "legacy-crypto"))]
         {
             Err(Error::AlgorithmNotPermitted {
@@ -270,12 +281,10 @@ impl SymmetricCipher for RustSymmetric {
             if key.is_empty() || key.len() > 256 {
                 return Err(Error::InvalidInput("RC4 key must be 1..=256 bytes"));
             }
-            // Calls the in-tree pure cipher impl directly (not the
-            // `pub fn rc4_crypt` wrapper, which itself routes through us
-            // — that would loop). Byte-equal to pre-Phase-3 output.
-            Ok(crate::encryption::rc4::rc4_crypt_impl(key, data))
+            Ok(Box::new(crate::encryption::rc4::Rc4Cipher::new(key)))
         }
     }
+    // ── end pdf_manipulator patch ──
 }
 
 fn check_key_iv(key_size: AesKeySize, key: &[u8], iv: &[u8]) -> Result<()> {

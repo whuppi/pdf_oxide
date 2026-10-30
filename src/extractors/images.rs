@@ -948,7 +948,9 @@ pub fn extract_image_from_xobject(
 pub fn extract_image_from_xobject_at(
     doc: Option<&crate::document::PdfDocument>,
     xobject: &crate::object::Object,
-    obj_ref: Option<ObjectRef>,
+    // ── pdf_manipulator patch: a stream decrypts itself, so its reference is not needed ──
+    _obj_ref: Option<ObjectRef>,
+    // ── end pdf_manipulator patch ──
     color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
     target: Option<(u32, u32)>,
 ) -> Result<PdfImage> {
@@ -1170,7 +1172,9 @@ pub fn extract_image_from_xobject_at(
     // applies it itself (plate routing) must still do so for those.
     let mut decode_folded_in = false;
     let data = if is_jbig2 {
-        let decoded = decode_jbig2_image(xobject, obj_ref, dict, doc, width, height)?;
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        let decoded = decode_jbig2_image(xobject, dict, doc, width, height)?;
+        // ── end pdf_manipulator patch ──
         // The JBIG2 decoder expands straight to 8-bit gray, bypassing the
         // packed-sample block below that is the only place /Decode is
         // otherwise honoured. ISO 32000-1 8.9.5.2 Table 90 applies to a JBIG2
@@ -1209,22 +1213,16 @@ pub fn extract_image_from_xobject_at(
             samples_are_raw = false;
         }
         let (data, dec_w, dec_h) =
-            decode_jpx_image(xobject, obj_ref, doc, &color_space, indexed, target)?;
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            decode_jpx_image(xobject, &color_space, indexed, target)?;
         jpx_decoded_dims = Some((dec_w, dec_h));
         data
     } else if is_jpeg_only || is_jpeg_chain {
-        let decoded = if let (Some(d), Some(ref_id)) = (doc.as_ref(), obj_ref) {
-            d.decode_stream_with_encryption(xobject, ref_id)?
-        } else {
-            xobject.decode_stream_data()?
-        };
+        let decoded = xobject.decode_stream_data()?;
         ImageData::Jpeg(decoded)
     } else {
-        let decoded_data = if let (Some(d), Some(ref_id)) = (doc.as_ref(), obj_ref) {
-            d.decode_stream_with_encryption(xobject, ref_id)?
-        } else {
-            xobject.decode_stream_data()?
-        };
+        let decoded_data = xobject.decode_stream_data()?;
+            // ── end pdf_manipulator patch ──
         if let Some(ir) = indexed_resolution.as_ref() {
             // Build a Transform if the Indexed base has a profile so
             // palette entries render through the real CMM (when linked).
@@ -2376,14 +2374,15 @@ fn save_raw_as_jpeg(
 #[cfg(feature = "rendering")]
 pub(crate) fn decode_jbig2_stencil(
     stream: &crate::object::Object,
-    obj_ref: Option<ObjectRef>,
     dict: &std::collections::HashMap<String, crate::object::Object>,
     doc: Option<&crate::document::PdfDocument>,
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>> {
     let ImageData::Raw { pixels, .. } =
-        decode_jbig2_image(stream, obj_ref, dict, doc, width, height)?
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        decode_jbig2_image(stream, dict, doc, width, height)?
+        // ── end pdf_manipulator patch ──
     else {
         return Err(Error::Image("JBIG2 stencil decode returned no samples".to_string()));
     };
@@ -2410,7 +2409,6 @@ pub(crate) fn decode_jbig2_stencil(
 #[cfg(feature = "rendering")]
 fn decode_jbig2_image(
     xobject: &crate::object::Object,
-    obj_ref: Option<ObjectRef>,
     dict: &std::collections::HashMap<String, crate::object::Object>,
     doc: Option<&crate::document::PdfDocument>,
     width: u32,
@@ -2419,11 +2417,9 @@ fn decode_jbig2_image(
     // The Jbig2Decoder in src/decoders/jbig2.rs is a pass-through: it returns
     // the raw compressed bitstream unchanged, which is exactly what hayro-jbig2
     // needs as input.
-    let jbig2_bytes: Vec<u8> = if let (Some(d), Some(ref_id)) = (doc.as_ref(), obj_ref) {
-        d.decode_stream_with_encryption(xobject, ref_id)?
-    } else {
-        xobject.decode_stream_data()?
-    };
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+    let jbig2_bytes: Vec<u8> = xobject.decode_stream_data()?;
+    // ── end pdf_manipulator patch ──
 
     // Load optional JBIG2Globals (shared symbol dictionaries referenced by multiple
     // embedded JBIG2 streams in the same PDF).
@@ -2432,7 +2428,9 @@ fn decode_jbig2_image(
         let globals_ref = dp.get("JBIG2Globals")?.as_reference()?;
         let d = doc.as_ref()?;
         let globals_obj = d.load_object(globals_ref).ok()?;
-        d.decode_stream_with_encryption(&globals_obj, globals_ref)
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        globals_obj.decode_stream_data()
+        // ── end pdf_manipulator patch ──
             .ok()
     })();
 
@@ -2479,7 +2477,6 @@ fn decode_jbig2_image(
 #[cfg(not(feature = "rendering"))]
 fn decode_jbig2_image(
     _xobject: &crate::object::Object,
-    _obj_ref: Option<ObjectRef>,
     _dict: &std::collections::HashMap<String, crate::object::Object>,
     _doc: Option<&crate::document::PdfDocument>,
     _width: u32,
@@ -2498,17 +2495,13 @@ fn decode_jbig2_image(
 #[cfg(feature = "jpeg2000")]
 fn decode_jpx_image(
     xobject: &crate::object::Object,
-    obj_ref: Option<ObjectRef>,
-    doc: Option<&crate::document::PdfDocument>,
     color_space: &ColorSpace,
     indexed: Option<(&IndexedResolution, Option<&crate::color::Transform>)>,
     target: Option<(u32, u32)>,
 ) -> Result<(ImageData, u32, u32)> {
-    let codestream: Vec<u8> = if let (Some(d), Some(ref_id)) = (doc.as_ref(), obj_ref) {
-        d.decode_stream_with_encryption(xobject, ref_id)?
-    } else {
-        xobject.decode_stream_data()?
-    };
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+    let codestream: Vec<u8> = xobject.decode_stream_data()?;
+    // ── end pdf_manipulator patch ──
 
     // An /Indexed dictionary space makes the codestream's one component a
     // table index, and §7.4.9 (pdf.md:3143) has the dictionary decide how the
@@ -2612,8 +2605,6 @@ fn decode_jpx_image(
 #[cfg(not(feature = "jpeg2000"))]
 fn decode_jpx_image(
     _xobject: &crate::object::Object,
-    _obj_ref: Option<ObjectRef>,
-    _doc: Option<&crate::document::PdfDocument>,
     _color_space: &ColorSpace,
     _indexed: Option<(&IndexedResolution, Option<&crate::color::Transform>)>,
     _target: Option<(u32, u32)>,
@@ -3482,7 +3473,7 @@ impl<'doc> PdfImageHandle<'doc> {
                 let obj = self.doc.load_object(*obj_ref)?;
                 match obj {
                     // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                    crate::object::Object::Stream { body, .. } => Ok(body.inline().to_vec()),
+                    crate::object::Object::Stream { body, .. } => body.read_whole_raw(),
                     // ── end pdf_manipulator patch ──
                     _ => Err(crate::error::Error::Image("XObject is not a stream".to_string())),
                 }

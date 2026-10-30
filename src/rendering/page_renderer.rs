@@ -3308,7 +3308,6 @@ impl PageRenderer {
                             if let Err(e) = self.render_image_mask(
                                 pixmap,
                                 &synthetic,
-                                None,
                                 transform,
                                 doc,
                                 clip,
@@ -4459,7 +4458,6 @@ impl PageRenderer {
                                             if let Err(e) = self.render_image_mask(
                                                 pixmap,
                                                 &xobj,
-                                                xobj_ref,
                                                 transform,
                                                 doc,
                                                 clip_mask,
@@ -4491,11 +4489,9 @@ impl PageRenderer {
                                     "Form" => {
                                         log::debug!("XObject '{}' is a Form", name);
                                         // Decoded stream data
-                                        let stream_data = if let Some(r) = xobj_ref {
-                                            doc.decode_stream_with_encryption(&xobj, r)?
-                                        } else {
-                                            xobj.decode_stream_data()?
-                                        };
+                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                        let stream_data = xobj.decode_stream_data()?;
+                                        // ── end pdf_manipulator patch ──
 
                                         // Form XObjects can have their own Resources dictionary,
                                         // and §7.3.10 (pdf.md:2032) allows it to be written as a
@@ -4686,7 +4682,9 @@ impl PageRenderer {
                                         .unwrap_or(0);
                                     if mw > 0 && mh > 0 {
                                         if let Ok(raw_mask_data) =
-                                            doc.decode_stream_with_encryption(&mask_stream, ref_obj)
+                                            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                            mask_stream.decode_stream_data()
+                                            // ── end pdf_manipulator patch ──
                                         {
                                             // CCITT data may be pass-through (not decompressed).
                                             // Check if we need to decompress Group 4 CCITT.
@@ -4716,7 +4714,6 @@ impl PageRenderer {
                                                 // knocked out.
                                                 match crate::extractors::images::decode_jbig2_stencil(
                                                     &mask_stream,
-                                                    Some(ref_obj),
                                                     mask_dict,
                                                     Some(doc),
                                                     mw,
@@ -5009,7 +5006,9 @@ impl PageRenderer {
     ///
     /// `/DecodeParms` arrays are positionally aligned with `/Filter`
     /// arrays. CCITT must be the final filter: earlier ASCII/Flate wrappers
-    /// have already been removed by `decode_stream_with_encryption`, while a
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+    /// have already been removed by `decode_stream_data`, while a
+    // ── end pdf_manipulator patch ──
     /// later filter would incorrectly receive still-compressed fax data from
     /// the stream decoder's intentional CCITT pass-through.
     fn image_mask_ccitt_params(
@@ -5326,7 +5325,6 @@ impl PageRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         xobject: &Object,
-        obj_ref: Option<ObjectRef>,
         transform: Transform,
         doc: &PdfDocument,
         clip_mask: Option<&tiny_skia::Mask>,
@@ -5364,11 +5362,9 @@ impl PageRenderer {
             _ => false,
         };
 
-        let mut raw = if let Some(r) = obj_ref {
-            doc.decode_stream_with_encryption(xobject, r)?
-        } else {
-            xobject.decode_stream_data()?
-        };
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        let mut raw = xobject.decode_stream_data()?;
+        // ── end pdf_manipulator patch ──
         if let Some(params) = Self::image_mask_ccitt_params(dict, width, height, doc)? {
             let (decoded, rows_valid) =
                 crate::extractors::ccitt_bilevel::decompress_ccitt_reporting(&raw, &params)?;
@@ -6038,7 +6034,6 @@ impl PageRenderer {
         let Some(pattern_entry) = pattern_map.get(pattern_name) else {
             return Ok(false);
         };
-        let pattern_ref = pattern_entry.as_reference();
         let pattern_obj = doc.resolve_object(pattern_entry)?;
         let Some(pdict) = pattern_obj.as_dict() else {
             return Ok(false);
@@ -6182,11 +6177,9 @@ impl PageRenderer {
         let step_y_len = step_y.0.hypot(step_y.1);
 
         // Render one cell into an offscreen pixmap sized to the device /BBox.
-        let stream_data = if let Some(r) = pattern_ref {
-            doc.decode_stream_with_encryption(&pattern_obj, r)?
-        } else {
-            pattern_obj.decode_stream_data()?
-        };
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        let stream_data = pattern_obj.decode_stream_data()?;
+        // ── end pdf_manipulator patch ──
         let cell_ops = match parse_content_stream(&stream_data) {
             Ok(ops) => ops,
             Err(_) => return Ok(false),
@@ -7045,7 +7038,6 @@ impl PageRenderer {
                                         let _ = self.render_image_mask(
                                             &mut scratch,
                                             &xobj,
-                                            xobj_ref,
                                             transform,
                                             doc,
                                             clip_mask,
@@ -8490,7 +8482,9 @@ impl PageRenderer {
                 // Decode through the encryption layer if present, the
                 // same way render_form_xobject does at the main
                 // dispatch site (page_renderer:2320).
-                let data = doc.decode_stream_with_encryption(&form_obj, smask.form_ref)?;
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                let data = form_obj.decode_stream_data()?;
+                // ── end pdf_manipulator patch ──
                 (dict.clone(), data)
             },
             _ => {
@@ -9056,7 +9050,9 @@ impl PageRenderer {
                         // checkbox and radio button in every AcroForm rendered
                         // blank while `Annotation::appearance_state` was parsed
                         // and never read anywhere in the renderer.
-                        let (n_entry, n_stream_obj) = match &n_stream_obj {
+                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                        let n_stream_obj = match &n_stream_obj {
+                        // ── end pdf_manipulator patch ──
                             Object::Dictionary(states) => {
                                 // With no /AS, or an /AS naming no member, the
                                 // clause blesses displaying nothing.
@@ -9074,17 +9070,14 @@ impl PageRenderer {
                                     );
                                     continue;
                                 };
-                                (selected.clone(), doc.resolve_object(selected)?)
+                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                doc.resolve_object(selected)?
                             },
-                            _ => (n_entry.clone(), n_stream_obj.clone()),
+                            _ => n_stream_obj.clone(),
                         };
-                        let n_entry = &n_entry;
                         if let Object::Stream { ref dict, .. } = n_stream_obj {
-                            let ap_data = if let Some(r) = n_entry.as_reference() {
-                                doc.decode_stream_with_encryption(&n_stream_obj, r)?
-                            } else {
-                                n_stream_obj.decode_stream_data()?
-                            };
+                            let ap_data = n_stream_obj.decode_stream_data()?;
+                                // ── end pdf_manipulator patch ──
 
                             if let Some(rect) = annot.rect {
                                 // §12.5.5: the appearance's transformed /BBox
@@ -10917,7 +10910,9 @@ fn decode_type3_charproc(doc: &PdfDocument, obj: &Object) -> Option<Vec<u8>> {
     if let Some(obj_ref) = obj.as_reference() {
         let resolved = doc.load_object(obj_ref).ok()?;
         if matches!(resolved, Object::Stream { .. }) {
-            return doc.decode_stream_with_encryption(&resolved, obj_ref).ok();
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            return resolved.decode_stream_data().ok();
+            // ── end pdf_manipulator patch ──
         }
         return None;
     }

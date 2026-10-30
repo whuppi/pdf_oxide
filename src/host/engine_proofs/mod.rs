@@ -7,6 +7,7 @@
 mod content_inline;
 mod content_stream;
 mod determinism;
+mod encrypted_streams;
 mod document_pages;
 mod editor_deflate;
 mod editor_duplicates;
@@ -22,5 +23,7 @@ mod kept_encryption;
 mod lzw;
 #[cfg(feature = "rendering")]
 mod source_trips;
+mod stream_extent;
 mod stream_head;
 mod support;
+mod whole_reads;

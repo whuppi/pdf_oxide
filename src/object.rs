@@ -1,20 +1,174 @@
 //! PDF object types.
 
 use crate::error::{Error, Result};
+// ── pdf_manipulator patch: stream bodies are StreamBody ──
+use crate::source::{Source, SourceRead};
+use std::io::Read;
+use std::sync::Arc;
+// ── end pdf_manipulator patch ──
 
 // ── pdf_manipulator patch: stream bodies are StreamBody ──
-/// The bytes of a stream as they sit in the file, before decryption and filters.
+/// The data of a stream before its filters.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamBody {
-    /// Held in memory.
+    /// Held in memory, as it is stored (a document's own streams are never
+    /// this kind).
     Inline(bytes::Bytes),
+    /// A window onto the bytes of the document the stream was loaded from.
+    Extent(Extent),
+}
+
+/// A window onto a document's bytes that reads itself: the source it was
+/// loaded from, where the data starts and how long it is, and what decrypts
+/// it. Cloning shares the source, so a clone costs a few words, not the data.
+///
+/// Whether and how the data is decrypted is decided when a reader opens, from
+/// the source's handler at that moment, so an extent made before a password
+/// authenticates reads plaintext after it. Identity is the source: two
+/// extents are equal when they share it and name the same window.
+#[derive(Clone)]
+pub struct Extent {
+    source: Arc<Source>,
+    start: u64,
+    len: u64,
+    obj: ObjectRef,
+    /// The stream is never enciphered: see [`crate::encryption::stream::is_exempt`].
+    exempt: bool,
+}
+
+impl Extent {
+    pub(crate) fn new(
+        source: Arc<Source>,
+        start: u64,
+        len: u64,
+        obj: ObjectRef,
+        dict: &std::collections::HashMap<String, Object>,
+    ) -> Self {
+        Self { source, start, len, obj, exempt: crate::encryption::stream::is_exempt(dict) }
+    }
+
+    /// The stored length, which for an encrypted source is the length of the
+    /// ciphertext.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether no data is stored.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The source the window sits in.
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> &Arc<Source> {
+        &self.source
+    }
+
+    /// The stored bytes as they sit in the source, never decrypted.
+    pub(crate) fn stored_reader(&self) -> SourceRead<'_> {
+        SourceRead::new(&self.source, self.start, self.len)
+    }
+
+    /// The same window, read as an enciphered stream even when it is an
+    /// object stream or a cross-reference stream.
+    pub(crate) fn enciphered(&self) -> Self {
+        Self { exempt: false, ..self.clone() }
+    }
+
+    fn raw_reader(&self) -> Result<Box<dyn Read + '_>> {
+        let stored = self.stored_reader();
+        if self.exempt {
+            return Ok(Box::new(stored));
+        }
+        match self.source.handler() {
+            None => Ok(Box::new(stored)),
+            Some(handler) => {
+                let cipher = handler.cipher_for(self.obj.id, self.obj.gen as u32)?;
+                Ok(Box::new(cipher.decrypting(stored)?))
+            },
+        }
+    }
+}
+
+impl PartialEq for Extent {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source)
+            && self.start == other.start
+            && self.len == other.len
+    }
+}
+
+impl std::fmt::Debug for Extent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Extent {{ obj: {}, start: {}, len: {} }}", self.obj.id, self.start, self.len)
+    }
 }
 
 impl StreamBody {
-    /// The held bytes.
-    pub fn inline(&self) -> &bytes::Bytes {
+    /// The stored length: the bytes held, or the window's length (for an
+    /// encrypted source, the ciphertext's).
+    pub fn len(&self) -> u64 {
         match self {
-            StreamBody::Inline(bytes) => bytes,
+            StreamBody::Inline(bytes) => bytes.len() as u64,
+            StreamBody::Extent(extent) => extent.len,
+        }
+    }
+
+    /// Whether no data is stored.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The held bytes, or `None` for an extent.
+    pub fn inline(&self) -> Option<&bytes::Bytes> {
+        match self {
+            StreamBody::Inline(bytes) => Some(bytes),
+            StreamBody::Extent(_) => None,
+        }
+    }
+
+    /// The data once decrypted, with its filters still applied. An extent
+    /// reads from its source in pieces; an inline body is read as it is.
+    pub fn raw_reader(&self) -> Result<Box<dyn Read + '_>> {
+        match self {
+            StreamBody::Inline(bytes) => Ok(Box::new(&bytes[..])),
+            StreamBody::Extent(extent) => extent.raw_reader(),
+        }
+    }
+
+    /// The length of the data [`Self::raw_reader`] yields. For an extent of an
+    /// encrypted source that is counted by reading it through once, in
+    /// constant memory.
+    pub fn decrypted_len(&self) -> Result<u64> {
+        match self {
+            StreamBody::Extent(extent) if !extent.exempt && extent.source.handler().is_some() => {
+                let mut counter = crate::source::Counter::default();
+                std::io::copy(&mut extent.raw_reader()?, &mut counter)
+                    .map_err(crate::encryption::stream::from_io)?;
+                Ok(counter.0)
+            },
+            other => Ok(other.len()),
+        }
+    }
+
+    /// The whole decrypted data in one buffer: the one named whole read of
+    /// raw bytes. Every caller is on the allow-list the engine proofs hold.
+    pub fn read_whole_raw(&self) -> Result<Vec<u8>> {
+        match self {
+            StreamBody::Inline(bytes) => Ok(bytes.to_vec()),
+            StreamBody::Extent(extent) => {
+                // The decrypted data is never longer than the stored data, so
+                // one allocation of that size holds it with no growth slack.
+                let mut out = Vec::new();
+                out.try_reserve_exact(extent.len as usize).map_err(|_| {
+                    Error::InvalidPdf(format!("a stream of {} bytes does not fit in memory", extent.len))
+                })?;
+                extent
+                    .raw_reader()?
+                    .read_to_end(&mut out)
+                    .map_err(crate::encryption::stream::from_io)?;
+                Ok(out)
+            },
         }
     }
 }
@@ -272,8 +426,10 @@ impl Object {
 
     /// Decode stream data using filters specified in the stream dictionary.
     ///
-    /// This is a convenience method that calls `decode_stream_data_with_decryption`
-    /// with no encryption parameters.
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+    /// The data is read whole (and decrypted, when its document is encrypted)
+    /// before its filters run: the one named whole read of decoded bytes.
+    // ── end pdf_manipulator patch ──
     ///
     /// # Returns
     ///
@@ -291,73 +447,17 @@ impl Object {
     /// # }
     /// ```
     pub fn decode_stream_data(&self) -> Result<Vec<u8>> {
-        self.decode_stream_data_with_decryption(None, 0, 0)
-    }
-
-    /// Decode stream data with optional decryption.
-    ///
-    /// PDF Spec: Section 7.6.2 - General Encryption Algorithm states that streams
-    /// must be decrypted BEFORE applying filters (decompression).
-    ///
-    /// # Arguments
-    ///
-    /// * `decryption_fn` - Optional decryption function (from EncryptionHandler)
-    /// * `obj_num` - Object number (for encryption key derivation)
-    /// * `gen_num` - Generation number (for encryption key derivation)
-    ///
-    /// # Returns
-    ///
-    /// The decoded stream data, or an error if decoding/decryption fails.
-    pub fn decode_stream_data_with_decryption(
-        &self,
-        decryption_fn: Option<&dyn Fn(&[u8]) -> Result<Vec<u8>>>,
-        obj_num: u32,
-        gen_num: u32,
-    ) -> Result<Vec<u8>> {
         match self {
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
             Object::Stream { dict, body } => {
-                let data = body.inline();
+                // PDF Spec: Section 7.6.2 - streams are decrypted BEFORE
+                // their filters run. The body is never trimmed: the loader
+                // already consumed exactly one EOL after `stream`
+                // (ISO 32000-1:2008 §7.3.8.1), and trimming CR/LF would corrupt
+                // binary streams that legitimately start with 0x0A or 0x0D —
+                // e.g. an Indexed palette whose first CMYK byte is 0x0D.
+                let decrypted_data = body.read_whole_raw()?;
                 // ── end pdf_manipulator patch ──
-                // Step 1: Decrypt stream data BEFORE applying filters
-                // PDF Spec: Section 7.6.2 - Encryption must be applied before compression
-                //
-                // IMPORTANT: For encrypted streams, we must NOT trim whitespace before decryption
-                // because encrypted data is binary and trimming might corrupt it (especially for AES
-                // where the first 16 bytes are the IV). We only trim for unencrypted streams.
-                let decrypted_data = if let Some(decrypt) = decryption_fn {
-                    log::debug!(
-                        "Decrypting stream for object {} {} (length: {} bytes)",
-                        obj_num,
-                        gen_num,
-                        data.len()
-                    );
-                    // For encrypted streams, pass raw data without trimming
-                    match decrypt(data) {
-                        Ok(data) => {
-                            log::debug!("Decryption successful: {} bytes", data.len());
-                            data
-                        },
-                        Err(e) => {
-                            log::error!(
-                                "Decryption failed for object {} {}: {}",
-                                obj_num,
-                                gen_num,
-                                e
-                            );
-                            return Err(e);
-                        },
-                    }
-                } else {
-                    // `parse_stream_data` in the parser already consumes
-                    // exactly one EOL after the `stream` keyword per
-                    // ISO 32000-1:2008 §7.3.8.1, so `data` begins with the
-                    // first byte of actual stream content. Re-trimming
-                    // CR/LF here would corrupt binary streams that
-                    // legitimately start with 0x0A or 0x0D — e.g. an
-                    // Indexed palette whose first CMYK byte is 0x0D.
-                    data.to_vec()
-                };
 
                 // Step 2: Apply filters (decompression)
                 // PDF Spec: ISO 32000-1:2008, Section 7.3.8.2 - Stream Objects
@@ -402,6 +502,9 @@ impl Object {
                     )
                 }
             },
+            // ── pdf_manipulator patch: an object the file lost decodes to nothing ──
+            Object::Null => Ok(Vec::new()),
+            // ── end pdf_manipulator patch ──
             _ => Err(Error::InvalidObjectType {
                 expected: "Stream".to_string(),
                 found: self.type_name().to_string(),
@@ -1131,7 +1234,9 @@ mod tests {
         assert_eq!(result.columns, 1);
     }
 
-    // ---- Tests for decode_stream_data_with_decryption ----
+    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+    // ---- Tests for decode_stream_data ----
+    // ── end pdf_manipulator patch ──
 
     #[test]
     fn test_decode_stream_with_decryption_no_decrypt() {
@@ -1140,58 +1245,18 @@ mod tests {
         // ── pdf_manipulator patch: stream bodies are StreamBody ──
         let obj = Object::stream(dict, bytes::Bytes::from_static(b"Hello"));
         // ── end pdf_manipulator patch ──
-        let decoded = obj.decode_stream_data_with_decryption(None, 0, 0).unwrap();
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        let decoded = obj.decode_stream_data().unwrap();
+        // ── end pdf_manipulator patch ──
         assert_eq!(decoded, b"Hello");
-    }
-
-    #[test]
-    fn test_decode_stream_with_decryption_fn() {
-        let mut dict = HashMap::new();
-        dict.insert("Length".to_string(), Object::Integer(5));
-        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-        let obj = Object::stream(dict, bytes::Bytes::from_static(b"Hello"));
-        // ── end pdf_manipulator patch ──
-        // Simple identity "decryption" function
-        let decrypt_fn = |data: &[u8]| -> Result<Vec<u8>> { Ok(data.to_vec()) };
-        let decoded = obj
-            .decode_stream_data_with_decryption(Some(&decrypt_fn), 1, 0)
-            .unwrap();
-        assert_eq!(decoded, b"Hello");
-    }
-
-    #[test]
-    fn test_decode_stream_with_decryption_fn_that_transforms() {
-        let mut dict = HashMap::new();
-        dict.insert("Length".to_string(), Object::Integer(5));
-        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-        let obj = Object::stream(dict, bytes::Bytes::from_static(b"\x01\x02\x03"));
-        // ── end pdf_manipulator patch ──
-        // "Decryption" that XOR-s with 0xFF
-        let decrypt_fn =
-            |data: &[u8]| -> Result<Vec<u8>> { Ok(data.iter().map(|b| b ^ 0xFF).collect()) };
-        let decoded = obj
-            .decode_stream_data_with_decryption(Some(&decrypt_fn), 1, 0)
-            .unwrap();
-        assert_eq!(decoded, vec![0xFE, 0xFD, 0xFC]);
-    }
-
-    #[test]
-    fn test_decode_stream_with_decryption_fn_error() {
-        let mut dict = HashMap::new();
-        dict.insert("Length".to_string(), Object::Integer(5));
-        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-        let obj = Object::stream(dict, bytes::Bytes::from_static(b"Hello"));
-        // ── end pdf_manipulator patch ──
-        let decrypt_fn =
-            |_data: &[u8]| -> Result<Vec<u8>> { Err(Error::InvalidPdf("decrypt fail".into())) };
-        let result = obj.decode_stream_data_with_decryption(Some(&decrypt_fn), 1, 0);
-        assert!(result.is_err());
     }
 
     #[test]
     fn test_decode_stream_not_a_stream_with_decryption() {
         let obj = Object::Name("NotAStream".to_string());
-        let result = obj.decode_stream_data_with_decryption(None, 0, 0);
+        // ── pdf_manipulator patch: decryption belongs to the stream's extent ──
+        let result = obj.decode_stream_data();
+        // ── end pdf_manipulator patch ──
         assert!(result.is_err());
         if let Err(Error::InvalidObjectType { expected, found }) = result {
             assert_eq!(expected, "Stream");

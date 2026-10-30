@@ -42,6 +42,9 @@ pub use policy::{
 pub use provider::{
     CryptoProvider, Hasher, SignatureVerifier, Signer, SigningKeyMaterial, SymmetricCipher,
 };
+// ── pdf_manipulator patch: RC4 as a keystream, for readers that decrypt in pieces ──
+pub use provider::StreamCipher;
+// ── end pdf_manipulator patch ──
 pub use rust_provider::RustCryptoProvider;
 pub use types::{
     AesKeySize, AsymmetricAlgorithm, EcCurve, HashAlgorithm, Padding, RsaPublicKey, RsaScheme,

@@ -98,7 +98,24 @@ pub trait SymmetricCipher: Send + Sync {
     /// Required for PDF Standard Security R≤4 (ISO 32000-1 §7.6.3).
     /// Returns [`super::error::Error::AlgorithmNotPermitted`] under FIPS providers.
     fn rc4(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>>;
+
+    // ── pdf_manipulator patch: RC4 as a keystream, for readers that decrypt in pieces ──
+    /// RC4 as a stateful keystream: each [`StreamCipher::apply`] continues
+    /// where the last stopped. Refused exactly as [`Self::rc4`] is; the
+    /// one-shot `rc4` is this plus one `apply`.
+    fn rc4_stream(&self, key: &[u8]) -> Result<Box<dyn StreamCipher>>;
+    // ── end pdf_manipulator patch ──
+// ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
 }
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: RC4 as a keystream, for readers that decrypt in pieces ──
+/// A cipher that transforms data in place, piece by piece.
+pub trait StreamCipher: Send {
+    /// XORs the next `data.len()` bytes of the keystream into `data`.
+    fn apply(&mut self, data: &mut [u8]);
+}
+// ── end pdf_manipulator patch ──
 
 /// Verify a digital signature.
 ///

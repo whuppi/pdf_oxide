@@ -275,7 +275,9 @@ impl PdfAConverter {
     /// all mutations, commits them in a single save+reparse, then replaces the
     /// caller's document with the updated version.
     pub fn convert(&self, document: &mut PdfDocument) -> Result<ConversionResult> {
-        let mut editor = DocumentEditor::from_bytes(document.source_bytes.clone())?;
+        // ── pdf_manipulator patch: the editor reads the source in windows ──
+        let mut editor = DocumentEditor::from_document(document.reopen()?)?;
+        // ── end pdf_manipulator patch ──
         let result = self.convert_with_editor(&mut editor)?;
         // Commit staged changes and propagate the updated document to the caller.
         editor.commit_in_place()?;
@@ -531,7 +533,7 @@ impl PdfAConverter {
                 let decoded = obj.decode_stream_data().unwrap_or_else(|_| {
                     // ── pdf_manipulator patch: stream bodies are StreamBody ──
                     if let Object::Stream { body, .. } = obj {
-                        body.inline().to_vec()
+                        body.read_whole_raw().unwrap_or_default()
                         // ── end pdf_manipulator patch ──
                     } else {
                         vec![]

@@ -368,11 +368,16 @@ fn scenario_idempotency_and_reparseable() -> Result<()> {
         let mut doc = PdfDocument::from_bytes(build_plain_pdf())?;
         convert_to_pdf_a(&mut doc, level)?;
 
+        // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+        let converted = doc.source_bytes_whole()?;
+        // ── end pdf_manipulator patch ──
         assert!(
-            doc.source_bytes.starts_with(b"%PDF-"),
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            converted.starts_with(b"%PDF-"),
             "converted bytes do not start with %PDF- for {level:?}"
         );
-        PdfDocument::from_bytes(doc.source_bytes.clone())
+        PdfDocument::from_bytes(converted)
+            // ── end pdf_manipulator patch ──
             .unwrap_or_else(|_| panic!("re-parse failed for {level:?}"));
 
         // Second conversion must not introduce new errors.

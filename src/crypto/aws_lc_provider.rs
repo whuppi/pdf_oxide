@@ -47,6 +47,9 @@ use super::error::{not_permitted, AlgorithmKind, Error, Result};
 use super::provider::{
     CryptoProvider, Hasher, SignatureVerifier, Signer, SigningKeyMaterial, SymmetricCipher,
 };
+// ── pdf_manipulator patch: RC4 as a keystream, for readers that decrypt in pieces ──
+use super::provider::StreamCipher;
+// ── end pdf_manipulator patch ──
 use super::types::{AesKeySize, EcCurve, HashAlgorithm, Padding, RsaPublicKey};
 
 /// FIPS-validated provider backed by `aws-lc-rs`.
@@ -263,6 +266,17 @@ impl SymmetricCipher for AwsLcSymmetric {
              documents with R=6 (AES-256) under a non-FIPS provider before opening",
         ))
     }
+
+    // ── pdf_manipulator patch: RC4 as a keystream, for readers that decrypt in pieces ──
+    fn rc4_stream(&self, _key: &[u8]) -> Result<Box<dyn StreamCipher>> {
+        Err(not_permitted(
+            AlgorithmKind::SymmetricCipher,
+            "RC4",
+            "FIPS 140-3 forbids RC4 — re-encrypt PDF Standard Security R≤4 \
+             documents with R=6 (AES-256) under a non-FIPS provider before opening",
+        ))
+    }
+    // ── end pdf_manipulator patch ──
 }
 
 // ---------------------------------------------------------------------------

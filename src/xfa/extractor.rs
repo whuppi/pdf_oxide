@@ -95,7 +95,7 @@ impl XfaExtractor {
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
             Object::Stream { dict, body } => {
                 // Single stream containing complete XDP
-                Self::decode_stream_data(dict, body.inline())
+                Self::decode_stream_data(dict, &body.read_whole_raw()?)
             },
             // ── end pdf_manipulator patch ──
             Object::Array(arr) => {
@@ -134,7 +134,7 @@ impl XfaExtractor {
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
             Object::Stream { dict, body } => {
                 // Single stream - return as single "xdp" packet
-                let decoded = Self::decode_stream_data(dict, body.inline())?;
+                let decoded = Self::decode_stream_data(dict, &body.read_whole_raw()?)?;
                 Ok(vec![("xdp".to_string(), decoded)])
             },
             // ── end pdf_manipulator patch ──
@@ -201,7 +201,7 @@ impl XfaExtractor {
                 let stream_obj = Self::resolve_object(doc, &arr[i + 1])?;
                 // ── pdf_manipulator patch: stream bodies are StreamBody ──
                 if let Object::Stream { dict, body } = &stream_obj {
-                    let decoded = Self::decode_stream_data(dict, body.inline())?;
+                    let decoded = Self::decode_stream_data(dict, &body.read_whole_raw()?)?;
                     // ── end pdf_manipulator patch ──
                     combined.extend_from_slice(&decoded);
                 }
@@ -234,7 +234,7 @@ impl XfaExtractor {
                 let stream_obj = Self::resolve_object(doc, &arr[i + 1])?;
                 // ── pdf_manipulator patch: stream bodies are StreamBody ──
                 if let Object::Stream { dict, body } = &stream_obj {
-                    let decoded = Self::decode_stream_data(dict, body.inline())?;
+                    let decoded = Self::decode_stream_data(dict, &body.read_whole_raw()?)?;
                     // ── end pdf_manipulator patch ──
                     packets.push((name, decoded));
                 }

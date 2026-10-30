@@ -280,7 +280,32 @@ impl EncryptionWriteHandler {
         }
     }
 
-    fn generate_iv() -> crate::Result<[u8; 16]> {
+    // ── pdf_manipulator patch: stream bodies encrypt in pieces ──
+    /// How the stream of object `obj_num` is enciphered on the way out.
+    pub(crate) fn stream_cipher(&self, obj_num: u32, gen_num: u16) -> super::stream::Cipher {
+        use super::stream::Cipher;
+        use crate::crypto::AesKeySize;
+
+        match self.algorithm {
+            Algorithm::None => Cipher::Identity,
+            Algorithm::RC4_40 | Algorithm::Rc4_128 => {
+                Cipher::Rc4 { key: self.derive_object_key(obj_num, gen_num) }
+            },
+            Algorithm::Aes128 => Cipher::Aes {
+                size: AesKeySize::Aes128,
+                key: self.derive_object_key(obj_num, gen_num),
+            },
+            Algorithm::Aes256 => Cipher::Aes {
+                size: AesKeySize::Aes256,
+                key: self.derive_object_key(obj_num, gen_num),
+            },
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
+    // ── pdf_manipulator patch: stream bodies encrypt in pieces ──
+    pub(crate) fn generate_iv() -> crate::Result<[u8; 16]> {
+        // ── end pdf_manipulator patch ──
         let mut iv = [0u8; 16];
         crate::crypto::active()
             .random_bytes(&mut iv)

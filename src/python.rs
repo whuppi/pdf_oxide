@@ -2634,7 +2634,13 @@ impl PyPdfDocument {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         // Sync raw_bytes so that to_bytes() sees the updated document,
         // drop any stale editor that was opened from the original bytes.
-        self.raw_bytes = Some(self.inner.source_bytes.to_vec());
+        // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+        self.raw_bytes = Some(
+            self.inner
+                .source_bytes_whole()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        );
+        // ── end pdf_manipulator patch ──
         self.path = None;
         self.editor = None;
         let d = pyo3::types::PyDict::new(py);

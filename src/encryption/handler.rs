@@ -254,6 +254,46 @@ impl EncryptionHandler {
         }
     }
 
+    // ── pdf_manipulator patch: stream bodies decrypt in pieces ──
+    /// How the stream of object `obj_num` is enciphered: its key, derived as
+    /// `decrypt_stream` derives it, with no data. The caller decides whether
+    /// the stream is enciphered at all (`/ObjStm`, `/XRef`, `/Crypt /Identity`).
+    pub(crate) fn cipher_for(&self, obj_num: u32, gen_num: u32) -> Result<super::stream::Cipher> {
+        use super::stream::Cipher;
+        use crate::crypto::AesKeySize;
+
+        let key = self
+            .encryption_key
+            .as_ref()
+            .ok_or_else(|| Error::InvalidPdf("Not authenticated".to_string()))?;
+        match self.algorithm {
+            Algorithm::None => Ok(Cipher::Identity),
+            Algorithm::Aes256 => {
+                if key.len() < 32 {
+                    return Err(Error::InvalidPdf(format!(
+                        "AES-256 file key too short: {} bytes (need 32)",
+                        key.len()
+                    )));
+                }
+                Ok(Cipher::Aes { size: AesKeySize::Aes256, key: key[..32].to_vec() })
+            },
+            Algorithm::RC4_40 | Algorithm::Rc4_128 => {
+                Ok(Cipher::Rc4 { key: self.compute_object_key(key, obj_num, gen_num)? })
+            },
+            Algorithm::Aes128 => {
+                let obj_key = self.compute_object_key(key, obj_num, gen_num)?;
+                if obj_key.len() < 16 {
+                    return Err(Error::InvalidPdf(format!(
+                        "AES-128 object key too short: {} bytes (need 16)",
+                        obj_key.len()
+                    )));
+                }
+                Ok(Cipher::Aes { size: AesKeySize::Aes128, key: obj_key[..16].to_vec() })
+            },
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Decrypt a string using the encryption key.
     ///
     /// # Arguments

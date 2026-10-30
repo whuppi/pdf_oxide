@@ -5,8 +5,13 @@
 
 use crate::encryption::EncryptionWriteHandler;
 use crate::object::{Object, ObjectRef};
+// ── pdf_manipulator patch: stream bodies are StreamBody ──
+use crate::object::StreamBody;
+// ── end pdf_manipulator patch ──
 use std::collections::HashMap;
-use std::io::Write;
+// ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+use std::io::{Read, Write};
+// ── end pdf_manipulator patch ──
 
 /// Serializer for PDF objects.
 ///
@@ -199,6 +204,57 @@ impl ObjectSerializer {
         buf
     }
 
+    // ── pdf_manipulator patch: an indirect object is written to a sink, its stream data in pieces ──
+    /// Like [`Self::serialize_indirect`], into `out`. A stream body that is
+    /// an extent is read from its source in pieces as it is written, so a
+    /// stream of any size passes through in constant memory; this is the
+    /// call for an object loaded from a document.
+    pub(crate) fn write_indirect(
+        &self,
+        mut out: &mut dyn Write,
+        id: u32,
+        gen: u16,
+        obj: &Object,
+    ) -> std::io::Result<()> {
+        writeln!(out, "{} {} obj", id, gen)?;
+        self.begin_indirect(id);
+        self.write_object(&mut out, obj)?;
+        write!(out, "\nendobj\n")
+    }
+
+    /// Like [`Self::serialize_indirect_encrypted`], into `out`; see
+    /// [`Self::write_indirect`].
+    pub(crate) fn write_indirect_encrypted(
+        &self,
+        mut out: &mut dyn Write,
+        id: u32,
+        gen: u16,
+        obj: &Object,
+        handler: &EncryptionWriteHandler,
+    ) -> std::io::Result<()> {
+        writeln!(out, "{} {} obj", id, gen)?;
+        self.begin_indirect(id);
+        self.write_object_encrypted(&mut out, obj, id, gen, handler)?;
+        write!(out, "\nendobj\n")
+    }
+
+    /// Writes the head of stream object `id`: its header, `dict` as given
+    /// (the caller states `/Length`) and the `stream` keyword. The caller
+    /// writes the data and `\nendstream\nendobj\n`.
+    pub(crate) fn write_stream_open(
+        &self,
+        mut out: &mut dyn Write,
+        id: u32,
+        gen: u16,
+        dict: &HashMap<String, Object>,
+    ) -> std::io::Result<()> {
+        writeln!(out, "{} {} obj", id, gen)?;
+        self.begin_indirect(id);
+        self.write_dictionary(&mut out, dict)?;
+        write!(out, "\nstream\n")
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Write an encrypted object to a buffer.
     fn write_object_encrypted<W: Write>(
         &self,
@@ -225,7 +281,7 @@ impl ObjectSerializer {
             },
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
             Object::Stream { dict, body } => {
-                self.write_stream_encrypted(w, dict, body.inline(), obj_num, gen_num, handler)
+                self.write_stream_encrypted(w, dict, body, obj_num, gen_num, handler)
             },
             // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: references to unwritten objects as null ──
@@ -290,22 +346,32 @@ impl ObjectSerializer {
         &self,
         w: &mut W,
         dict: &HashMap<String, Object>,
-        data: &[u8],
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        body: &StreamBody,
+        // ── end pdf_manipulator patch ──
         obj_num: u32,
         gen_num: u16,
         handler: &EncryptionWriteHandler,
     ) -> std::io::Result<()> {
-        // Encrypt the stream data
-        let encrypted_data = handler.encrypt_stream(data, obj_num, gen_num);
+        // ── pdf_manipulator patch: stream data is encrypted in pieces ──
+        // The data is encrypted as it is written, so its encrypted length
+        // is worked out first from the plain length.
+        let cipher = handler.stream_cipher(obj_num, gen_num);
+        let plain_len = body.decrypted_len().map_err(std::io::Error::other)?;
 
         // Update dictionary with encrypted length
         let mut dict_with_length = dict.clone();
-        dict_with_length.insert("Length".to_string(), Object::Integer(encrypted_data.len() as i64));
+        dict_with_length
+            .insert("Length".to_string(), Object::Integer(cipher.encrypted_len(plain_len) as i64));
 
         // Write dictionary (with encrypted strings inside)
         self.write_dictionary_encrypted(w, &dict_with_length, obj_num, gen_num, handler)?;
         write!(w, "\nstream\n")?;
-        w.write_all(&encrypted_data)?;
+        let iv = EncryptionWriteHandler::generate_iv().map_err(std::io::Error::other)?;
+        let mut encrypting = cipher.encrypting(&mut *w, iv).map_err(std::io::Error::other)?;
+        copy_body(&mut encrypting, body)?;
+        encrypting.finish()?;
+        // ── end pdf_manipulator patch ──
         write!(w, "\nendstream")
     }
 
@@ -321,7 +387,7 @@ impl ObjectSerializer {
             Object::Array(arr) => self.write_array(w, arr),
             Object::Dictionary(dict) => self.write_dictionary(w, dict),
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            Object::Stream { dict, body } => self.write_stream(w, dict, body.inline()),
+            Object::Stream { dict, body } => self.write_stream(w, dict, body),
             // ── end pdf_manipulator patch ──
             // ── pdf_manipulator patch: references to unwritten objects as null ──
             Object::Reference(r) => self.write_reference(w, r),
@@ -457,20 +523,50 @@ impl ObjectSerializer {
         &self,
         w: &mut W,
         dict: &HashMap<String, Object>,
-        data: &[u8],
+        // ── pdf_manipulator patch: stream bodies are StreamBody ──
+        body: &StreamBody,
+        // ── end pdf_manipulator patch ──
     ) -> std::io::Result<()> {
-        // Add Length to dictionary if not present
+        // ── pdf_manipulator patch: an extent's /Length is the length it writes ──
+        // Add Length to dictionary if not present; an extent states it
+        // always: the dictionary's own may name a data length that was
+        // repaired, or the ciphertext's.
         let mut dict_with_length = dict.clone();
-        if !dict_with_length.contains_key("Length") {
-            dict_with_length.insert("Length".to_string(), Object::Integer(data.len() as i64));
+        match body {
+            StreamBody::Inline(data) => {
+                if !dict_with_length.contains_key("Length") {
+                    dict_with_length
+                        .insert("Length".to_string(), Object::Integer(data.len() as i64));
+                }
+            },
+            StreamBody::Extent(_) => {
+                let len = body.decrypted_len().map_err(std::io::Error::other)?;
+                dict_with_length.insert("Length".to_string(), Object::Integer(len as i64));
+            },
         }
 
         self.write_dictionary(w, &dict_with_length)?;
         write!(w, "\nstream\n")?;
-        w.write_all(data)?;
+        copy_body(w, body)?;
+        // ── end pdf_manipulator patch ──
         write!(w, "\nendstream")
     }
 }
+
+// ── pdf_manipulator patch: stream data is written in pieces ──
+/// Writes the decrypted data of `body` to `w` in 64 KiB pieces.
+fn copy_body(w: &mut dyn Write, body: &StreamBody) -> std::io::Result<()> {
+    let mut data = body.raw_reader().map_err(std::io::Error::other)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = data.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        w.write_all(&buf[..n])?;
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Helper functions for building PDF objects.
 impl ObjectSerializer {

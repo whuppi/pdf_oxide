@@ -47,3 +47,30 @@ pub(super) fn open_editor_from_bytes(bytes: &[u8], tag: &str) -> DocumentEditor 
     let _ = std::fs::remove_file(&tmp);
     editor
 }
+
+fn pdfs_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            pdfs_under(&path, out);
+        } else if path.extension().is_some_and(|e| e == "pdf") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every PDF of the crate's fixtures and of the bench corpus when it is present.
+pub(super) fn corpus_pdfs() -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    for dir in [root.join("tests/fixtures"), root.join("../../tool/bench/.corpus")] {
+        if dir.is_dir() {
+            pdfs_under(&dir, &mut out);
+        } else {
+            println!("skipped, absent: {}", dir.display());
+        }
+    }
+    out
+}

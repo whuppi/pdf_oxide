@@ -735,7 +735,9 @@ impl FontInfo {
                                     .map(|obj| (obj, ff2_ref))
                             })
                             .and_then(|(ff2_stream, ff2_ref)| {
-                                doc.decode_stream_with_encryption(&ff2_stream, ff2_ref)
+                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                ff2_stream.decode_stream_data()
+                                // ── end pdf_manipulator patch ──
                                     .inspect_err(|e| {
                                         log::warn!(
                                             "Font '{}': failed to decode FontFile2 stream {}: {}",
@@ -776,7 +778,9 @@ impl FontInfo {
                                     .map(|obj| (obj, ff3_ref))
                             })
                             .and_then(|(ff3_stream, ff3_ref)| {
-                                doc.decode_stream_with_encryption(&ff3_stream, ff3_ref)
+                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                ff3_stream.decode_stream_data()
+                                // ── end pdf_manipulator patch ──
                                     .inspect_err(|e| {
                                         log::warn!(
                                             "Font '{}': failed to decode FontFile3 stream {}: {}",
@@ -825,7 +829,9 @@ impl FontInfo {
                                     .map(|obj| (obj, ff_ref))
                             })
                             .and_then(|(ff_stream, ff_ref)| {
-                                doc.decode_stream_with_encryption(&ff_stream, ff_ref)
+                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                ff_stream.decode_stream_data()
+                                // ── end pdf_manipulator patch ──
                                     .inspect_err(|e| {
                                         log::warn!(
                                             "Font '{}': failed to decode FontFile stream {}: {}",
@@ -1050,7 +1056,9 @@ impl FontInfo {
         {
             let stream_opt = match doc.load_object(cmap_ref) {
                 Ok(cmap_obj) => {
-                    match doc.decode_stream_with_encryption(&cmap_obj, cmap_ref) {
+                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                    match cmap_obj.decode_stream_data() {
+                    // ── end pdf_manipulator patch ──
                         Ok(data) => Some(data),
                         Err(e) => {
                             log::warn!(
@@ -1761,7 +1769,9 @@ impl FontInfo {
                         // Handle Stream object (binary uint16 array)
                         match doc.load_object(stream_ref) {
                             Ok(stream_obj) => {
-                                match doc.decode_stream_with_encryption(&stream_obj, stream_ref) {
+                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                                match stream_obj.decode_stream_data() {
+                                // ── end pdf_manipulator patch ──
                                     Ok(stream_data) => {
                                         // Validate stream length (must be even)
                                         if stream_data.len() % 2 != 0 {
@@ -1982,7 +1992,9 @@ impl FontInfo {
                 return None;
             },
         };
-        let font_data = match doc.decode_stream_with_encryption(&ff2_stream, ff2_ref) {
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        let font_data = match ff2_stream.decode_stream_data() {
+        // ── end pdf_manipulator patch ──
             Ok(data) => data,
             Err(e) => {
                 log::warn!(
@@ -2092,7 +2104,9 @@ impl FontInfo {
                         continue;
                     },
                 };
-                let font_data = match doc.decode_stream_with_encryption(&ff_stream, ff_ref) {
+                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+                let font_data = match ff_stream.decode_stream_data() {
+                // ── end pdf_manipulator patch ──
                     Ok(data) => data,
                     Err(e) => {
                         log::warn!("Font '{}': Failed to decode {} stream: {}", base_font, key, e);

@@ -127,12 +127,17 @@ fn test_convert_roundtrip_bytes_are_valid_pdf() {
     convert_to_pdf_a(&mut doc, PdfALevel::A2b).expect("conversion failed");
 
     // The updated source_bytes must still be a valid PDF.
+    // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+    let converted = doc.source_bytes_whole().expect("converted bytes read");
+    // ── end pdf_manipulator patch ──
     assert!(
-        doc.source_bytes.starts_with(b"%PDF-"),
+        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+        converted.starts_with(b"%PDF-"),
         "source_bytes after conversion is not a valid PDF"
     );
     // Must be re-parseable.
-    PdfDocument::from_bytes(doc.source_bytes.clone()).expect("re-parse of converted bytes failed");
+    PdfDocument::from_bytes(converted).expect("re-parse of converted bytes failed");
+        // ── end pdf_manipulator patch ──
 }
 
 #[test]
@@ -232,8 +237,10 @@ fn test_convert_all_levels() {
         );
 
         // After conversion the document must still be parseable.
-        PdfDocument::from_bytes(doc.source_bytes.clone())
+        // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+        PdfDocument::from_bytes(doc.source_bytes_whole().expect("converted bytes read"))
             .expect("re-parse failed after conversion for level {level:?}");
+        // ── end pdf_manipulator patch ──
 
         // The post-conversion validation must not report any always-fixable errors.
         let post =

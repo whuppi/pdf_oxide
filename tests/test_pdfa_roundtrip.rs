@@ -683,11 +683,16 @@ fn test_converted_bytes_are_reparseable() {
         let mut doc = PdfDocument::from_bytes(bytes).expect("parse");
         convert_to_pdf_a(&mut doc, level).expect("convert");
 
+        // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+        let converted = doc.source_bytes_whole().expect("converted bytes read");
+        // ── end pdf_manipulator patch ──
         assert!(
-            doc.source_bytes.starts_with(b"%PDF-"),
+            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
+            converted.starts_with(b"%PDF-"),
             "converted bytes do not start with %PDF- for level {level:?}"
         );
-        PdfDocument::from_bytes(doc.source_bytes.clone())
+        PdfDocument::from_bytes(converted)
+            // ── end pdf_manipulator patch ──
             .expect("re-parse of converted bytes failed for level {level:?}");
     }
 }
@@ -697,7 +702,10 @@ fn test_converted_multipage_pdf_is_reparseable() {
     let bytes = build_multipage_pdf();
     let mut doc = PdfDocument::from_bytes(bytes).expect("parse");
     convert_to_pdf_a(&mut doc, PdfALevel::A2b).expect("convert");
-    PdfDocument::from_bytes(doc.source_bytes.clone()).expect("re-parse");
+    // ── pdf_manipulator patch: the source's bytes are read, not held as a field ──
+    PdfDocument::from_bytes(doc.source_bytes_whole().expect("converted bytes read"))
+        .expect("re-parse");
+    // ── end pdf_manipulator patch ──
 }
 
 // ---------------------------------------------------------------------------

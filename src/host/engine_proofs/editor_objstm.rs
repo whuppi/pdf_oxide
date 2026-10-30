@@ -130,9 +130,9 @@ fn stream_head_finds_streams_whatever_the_size_of_their_dictionary() {
 
     for (id, data) in [(4, &small), (5, &wide)] {
         let head = doc.stream_head(ObjectRef::new(id, 0)).unwrap().expect("a plain stream");
-        assert_eq!(head.data_len as usize, data.len(), "object {id}");
-        let mut copied = vec![0u8; data.len()];
-        doc.read_source_at(head.data_start, &mut copied).unwrap();
+        assert_eq!(head.data_len() as usize, data.len(), "object {id}");
+        let mut copied = Vec::new();
+        std::io::Read::read_to_end(&mut head.extent.stored_reader(), &mut copied).unwrap();
         assert_eq!(&copied, data, "object {id}");
     }
     for id in [1, 3] {

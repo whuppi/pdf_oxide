@@ -42,8 +42,8 @@ pub fn reduce_images(
         let Object::Stream { dict, body } = &object else {
             return Ok(());
         };
-        let data = body.inline();
-        let kind = classify(editor.source(), dict, data);
+        let data = body.read_whole_raw()?;
+        let kind = classify(editor.source(), dict, &data);
         let uses: Vec<Use> = entry.placements.iter().map(|&ctm| Use { ctm }).collect();
         let mask_before = match kind.masks.soft_mask {
             Some(r) => stream_len(editor, r)?,
@@ -69,9 +69,12 @@ pub fn reduce_images(
                     Some(r) => Some((r, staged_or_source(editor, r)?)),
                     None => None,
                 };
+                // The data was read once, for `classify`; the decode reads it
+                // from memory instead of asking the source for it again.
+                let held = Object::stream(dict.clone(), data);
                 match apply(
                     editor.source(),
-                    &object,
+                    &held,
                     entry.object,
                     &kind,
                     mask.as_ref(),
@@ -118,7 +121,7 @@ fn staged_or_source(editor: &mut DocumentEditor, r: ObjectRef) -> Result<Object>
 
 fn stream_len(editor: &mut DocumentEditor, r: ObjectRef) -> Result<u64> {
     Ok(match staged_or_source(editor, r)? {
-        Object::Stream { body, .. } => body.inline().len() as u64,
+        Object::Stream { body, .. } => body.len(),
         _ => 0,
     })
 }
@@ -310,7 +313,6 @@ fn decode_bilevel(doc: &PdfDocument, object: &Object, kind: &Kind) -> Result<Sam
     let Object::Stream { dict, body } = object else {
         return Err(Error::Image("image XObject is not a stream".to_string()));
     };
-    let data = body.inline();
     let (width, height) = (kind.width, kind.height);
     let row_bytes = (width as usize).div_ceil(8);
     let (packed, complement) = match kind.encoding {
@@ -321,7 +323,8 @@ fn decode_bilevel(doc: &PdfDocument, object: &Object, kind: &Kind) -> Result<Sam
                 return Err(Error::Image("CCITT behind another filter".to_string()));
             }
             let params = ccitt_params_of(doc, dict, width, height);
-            (crate::extractors::ccitt_bilevel::decompress_ccitt(data, &params)?, true)
+            let data = body.read_whole_raw()?;
+            (crate::extractors::ccitt_bilevel::decompress_ccitt(&data, &params)?, true)
         },
         _ => return Err(Error::Image("bilevel image in a codec without a decoder".to_string())),
     };

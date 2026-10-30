@@ -62,9 +62,9 @@ fn saved(source: Vec<u8>) -> PdfDocument {
     PdfDocument::from_bytes(bytes).unwrap()
 }
 
-fn parts(object: &Object) -> (&std::collections::HashMap<String, Object>, &[u8]) {
+fn parts(object: &Object) -> (&std::collections::HashMap<String, Object>, Vec<u8>) {
     match object {
-        Object::Stream { dict, body } => (dict, body.inline()),
+        Object::Stream { dict, body } => (dict, body.read_whole_raw().unwrap()),
         other => panic!("not a stream: {other:?}"),
     }
 }

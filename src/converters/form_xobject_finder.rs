@@ -326,11 +326,9 @@ pub fn rasterize_form_and_inline_regions(
     // page with N Form-XObjects re-rendered the page N times. On a
     // 10-page LaTeX paper with 12 Form-XObjects we saw 263 seconds
     // for PDF→DOCX; with this caching it should drop by ~Nx.
-    let bytes = doc.source_bytes.clone();
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-    let doc_mut = match crate::document::PdfDocument::from_bytes(bytes) {
+    // ── pdf_manipulator patch: the second document reads the source in windows ──
+    let doc_mut = match doc.reopen() {
+        // ── end pdf_manipulator patch ──
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };

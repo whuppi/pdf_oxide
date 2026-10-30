@@ -9,7 +9,6 @@
 //! [`CHUNK`] pieces, so a stream that inflates to many times its size is
 //! never held decoded.
 
-use crate::document::PdfDocument;
 use crate::object::Object;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use std::collections::HashMap;
@@ -45,52 +44,6 @@ pub(crate) fn encoding(dict: &HashMap<String, Object>) -> Encoding {
             _ => Encoding::Other,
         },
         Some(_) => Encoding::Other,
-    }
-}
-
-/// Reads `[at, end)` of the source in pieces.
-pub(crate) struct SourceRead<'a> {
-    source: &'a PdfDocument,
-    at: u64,
-    end: u64,
-}
-
-impl<'a> SourceRead<'a> {
-    pub(crate) fn new(source: &'a PdfDocument, at: u64, len: u64) -> Self {
-        Self { source, at, end: at + len }
-    }
-}
-
-impl Read for SourceRead<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let want = ((self.end - self.at) as usize).min(buf.len());
-        if want == 0 {
-            return Ok(0);
-        }
-        let n = self
-            .source
-            .read_source_at(self.at, &mut buf[..want])
-            .map_err(io::Error::other)?;
-        if n == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        self.at += n as u64;
-        Ok(n)
-    }
-}
-
-/// A sink that only counts.
-#[derive(Default)]
-pub(crate) struct Counter(pub(crate) u64);
-
-impl Write for Counter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 += buf.len() as u64;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
