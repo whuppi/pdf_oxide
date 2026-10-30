@@ -155,7 +155,18 @@ fn build<'a>(spec: &Rc<Spec<'a>>, upto: usize) -> Result<Box<dyn Read + 'a>> {
 /// Reads `r` to its end into one buffer, growing it in 64 KiB steps. A
 /// refused allocation is a typed decode error, not an abort. `hint` is the
 /// size to expect (0 when unknown) and is reserved first.
-pub fn read_whole(mut r: impl Read, hint: usize) -> Result<Vec<u8>> {
+pub fn read_whole(r: impl Read, hint: usize) -> Result<Vec<u8>> {
+    let mut out = read_whole_loose(r, hint)?;
+    // The last 64 KiB step is mostly empty for a small stream, and a caller
+    // that caches the buffer charges its length, not its capacity. A large
+    // stream's spare is under a step, which is below the eighth that is kept.
+    if out.capacity() - out.len() > out.len() / 8 {
+        out.shrink_to_fit();
+    }
+    Ok(out)
+}
+
+fn read_whole_loose(mut r: impl Read, hint: usize) -> Result<Vec<u8>> {
     const STEP: usize = 64 * 1024;
     let mut out: Vec<u8> = Vec::new();
     let refused = |wanted: usize| {
