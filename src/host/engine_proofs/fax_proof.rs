@@ -35,7 +35,7 @@ const ROW_BYTES: usize = 3;
 /// T.4 — the same values `WHITE_CODES` / `BLACK_CODES` in
 /// `src/decoders/ccitt.rs` carry. Runs stay small so a fixture needs only
 /// terminating codes.
-fn mh(run: usize, black: bool) -> String {
+pub(super) fn mh(run: usize, black: bool) -> String {
     if black {
         match run {
             1 => "010".to_string(),
@@ -66,7 +66,7 @@ fn mh(run: usize, black: bool) -> String {
 }
 
 /// Packs an MSB-first bit string into bytes, zero-padding the last.
-fn bits_to_bytes(bits: &str) -> Vec<u8> {
+pub(super) fn bits_to_bytes(bits: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut acc = 0u8;
     let mut n = 0u8;
@@ -88,7 +88,7 @@ fn bits_to_bytes(bits: &str) -> Vec<u8> {
 /// One Group 3 line: a one-dimensional line coded by its white→black runs,
 /// or the two-dimensional line identical to the row before it (a tag bit of
 /// `0` and one T.6 V0 code).
-enum G3Line {
+pub(super) enum G3Line {
     Runs(Vec<usize>),
     Same,
 }
@@ -97,7 +97,7 @@ enum G3Line {
 /// (one-dimensional) before its MH codes; a `Same` line a tag bit of `0`.
 /// Lines run back-to-back (no EOL); when `byte_align`, each line after the
 /// first is padded out to a byte boundary, as `/EncodedByteAlign` declares.
-fn group3(lines: &[G3Line], byte_align: bool) -> Vec<u8> {
+pub(super) fn group3(lines: &[G3Line], byte_align: bool) -> Vec<u8> {
     let mut bits = String::new();
     for (i, line) in lines.iter().enumerate() {
         if byte_align && i > 0 && bits.len() % 8 != 0 {
@@ -122,7 +122,7 @@ fn group3(lines: &[G3Line], byte_align: bool) -> Vec<u8> {
 }
 
 /// A picture, four rows of 24 pixels: bands, a gap and a stripe.
-fn picture_lines() -> Vec<G3Line> {
+pub(super) fn picture_lines() -> Vec<G3Line> {
     use G3Line::*;
     vec![Runs(vec![3, 2, 4, 5, 10]), Same, Runs(vec![5, 6, 11, 2]), Same]
 }
@@ -441,4 +441,59 @@ fn the_g3_stencil_reads_and_renders_the_whole_decode() {
         let coded = render(&coded_doc, &format!("coded K={k}"));
         assert_eq!(coded, plain, "the stencil paints the whole decode's picture");
     }
+}
+
+/// A CCITT image (not a stencil) whose `/DecodeParms` array holds its
+/// parameters by reference renders the page its inline form renders. The
+/// image path resolves each array entry before it reads the parameters, so
+/// the reference is a dictionary the decode sees, not an unresolved entry.
+/// No Dart battery sees it: the batteries build no image whose parameters
+/// sit behind a reference inside an array.
+#[test]
+fn a_ccitt_image_decode_params_array_by_reference_renders_as_inline() {
+    fn gray_ccitt_pdf(indirect_entry: bool) -> Vec<u8> {
+        let entry = if indirect_entry { "6 0 R" } else { "<< /K -1 /Columns 8 /Rows 1 >>" };
+        let mut objects = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 80 10] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+                .to_vec(),
+            stream_object(4, "", b"q 80 0 0 10 0 0 cm /Im0 Do Q\n"),
+            format!(
+                "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 8 /Height 1 \
+                 /BitsPerComponent 1 /ColorSpace /DeviceGray \
+                 /Filter [/ASCIIHexDecode /CCITTFaxDecode] /DecodeParms [null {entry}] \
+                 /Length 5 >>\nstream\n31C0>\nendstream\nendobj\n"
+            )
+            .into_bytes(),
+        ];
+        if indirect_entry {
+            objects.push(b"6 0 obj\n<< /K -1 /Columns 8 /Rows 1 >>\nendobj\n".to_vec());
+        }
+        pdf_from_objects(&objects)
+    }
+
+    let render = |pdf: Vec<u8>| {
+        let doc = PdfDocument::from_bytes(pdf).expect("fixture parses");
+        let mut renderer =
+            PageRenderer::new(RenderOptions::with_dpi(72).with_transparent_background());
+        let mut raster = Vec::new();
+        let _ = renderer
+            .render_bands(
+                &doc,
+                0,
+                &|_, height| 0..height,
+                &CancelCheck::none(),
+                &mut |_, band| {
+                    raster.extend_from_slice(band.data());
+                    Ok(())
+                },
+            )
+            .expect("renders");
+        raster
+    };
+    let inline = render(gray_ccitt_pdf(false));
+    assert!(inline.iter().any(|&b| b != 0), "the inline form paints the picture");
+    assert_eq!(render(gray_ccitt_pdf(true)), inline, "the by-reference array renders as inline");
 }

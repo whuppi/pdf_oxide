@@ -76,6 +76,9 @@ enum Kind {
     /// A fax image's rows, decoded a row at a time from the stream: two
     /// transition lines and one row are all the decode holds.
     Fax(Fax),
+    /// A stencil's sample bits, read off the stream's filter readers one
+    /// row at a time (the window the filters hold plus the row).
+    Stencil(Stencil),
 }
 
 struct Strips {
@@ -128,7 +131,11 @@ struct Fax {
     /// failed and every remaining row is the blank stand-in.
     row: Vec<u8>,
     failed: bool,
-}
+    /// Set when the stencil's `/Decode` `[1 0]` puts the sample the mapping
+    /// paints where the engine's bit is clear: the sample a row carries is
+    /// then one flip from the decoded bit. Stencil readers only; the image
+    /// and mask rows keep the engine's own polarity.
+    reversed: bool,}
 
 impl Fax {
     /// Opens the fax rows of the stream `dict` names: the reader its filters
@@ -141,8 +148,8 @@ impl Fax {
         params: CcittParams,
         height: u32,
     ) -> Result<Kind> {
-        // The cursor's engine reads a u16 width; wider than that stays on the
-        // whole-decode path, which truncates it the way it always has.
+        // The cursor's engine reads a u16 width; a wider fax image is an
+        // error, and the caller skips that image with a warning.
         let width = params.columns;
         if width > u16::MAX as u32 {
             return Err(Error::Image(format!(
@@ -161,6 +168,7 @@ impl Fax {
             params,
             row: Vec::new(),
             failed: false,
+            reversed: false,
         }))
     }
 
@@ -246,6 +254,136 @@ impl Fax {
         self.row.clear();
         self.failed = false;
         Ok(())
+    }
+
+    /// Reads the next row into `out` (`row_bytes` bytes, MSB first) as the
+    /// stencil's own sample bits: a set bit is the sample the stencil's
+    /// `/Decode` puts where the mapping paints. A row the engine cannot
+    /// serve is the engine's white stand-in carried into the sample space,
+    /// and so is every row after. A sample read and the luma read drive the
+    /// same buffer through two different flips: one cursor serves one of
+    /// them.
+    fn read_samples(&mut self, out: &mut [u8]) -> Result<()> {
+        if self.row.len() != self.row_bytes {
+            self.row.clear();
+            self.row.resize(self.row_bytes, 0);
+        }
+        let mut failed_now = false;
+        let mut carried = false;
+        if !self.failed {
+            let decoded_before = self.engine.decoded_rows();
+            match self.engine.pull_row(&mut self.feed, Some(self.height), &mut self.row) {
+                Ok(_) => {},
+                Err(e) => {
+                    log::warn!(
+                        "CCITT stencil sample rows gave up ({}x{}, K={}): {e}",
+                        self.params.columns,
+                        self.height,
+                        self.params.k
+                    );
+                    self.failed = true;
+                    failed_now = true;
+                },
+            }
+            // A row the engine served without a real decode behind it (the
+            // stream that gave out before it, the block that ended early)
+            // is the white stand-in, not content: nothing more of this
+            // stencil exists to read, and the rest is the sample no paint
+            // under this mask's own /Decode reads.
+            carried = self.engine.decoded_rows() == decoded_before;
+            if carried && !failed_now {
+                self.failed = true;
+            }
+        }
+        if self.failed || failed_now || carried {
+            // A row the cursor could not decode, or the engine's white
+            // stand-in, wears the sample the mapping reads as nothing to
+            // paint (the page as it would look with the stencil absent);
+            // the flip below never applies to it.
+            self.row.fill(if self.reversed { 0x00 } else { 0xFF });
+        } else if self.reversed != self.params.black_is_1 {
+            // The engine's bit to the sample the stencil's `/Decode` mapping
+            // paints: inverted with the folded `black_is_1` and again with
+            // the stencil's own, so the two folds cancel when both say the
+            // same.
+            for b in &mut self.row {
+                *b = !*b;
+            }
+        }
+        out.copy_from_slice(&self.row);
+        Ok(())
+    }
+}
+
+/// A raw or Flate-family stencil's sample bits, read off the stream's filter
+/// readers a row at a time. A stencil has no colour space (`/ImageMask
+/// true`), so the strip reader an image takes is not open: the filtered
+/// bytes are the samples, `row_bytes` a row.
+struct Stencil {
+    /// The stream's dictionary as stored, to open its reader again from.
+    dict: HashMap<String, Object>,
+    body: crate::object::StreamBody,
+    row_bytes: usize,
+    /// The sample a row's padding carries on the luma read: the bit the
+    /// mapping reads as the base image visible, which is what a `/Mask`
+    /// stencil's missing samples stand for. A sample read pads with
+    /// [`Stencil::no_paint`] instead.
+    white_pad: u8,
+    /// The gray value (0 or 255) a set sample bit stands for in `read`.
+    one: u8,
+    reader: Box<dyn Read>,
+    /// The row last read from the reader, reused across reads. Its bytes
+    /// past what `fill` returned are the caller's padding.
+    row: Vec<u8>,
+    failed: bool,
+}
+
+impl Stencil {
+    /// Reads the next row's bytes from the reader into the row and returns
+    /// how many the stream gave: `row_bytes` for a full row, fewer where the
+    /// stream ends short or has failed. The bytes past that count are not
+    /// the stream's, so the caller pads them.
+    fn fill(&mut self) -> usize {
+        if self.row.len() != self.row_bytes {
+            self.row.clear();
+            self.row.resize(self.row_bytes, 0);
+        }
+        if self.failed {
+            return 0;
+        }
+        let mut filled = 0;
+        while filled < self.row_bytes {
+            match self.reader.read(&mut self.row[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+                Err(e) => {
+                    log::warn!("stencil sample rows stopped early: {e}");
+                    self.failed = true;
+                    break;
+                },
+            }
+        }
+        filled
+    }
+
+    /// The sample bit under which no paint lands: the opposite of the bit
+    /// the mapping paints, so a padded row shows nothing of the stencil.
+    fn no_paint(&self) -> u8 {
+        if self.one == 255 { 0x00 } else { 0xFF }
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        self.reader = Strips::open_reader(&self.dict, &self.body, None)?;
+        self.row.clear();
+        self.failed = false;
+        Ok(())
+    }
+
+    /// Bytes this source holds: the row window and the body's bytes when
+    /// they are the stream's own.
+    fn retained(&self) -> usize {
+        self.row.capacity() + self.body.inline().map_or(0, |bytes| bytes.len())
     }
 }
 
@@ -562,7 +700,6 @@ impl ImageRows {
         };
         let (mw, mh) = (dimension("Width")?, dimension("Height")?);
         let row_bytes = (mw as usize).div_ceil(8);
-        let expected = row_bytes * mh as usize;
         let filters = dict
             .get("Filter")
             .map(crate::object::extract_filter_names)
@@ -574,23 +711,38 @@ impl ImageRows {
             .map(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)).unwrap_or(0.0) >= 0.5)
             .unwrap_or(false);
 
-        // The packed 1-bit samples of the stencil. A mask the codec could not
-        // decode has no sample to test: it reads as the base image visible,
-        // the same result an absent /Mask gives.
-        let packed = if is_filter(&filters, &["JBIG2Decode"]) {
-            crate::extractors::images::decode_jbig2_stencil(xobject, dict, Some(doc), mw, mh)
-                .unwrap_or_default()
+        // The sample a row the source cannot serve stands for: the mapping
+        // below reads the base image visible where no sample exists (the
+        // padding is the bit that does, ISO 32000-1 §8.9.6.2).
+        let white_pad = if decode_reverses { 0xFF } else { 0x00 };
+        let kind = if is_filter(&filters, &["JBIG2Decode"]) {
+            // The exception (d-122): the format composes its page bitmap
+            // before any row could leave it, so its packed rows are held
+            // whole. A mask the codec could not decode has no sample to
+            // test: it reads as the base image visible, the same result an
+            // absent /Mask gives.
+            let packed =
+                crate::extractors::images::decode_jbig2_stencil(xobject, dict, Some(doc), mw, mh)
+                    .unwrap_or_default();
+            let mut packed = packed;
+            if packed.len() < row_bytes * mh as usize {
+                packed.resize(row_bytes * mh as usize, white_pad);
+            }
+            Kind::Bits {
+                packed,
+                row_bytes,
+                one: if decode_reverses { 255 } else { 0 },
+            }
         } else if is_filter(&filters, &["CCITTFaxDecode"]) {
             // The stencil's codestream is decoded a row at a time off the
-            // stream's reader, never held whole. The decoded rows are
-            // complemented so `0` is the inked sample the `/Decode` mapping
-            // below reads, and rows the cursor could not serve stay white —
-            // the blank stand-in the whole decode made of a stream it could
-            // not read.
-            let decode_parms = dict.get("DecodeParms").and_then(|o| match o {
-                Object::Reference(_) => doc.resolve_object(o).ok(),
-                other => Some(other.clone()),
-            });
+            // stream's reader, never held whole. The cursor's rows leave
+            // with its `black_is_1` flip applied; the sample the stencil's
+            // mapping reads sits at most one flip from the decoded bit, and
+            // the read folds that flip in.
+            let decode_parms = crate::extractors::images::resolved_decode_parms(
+                Some(doc),
+                dict.get("DecodeParms"),
+            );
             let mut params =
                 crate::object::extract_ccitt_params_with_width(decode_parms.as_ref(), Some(mw))
                     .unwrap_or(crate::decoders::CcittParams {
@@ -601,92 +753,35 @@ impl ImageRows {
                     });
             params.columns = mw;
             params.rows = Some(mh);
-            let rows = crate::decoders::ccitt::FaxRowEngine::new(&params);
-            let mut packed = vec![0u8; expected];
-            match rows {
-                Ok(mut engine) => {
-                    if params.columns <= u16::MAX as u32 {
-                        let reader = Strips::open_reader(dict, body, None)?;
-                        let mut feed = BitFeed::new(reader);
-                        for row in packed.chunks_exact_mut(row_bytes) {
-                            if engine.pull_row(&mut feed, Some(mh), row).is_err() {
-                                log::warn!("CCITT stencil rows stopped early: the cursor could not read a row");
-                                break; // the rest stay white padding
-                            }
-                            if params.black_is_1 {
-                                for b in row.iter_mut() {
-                                    *b = !*b;
-                                }
-                            }
-                        }
-                    } else {
-                        log::warn!(
-                            "CCITT stencil /Width {mw} exceeds the row cursor's limit {}",
-                            u16::MAX
-                        );
-                    }
-                },
-                Err(e) => {
-                    log::warn!("CCITT stencil rows unreadable: {e}");
-                },
+            // The read's flip lands a decoded bit on the sample the luma
+            // mapping reads (a set sample bit is `one`, a clear one the
+            // other): inverted with the engine's own `/BlackIs1` and with
+            // the sample the stencil's `/Decode` puts where the mapping
+            // paints, so the two folds cancel when both say the same.
+            params.black_is_1 = decode_reverses == params.black_is_1;
+            let mut fax_kind = Fax::open(dict, body, params, mh)?;
+            if let Kind::Fax(fax) = &mut fax_kind {
+                fax.reversed = decode_reverses;
             }
-            // The decoder emits 1 for an inked pixel, the complement of the
-            // sample value the rule below is written against.
-            for b in &mut packed {
-                *b = !*b;
-            }
-            packed
+            fax_kind
         } else {
-            let raw = xobject.decode_stream_data()?;
-            if raw.len() < expected / 2 {
-                // Data is still compressed: Group 4 CCITT.
-                let k = dict
-                    .get("DecodeParms")
-                    .and_then(|o| o.as_dict())
-                    .and_then(|d| d.get("K"))
-                    .and_then(|o| o.as_integer())
-                    .unwrap_or(0);
-                if k == -1 {
-                    #[allow(deprecated)]
-                    match crate::extractors::ccitt_bilevel::decompress_ccitt_group4(&raw, mw, mh) {
-                        Ok(mut decompressed) => {
-                            // The CCITT decoder emits 1 for an inked pixel,
-                            // the complement of the sample value the rule
-                            // below is written against.
-                            for b in &mut decompressed {
-                                *b = !*b;
-                            }
-                            decompressed
-                        },
-                        Err(_) => raw,
-                    }
-                } else {
-                    raw
-                }
-            } else {
-                raw
-            }
-        };
-        // A set bit lets the base image show only when /Decode reverses;
-        // otherwise a clear bit does. Past the end of the stream there is no
-        // sample to test, so the base image stays visible: the padding is the
-        // bit that does.
-        let pad = if decode_reverses { 0xFF } else { 0x00 };
-        let mut packed = packed;
-        if packed.len() < expected {
-            packed.resize(expected, pad);
-        }
-        Ok(Self {
-            width: mw,
-            height: mh,
-            output: Output::Luma,
-            next: 0,
-            kind: Kind::Bits {
-                packed,
+            // Raw and Flate-family filters, through the stream's filter
+            // readers (decryption on, predictor included) a row at a time.
+            Kind::Stencil(Stencil {
+                dict: dict.clone(),
+                body: body.clone(),
                 row_bytes,
+                // Past the end of the stream, a /Mask read shows the base
+                // image there (the luma pad); a sample read paints nothing
+                // there (`Stencil::no_paint`).
+                white_pad,
                 one: if decode_reverses { 255 } else { 0 },
-            },
-        })
+                reader: Strips::open_reader(dict, body, None)?,
+                row: Vec::new(),
+                failed: false,
+            })
+        };
+        Ok(Self { width: mw, height: mh, output: Output::Luma, next: 0, kind })
     }
 
     pub(crate) fn size(&self) -> (u32, u32) {
@@ -702,6 +797,17 @@ impl ImageRows {
             Kind::Raster(img) => img.as_bytes().len(),
             Kind::Bits { packed, .. } => packed.len(),
             Kind::Fax(fax) => fax.retained(),
+            Kind::Stencil(stencil) => stencil.retained(),
+        }
+    }
+
+    /// Whether the source has failed: a `Fax` or `Stencil` kind that cannot
+    /// read a row from here on serves the padding instead.
+    pub(crate) fn failed(&self) -> bool {
+        match &self.kind {
+            Kind::Fax(fax) => fax.failed,
+            Kind::Stencil(stencil) => stencil.failed,
+            _ => false,
         }
     }
 
@@ -716,6 +822,9 @@ impl ImageRows {
         }
         if let Kind::Fax(fax) = &mut self.kind {
             fax.restart()?;
+        }
+        if let Kind::Stencil(stencil) = &mut self.kind {
+            stencil.restart()?;
         }
         Ok(())
     }
@@ -736,6 +845,12 @@ impl ImageRows {
         }
         if let Kind::Fax(fax) = &mut self.kind {
             fax.skip(target - self.next)?;
+        }
+        if let Kind::Stencil(stencil) = &mut self.kind {
+            let rows = target - self.next;
+            for _ in 0..rows {
+                stencil.fill();
+            }
         }
         self.next = target;
         Ok(())
@@ -759,6 +874,11 @@ impl ImageRows {
                 // folded into the params it opens with.
                 fax.read(out, width, output)?;
             },
+            Kind::Stencil(stencil) => {
+                let filled = stencil.fill();
+                stencil.row[filled..].fill(stencil.white_pad);
+                bilevel_row(&stencil.row, width, stencil.one, output, out);
+            },
             Kind::Strips(s) => {
                 if y >= s.first + s.count {
                     Self::fill(s, doc, y, width, self.height, output)?;
@@ -767,6 +887,53 @@ impl ImageRows {
                 let at = (y - s.first) as usize * stride;
                 out.copy_from_slice(&s.pixels[at..at + stride]);
             },
+        }
+        self.next += 1;
+        Ok(())
+    }
+
+    /// The sample bits of the padding a stencil's unreadable rows carry:
+    /// none of them paints under the mask's own `/Decode`. `one` is 255
+    /// exactly when `/Decode` `[1 0]` puts the painted sample where the bit
+    /// is set, so the padding is the opposite bit.
+    fn no_paint_sample_byte(&self) -> u8 {
+        match &self.kind {
+            Kind::Bits { one, .. } => {
+                if *one == 255 { 0x00 } else { 0xFF }
+            },
+            Kind::Stencil(stencil) => stencil.no_paint(),
+            Kind::Fax(fax) => {
+                if fax.reversed { 0x00 } else { 0xFF }
+            },
+            _ => 0xFF,
+        }
+    }
+
+    /// Reads the next row into `out` (`row_bytes` bytes, MSB first) as the
+    /// stencil's own sample bits: a set bit is the sample the stencil's
+    /// `/Decode` puts where the mapping paints. One cursor is read through
+    /// `read` or through this, never both: the two carry the kind's
+    /// personal buffer through different spaces.
+    /// A `Kind::Bits` row is read as the samples it holds; a raw or
+    /// Flate-family stencil's row is what its reader yields; a fax stencil
+    /// carries the decoded bit to the sample space the `/Decode` names.
+    pub(crate) fn read_samples(&mut self, out: &mut [u8]) -> Result<()> {
+        let y = self.next;
+        if y >= self.height {
+            return Err(Error::Image("image has no more rows".to_string()));
+        }
+        match &mut self.kind {
+            Kind::Bits { packed, row_bytes, .. } => {
+                out.copy_from_slice(&packed[y as usize * *row_bytes..(y as usize + 1) * *row_bytes]);
+            },
+            Kind::Fax(fax) => fax.read_samples(out)?,
+            Kind::Stencil(stencil) => {
+                let pad = stencil.no_paint();
+                let filled = stencil.fill();
+                stencil.row[filled..].fill(pad);
+                out.copy_from_slice(&stencil.row);
+            },
+            _ => return Err(Error::Image("not a stencil row source".to_string())),
         }
         self.next += 1;
         Ok(())
@@ -838,7 +1005,246 @@ impl ImageRows {
     }
 }
 
-/// A mask read in step with the image it masks: a gray image, sampled
+/// Premultiplied RGBA8 of the columns `x0..x1` of a packed 1-bit stencil's
+/// rows, `rows` holding the mask's sample bits for exactly those rows (row
+/// `r` is stencil row `y0 + r`, `row_bytes` bytes each) and nothing else.
+/// `colour` where the stencil paints and clear elsewhere: a sample paints
+/// where it is 0, or where it is 1 when `invert`. The row-range form of
+/// [`stencil_region`], for the band a cursor serves instead of the mask's
+/// whole bitmap.
+pub(crate) fn stencil_region_rows(
+    rows: &[u8],
+    row_bytes: usize,
+    invert: bool,
+    colour: [u8; 4],
+    x0: u32,
+    x1: u32,
+) -> Vec<u8> {
+    let width = (x1 - x0) as usize;
+    let height = rows.len() / row_bytes.max(1);
+    let mut out = vec![0u8; width * height * 4];
+    for (band_y, row) in rows.chunks_exact(row_bytes).enumerate() {
+        for x in x0..x1 {
+            let byte = row.get(x as usize / 8).copied().unwrap_or(0);
+            let bit = (byte >> (7 - (x % 8))) & 1 == 1;
+            if bit == invert {
+                let at = (band_y * width + (x - x0) as usize) * 4;
+                out[at..at + 4].copy_from_slice(&colour);
+            }
+        }
+    }
+    out
+}
+
+/// A stencil's rows reduced to its device footprint, read a row at a time
+/// through the resampler the image path reduces its rows with.
+struct StencilReduce {
+    resampler: RowResampler,
+    /// The destination row the next `coverage` call asks for first.
+    next_dst: u32,
+    /// The source row's sample bits, and its coverage as RGBA8.
+    bits: Vec<u8>,
+    cov: Vec<u8>,
+}
+
+/// The rows of one stencil band, as the band paints them.
+pub(crate) enum StencilBand {
+    /// Sample bits, `row_bytes` a row. A sample paints where its bit is
+    /// `invert`.
+    Bits { rows: Vec<u8>, row_bytes: usize, invert: bool },
+    /// Premultiplied RGBA8 rows of a reduced stencil, `width` pixels each;
+    /// the alpha is the coverage.
+    Coverage { rgba: Vec<u8>, width: usize },
+}
+
+impl StencilBand {
+    /// The band's pixels in `colour` where the stencil paints, for the
+    /// columns `x0..x1`.
+    pub(crate) fn paint(&self, colour: [u8; 4], x0: u32, x1: u32) -> Vec<u8> {
+        match self {
+            StencilBand::Bits { rows, row_bytes, invert } => {
+                stencil_region_rows(rows, *row_bytes, *invert, colour, x0, x1)
+            },
+            StencilBand::Coverage { rgba, width } => {
+                coverage_region_rows(rgba, *width, colour, x0, x1)
+            },
+        }
+    }
+}
+
+/// The columns `x0..x1` of reduced stencil rows, `colour` scaled by each
+/// pixel's coverage (its alpha).
+fn coverage_region_rows(rgba: &[u8], width: usize, colour: [u8; 4], x0: u32, x1: u32) -> Vec<u8> {
+    let out_w = (x1 - x0) as usize;
+    let height = rgba.len() / (width * 4);
+    let mut out = vec![0u8; out_w * height * 4];
+    for (y, row) in rgba.chunks_exact(width * 4).enumerate() {
+        for (x, px) in row[x0 as usize * 4..x1 as usize * 4].chunks_exact(4).enumerate() {
+            let alpha = u32::from(px[3]);
+            let at = (y * out_w + x) * 4;
+            for (out_c, c) in out[at..at + 4].iter_mut().zip(colour) {
+                *out_c = ((u32::from(c) * alpha + 127) / 255) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// One stencil mask open across the bands of a page: rows read as packed
+/// sample bits a band paints, never the mask's whole bitmap. A stencil larger
+/// than its device footprint is read as coverage at that footprint.
+pub(crate) struct StencilCursor {
+    rows: ImageRows,
+    /// Set when a row the source could not read has been met: from then on
+    /// every row is the padding that no paint under this mask's `/Decode`
+    /// reads, the page as it would look with the stencil absent.
+    failed: bool,
+    reduce: Option<StencilReduce>,
+}
+
+impl StencilCursor {
+    /// Opens the stencil `xobject` (`/ImageMask true`) for a device footprint
+    /// of `footprint` pixels: a stencil larger than that in a dimension is
+    /// reduced to it in that dimension.
+    pub(crate) fn open(
+        doc: &crate::document::PdfDocument,
+        xobject: &Object,
+        footprint: (u32, u32),
+    ) -> Result<Self> {
+        let rows = ImageRows::open_stencil(doc, xobject)?;
+        let (width, height) = rows.size();
+        let reduce = (width > footprint.0 || height > footprint.1).then(|| {
+            let (dst_w, dst_h) = (width.min(footprint.0), height.min(footprint.1));
+            StencilReduce {
+                resampler: RowResampler::new(width, height, dst_w, dst_h),
+                next_dst: 0,
+                bits: vec![0; (width as usize).div_ceil(8)],
+                cov: vec![0; width as usize * 4],
+            }
+        });
+        Ok(Self { rows, failed: false, reduce })
+    }
+
+    /// The size the stencil is painted at: its own, or its footprint when it
+    /// was reduced.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        match &self.reduce {
+            Some(reduce) => reduce.resampler.dst_size(),
+            None => self.rows.size(),
+        }
+    }
+
+    /// The rows `y0..y1` of the stencil as a band paints them.
+    pub(crate) fn band(&mut self, y0: u32, y1: u32, invert: bool) -> Result<StencilBand> {
+        if self.reduce.is_some() {
+            let (width, _) = self.size();
+            let rgba = self.coverage(y0, y1, invert)?;
+            return Ok(StencilBand::Coverage { rgba, width: width as usize });
+        }
+        let row_bytes = self.row_bytes();
+        Ok(StencilBand::Bits { rows: self.region(y0, y1)?, row_bytes, invert })
+    }
+
+    /// The reduced rows `y0..y1` as premultiplied RGBA8, the whole reduced
+    /// width a row, the alpha the stencil's coverage of each pixel. Rows are
+    /// asked for in order: a request behind the last row produced starts the
+    /// decode over.
+    fn coverage(&mut self, y0: u32, y1: u32, invert: bool) -> Result<Vec<u8>> {
+        let Some(reduce) = self.reduce.as_mut() else {
+            return Err(Error::Image("stencil has no reduction to read".to_string()));
+        };
+        let (dst_w, dst_h) = reduce.resampler.dst_size();
+        let y1 = y1.min(dst_h);
+        if y0 >= y1 {
+            return Ok(Vec::new());
+        }
+        if y0 < reduce.next_dst {
+            if self.rows.restart().is_err() {
+                self.failed = true;
+            }
+            reduce.resampler.reset();
+            reduce.next_dst = 0;
+        }
+        let mut out = vec![0u8; (y1 - y0) as usize * dst_w as usize * 4];
+        for dst in y0..y1 {
+            let (start, stop) = reduce.resampler.source_rows_of(dst);
+            while reduce.resampler.next_source_row() < start {
+                self.rows.skip(1)?;
+                reduce.resampler.skip();
+            }
+            while reduce.resampler.next_source_row() < stop {
+                if self.failed {
+                    reduce.bits.fill(self.rows.no_paint_sample_byte());
+                } else if self.rows.read_samples(&mut reduce.bits).is_err() || self.rows.failed() {
+                    self.failed = true;
+                    reduce.bits.fill(self.rows.no_paint_sample_byte());
+                }
+                for (x, px) in reduce.cov.chunks_exact_mut(4).enumerate() {
+                    let bit = (reduce.bits[x / 8] >> (7 - x % 8)) & 1 == 1;
+                    px.fill(if bit == invert { 255 } else { 0 });
+                }
+                reduce.resampler.feed(&reduce.cov);
+            }
+            let at = (dst - y0) as usize * dst_w as usize * 4;
+            reduce.resampler.take(dst, &mut out[at..at + dst_w as usize * 4]);
+            reduce.next_dst = dst + 1;
+        }
+        Ok(out)
+    }
+
+    /// The stencil's sample bits for the rows `y0..y1`, each `row_bytes`
+    /// bytes, bottom left in the band's order (topmost first). A request
+    /// behind the last row produced starts the decode over. `rows.next`
+    /// advances, so the same rows are read once across the bands.
+    pub(crate) fn region(&mut self, y0: u32, y1: u32) -> Result<Vec<u8>> {
+        let (_, height) = self.rows.size();
+        let y1 = y1.min(height);
+        if y0 >= y1 {
+            return Ok(Vec::new());
+        }
+        if y0 < self.rows.next {
+            if self.rows.restart().is_err() {
+                self.failed = true;
+            }
+        }
+        if self.rows.next < y0 {
+            self.rows.skip(y0 - self.rows.next)?;
+        }
+        let row_bytes = self.row_bytes();
+        let mut out = vec![0u8; row_bytes * (y1 - y0) as usize];
+        for row in out.chunks_exact_mut(row_bytes) {
+            if self.failed {
+                row.fill(self.no_paint_byte());
+            } else if self.rows.read_samples(row).is_err() || self.rows.failed() {
+                self.failed = true;
+                row.fill(self.no_paint_byte());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bytes a stencil row spans, which every row of a region holds.
+    fn row_bytes(&self) -> usize {
+        let (width, _) = self.rows.size();
+        (width as usize).div_ceil(8)
+    }
+
+    /// The sample bits of the padding when the stencil's rows stop: none of
+    /// them paints under this mask's own `/Decode` (which the row source
+    /// knows through its `one` and its folded fax polarity).
+    fn no_paint_byte(&self) -> u8 {
+        self.rows.no_paint_sample_byte()
+    }
+
+    /// Bytes this cursor holds in memory: the row source's (its reader
+    /// windows, an exception's whole bitmap) and little of its own.
+    fn retained_bytes(&self) -> usize {
+        let reduced = self.reduce.as_ref().map_or(0, |reduce| {
+            reduce.resampler.retained_bytes() + reduce.bits.capacity() + reduce.cov.capacity()
+        });
+        self.rows.retained_bytes() + reduced + std::mem::size_of::<StencilCursor>()
+    }
+}
 /// nearest-neighbour onto the base image's grid (§8.9.6.3 maps both to the
 /// same unit square, so they need not share a resolution).
 struct MaskRows {
@@ -1129,36 +1535,6 @@ impl ImageCursor {
     }
 }
 
-/// Premultiplied RGBA8 of the columns `x0..x1`, rows `y0..y1` of a packed
-/// 1-bit stencil, `colour` where the stencil paints and clear elsewhere. A
-/// sample paints where it is 0, or where it is 1 when `invert`; a byte past
-/// the end of `packed` reads as 0.
-pub(crate) fn stencil_region(
-    packed: &[u8],
-    row_bytes: usize,
-    invert: bool,
-    colour: [u8; 4],
-    x0: u32,
-    x1: u32,
-    y0: u32,
-    y1: u32,
-) -> Vec<u8> {
-    let width = (x1 - x0) as usize;
-    let mut out = vec![0u8; width * (y1 - y0) as usize * 4];
-    for y in y0..y1 {
-        let row = y as usize * row_bytes;
-        for x in x0..x1 {
-            let byte = packed.get(row + x as usize / 8).copied().unwrap_or(0);
-            let bit = (byte >> (7 - (x % 8))) & 1 == 1;
-            if bit == invert {
-                let at = ((y - y0) as usize * width + (x - x0) as usize) * 4;
-                out[at..at + 4].copy_from_slice(&colour);
-            }
-        }
-    }
-    out
-}
-
 /// What a page's open images are keyed by: the stream, or for an inline image
 /// the hash of its data, and the transform the image is painted under.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1199,27 +1575,40 @@ const TABLE_BYTES: usize = 4 * 1024 * 1024;
 /// A page's open images. One that is not drawn in the next band is of no use
 /// to a page that paints thousands of inline images, so the table holds a
 /// byte budget of them and puts the least recently drawn out.
-#[derive(Default)]
-pub(crate) struct CursorTable {
-    open: HashMap<CursorKey, (u64, usize, ImageCursor)>,
+/// What a let-over cursor says of the bytes it holds, which the table's
+/// budget works with.
+pub(crate) trait CursorBytes {
+    fn held_bytes(&self) -> usize;
+}
+
+pub(crate) struct CursorTable<T> {
+    open: HashMap<CursorKey, (u64, usize, T)>,
     bytes: usize,
     clock: u64,
 }
 
-impl CursorTable {
-    pub(crate) fn clear(&mut self) {
-        self.open.clear();
-        self.bytes = 0;
+impl<T> Default for CursorTable<T> {
+    fn default() -> Self {
+        Self { open: HashMap::new(), bytes: 0, clock: 0 }
     }
+}
 
+impl CursorTable<ImageCursor> {
     /// Bytes the open images hold.
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
+}
 
-    /// The open image for `key`, which leaves the table while it is drawn.
-    pub(crate) fn take(&mut self, key: &CursorKey) -> Option<ImageCursor> {
+impl<T: CursorBytes> CursorTable<T> {
+    pub(crate) fn clear(&mut self) {
+        self.open.clear();
+        self.bytes = 0;
+    }
+
+    /// The open cursor for `key`, which leaves the table while it is drawn.
+    pub(crate) fn take(&mut self, key: &CursorKey) -> Option<T> {
         let (_, bytes, cursor) = self.open.remove(key)?;
         self.bytes -= bytes;
         Some(cursor)
@@ -1229,9 +1618,9 @@ impl CursorTable {
     /// while the table holds more than its budget. The cursor just drawn is
     /// kept whatever it holds: a raster that is one image's alone is the
     /// decode, and dropping it would repeat the decode in the next band.
-    pub(crate) fn put(&mut self, key: CursorKey, cursor: ImageCursor) {
+    pub(crate) fn put(&mut self, key: CursorKey, cursor: T) {
         self.clock += 1;
-        let bytes = cursor.retained_bytes();
+        let bytes = cursor.held_bytes();
         self.bytes += bytes;
         self.open.insert(key.clone(), (self.clock, bytes, cursor));
         while self.bytes > TABLE_BYTES {
@@ -1248,5 +1637,17 @@ impl CursorTable {
                 self.bytes -= bytes;
             }
         }
+    }
+}
+
+impl CursorBytes for ImageCursor {
+    fn held_bytes(&self) -> usize {
+        self.retained_bytes()
+    }
+}
+
+impl CursorBytes for StencilCursor {
+    fn held_bytes(&self) -> usize {
+        self.retained_bytes()
     }
 }

@@ -848,8 +848,6 @@ pub(crate) fn fax_params(
     width: u32,
     height: u32,
 ) -> Option<crate::decoders::CcittParams> {
-    use crate::object::Object;
-
     let bits_per_component = dict.get("BitsPerComponent").and_then(|o| o.as_integer());
     if bits_per_component != Some(1) {
         return None;
@@ -871,10 +869,8 @@ pub(crate) fn fax_params(
         };
     if resolved_color_space != ColorSpace::DeviceGray {
         return None;
-    }    let decode_parms = dict.get("DecodeParms").and_then(|o| match o {
-        Object::Reference(_) => doc.and_then(|d| d.resolve_object(o).ok()),
-        other => Some(other.clone()),
-    });
+    }
+    let decode_parms = resolved_decode_parms(doc, dict.get("DecodeParms"));
     let mut ccitt_params =
         crate::object::extract_ccitt_params_with_width(decode_parms.as_ref(), Some(width))?;
     if ccitt_params.rows.is_none() {
@@ -892,6 +888,26 @@ pub(crate) fn fax_params(
         ccitt_params.black_is_1 = !ccitt_params.black_is_1;
     }
     Some(ccitt_params)
+}
+
+/// The `/DecodeParms` a filter reads, with its indirect references resolved
+/// at the top level and in each entry of an array, so the params readers
+/// see direct objects. A reference that does not resolve becomes null.
+pub(crate) fn resolved_decode_parms(
+    doc: Option<&crate::document::PdfDocument>,
+    parms: Option<&crate::object::Object>,
+) -> Option<crate::object::Object> {
+    use crate::object::Object;
+
+    let resolve = |obj: &Object| match (obj, doc) {
+        (Object::Reference(_), Some(doc)) => doc.resolve_object(obj).unwrap_or(Object::Null),
+        (Object::Reference(_), None) => Object::Null,
+        (other, _) => other.clone(),
+    };
+    match parms? {
+        Object::Array(entries) => Some(Object::Array(entries.iter().map(resolve).collect())),
+        other => Some(resolve(other)),
+    }
 }
 // ── end pdf_manipulator patch ──
 

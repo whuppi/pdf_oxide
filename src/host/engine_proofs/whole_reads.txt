@@ -23,7 +23,6 @@ fonts::font_dict::from_dict
 fonts::font_dict::parse_descendant_fonts
 fonts::font_dict::resolve_encoding_writing_mode
 host::attachments::attachment_bytes
-host::images::stream::open_stencil # a /Mask stencil is one bit a pixel; its packed rows are kept and read in step with the image
 object::decode_stream_data
 object::read_whole_raw
 objstm::decode_object_stream
@@ -36,7 +35,6 @@ rendering::page_renderer::evaluate_type0_multi
 rendering::page_renderer::parse_type0_transfer_function
 rendering::page_renderer::parse_type4_transfer_function
 rendering::page_renderer::project_iccbased_to_rgb
-rendering::page_renderer::render_image_mask # a stencil is one bit a pixel; its packed rows are kept and only the samples a band reaches become pixels
 rendering::resolution::color::evaluate_type0_sampled
 rendering::resolution::color::evaluate_type4
 rendering::resolution::color::resolve_iccbased

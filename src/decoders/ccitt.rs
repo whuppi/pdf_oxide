@@ -293,8 +293,7 @@ impl FaxRowEngine {
         })
     }
 
-    /// Rows read from the stream — the produced buffer's real content, as
-    /// apart from its white padding.
+    /// Rows actually decoded from the codestream (excludes white padding).
     pub(crate) fn decoded_rows(&self) -> usize {
         self.decoded
     }

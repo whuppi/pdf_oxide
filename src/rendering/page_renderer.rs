@@ -27,7 +27,7 @@ use crate::rendering::band::{
 // ── end pdf_manipulator patch ──
 // ── pdf_manipulator patch: an image is read from its open decode ──
 use crate::host::images::stream::{
-    stencil_region, CursorKey as ImageCursorKey, CursorTable, ImageCursor,
+    CursorKey as ImageCursorKey, CursorTable, ImageCursor, StencilCursor,
 };
 // ── end pdf_manipulator patch ──
 use crate::rendering::path_rasterizer::PathRasterizer;
@@ -321,7 +321,11 @@ pub struct PageRenderer {
     /// The page's images that are open: each is read from its first row to
     /// its last across the bands, and dropped when the page is done or when
     /// the table needs the room.
-    image_cursors: CursorTable,
+    image_cursors: CursorTable<ImageCursor>,
+    /// The page's stencil masks (`/ImageMask true`) that are open: each is
+    /// read a row at a time across the bands and dropped with the page, the
+    /// same life an image cursor has.
+    stencil_cursors: CursorTable<StencilCursor>,
     /// Whether a soft-mask group paints nothing anywhere on the page, which a
     /// band cannot say of itself, by the mask group and the transform it is
     /// drawn under. Dropped with the page.
@@ -382,7 +386,8 @@ impl PageRenderer {
             band: BandContext::whole(0, 0),
             forced_rows: None,
             text_clip_outlines: std::cell::Cell::new(0),
-            image_cursors: CursorTable::default(),
+            image_cursors: CursorTable::<ImageCursor>::default(),
+            stencil_cursors: CursorTable::<StencilCursor>::default(),
             smask_blank: HashMap::new(),
             // ── end pdf_manipulator patch ──
         }
@@ -554,6 +559,7 @@ impl PageRenderer {
     ) -> Result<(u32, u32)> {
         let result = self.render_bands_open(doc, page_num, select, cancel, on_band);
         self.image_cursors.clear();
+        self.stencil_cursors.clear();
         result
     }
 
@@ -579,6 +585,7 @@ impl PageRenderer {
         // An image's open decode lasts one page, and so does what the
         // renderer learned about the soft masks on it.
         self.image_cursors.clear();
+        self.stencil_cursors.clear();
         self.smask_blank.clear();
         // Reset the H3b silent-K=0 warning latch so a new page's first
         // RGB-to-CMYK fallback under a declared-but-unparseable
@@ -4980,155 +4987,6 @@ impl PageRenderer {
     }
     // ── end pdf_manipulator patch ──
 
-    /// Return CCITT parameters for an ImageMask stream, if present.
-    ///
-    /// `/DecodeParms` arrays are positionally aligned with `/Filter`
-    /// arrays. CCITT must be the final filter: earlier ASCII/Flate wrappers
-    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-    /// have already been removed by `decode_stream_data`, while a
-    // ── end pdf_manipulator patch ──
-    /// later filter would incorrectly receive still-compressed fax data from
-    /// the stream decoder's intentional CCITT pass-through.
-    fn image_mask_ccitt_params(
-        dict: &HashMap<String, Object>,
-        width: u32,
-        height: u32,
-        doc: &PdfDocument,
-    ) -> Result<Option<crate::decoders::CcittParams>> {
-        let (ccitt_index, filter_count) = match dict.get("Filter") {
-            Some(Object::Name(name)) if Self::is_ccitt_filter(name) => (0, 1),
-            Some(Object::Array(filters)) => {
-                let Some(index) = filters
-                    .iter()
-                    .position(|filter| filter.as_name().is_some_and(Self::is_ccitt_filter))
-                else {
-                    return Ok(None);
-                };
-                (index, filters.len())
-            },
-            _ => return Ok(None),
-        };
-
-        if ccitt_index + 1 != filter_count {
-            return Err(Error::Image(
-                "CCITTFaxDecode must be the final ImageMask filter".to_string(),
-            ));
-        }
-        if width > u16::MAX as u32 {
-            return Err(Error::Image(format!(
-                "CCITT ImageMask width {width} exceeds decoder limit {}",
-                u16::MAX
-            )));
-        }
-
-        let resolved_params = dict
-            .get("DecodeParms")
-            .map(|params| {
-                let resolved = doc.resolve_object(params).map_err(|error| {
-                    Error::Image(format!("Unable to resolve CCITT ImageMask /DecodeParms: {error}"))
-                })?;
-                if params.as_reference().is_some() && matches!(&resolved, Object::Null) {
-                    return Err(Error::Image(
-                        "Unable to resolve CCITT ImageMask /DecodeParms: reference resolved to null"
-                            .to_string(),
-                    ));
-                }
-                Ok(resolved)
-            })
-            .transpose()?;
-        let selected_params = match resolved_params {
-            Some(Object::Array(params)) => params
-                .get(ccitt_index)
-                .map(|params| {
-                    let resolved = doc.resolve_object(params).map_err(|error| {
-                        Error::Image(format!(
-                            "Unable to resolve CCITT ImageMask /DecodeParms array entry: {error}"
-                        ))
-                    })?;
-                    if params.as_reference().is_some() && matches!(&resolved, Object::Null) {
-                        return Err(Error::Image(
-                            "Unable to resolve CCITT ImageMask /DecodeParms array entry: reference resolved to null"
-                                .to_string(),
-                        ));
-                    }
-                    Ok(resolved)
-                })
-                .transpose()?,
-            other => other,
-        };
-        let params_obj = selected_params.as_ref();
-        let params_dict = match params_obj {
-            None | Some(Object::Null) => None,
-            Some(params) => Some(params.as_dict().ok_or_else(|| {
-                Error::Image("CCITT ImageMask /DecodeParms must be a dictionary".to_string())
-            })?),
-        };
-        if params_dict
-            .and_then(|decode_params| decode_params.get("K"))
-            .is_some_and(|value| value.as_integer().is_none())
-        {
-            return Err(Error::Image(
-                "CCITT ImageMask /DecodeParms /K must be an integer".to_string(),
-            ));
-        }
-        Self::validate_ccitt_mask_dimension(params_dict, "Columns", width)?;
-        Self::validate_ccitt_mask_dimension(params_dict, "Rows", height)?;
-
-        let mut params = crate::object::extract_ccitt_params_with_width(params_obj, Some(width))
-            .unwrap_or_else(|| crate::decoders::CcittParams {
-                // ISO 32000-1 Table 11: absent /K defaults to Group 3 1-D.
-                k: 0,
-                columns: width,
-                rows: Some(height),
-                ..Default::default()
-            });
-        let has_explicit_k = params_obj
-            .and_then(Object::as_dict)
-            .is_some_and(|decode_params| decode_params.contains_key("K"));
-        if !has_explicit_k {
-            // The shared parser currently carries a historical Group 4
-            // default; enforce the PDF filter default at this renderer
-            // boundary without changing other image-extraction behaviour.
-            params.k = 0;
-        }
-        // Width and Height are authoritative for an Image XObject. Explicit
-        // mismatches were rejected above; normalise omitted values here.
-        params.columns = width;
-        params.rows = Some(height);
-        Ok(Some(params))
-    }
-
-    fn validate_ccitt_mask_dimension(
-        params: Option<&HashMap<String, Object>>,
-        key: &str,
-        expected: u32,
-    ) -> Result<()> {
-        let Some(value) = params.and_then(|decode_params| decode_params.get(key)) else {
-            return Ok(());
-        };
-        let integer = value.as_integer().ok_or_else(|| {
-            Error::Image(format!("CCITT ImageMask /DecodeParms /{key} must be an integer"))
-        })?;
-        let actual = u32::try_from(integer).map_err(|_| {
-            Error::Image(format!("CCITT ImageMask /DecodeParms /{key} must be positive"))
-        })?;
-        if actual == 0 {
-            return Err(Error::Image(format!(
-                "CCITT ImageMask /DecodeParms /{key} must be positive"
-            )));
-        }
-        if actual != expected {
-            return Err(Error::Image(format!(
-                "CCITT ImageMask /DecodeParms /{key} {actual} does not match image dimension {expected}"
-            )));
-        }
-        Ok(())
-    }
-
-    fn is_ccitt_filter(name: &str) -> bool {
-        name.eq_ignore_ascii_case("CCITTFaxDecode") || name.eq_ignore_ascii_case("CCF")
-    }
-
     /// `(width, height, row_bytes, packed_len, rgba_len)` for a 1-bpc stencil,
     /// rejecting geometry that does not fit or that no stream could back —
     /// before anything is allocated from it.
@@ -5194,11 +5052,10 @@ impl PageRenderer {
     fn image_mask_shading_pattern(
         &mut self,
         pixmap: &mut Pixmap,
-        dict: &std::collections::HashMap<String, Object>,
-        raw: &[u8],
+        band: &[u8],
+        rect: (u32, u32, u32),
         width: u32,
         height: u32,
-        row_bytes: usize,
         transform: Transform,
         clip_mask: Option<&tiny_skia::Mask>,
         gs: &GraphicsState,
@@ -5226,16 +5083,6 @@ impl PageRenderer {
         };
         let pattern_obj = doc.resolve_object(entry)?;
 
-        // §8.9.6.4: sample 0 paints under the default /Decode; [1 0] inverts.
-        let invert = match dict.get("Decode") {
-            Some(Object::Array(arr)) => match arr.first() {
-                Some(Object::Integer(1)) => true,
-                Some(Object::Real(v)) => (*v - 1.0).abs() < 1e-6,
-                _ => false,
-            },
-            _ => false,
-        };
-
         // Rasterise the stencil into a full-opacity pixmap, then let the
         // existing blit put it into device space so the mask lands exactly
         // where the flat-colour path would have painted.
@@ -5245,21 +5092,17 @@ impl PageRenderer {
             return Ok(None);
         };
         let image_transform = image_unit_square_transform(transform, width, height);
-        // ── pdf_manipulator patch: only the stencil samples the band reaches become pixels ──
-        if let Some((x0, x1, y0, y1)) = Self::source_rect(pixmap, image_transform, width, height) {
-            let rows = stencil_region(raw, row_bytes, invert, [255; 4], x0, x1, y0, y1);
-            Self::draw_rows(
-                &mut coverage,
-                &rows,
-                x1 - x0,
-                (x0 as i32, y0 as i32),
-                (width, height),
-                &pixmap_paint_for_image_blit(image_transform, 1.0, "Normal"),
-                image_transform,
-                clip_mask,
-            );
-        }
-        // ── end pdf_manipulator patch ──
+        let (x0, x1, y0) = rect;
+        Self::draw_rows(
+            &mut coverage,
+            band,
+            x1 - x0,
+            (x0 as i32, y0 as i32),
+            (width, height),
+            &pixmap_paint_for_image_blit(image_transform, 1.0, "Normal"),
+            image_transform,
+            clip_mask,
+        );
 
         // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
         let Some(mut mask) = tiny_skia::Mask::new_like(pixmap) else {
@@ -5300,7 +5143,7 @@ impl PageRenderer {
             .as_dict()
             .ok_or_else(|| Error::Image("ImageMask XObject is not a stream".to_string()))?;
 
-        let (width, height, row_bytes, expected, _) = Self::image_mask_layout(dict)?;
+        Self::image_mask_layout(dict)?;
 
         // PDF §8.9.6.4: ImageMask BitsPerComponent must be 1 when present.
         // Some producers omit it; default to 1.
@@ -5326,72 +5169,17 @@ impl PageRenderer {
             _ => false,
         };
 
-        // ── pdf_manipulator patch: the stencil's own bytes, or the CCITT rows decoded one at a time ──
-        let raw = if let Some(params) = Self::image_mask_ccitt_params(dict, width, height, doc)? {
-            // The CCITT rows decode a row at a time off the stream's reader,
-            // the way a band consumes them; the whole decode never runs. A
-            // row the cursor could not read stops the decode early: the rows
-            // past it are the blank the padded tail becomes below.
-            let body_for_read = match xobject {
-                Object::Stream { body, .. } => body.clone(),
-                _ => return Err(Error::Image("ImageMask XObject is not a stream".to_string())),
-            };
-            let reader =
-                crate::decoders::stream::reader_in(dict, None, move || body_for_read.owned_reader())?;
-            let mut feed = crate::decoders::ccitt::BitFeed::new(reader);
-            let mut engine = crate::decoders::ccitt::FaxRowEngine::new(&params)?;
-            let mut raw = vec![0u8; expected];
-            for row in raw.chunks_exact_mut(row_bytes) {
-                match engine.pull_row(&mut feed, Some(height), row) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        log::warn!(
-                            "CCITT image-mask rows stopped early ({}x{}, K={}): {e}",
-                            width,
-                            height,
-                            params.k
-                        );
-                        break;
-                    },
-                }
-            }
-            // Sample space: `BlackIs1` and one complement recover the samples
-            // the `/Decode` mapping below reads (the decoder normalises to
-            // `0=white, 1=black`, the sentinel of what the row values mean).
-            if params.black_is_1 {
-                for b in raw.iter_mut() {
-                    *b = !*b;
-                }
-            }
-            for b in raw.iter_mut() {
-                *b = !*b;
-            }
-            // Rows the decoder could not read are padding, not content — a
-            // truncated stream is padded white and a wholly undecodable one is
-            // replaced by a blank buffer. Neither is neutral: an ImageMask
-            // paints where the sample is 0 under the default /Decode and where
-            // it is 1 under [1 0], so one of the two reads the padding as
-            // "paint every pixel" and an unreadable stencil covers its whole
-            // footprint in the fill colour.
-            //
-            // Overwrite only the padded tail — the rows that *did* decode are
-            // real content and this crate deliberately keeps them rather than
-            // blanking the page — with the value that draws nothing under this
-            // mask's own /Decode. The result is the page as it would look with
-            // the stencil absent, which is the honest degradation.
-            if engine.decoded_rows() < height as usize && row_bytes > 0 {
-                let blank = if invert { 0x00 } else { 0xFF };
-                let from = engine
-                    .decoded_rows()
-                    .saturating_mul(row_bytes)
-                    .min(raw.len());
-                raw[from..].fill(blank);
-            }
-            raw
-        } else {
-            xobject.decode_stream_data()?
-        };
-        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: the stencil's rows read a band at a time from a cursor ──
+        // The stencil is a row source of its own (raw and Flate-family
+        // samples off the stream's filter readers, CCITT off the fax row
+        // cursor, JBIG2 the ruled exception that keeps its packed bitmap),
+        // opened once and read across the bands the way an image is. The
+        // rows the band paints come off it, never a whole decode.
+        // The device size the stencil is painted at, the page-capped footprint
+        // images are reduced to: a stencil larger than it is reduced to it, so
+        // a band holds no more of the stencil than the page can show.
+        let footprint = Self::device_footprint(transform, (self.band.width, self.band.page_height))
+            .unwrap_or((u32::MAX, u32::MAX));
 
         // When the fill colour is a shading pattern the stencil is not painted
         // with a colour at all — it becomes the coverage the gradient is
@@ -5407,26 +5195,6 @@ impl PageRenderer {
         // rendered a mean tone of 180.75 where the panel agrees on 230.01.
         let fill_is_pattern =
             gs.fill_pattern_name.is_some() && self.is_pattern_space(&gs.fill_color_space);
-        if fill_is_pattern {
-            if let Some(painted) = self.image_mask_shading_pattern(
-                pixmap,
-                dict,
-                &raw,
-                width,
-                height,
-                row_bytes,
-                transform,
-                clip_mask,
-                gs,
-                base_transform,
-                resources,
-                doc,
-            )? {
-                if painted {
-                    return Ok(());
-                }
-            }
-        }
 
         // Stencil pixels → premultiplied RGBA, applying the fill colour
         // to each opaque sample. Rows are packed MSB-first; each row is
@@ -5447,41 +5215,66 @@ impl PageRenderer {
             .round()
             .clamp(0.0, 255.0) as u8;
 
-        if raw.len() < expected {
-            return Err(Error::Image(format!(
-                "ImageMask stream too short: {} bytes for {}x{} (expected {})",
-                raw.len(),
-                width,
-                height,
-                expected
-            )));
-        }
-
-        let image_transform = image_unit_square_transform(transform, width, height);
         // Opacity is 1.0 because fill_alpha is already baked into the
         // stencil pixels; blend mode + scale-driven quality come from the
         // shared helper.
+        let key = ImageCursorKey::new(
+            None,
+            xobject,
+            [transform.sx, transform.kx, transform.tx, transform.ky, transform.sy, transform.ty],
+        );
+        let mut cursor = match self.stencil_cursors.take(&key) {
+            Some(cursor) => cursor,
+            None => StencilCursor::open(doc, xobject, footprint)?,
+        };
+        let (width, height) = cursor.size();
+        let image_transform = image_unit_square_transform(transform, width, height);
         let paint = pixmap_paint_for_image_blit(image_transform, 1.0, &gs.blend_mode);
 
-        // ── pdf_manipulator patch: only the stencil samples the band reaches become pixels ──
-        if let Some((x0, x1, y0, y1)) = Self::source_rect(pixmap, image_transform, width, height) {
-            let rows = stencil_region(&raw, row_bytes, invert, [pr, pg, pb, pa], x0, x1, y0, y1);
-            Self::draw_rows(
-                pixmap,
-                &rows,
-                x1 - x0,
-                (x0 as i32, y0 as i32),
-                (width, height),
-                &paint,
-                image_transform,
-                clip_mask,
-            );
+        // Only the stencil samples the band reaches become pixels.
+        match Self::source_rect(pixmap, image_transform, width, height) {
+            Some((x0, x1, y0, y1)) => {
+                // A cursor that fails part way is dropped, not kept: the
+                // error leaves it here.
+                let band = cursor.band(y0, y1, invert)?;
+                if fill_is_pattern {
+                    let coverage = band.paint([255; 4], x0, x1);
+                    if let Some(true) = self.image_mask_shading_pattern(
+                        pixmap,
+                        &coverage,
+                        (x0, x1, y0),
+                        width,
+                        height,
+                        transform,
+                        clip_mask,
+                        gs,
+                        base_transform,
+                        resources,
+                        doc,
+                    )? {
+                        self.stencil_cursors.put(key, cursor);
+                        return Ok(());
+                    }
+                }
+                let painted = band.paint([pr, pg, pb, pa], x0, x1);
+                Self::draw_rows(
+                    pixmap,
+                    &painted,
+                    x1 - x0,
+                    (x0 as i32, y0 as i32),
+                    (width, height),
+                    &paint,
+                    image_transform,
+                    clip_mask,
+                );
+            },
+            None => {},
         }
-        // ── end pdf_manipulator patch ──
 
+        self.stencil_cursors.put(key, cursor);
         Ok(())
     }
-
+    // ── end pdf_manipulator patch ──
     /// Render a Form XObject by parsing its content stream recursively.
     ///
     /// Per PDF spec §8.10, a Form XObject contains its own content stream,
@@ -12243,25 +12036,6 @@ mod tests {
         ])
     }
 
-    fn ccitt_mask_dict(
-        width: i64,
-        height: i64,
-        columns: i64,
-        rows: i64,
-    ) -> HashMap<String, Object> {
-        let mut dict = image_mask_dict(width, height);
-        dict.insert("Filter".to_string(), Object::Name("CCITTFaxDecode".to_string()));
-        dict.insert(
-            "DecodeParms".to_string(),
-            Object::Dictionary(HashMap::from([
-                ("K".to_string(), Object::Integer(-1)),
-                ("Columns".to_string(), Object::Integer(columns)),
-                ("Rows".to_string(), Object::Integer(rows)),
-            ])),
-        );
-        dict
-    }
-
     #[test]
     fn image_mask_layout_rejects_non_positive_dimensions_before_allocation() {
         let negative = PageRenderer::image_mask_layout(&image_mask_dict(-1, 1));
@@ -12276,105 +12050,6 @@ mod tests {
         let layout =
             PageRenderer::image_mask_layout(&image_mask_dict(5_000, 4_000)).expect("valid layout");
         assert_eq!(layout, (5_000, 4_000, 625, 2_500_000, 80_000_000));
-    }
-
-    #[test]
-    fn ccitt_image_mask_rejects_width_beyond_decoder_limit() {
-        let dict = ccitt_mask_dict(65_536, 1, 65_536, 1);
-        let doc = minimal_pdf_doc();
-        let result = PageRenderer::image_mask_ccitt_params(&dict, 65_536, 1, &doc);
-        assert!(matches!(result, Err(Error::Image(message)) if message.contains("decoder limit")));
-    }
-
-    #[test]
-    fn ccitt_image_mask_rejects_dimension_mismatches() {
-        let columns = ccitt_mask_dict(8, 1, 7, 1);
-        let doc = minimal_pdf_doc();
-        let result = PageRenderer::image_mask_ccitt_params(&columns, 8, 1, &doc);
-        assert!(matches!(result, Err(Error::Image(message)) if message.contains("/Columns 7")));
-
-        let rows = ccitt_mask_dict(8, 1, 8, 2);
-        let result = PageRenderer::image_mask_ccitt_params(&rows, 8, 1, &doc);
-        assert!(matches!(result, Err(Error::Image(message)) if message.contains("/Rows 2")));
-    }
-
-    #[test]
-    fn ccitt_image_mask_rejects_invalid_k_and_accepts_all_negative_k_values() {
-        let doc = minimal_pdf_doc();
-        let mut invalid = ccitt_mask_dict(8, 1, 8, 1);
-        let Some(Object::Dictionary(invalid_params)) = invalid.get_mut("DecodeParms") else {
-            panic!("decode parameters must be a dictionary");
-        };
-        invalid_params.insert("K".to_string(), Object::Name("invalid".to_string()));
-        let result = PageRenderer::image_mask_ccitt_params(&invalid, 8, 1, &doc);
-        assert!(
-            matches!(result, Err(Error::Image(message)) if message.contains("/K must be an integer"))
-        );
-
-        let mut negative = ccitt_mask_dict(8, 1, 8, 1);
-        let Some(Object::Dictionary(negative_params)) = negative.get_mut("DecodeParms") else {
-            panic!("decode parameters must be a dictionary");
-        };
-        negative_params.insert("K".to_string(), Object::Integer(-2));
-        let params = PageRenderer::image_mask_ccitt_params(&negative, 8, 1, &doc)
-            .expect("valid parameters")
-            .expect("CCITT parameters");
-        assert!(params.is_group_4());
-        assert_eq!(params.k, -2);
-    }
-
-    #[test]
-    fn ccitt_image_mask_rejects_dangling_and_wrong_type_decode_params_references() {
-        let mut dangling = ccitt_mask_dict(8, 1, 8, 1);
-        dangling.insert("DecodeParms".to_string(), Object::Reference(ObjectRef::new(99, 0)));
-        let error = PageRenderer::image_mask_ccitt_params(&dangling, 8, 1, &minimal_pdf_doc())
-            .expect_err("dangling reference must fail");
-        assert!(
-            matches!(&error, Error::Image(message) if message.contains("Unable to resolve")),
-            "unexpected dangling-reference error: {error:?}"
-        );
-
-        let mut dangling_array = ccitt_mask_dict(8, 1, 8, 1);
-        dangling_array.insert(
-            "Filter".to_string(),
-            Object::Array(vec![
-                Object::Name("ASCIIHexDecode".to_string()),
-                Object::Name("CCITTFaxDecode".to_string()),
-            ]),
-        );
-        dangling_array.insert(
-            "DecodeParms".to_string(),
-            Object::Array(vec![Object::Null, Object::Reference(ObjectRef::new(99, 0))]),
-        );
-        let error =
-            PageRenderer::image_mask_ccitt_params(&dangling_array, 8, 1, &minimal_pdf_doc())
-                .expect_err("dangling array entry must fail");
-        assert!(
-            matches!(&error, Error::Image(message) if message.contains("array entry")),
-            "unexpected dangling array-entry error: {error:?}"
-        );
-
-        let mut wrong_type = ccitt_mask_dict(8, 1, 8, 1);
-        wrong_type.insert("DecodeParms".to_string(), Object::Reference(ObjectRef::new(4, 0)));
-        let doc = pdf_doc_with_extra_object(Some(b"42"));
-        let result = PageRenderer::image_mask_ccitt_params(&wrong_type, 8, 1, &doc);
-        assert!(
-            matches!(result, Err(Error::Image(message)) if message.contains("must be a dictionary"))
-        );
-    }
-
-    #[test]
-    fn ccitt_image_mask_rejects_non_final_filter() {
-        let mut dict = ccitt_mask_dict(8, 1, 8, 1);
-        dict.insert(
-            "Filter".to_string(),
-            Object::Array(vec![
-                Object::Name("CCITTFaxDecode".to_string()),
-                Object::Name("ASCIIHexDecode".to_string()),
-            ]),
-        );
-        let result = PageRenderer::image_mask_ccitt_params(&dict, 8, 1, &minimal_pdf_doc());
-        assert!(matches!(result, Err(Error::Image(message)) if message.contains("final")));
     }
 
     #[test]
