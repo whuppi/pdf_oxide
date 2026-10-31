@@ -1,3 +1,15 @@
+<!-- ── pdf_manipulator patch: what this fork is ── -->
+> **This is whuppi's fork of [pdf_oxide](https://github.com/yfedoseev/pdf_oxide).** It is the engine inside [pdf_manipulator](https://github.com/whuppi/pdf_manipulator), a Dart and Flutter PDF package, and it changes together with that package.
+>
+> The fork's goal is memory that does not grow with the file. Streams are read from the source in small pieces, and page content is read one operator at a time. A memory test holds each operation it covers to 16 MiB of peak memory on inputs of 64 MiB and more. The fork also writes the same bytes on every run, makes smaller compressed files (object streams, deflate level 9, one copy of identical images and fonts, unused resources removed), and fixes the bugs we found while we built it, each with a test.
+>
+> Our own code is in `src/host/`. Every change to upstream code sits between `pdf_manipulator patch` markers, so that the fork can move to each new upstream release.
+>
+> You can use the fork from Rust. Depend on a fixed commit (`rev`), not on a branch, because the branch gets a new name for each upstream release. The `src/host/` API is internal to pdf_manipulator and can change in any commit.
+>
+> For the general library, its language bindings and support, use [upstream](https://github.com/yfedoseev/pdf_oxide). License: MIT or Apache-2.0, the same as upstream.
+<!-- ── end pdf_manipulator patch ── -->
+
 # PDFOxide - The Fastest PDF Toolkit for 20 Languages — Python, Rust, Go, JS/TS, C#, Java, Kotlin, Swift, C++ & more, plus CLI & AI
 
 > **New in v0.3.69 — eleven new language bindings.** PDFOxide now ships idiomatic bindings for **C++, Swift, Kotlin, Dart, R, Julia, Zig, Scala, Clojure, Objective-C, and Elixir**, each built over the stable C ABI with its own CI workflow, api-coverage tests, and runnable examples. That brings the toolkit to **20 languages** (Rust core + 19 bindings). Want another language? [Open an issue](https://github.com/yfedoseev/pdf_oxide/issues/new) and tell us.
