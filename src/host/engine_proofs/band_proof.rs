@@ -2,10 +2,10 @@
 //!
 //! Each fixture is rendered with the band height forced to 1, 17 and 256 rows
 //! and as one band, at 36, 72, 150 and 300 dpi, on a transparent background so
-//! a pixel's alpha is its coverage. Until the rasteriser's edge clipping is
-//! made exact across a band's top, a pixel may differ only where it is partly
-//! covered in one of the two renders, or is an edge between two flat areas:
-//! every other difference fails. The counts are printed per fixture.
+//! a pixel's alpha is its coverage. The bytes must be those of one render of
+//! the whole canvas: no pixel may differ, whatever its coverage. Each case
+//! prints its count of differing pixels, and the first one with its colour in
+//! both renders.
 
 use super::support::{pdf_from_objects, stream_object};
 use crate::cancel::CancelCheck;
@@ -19,11 +19,6 @@ struct Fixture {
     annots: String,
     /// Objects numbered from 5.
     extra: Vec<Vec<u8>>,
-    /// `Some(levels)` when colour varies smoothly, so a neighbour test cannot
-    /// tell an edge from an interior: only partial coverage, or a step of at
-    /// most `levels` in every channel (a gradient value on a rounding tie,
-    /// moved by float error), excuses a difference.
-    smooth: Option<u8>,
 }
 
 impl Fixture {
@@ -34,7 +29,6 @@ impl Fixture {
             resources: String::new(),
             annots: String::new(),
             extra: Vec::new(),
-            smooth: None,
         }
     }
 
@@ -131,7 +125,6 @@ fn fixtures() -> Vec<Fixture> {
          /S2 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [40 60 160 90] \
          /Function {function} /Extend [false true] >> >>"
     );
-    axial.smooth = Some(1);
     all.push(axial);
 
     let mut radial = Fixture::new(
@@ -145,7 +138,6 @@ fn fixtures() -> Vec<Fixture> {
          /S2 << /ShadingType 3 /ColorSpace /DeviceRGB /Coords [90 120 5 100 110 60] \
          /Function {function} /Extend [true false] >> >>"
     );
-    radial.smooth = Some(64);
     all.push(radial);
 
     all.push(mesh_fixture());
@@ -243,7 +235,6 @@ fn mesh_fixture() -> Fixture {
             &patch(true),
         ),
     ];
-    fixture.smooth = Some(1);
     fixture
 }
 
@@ -354,14 +345,8 @@ fn render(doc: &PdfDocument, dpi: u32, rows: Option<u32>) -> (u32, u32, Vec<u8>)
 #[derive(Default)]
 struct Diff {
     differing: u64,
-    partial: u64,
-    edge: u64,
-    tie: u64,
-    other: u64,
     max_channel: u8,
     first: Option<(u32, u32, [u8; 4], [u8; 4])>,
-    /// The first few unexcused pixels, as `(x, y, whole, cut)`.
-    others: Vec<(u32, u32, [u8; 4], [u8; 4])>,
 }
 
 fn pixel(raster: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
@@ -369,40 +354,16 @@ fn pixel(raster: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     raster[at..at + 4].try_into().expect("four bytes")
 }
 
-/// True when no neighbour of the pixel differs from it.
-fn flat(raster: &[u8], width: u32, height: u32, x: u32, y: u32) -> bool {
-    let here = pixel(raster, width, x, y);
-    (y.saturating_sub(1)..=(y + 1).min(height - 1)).all(|ny| {
-        (x.saturating_sub(1)..=(x + 1).min(width - 1)).all(|nx| pixel(raster, width, nx, ny) == here)
-    })
-}
-
-fn compare(width: u32, height: u32, whole: &[u8], cut: &[u8], smooth: Option<u8>) -> Diff {
+fn compare(width: u32, height: u32, whole: &[u8], cut: &[u8]) -> Diff {
     let mut diff = Diff::default();
     for y in 0..height {
         for x in 0..width {
             let (a, b) = (pixel(whole, width, x, y), pixel(cut, width, x, y));
-            if a == b {
-                continue;
-            }
-            diff.differing += 1;
-            diff.first.get_or_insert((x, y, a, b));
-            for channel in 0..4 {
-                diff.max_channel = diff.max_channel.max(a[channel].abs_diff(b[channel]));
-            }
-            let partly = |p: [u8; 4]| p[3] != 0 && p[3] != 255;
-            if partly(a) || partly(b) {
-                diff.partial += 1;
-            } else if smooth.is_some_and(|levels| (0..4).all(|c| a[c].abs_diff(b[c]) <= levels)) {
-                diff.tie += 1;
-            } else if smooth.is_none()
-                && !(flat(whole, width, height, x, y) && flat(cut, width, height, x, y))
-            {
-                diff.edge += 1;
-            } else {
-                diff.other += 1;
-                if diff.others.len() < 8 {
-                    diff.others.push((x, y, a, b));
+            if a != b {
+                diff.differing += 1;
+                diff.first.get_or_insert((x, y, a, b));
+                for channel in 0..4 {
+                    diff.max_channel = diff.max_channel.max(a[channel].abs_diff(b[channel]));
                 }
             }
         }
@@ -419,28 +380,18 @@ fn prove(fixture: &Fixture) {
         for rows in [Some(1), Some(17), Some(256), None] {
             let (w, h, cut) = render(&doc, dpi, rows);
             assert_eq!((w, h), (width, height));
-            let diff = compare(width, height, &whole, &cut, fixture.smooth);
+            let diff = compare(width, height, &whole, &cut);
             println!(
-                "band_proof {:<12} {dpi:>3} dpi rows {:>8}: {} px, differing {} (partial coverage {}, \
-                 edge {}, one-level tie {}, other {}), max channel step {}",
+                "band_proof {:<12} {dpi:>3} dpi rows {:>8}: {} px, differing {}, max channel step {}",
                 fixture.name,
                 rows.map_or("default".to_string(), |r| r.to_string()),
                 width as u64 * height as u64,
                 diff.differing,
-                diff.partial,
-                diff.edge,
-                diff.tie,
-                diff.other,
                 diff.max_channel,
             );
             if let Some((x, y, a, b)) = diff.first {
                 println!("    first differing pixel ({x}, {y}): whole {a:?} cut {b:?}");
-            }
-            for (x, y, a, b) in &diff.others {
-                println!("    unexcused pixel ({x}, {y}): whole {a:?} cut {b:?}");
-            }
-            if diff.other > 0 {
-                failures.push(format!("{dpi} dpi, rows {rows:?}: {} unexcused", diff.other));
+                failures.push(format!("{dpi} dpi, rows {rows:?}: {} differing", diff.differing));
             }
         }
     }

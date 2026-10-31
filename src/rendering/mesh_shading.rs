@@ -644,7 +644,9 @@ fn render_patches(
     clip_mask: Option<&Mask>,
     to_rgba: &dyn Fn(&[f32]) -> (f32, f32, f32, f32),
 ) {
-    let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
+    // ── pdf_manipulator patch: a mesh is drawn in the page's coordinates ──
+    let canvas = canvas_of(pixmap);
+    // ── end pdf_manipulator patch ──
     for patch in patches {
         // Adaptive subdivision from the device-space size of the corners.
         let corners = [
@@ -668,7 +670,7 @@ fn render_patches(
         if is_tensor {
             control.extend(patch.interior.iter().map(|&p| map_pt(transform, p)));
         }
-        if !bbox_intersects_canvas(&control, w, h) {
+        if !bbox_intersects_canvas(&control, canvas) {
             continue;
         }
         // Resolve the four corner colours (RGBA) once, for a patch that
@@ -835,7 +837,7 @@ fn rasterize_raw_triangles(
     clip_mask: Option<&Mask>,
     to_rgba: &dyn Fn(&[f32]) -> (f32, f32, f32, f32),
 ) {
-    let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
+    let canvas = canvas_of(pixmap);
     for tri in tris {
         // A triangle that does not reach the band is dropped before its
         // colours are resolved.
@@ -844,7 +846,7 @@ fn rasterize_raw_triangles(
             map_pt(transform, (tri[1].x, tri[1].y)),
             map_pt(transform, (tri[2].x, tri[2].y)),
         ];
-        if !bbox_intersects_canvas(&corners, w, h) {
+        if !bbox_intersects_canvas(&corners, canvas) {
             continue;
         }
         let mut verts = [((0.0f32, 0.0f32), (0.0f32, 0.0f32, 0.0f32, 0.0f32)); 3];
@@ -864,9 +866,22 @@ fn map_pt(transform: Transform, p: Pt) -> Pt {
     (pt.x, pt.y)
 }
 
-/// True when the device bounding box of the corner points overlaps the
-/// canvas rectangle `[0, w] × [0, h]`.
-fn bbox_intersects_canvas(corners: &[Pt], w: f32, h: f32) -> bool {
+// ── pdf_manipulator patch: a mesh is drawn in the page's coordinates ──
+/// The part of the device plane a pixmap shows, `(left, top, right, bottom)`.
+type Canvas = (f32, f32, f32, f32);
+
+fn canvas_of(pixmap: &Pixmap) -> Canvas {
+    let (left, top) = pixmap.origin();
+    (
+        left as f32,
+        top as f32,
+        left as f32 + pixmap.width() as f32,
+        top as f32 + pixmap.height() as f32,
+    )
+}
+
+/// True when the device bounding box of the corner points overlaps the canvas.
+fn bbox_intersects_canvas(corners: &[Pt], canvas: Canvas) -> bool {
     let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for &(x, y) in corners {
         minx = minx.min(x);
@@ -874,8 +889,9 @@ fn bbox_intersects_canvas(corners: &[Pt], w: f32, h: f32) -> bool {
         maxx = maxx.max(x);
         maxy = maxy.max(y);
     }
-    minx <= w && maxx >= 0.0 && miny <= h && maxy >= 0.0
+    minx <= canvas.2 && maxx >= canvas.0 && miny <= canvas.3 && maxy >= canvas.1
 }
+// ── end pdf_manipulator patch ──
 
 type ColoredVertex = ((f32, f32), (f32, f32, f32, f32));
 
@@ -899,10 +915,13 @@ fn fill_gouraud_triangle(
     let (p2, c2) = v2;
 
     // Device-space bounding box, clamped to the canvas.
-    let minx = p0.0.min(p1.0).min(p2.0).floor().max(0.0) as i32;
-    let maxx = p0.0.max(p1.0).max(p2.0).ceil().min(width as f32) as i32;
-    let miny = p0.1.min(p1.1).min(p2.1).floor().max(0.0) as i32;
-    let maxy = p0.1.max(p1.1).max(p2.1).ceil().min(height as f32) as i32;
+    // ── pdf_manipulator patch: a mesh is drawn in the page's coordinates ──
+    let (left, top) = pixmap.origin();
+    let minx = p0.0.min(p1.0).min(p2.0).floor().max(left as f32) as i32;
+    let maxx = p0.0.max(p1.0).max(p2.0).ceil().min((left + width) as f32) as i32;
+    let miny = p0.1.min(p1.1).min(p2.1).floor().max(top as f32) as i32;
+    let maxy = p0.1.max(p1.1).max(p2.1).ceil().min((top + height) as f32) as i32;
+    // ── end pdf_manipulator patch ──
     if minx >= maxx || miny >= maxy {
         return;
     }
@@ -933,7 +952,9 @@ fn fill_gouraud_triangle(
             if a <= 0.0 {
                 continue;
             }
-            let pixel_idx = (py * width + px) as usize;
+            // ── pdf_manipulator patch: a mesh is drawn in the page's coordinates ──
+            let pixel_idx = ((py - top) * width + (px - left)) as usize;
+            // ── end pdf_manipulator patch ──
             if let Some(md) = mask_data {
                 if let Some(&m) = md.get(pixel_idx) {
                     a *= m as f32 / 255.0;

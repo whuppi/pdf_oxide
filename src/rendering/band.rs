@@ -20,6 +20,11 @@ use std::ops::Range;
 /// Raster bytes every band-sized buffer of one render may use together.
 pub(crate) const BAND_BUDGET_BYTES: usize = 2 * 1024 * 1024;
 
+/// How far, in device pixels, a stroke thinner than a pixel draws past its
+/// path: an anti-aliased hairline spreads over the pixels either side of it,
+/// and a cap adds up to two more.
+pub(crate) const HAIRLINE_REACH: f64 = 2.0;
+
 /// How a page's rows are cut into bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandPlan {
@@ -73,34 +78,83 @@ pub trait RowSink {
     fn rows(&mut self, y: u32, rgba_straight: &[u8]) -> Result<()>;
 }
 
-/// The size of the band being rendered and of the page it is cut from. Device
-/// coordinates the renderer works in are band-local: the base transform is
-/// already translated by minus the band's top, so a band needs no offset.
+/// The size of the page raster a band is cut from.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BandContext {
-    pub(crate) rows: u32,
     pub(crate) width: u32,
     pub(crate) page_height: u32,
 }
 
 impl BandContext {
-    /// A band that is the whole raster.
+    /// A page whose raster is not known yet.
     pub(crate) fn whole(width: u32, height: u32) -> Self {
         Self {
-            rows: height,
             width,
             page_height: height,
         }
     }
+}
 
-    /// True when band-local device bounds lie wholly outside the band, one
-    /// pixel of slack on every side for anti-aliasing. A paint that misses
-    /// draws nothing here.
+/// The part of the device plane a pixmap shows. Everything the renderer
+/// draws is in the device plane, in whole-page coordinates; a band is a
+/// window onto it, and any other pixmap made like the band shows the same
+/// part.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Window {
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+}
+
+impl Window {
+    pub(crate) fn of(pixmap: &tiny_skia::Pixmap) -> Self {
+        let (left, top) = pixmap.origin();
+        Self {
+            left,
+            top,
+            width: pixmap.width(),
+            height: pixmap.height(),
+        }
+    }
+
+    pub(crate) fn of_mask(mask: &tiny_skia::Mask) -> Self {
+        let (left, top) = mask.origin();
+        Self {
+            left,
+            top,
+            width: mask.width(),
+            height: mask.height(),
+        }
+    }
+
+    /// True when device bounds lie wholly outside the window, one pixel of
+    /// slack on every side for anti-aliasing. A paint that misses draws
+    /// nothing here.
     pub(crate) fn misses(&self, bounds: tiny_skia::Rect) -> bool {
-        bounds.right() < -1.0
-            || bounds.bottom() < -1.0
-            || bounds.left() > self.width as f32 + 1.0
-            || bounds.top() > self.rows as f32 + 1.0
+        f64::from(bounds.right()) < f64::from(self.left) - 1.0
+            || f64::from(bounds.bottom()) < f64::from(self.top) - 1.0
+            || f64::from(bounds.left()) > f64::from(self.left) + f64::from(self.width) + 1.0
+            || f64::from(bounds.top()) > f64::from(self.top) + f64::from(self.height) + 1.0
+    }
+
+    /// True when the device-plane rectangle `[left, top, right, bottom]` does
+    /// not touch the window at all (no slack).
+    pub(crate) fn excludes(&self, left: f64, top: f64, right: f64, bottom: f64) -> bool {
+        right < f64::from(self.left)
+            || bottom < f64::from(self.top)
+            || left > f64::from(self.left) + f64::from(self.width)
+            || top > f64::from(self.top) + f64::from(self.height)
+    }
+
+    /// The window as a device-plane rectangle.
+    pub(crate) fn rect(&self) -> Option<tiny_skia::Rect> {
+        tiny_skia::Rect::from_xywh(
+            self.left as f32,
+            self.top as f32,
+            self.width as f32,
+            self.height as f32,
+        )
     }
 
     /// True when `path` under `transform`, widened by `reach` device units
@@ -134,9 +188,10 @@ impl BandContext {
         width: f32,
         miter_limit: f32,
     ) -> bool {
-        let reach = f64::from(width.abs())
+        let reach = (f64::from(width.abs())
             * f64::from(miter_limit.max(1.5))
-            * super::device_scale(transform);
+            * super::device_scale(transform))
+        .max(HAIRLINE_REACH);
         self.misses_path(path, transform, reach)
     }
 

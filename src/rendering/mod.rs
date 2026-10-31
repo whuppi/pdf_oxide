@@ -288,12 +288,10 @@ pub(crate) fn device_bounds_rasterizable(
 pub(crate) fn device_bounds_miss_pixmap(
     path: &tiny_skia::Path,
     transform: tiny_skia::Transform,
-    width: u32,
-    height: u32,
+    window: band::Window,
 ) -> bool {
-    device_bounds(path, transform).is_some_and(|[min_x, min_y, max_x, max_y]| {
-        max_x < 0.0 || max_y < 0.0 || min_x > f64::from(width) || min_y > f64::from(height)
-    })
+    device_bounds(path, transform)
+        .is_some_and(|[min_x, min_y, max_x, max_y]| window.excludes(min_x, min_y, max_x, max_y))
 }
 
 /// Whether a draw is worth handing to tiny_skia for a `width` x `height`
@@ -315,17 +313,17 @@ fn rasterizable_on(
     path: &tiny_skia::Path,
     transform: tiny_skia::Transform,
     device_reach: f64,
-    width: u32,
-    height: u32,
+    window: band::Window,
 ) -> bool {
     let Some([x0, y0, x1, y1]) = device_bounds(path, transform) else {
         return false;
     };
-    if x1 + device_reach < 0.0
-        || y1 + device_reach < 0.0
-        || x0 - device_reach > f64::from(width)
-        || y0 - device_reach > f64::from(height)
-    {
+    if window.excludes(
+        x0 - device_reach,
+        y0 - device_reach,
+        x1 + device_reach,
+        y1 + device_reach,
+    ) {
         return false;
     }
     x0.abs().max(x1.abs()) <= MAX_DEVICE_COORD && y0.abs().max(y1.abs()) <= MAX_DEVICE_COORD
@@ -379,7 +377,7 @@ pub(crate) fn guarded_fill_path(
     // ── pdf_manipulator patch: a fill that misses the band was still a fill ──
     band::count_fill();
     // ── end pdf_manipulator patch ──
-    if !rasterizable_on(path, transform, 0.0, pixmap.width(), pixmap.height()) {
+    if !rasterizable_on(path, transform, 0.0, band::Window::of(pixmap)) {
         log::debug!("skipping unrasterizable draw: {:?}", path.bounds());
         return;
     }
@@ -399,8 +397,10 @@ pub(crate) fn guarded_stroke_path(
 ) {
     let clamped = clamp_stroke_reach(stroke, transform);
     let stroke = clamped.as_ref().unwrap_or(stroke);
-    let reach = stroke_reach(stroke) * device_scale(transform);
-    if !rasterizable_on(path, transform, reach, pixmap.width(), pixmap.height()) {
+    // ── pdf_manipulator patch: a hairline reaches past its path by its anti-aliased footprint ──
+    let reach = (stroke_reach(stroke) * device_scale(transform)).max(band::HAIRLINE_REACH);
+    // ── end pdf_manipulator patch ──
+    if !rasterizable_on(path, transform, reach, band::Window::of(pixmap)) {
         log::debug!("skipping unrasterizable stroke: {:?}", path.bounds());
         return;
     }
@@ -417,7 +417,7 @@ pub(crate) fn guarded_mask_fill_path(
     anti_alias: bool,
     transform: tiny_skia::Transform,
 ) {
-    if !rasterizable_on(path, transform, 0.0, mask.width(), mask.height()) {
+    if !rasterizable_on(path, transform, 0.0, band::Window::of_mask(mask)) {
         log::debug!("skipping unrasterizable draw: {:?}", path.bounds());
         return;
     }
@@ -451,9 +451,7 @@ pub(crate) fn paint_with_nonsep_blend<F>(
 ) where
     F: FnOnce(&mut tiny_skia::Pixmap),
 {
-    let w = dest.width();
-    let h = dest.height();
-    let mut scratch = match tiny_skia::Pixmap::new(w, h) {
+    let mut scratch = match tiny_skia::Pixmap::new_like(dest) {
         Some(p) => p,
         None => {
             // Allocation failed — fall back to direct paint (degraded

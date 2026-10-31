@@ -252,10 +252,29 @@ pub(crate) struct CmykSidecar {
     /// per §11.7.3 ("an additive value of 1.0 or a subtractive tint
     /// value of 0.0 shall be assumed" for an unset component).
     spots: Vec<u8>,
+    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+    /// Where the pixels sit in the device plane: the origin of the pixmap
+    /// the sidecar belongs to.
+    origin: (i32, i32),
+    // ── end pdf_manipulator patch ──
 }
 
 #[allow(dead_code)]
 impl CmykSidecar {
+    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+    /// The sidecar for the pixmap whose top-left pixel is `origin` in the
+    /// device plane.
+    pub(crate) fn with_origin(mut self, origin: (i32, i32)) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Where the sidecar's top-left pixel sits in the device plane.
+    pub(crate) fn origin(&self) -> (i32, i32) {
+        self.origin
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Allocate the sidecar for a page of `(width, height)` pixels
     /// and the given set of spot ink names.
     ///
@@ -272,6 +291,9 @@ impl CmykSidecar {
             cmyk,
             spot_names,
             spots,
+            // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+            origin: (0, 0),
+            // ── end pdf_manipulator patch ──
         }
     }
 

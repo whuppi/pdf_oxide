@@ -22,7 +22,7 @@ use crate::object::{Object, ObjectRef};
 use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
 // ── pdf_manipulator patch: pages are rastered in bands ──
 use crate::rendering::band::{
-    demultiply_in_place, fills_counted, group_depth, BandContext, BandPlan,
+    demultiply_in_place, fills_counted, group_depth, BandContext, BandPlan, Window,
 };
 // ── end pdf_manipulator patch ──
 use crate::rendering::path_rasterizer::PathRasterizer;
@@ -680,11 +680,13 @@ impl PageRenderer {
         for (top, rows) in plan.bands(wanted) {
             cancel.check()?;
             self.band = BandContext {
-                rows,
                 width,
                 page_height: height,
             };
-            let mut pixmap = Pixmap::new(width, rows)
+            // The band is a window onto the page: everything is drawn in
+            // whole-page coordinates, and the pixmap keeps the rows from
+            // `top`.
+            let mut pixmap = Pixmap::new_at(width, rows, (0, top as i32))
                 .ok_or_else(|| Error::InvalidPdf("Failed to create pixmap".to_string()))?;
 
             // Fill background
@@ -694,10 +696,11 @@ impl PageRenderer {
             }
 
             self.cmyk_sidecar =
-                needs_cmyk_sidecar.then(|| CmykSidecar::new(width, rows, spot_names.clone()));
+                needs_cmyk_sidecar.then(|| {
+                    CmykSidecar::new(width, rows, spot_names.clone()).with_origin((0, top as i32))
+                });
 
-            // Every device coordinate of this band is relative to its top.
-            let band_transform = transform.post_translate(0.0, -(top as f32));
+            let band_transform = transform;
 
             let mut stream = doc.page_operators(page_num)?;
             let mut operators = std::iter::from_fn(|| {
@@ -1830,7 +1833,7 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
                         if let Some(path) = current_path.finish().filter(|path| {
-                            !self.path_misses_band(path, base_transform, gs_stack.current(), true)
+                            !Self::path_misses_band(pixmap, path, base_transform, gs_stack.current(), true)
                         }) {
                             // ── end pdf_manipulator patch ──
                             let gs_clone = gs_stack.current().clone();
@@ -1937,7 +1940,7 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
                         if let Some(path) = current_path.finish().filter(|path| {
-                            !self.path_misses_band(path, base_transform, gs_stack.current(), false)
+                            !Self::path_misses_band(pixmap, path, base_transform, gs_stack.current(), false)
                         }) {
                             // ── end pdf_manipulator patch ──
                             let gs_clone = gs_stack.current().clone();
@@ -2113,7 +2116,7 @@ impl PageRenderer {
                         }
                         // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
                         if let Some(path) = current_path.finish().filter(|path| {
-                            !self.path_misses_band(path, base_transform, gs_stack.current(), true)
+                            !Self::path_misses_band(pixmap, path, base_transform, gs_stack.current(), true)
                         }) {
                             // ── end pdf_manipulator patch ──
                             let gs_clone = gs_stack.current().clone();
@@ -2306,7 +2309,8 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
                         if let Some(path) = current_path.finish().filter(|path| {
-                            !self.path_misses_band(
+                            !Self::path_misses_band(
+                                pixmap,
                                 path,
                                 base_transform,
                                 gs_stack.current(),
@@ -2546,7 +2550,7 @@ impl PageRenderer {
                         // the clip alone.
                         if !has_coverage && self.text_clip_outlines.get() != 0 {
                             if let Some(slot) = clip_stack.last_mut() {
-                                *slot = tiny_skia::Mask::new(pixmap.width(), pixmap.height());
+                                *slot = tiny_skia::Mask::new_like(pixmap);
                             }
                         }
                         // ── end pdf_manipulator patch ──
@@ -2629,8 +2633,9 @@ impl PageRenderer {
                             if gs.render_mode >= 4 {
                                 self.accumulate_text_clip_tj(
                                     &mut text_clip_accum,
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     text,
                                     transform,
                                     gs,
@@ -2673,8 +2678,9 @@ impl PageRenderer {
                             // from the font, or the text matrix stops moving.
                             let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
                                 match self.glyph_coverage_mask(
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     gs,
                                     |r, scratch, cgs, fonts| {
                                         let _ = r.render_text(
@@ -2813,8 +2819,9 @@ impl PageRenderer {
                             if gs.render_mode >= 4 {
                                 self.accumulate_text_clip_tj(
                                     &mut text_clip_accum,
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     text,
                                     transform,
                                     gs,
@@ -2843,8 +2850,9 @@ impl PageRenderer {
                             // from the font, or the text matrix stops moving.
                             let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
                                 match self.glyph_coverage_mask(
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     gs,
                                     |r, scratch, cgs, fonts| {
                                         let _ = r.render_text(
@@ -2976,8 +2984,9 @@ impl PageRenderer {
                             if gs.render_mode >= 4 {
                                 self.accumulate_text_clip_tj_array(
                                     &mut text_clip_accum,
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     array,
                                     transform,
                                     gs,
@@ -3006,8 +3015,9 @@ impl PageRenderer {
                             });
                             let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
                                 match self.glyph_coverage_mask(
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     gs,
                                     |r, scratch, cgs, fonts| {
                                         let _ = r.render_tj_array(
@@ -3155,8 +3165,9 @@ impl PageRenderer {
                             if gs.render_mode >= 4 {
                                 self.accumulate_text_clip_tj(
                                     &mut text_clip_accum,
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     text,
                                     transform,
                                     gs,
@@ -3186,8 +3197,9 @@ impl PageRenderer {
                             // from the font, or the text matrix stops moving.
                             let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
                                 match self.glyph_coverage_mask(
-                                    pixmap.width(),
-                                    pixmap.height(),
+                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                                    pixmap,
+                                    // ── end pdf_manipulator patch ──
                                     gs,
                                     |r, scratch, cgs, fonts| {
                                         let _ = r.render_text(
@@ -3407,7 +3419,7 @@ impl PageRenderer {
                 Operator::InlineImage { dict, data } => {
                     // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
                     if excluded_layer_depth == 0
-                        && !self.band.misses_unit_square(combine_transforms(
+                        && !Window::of(pixmap).misses_unit_square(combine_transforms(
                             base_transform,
                             &gs_stack.current().ctm,
                         ))
@@ -3679,20 +3691,20 @@ impl PageRenderer {
 
     // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
     /// True when painting `path` under the current graphics state (stroked
-    /// when `stroked`) cannot touch the band being rendered.
+    /// when `stroked`) cannot touch the part of the page `pixmap` shows.
     fn path_misses_band(
-        &self,
+        pixmap: &Pixmap,
         path: &tiny_skia::Path,
         base_transform: Transform,
         gs: &GraphicsState,
         stroked: bool,
     ) -> bool {
         let transform = combine_transforms(base_transform, &gs.ctm);
+        let window = Window::of(pixmap);
         if stroked {
-            self.band
-                .misses_stroke(path, transform, gs.line_width, gs.miter_limit)
+            window.misses_stroke(path, transform, gs.line_width, gs.miter_limit)
         } else {
-            self.band.misses_path(path, transform, 0.0)
+            window.misses_path(path, transform, 0.0)
         }
     }
     // ── end pdf_manipulator patch ──
@@ -4013,12 +4025,16 @@ impl PageRenderer {
             // hidden. §8.5.4: content outside the clipping path shall not be
             // painted, and Annex C.1 licenses *having* an arithmetic limit but
             // not resolving past one in the direction that paints more.
-            if super::device_bounds_miss_pixmap(&path, transform, pixmap.width(), pixmap.height()) {
+            // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+            if super::device_bounds_miss_pixmap(&path, transform, Window::of(pixmap)) {
+                // ── end pdf_manipulator patch ──
                 log::debug!(
                     "shading /BBox lies wholly off-pixmap and cannot be rasterized;                      clipping the shading away: {:?}",
                     path.bounds()
                 );
-                return tiny_skia::Mask::new(pixmap.width(), pixmap.height());
+                // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                return tiny_skia::Mask::new_like(pixmap);
+                // ── end pdf_manipulator patch ──
             }
             // Merely enormous but still reaching the page: it restricts nothing
             // visible, so keeping the caller's existing clip is harmless and an
@@ -4026,7 +4042,9 @@ impl PageRenderer {
             return None;
         }
 
-        let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut mask = tiny_skia::Mask::new_like(pixmap)?;
+        // ── end pdf_manipulator patch ──
         guarded_mask_fill_path(&mut mask, &path, tiny_skia::FillRule::Winding, true, transform);
         if let Some(c) = clip_mask {
             for (mv, cv) in mask.data_mut().iter_mut().zip(c.data().iter()) {
@@ -4333,7 +4351,17 @@ impl PageRenderer {
         // `/Extend`, one side of the strip is the page boundary, the
         // other is the perpendicular.
         let slab_clip_mask =
-            build_axial_extend_clip(pixmap, p0, p1, extend_start, extend_end, clip_mask);
+            // ── pdf_manipulator patch: the slab's reach is the page's, not the band's ──
+            build_axial_extend_clip(
+                pixmap,
+                (self.band.width, self.band.page_height),
+                p0,
+                p1,
+                extend_start,
+                extend_end,
+                clip_mask,
+            );
+            // ── end pdf_manipulator patch ──
         let effective_clip = slab_clip_mask.as_ref().or(clip_mask);
 
         let gradient = tiny_skia::LinearGradient::new(
@@ -4350,9 +4378,9 @@ impl PageRenderer {
             paint.anti_alias = true;
 
             // Fill entire pixmap with gradient (clipped by clip_mask)
-            let rect =
-                tiny_skia::Rect::from_xywh(0.0, 0.0, pixmap.width() as f32, pixmap.height() as f32)
-                    .unwrap();
+            // ── pdf_manipulator patch: the shading fills the part of the page the pixmap shows ──
+            let rect = Window::of(pixmap).rect().unwrap();
+            // ── end pdf_manipulator patch ──
             let path = PathBuilder::from_rect(rect);
             pixmap.fill_path(
                 &path,
@@ -4482,9 +4510,9 @@ impl PageRenderer {
             let mut paint = tiny_skia::Paint::default();
             paint.shader = shader;
             paint.anti_alias = true;
-            let rect =
-                tiny_skia::Rect::from_xywh(0.0, 0.0, pixmap.width() as f32, pixmap.height() as f32)
-                    .unwrap();
+            // ── pdf_manipulator patch: the shading fills the part of the page the pixmap shows ──
+            let rect = Window::of(pixmap).rect().unwrap();
+            // ── end pdf_manipulator patch ──
             let path = PathBuilder::from_rect(rect);
             pixmap.fill_path(
                 &path,
@@ -4572,8 +4600,8 @@ impl PageRenderer {
                             if let Some(subtype) = dict.get("Subtype").and_then(|o| o.as_name()) {
                                 match subtype {
                                     // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
-                                    "Image" if self.band.misses_unit_square(transform) => {},
-                                    "Form" if form_misses_band(&self.band, dict, transform) => {},
+                                    "Image" if Window::of(pixmap).misses_unit_square(transform) => {},
+                                    "Form" if form_misses_band(&Window::of(pixmap), dict, transform) => {},
                                     // ── end pdf_manipulator patch ──
                                     "Image" => {
                                         // ImageMask XObjects (1-bit stencil painted with
@@ -5432,7 +5460,9 @@ impl PageRenderer {
             return Ok(None);
         };
 
-        let Some(mut coverage) = Pixmap::new(pixmap.width(), pixmap.height()) else {
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let Some(mut coverage) = Pixmap::new_like(pixmap) else {
+        // ── end pdf_manipulator patch ──
             return Ok(None);
         };
         let image_transform = image_unit_square_transform(transform, width, height);
@@ -5445,7 +5475,9 @@ impl PageRenderer {
             clip_mask,
         );
 
-        let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else {
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let Some(mut mask) = tiny_skia::Mask::new_like(pixmap) else {
+        // ── end pdf_manipulator patch ──
             return Ok(None);
         };
         // The coverage buffer is RGBA, so it divides exactly into pixels and
@@ -5811,7 +5843,9 @@ impl PageRenderer {
 
             // Create a separate pixmap for the group
             let mut group_pixmap =
-                Pixmap::new(pixmap.width(), pixmap.height()).ok_or_else(|| {
+                // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                Pixmap::new_like(pixmap).ok_or_else(|| {
+                // ── end pdf_manipulator patch ──
                     crate::error::Error::InvalidPdf("Failed to create group pixmap".into())
                 })?;
 
@@ -5971,12 +6005,15 @@ impl PageRenderer {
     /// so the alpha channel is per-pixel coverage including antialiased edges.
     fn glyph_coverage_mask(
         &self,
-        width: u32,
-        height: u32,
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        pixmap: &Pixmap,
+        // ── end pdf_manipulator patch ──
         gs: &GraphicsState,
         draw: impl FnOnce(&TextRasterizer, &mut Pixmap, &GraphicsState, &HashMap<String, Arc<FontInfo>>),
     ) -> Option<tiny_skia::Mask> {
-        let mut scratch = Pixmap::new(width, height)?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut scratch = Pixmap::new_like(pixmap)?;
+        // ── end pdf_manipulator patch ──
         let cov_gs = Self::coverage_only_gs(gs);
         draw(&self.text_rasterizer, &mut scratch, &cov_gs, &self.fonts);
         Some(tiny_skia::Mask::from_pixmap(scratch.as_ref(), tiny_skia::MaskType::Alpha))
@@ -6194,7 +6231,9 @@ impl PageRenderer {
         if pattern_type == 2 {
             // The shape being filled becomes the clip, since the gradient's
             // own geometry is independent of it.
-            let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else {
+            // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+            let Some(mut mask) = tiny_skia::Mask::new_like(pixmap) else {
+            // ── end pdf_manipulator patch ──
                 return Ok(false);
             };
             guarded_mask_fill_path(&mut mask, path, fill_rule, true, path_transform);
@@ -6403,11 +6442,16 @@ impl PageRenderer {
             rx1 = rx1.max(x);
             ry1 = ry1.max(y);
         }
-        let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
-        rx0 = rx0.max(0.0);
-        ry0 = ry0.max(0.0);
-        rx1 = rx1.min(w);
-        ry1 = ry1.min(h);
+        // ── pdf_manipulator patch: the pattern fills the part of the page the pixmap shows ──
+        let window = Window::of(pixmap).rect();
+        let (left, top, right, bottom) = window.map_or((0.0, 0.0, 0.0, 0.0), |r| {
+            (r.left(), r.top(), r.right(), r.bottom())
+        });
+        rx0 = rx0.max(left);
+        ry0 = ry0.max(top);
+        rx1 = rx1.min(right);
+        ry1 = ry1.min(bottom);
+        // ── end pdf_manipulator patch ──
         if rx1 <= rx0 || ry1 <= ry0 {
             return Ok(true); // fill region off-screen — nothing to paint
         }
@@ -6442,7 +6486,9 @@ impl PageRenderer {
 
         // Build the fill-region mask (path coverage ∩ active clip) once and
         // blit the cell into every lattice position under it.
-        let mut mask = match tiny_skia::Mask::new(pixmap.width(), pixmap.height()) {
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut mask = match tiny_skia::Mask::new_like(pixmap) {
+        // ── end pdf_manipulator patch ──
             Some(m) => m,
             None => {
                 flood(pixmap);
@@ -6829,7 +6875,9 @@ impl PageRenderer {
     ) -> Option<Vec<u8>> {
         let sidecar = self.cmyk_sidecar.as_ref()?;
         let (w, h) = sidecar.dims();
-        let mut mask = tiny_skia::Mask::new(w, h)?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut mask = tiny_skia::Mask::new_at(w, h, sidecar.origin())?;
+        // ── end pdf_manipulator patch ──
         guarded_mask_fill_path(&mut mask, path, fill_rule, true, transform);
         let mut buf = mask.data().to_vec();
         // Intersect with the active clip mask. tiny_skia's clip mask
@@ -6858,7 +6906,9 @@ impl PageRenderer {
     ) -> Option<Vec<u8>> {
         let sidecar = self.cmyk_sidecar.as_ref()?;
         let (w, h) = sidecar.dims();
-        let mut scratch = Pixmap::new(w, h)?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut scratch = Pixmap::new_at(w, h, sidecar.origin())?;
+        // ── end pdf_manipulator patch ──
         let dash = if !gs.dash_pattern.0.is_empty() {
             tiny_skia::StrokeDash::new(gs.dash_pattern.0.clone(), gs.dash_pattern.1)
         } else {
@@ -6973,8 +7023,9 @@ impl PageRenderer {
     fn accumulate_text_clip_tj(
         &self,
         accum: &mut Option<Pixmap>,
-        width: u32,
-        height: u32,
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        pixmap: &Pixmap,
+        // ── end pdf_manipulator patch ──
         text: &[u8],
         transform: Transform,
         gs: &GraphicsState,
@@ -6982,7 +7033,9 @@ impl PageRenderer {
         doc: &PdfDocument,
     ) {
         if accum.is_none() {
-            *accum = Pixmap::new(width, height);
+            // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+            *accum = Pixmap::new_like(pixmap);
+            // ── end pdf_manipulator patch ──
         }
         let Some(scratch) = accum.as_mut() else {
             return;
@@ -7017,8 +7070,9 @@ impl PageRenderer {
     fn accumulate_text_clip_tj_array(
         &self,
         accum: &mut Option<Pixmap>,
-        width: u32,
-        height: u32,
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        pixmap: &Pixmap,
+        // ── end pdf_manipulator patch ──
         array: &[crate::content::operators::TextElement],
         transform: Transform,
         gs: &GraphicsState,
@@ -7026,7 +7080,9 @@ impl PageRenderer {
         doc: &PdfDocument,
     ) {
         if accum.is_none() {
-            *accum = Pixmap::new(width, height);
+            // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+            *accum = Pixmap::new_like(pixmap);
+            // ── end pdf_manipulator patch ──
         }
         let Some(scratch) = accum.as_mut() else {
             return;
@@ -7076,7 +7132,9 @@ impl PageRenderer {
     ) -> Option<Vec<u8>> {
         let sidecar = self.cmyk_sidecar.as_ref()?;
         let (w, h) = sidecar.dims();
-        let mut scratch = Pixmap::new(w, h)?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut scratch = Pixmap::new_at(w, h, sidecar.origin())?;
+        // ── end pdf_manipulator patch ──
         let cov_gs = Self::coverage_only_gs(gs);
         // Suppress error logs — the coverage scratch path is permitted
         // to fail silently because the visible-paint call will have
@@ -7109,7 +7167,9 @@ impl PageRenderer {
     ) -> Option<Vec<u8>> {
         let sidecar = self.cmyk_sidecar.as_ref()?;
         let (w, h) = sidecar.dims();
-        let mut scratch = Pixmap::new(w, h)?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut scratch = Pixmap::new_at(w, h, sidecar.origin())?;
+        // ── end pdf_manipulator patch ──
         let cov_gs = Self::coverage_only_gs(gs);
         let _ = self.text_rasterizer.render_tj_array(
             &mut scratch,
@@ -7148,7 +7208,9 @@ impl PageRenderer {
     ) -> Option<Vec<u8>> {
         let sidecar = self.cmyk_sidecar.as_ref()?;
         let (w, h) = sidecar.dims();
-        let mut scratch = Pixmap::new(w, h)?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut scratch = Pixmap::new_at(w, h, sidecar.origin())?;
+        // ── end pdf_manipulator patch ──
         let cov_gs = Self::coverage_only_gs(gs);
         // Resolve the XObject reference + subtype dispatch the same
         // way the visible-paint Do arm does, but only for Image and
@@ -7317,7 +7379,9 @@ impl PageRenderer {
     ) -> Option<Vec<u8>> {
         let sidecar = self.cmyk_sidecar.as_ref()?;
         let (w, h) = sidecar.dims();
-        let mut scratch = Pixmap::new(w, h)?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut scratch = Pixmap::new_at(w, h, sidecar.origin())?;
+        // ── end pdf_manipulator patch ──
         let cov_gs = Self::coverage_only_gs(gs);
         let _ =
             self.render_shading(&mut scratch, name, transform, &cov_gs, resources, doc, clip_mask);
@@ -8593,7 +8657,9 @@ impl PageRenderer {
         // colour space's black point (also fills with zeros).
         let w = pixmap.width();
         let h = pixmap.height();
-        let mut mask_pixmap = match Pixmap::new(w, h) {
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut mask_pixmap = match Pixmap::new_like(pixmap) {
+            // ── end pdf_manipulator patch ──
             Some(p) => p,
             None => {
                 // Allocation failed — restore the snapshot to avoid
@@ -8872,9 +8938,9 @@ impl PageRenderer {
         resources: &Object,
     ) -> Result<()> {
         // Backdrop is the pixmap state at group entry.
-        let width = pixmap.width();
-        let height = pixmap.height();
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
         let backdrop_data: Vec<u8> = pixmap.data().to_vec();
+        // ── end pdf_manipulator patch ──
 
         // Sidecar backdrop snapshot. ISO 32000-1 §11.3.3 + §11.4.6.2:
         // a knockout group composes each element against the group's
@@ -8930,7 +8996,9 @@ impl PageRenderer {
             // element's pixel contribution reaches the scratch. The
             // scratch is initialised to the backdrop so the paint
             // composites against the group's initial backdrop only.
-            let mut scratch = Pixmap::new(width, height).ok_or_else(|| {
+            // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+            let mut scratch = Pixmap::new_like(pixmap).ok_or_else(|| {
+                // ── end pdf_manipulator patch ──
                 crate::error::Error::InvalidPdf("knockout scratch pixmap alloc failed".into())
             })?;
             scratch.data_mut().copy_from_slice(&backdrop_data);
@@ -11756,7 +11824,7 @@ fn form_matrix(dict: &std::collections::HashMap<String, Object>) -> Transform {
 /// so the form draws nothing here and need not be read. A form without a
 /// usable box is never culled.
 fn form_misses_band(
-    band: &BandContext,
+    band: &Window,
     dict: &std::collections::HashMap<String, Object>,
     transform: Transform,
 ) -> bool {
@@ -11857,7 +11925,9 @@ fn form_bbox_clip(
     if !device_bounds_rasterizable(&path, transform) {
         return None;
     }
-    let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+    let mut mask = tiny_skia::Mask::new_like(pixmap)?;
+    // ── end pdf_manipulator patch ──
     mask.fill_path(&path, tiny_skia::FillRule::Winding, true, transform);
     Some(mask)
 }
@@ -11892,14 +11962,18 @@ fn apply_pending_clip(
         // the case the existing behaviour was written for, and an empty mask
         // there would wrongly erase every subsequent draw.
         if !device_bounds_rasterizable(&path, transform) {
-            if super::device_bounds_miss_pixmap(&path, transform, pixmap.width(), pixmap.height()) {
+            // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+            if super::device_bounds_miss_pixmap(&path, transform, Window::of(pixmap)) {
+                // ── end pdf_manipulator patch ──
                 log::debug!(
                     "clip lies wholly off-pixmap and cannot be rasterized; clipping everything                      away: {:?}",
                     path.bounds()
                 );
                 // An all-zero mask: nothing subsequent paints, which is what a
                 // clip excluding the whole page means.
-                if let Some(empty) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) {
+                // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                if let Some(empty) = tiny_skia::Mask::new_like(pixmap) {
+                // ── end pdf_manipulator patch ──
                     if let Some(slot) = clip_stack.last_mut() {
                         *slot = Some(empty);
                     }
@@ -11928,7 +12002,9 @@ fn apply_pending_clip(
                 existing_mask.intersect_path(&path, fill_rule, true, transform);
             },
             None => {
-                let mut new_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height()).unwrap();
+                // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+                let mut new_mask = tiny_skia::Mask::new_like(pixmap).unwrap();
+                // ── end pdf_manipulator patch ──
                 new_mask.fill_path(&path, fill_rule, true, transform);
                 *slot = Some(new_mask);
             },
@@ -11947,6 +12023,9 @@ fn apply_pending_clip(
 /// the intersection of the slab with the inherited `clip_mask`.
 fn build_axial_extend_clip(
     pixmap: &Pixmap,
+    // ── pdf_manipulator patch: the slab's reach is the page's, not the band's ──
+    page: (u32, u32),
+    // ── end pdf_manipulator patch ──
     p0: tiny_skia::Point,
     p1: tiny_skia::Point,
     extend_start: bool,
@@ -11957,8 +12036,12 @@ fn build_axial_extend_clip(
         return None;
     }
 
-    let w = pixmap.width() as f32;
-    let h = pixmap.height() as f32;
+    // ── pdf_manipulator patch: the slab's reach is the page's, not the band's ──
+    // The slab's corners are far past the raster, and they set the slope of
+    // its sides, so they must be the same for every band of a page.
+    let w = page.0 as f32;
+    let h = page.1 as f32;
+    // ── end pdf_manipulator patch ──
 
     // Axis vector (device-space) and unit-normal perpendicular. A
     // degenerate axis (p0 ≈ p1) collapses to a zero-area gradient; no
@@ -12003,7 +12086,9 @@ fn build_axial_extend_clip(
     pb.close();
     let path = pb.finish()?;
 
-    let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+    let mut mask = tiny_skia::Mask::new_like(pixmap)?;
+    // ── end pdf_manipulator patch ──
     guarded_mask_fill_path(
         &mut mask,
         &path,
@@ -12045,7 +12130,9 @@ fn build_radial_extend_clip(
     //
     // When `Extend[0] = false` we also exclude the inner disk
     // (subtract it via an even-odd fill rule).
-    let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+    let mut mask = tiny_skia::Mask::new_like(pixmap)?;
+    // ── end pdf_manipulator patch ──
 
     let outer_path = {
         let mut pb = PathBuilder::new();
@@ -12057,12 +12144,9 @@ fn build_radial_extend_clip(
         } else {
             // No outer-side clip: the outer boundary is the full
             // pixmap rectangle.
-            let rect = tiny_skia::Rect::from_xywh(
-                0.0,
-                0.0,
-                pixmap.width() as f32,
-                pixmap.height() as f32,
-            )?;
+            // ── pdf_manipulator patch: the shading fills the part of the page the pixmap shows ──
+            let rect = Window::of(pixmap).rect()?;
+            // ── end pdf_manipulator patch ──
             pb.push_rect(rect);
         }
         pb.finish()?
@@ -12080,7 +12164,9 @@ fn build_radial_extend_clip(
         // tiny-skia's `Mask` is a single-channel u8 buffer; "subtract"
         // by filling the inner path into a fresh inner-mask and then
         // multiplying mask by (1 - inner_mask).
-        let mut inner_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
+        let mut inner_mask = tiny_skia::Mask::new_like(pixmap)?;
+        // ── end pdf_manipulator patch ──
         let mut pb = PathBuilder::new();
         pb.push_circle(c0.x, c0.y, r0);
         if let Some(inner_path) = pb.finish() {
