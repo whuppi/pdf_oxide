@@ -131,6 +131,18 @@ impl Kind {
 
 /// Classify an image XObject from its dictionary and stored bytes.
 pub fn classify(doc: &PdfDocument, dict: &HashMap<String, Object>, data: &[u8]) -> Kind {
+    classify_stored(doc, dict, data.len() as u64, data)
+}
+
+/// [`classify`] for a stream that is not held: `stored_len` is its length as
+/// stored and `head` its first bytes, which are all a JPEG's quality is read
+/// from (the quantization tables precede the first scan).
+pub fn classify_stored(
+    doc: &PdfDocument,
+    dict: &HashMap<String, Object>,
+    stored_len: u64,
+    head: &[u8],
+) -> Kind {
     let filters = filter_names(doc, dict);
     let encoding = match filters.last().map(|n| PdfFilter::from_name(n)) {
         None
@@ -180,10 +192,10 @@ pub fn classify(doc: &PdfDocument, dict: &HashMap<String, Object>, data: &[u8]) 
         masks: masks(doc, dict),
         width: int("Width").unwrap_or(0).max(0) as u32,
         height: int("Height").unwrap_or(0).max(0) as u32,
-        compressed_len: data.len() as u64,
+        compressed_len: stored_len,
         // Only a bare DCT stream is a JPEG we can read the tables of.
         jpeg_quality: if encoding == Encoding::Jpeg && filters.len() == 1 {
-            estimate_jpeg_quality(data)
+            estimate_jpeg_quality(head)
         } else {
             None
         },

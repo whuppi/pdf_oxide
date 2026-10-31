@@ -23,8 +23,6 @@ fonts::font_dict::from_dict
 fonts::font_dict::parse_descendant_fonts
 fonts::font_dict::resolve_encoding_writing_mode
 host::attachments::attachment_bytes
-host::images::execute::decode_bilevel # the reducer re-encodes a whole image
-host::images::execute::reduce_images # the reducer re-encodes a whole image
 host::images::stream::open_stencil # a /Mask stencil is one bit a pixel; its packed rows are kept and read in step with the image
 object::decode_stream_data
 object::read_whole_raw

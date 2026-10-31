@@ -1,6 +1,7 @@
-//! Encoders the reducer writes with. Pure functions over 8-bit sample
-//! buffers; nothing here reads a PDF.
+//! Encoders the reducer writes with: each takes 8-bit sample rows one at a
+//! time, and has a form over a held buffer; nothing here reads a PDF.
 
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::io::Write;
 
@@ -8,7 +9,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
 use crate::error::{Error, Result};
-use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+use jpeg_encoder::{rgb_to_ycbcr, Encoder, ImageBuffer, JpegColorType, SamplingFactor};
 
 use super::policy::Subsampling;
 
@@ -112,6 +113,68 @@ fn best_filtered_row(row: &[u8], prior: &[u8], bpp: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(&best_row);
 }
 
+/// Flate with PNG predictors, 8 bits per component, rows pushed one at a
+/// time: what is held is the previous row and the compressed output.
+pub struct FlateRows {
+    zlib: ZlibEncoder<Vec<u8>>,
+    prior: Vec<u8>,
+    filtered: Vec<u8>,
+    channels: u8,
+    width: u32,
+}
+
+impl FlateRows {
+    /// An encoder for rows of `width` pixels of `channels` 1, 3 or 4 samples.
+    pub fn new(width: u32, channels: u8) -> Result<Self> {
+        if !matches!(channels, 1 | 3 | 4) {
+            return Err(Error::Image(format!(
+                "encode_flate_predicted: channels must be 1, 3 or 4, got {channels}"
+            )));
+        }
+        if width == 0 {
+            return Err(Error::Image("encode_flate_predicted: width must be non-zero".to_string()));
+        }
+        Ok(Self {
+            zlib: ZlibEncoder::new(Vec::new(), Compression::best()),
+            prior: vec![0u8; width as usize * channels as usize],
+            filtered: Vec::new(),
+            channels,
+            width,
+        })
+    }
+
+    /// The next row, `width * channels` bytes.
+    pub fn push(&mut self, row: &[u8]) -> Result<()> {
+        if row.len() != self.prior.len() {
+            return Err(Error::Image(format!(
+                "encode_flate_predicted: row holds {} bytes, expected {}",
+                row.len(),
+                self.prior.len()
+            )));
+        }
+        self.filtered.clear();
+        best_filtered_row(row, &self.prior, self.channels as usize, &mut self.filtered);
+        self.prior.copy_from_slice(row);
+        self.zlib
+            .write_all(&self.filtered)
+            .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib write failed: {e}")))
+    }
+
+    /// The finished stream.
+    pub fn finish(self) -> Result<FlateEncoded> {
+        let bytes = self
+            .zlib
+            .finish()
+            .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib finish failed: {e}")))?;
+        Ok(FlateEncoded {
+            bytes,
+            predictor: 15,
+            colors: self.channels,
+            columns: self.width,
+        })
+    }
+}
+
 /// Flate with PNG predictors, 8 bits per component, `channels` 1, 3 or 4.
 pub fn encode_flate_predicted(
     samples: &[u8],
@@ -119,39 +182,126 @@ pub fn encode_flate_predicted(
     height: u32,
     channels: u8,
 ) -> Result<FlateEncoded> {
-    if !matches!(channels, 1 | 3 | 4) {
-        return Err(Error::Image(format!(
-            "encode_flate_predicted: channels must be 1, 3 or 4, got {channels}"
-        )));
-    }
+    let mut rows = FlateRows::new(width, channels)?;
     expect_buffer_len(samples, width, height, channels as u32, "encode_flate_predicted")?;
-
-    let bpp = channels as usize;
-    let row_len = width as usize * bpp;
-    let mut filtered = Vec::with_capacity((row_len + 1) * height as usize);
-    let mut prior = vec![0u8; row_len];
-    for row in samples.chunks_exact(row_len) {
-        best_filtered_row(row, &prior, bpp, &mut filtered);
-        prior.copy_from_slice(row);
+    for row in samples.chunks_exact(width as usize * channels as usize) {
+        rows.push(row)?;
     }
-
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-    encoder
-        .write_all(&filtered)
-        .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib write failed: {e}")))?;
-    let bytes = encoder
-        .finish()
-        .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib finish failed: {e}")))?;
-
-    Ok(FlateEncoded {
-        bytes,
-        predictor: 15,
-        colors: channels,
-        columns: width,
-    })
+    rows.finish()
 }
 
-/// Baseline JPEG; `channels` 1 (L8) or 3 (Rgb8); `quality` 1..=100.
+/// The rows `next_row` yields, as the encoder asks for them: in order, the
+/// last one again for the lines that pad the final MCU row.
+struct RowFeed<'a> {
+    width: u16,
+    height: u16,
+    channels: u8,
+    state: RefCell<FeedState<'a>>,
+    /// The first failure of `next_row`, which the encoder cannot carry.
+    failure: &'a RefCell<Option<Error>>,
+}
+
+struct FeedState<'a> {
+    next: u32,
+    row: Vec<u8>,
+    pull: &'a mut dyn FnMut(&mut [u8]) -> Result<()>,
+}
+
+impl ImageBuffer for RowFeed<'_> {
+    fn get_jpeg_color_type(&self) -> JpegColorType {
+        if self.channels == 1 {
+            JpegColorType::Luma
+        } else {
+            JpegColorType::Ycbcr
+        }
+    }
+
+    fn width(&self) -> u16 {
+        self.width
+    }
+
+    fn height(&self) -> u16 {
+        self.height
+    }
+
+    fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+        let mut guard = self.state.borrow_mut();
+        let state = &mut *guard;
+        while state.next <= u32::from(y) {
+            if self.failure.borrow().is_none() {
+                if let Err(e) = (state.pull)(&mut state.row) {
+                    *self.failure.borrow_mut() = Some(e);
+                }
+            }
+            state.next += 1;
+        }
+        if self.channels == 1 {
+            buffers[0].extend_from_slice(&state.row);
+        } else {
+            for px in state.row.chunks_exact(3) {
+                let (luma, cb, cr) = rgb_to_ycbcr(px[0], px[1], px[2]);
+                buffers[0].push(luma);
+                buffers[1].push(cb);
+                buffers[2].push(cr);
+            }
+        }
+    }
+}
+
+/// Baseline JPEG; `channels` 1 (L8) or 3 (Rgb8); `quality` 1..=100. The rows
+/// are asked of `next_row` one at a time, `width * channels` bytes each, so
+/// the encoder holds a band of MCU rows and its output, never the image.
+/// Huffman tables are the standard ones: optimised tables need every
+/// coefficient of the image before the first byte is written.
+pub fn encode_jpeg_rows(
+    width: u32,
+    height: u32,
+    channels: u8,
+    quality: u8,
+    subsampling: Subsampling,
+    next_row: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+) -> Result<Vec<u8>> {
+    if !matches!(channels, 1 | 3) {
+        return Err(Error::Image(format!("encode_jpeg: channels must be 1 or 3, got {channels}")));
+    }
+    if !(1..=100).contains(&quality) {
+        return Err(Error::Image(format!("encode_jpeg: quality must be 1..=100, got {quality}")));
+    }
+    if width == 0 || height == 0 {
+        return Err(Error::Image("encode_jpeg: width and height must be non-zero".to_string()));
+    }
+    // Baseline JPEG carries dimensions in 16 bits.
+    let (w16, h16) = match (u16::try_from(width), u16::try_from(height)) {
+        (Ok(w), Ok(h)) => (w, h),
+        _ => return Err(Error::Image(format!("encode_jpeg: {width}x{height} exceeds 65535"))),
+    };
+    let failure = RefCell::new(None);
+    let feed = RowFeed {
+        width: w16,
+        height: h16,
+        channels,
+        state: RefCell::new(FeedState {
+            next: 0,
+            row: vec![0u8; width as usize * channels as usize],
+            pull: next_row,
+        }),
+        failure: &failure,
+    };
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::new(&mut bytes, quality);
+    encoder.set_sampling_factor(match subsampling {
+        Subsampling::Full => SamplingFactor::F_1_1,
+        Subsampling::Half => SamplingFactor::F_2_2,
+    });
+    let encoded = encoder.encode_image(feed);
+    if let Some(e) = failure.into_inner() {
+        return Err(e);
+    }
+    encoded.map_err(|e| Error::Image(format!("encode_jpeg: {e}")))?;
+    Ok(bytes)
+}
+
+/// [`encode_jpeg_rows`] of a held buffer.
 pub fn encode_jpeg(
     samples: &[u8],
     width: u32,
@@ -163,39 +313,43 @@ pub fn encode_jpeg(
     if !matches!(channels, 1 | 3) {
         return Err(Error::Image(format!("encode_jpeg: channels must be 1 or 3, got {channels}")));
     }
-    if !(1..=100).contains(&quality) {
-        return Err(Error::Image(format!("encode_jpeg: quality must be 1..=100, got {quality}")));
-    }
     expect_buffer_len(samples, width, height, channels as u32, "encode_jpeg")?;
-
-    // Baseline JPEG carries dimensions in 16 bits.
-    let (w16, h16) = match (u16::try_from(width), u16::try_from(height)) {
-        (Ok(w), Ok(h)) => (w, h),
-        _ => return Err(Error::Image(format!("encode_jpeg: {width}x{height} exceeds 65535"))),
-    };
-    let color = if channels == 1 { ColorType::Luma } else { ColorType::Rgb };
-    let mut bytes = Vec::new();
-    let mut encoder = Encoder::new(&mut bytes, quality);
-    encoder.set_sampling_factor(match subsampling {
-        Subsampling::Full => SamplingFactor::F_1_1,
-        Subsampling::Half => SamplingFactor::F_2_2,
-    });
-    // Per-image Huffman tables: a few percent smaller, lossless.
-    encoder.set_optimized_huffman_tables(true);
-    encoder
-        .encode(samples, w16, h16, color)
-        .map_err(|e| Error::Image(format!("encode_jpeg: {e}")))?;
-    Ok(bytes)
+    let mut rows = samples.chunks_exact(width as usize * channels as usize);
+    encode_jpeg_rows(width, height, channels, quality, subsampling, &mut |out| {
+        out.copy_from_slice(rows.next().ok_or_else(|| Error::Image("encode_jpeg: no more rows".to_string()))?);
+        Ok(())
+    })
 }
 
-/// CCITT Group 4 (K = −1) of a buffer holding 0 (black) or 255 (white) per pixel,
-/// for a dictionary saying `/BlackIs1 false`.
-pub fn encode_ccitt_g4(gray: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
-    expect_buffer_len(gray, width, height, 1, "encode_ccitt_g4")?;
+/// CCITT Group 4 (K = −1), a line at a time, of rows holding 0 (black) or 255
+/// (white) per pixel, for a dictionary saying `/BlackIs1 false`: what is held
+/// is the previous line and the encoded output.
+pub struct CcittRows {
+    encoder: fax::encoder::Encoder<fax::VecWriter>,
+    width: u32,
+}
 
-    let mut encoder = fax::encoder::Encoder::new(fax::VecWriter::new());
-    let row_len = width as usize;
-    for row in gray.chunks_exact(row_len) {
+impl CcittRows {
+    /// An encoder for lines of `width` pixels.
+    pub fn new(width: u32) -> Result<Self> {
+        if width == 0 {
+            return Err(Error::Image("encode_ccitt_g4: width must be non-zero".to_string()));
+        }
+        Ok(Self {
+            encoder: fax::encoder::Encoder::new(fax::VecWriter::new()),
+            width,
+        })
+    }
+
+    /// The next line, `width` bytes.
+    pub fn push(&mut self, row: &[u8]) -> Result<()> {
+        if row.len() != self.width as usize {
+            return Err(Error::Image(format!(
+                "encode_ccitt_g4: line holds {} bytes, expected {}",
+                row.len(),
+                self.width
+            )));
+        }
         let pels = row.iter().map(|&v| {
             if v == 0 {
                 fax::Color::Black
@@ -203,10 +357,25 @@ pub fn encode_ccitt_g4(gray: &[u8], width: u32, height: u32) -> Result<Vec<u8>> 
                 fax::Color::White
             }
         });
-        infallible(encoder.encode_line(pels, width));
+        infallible(self.encoder.encode_line(pels, self.width));
+        Ok(())
     }
-    let writer = infallible(encoder.finish());
-    Ok(writer.finish())
+
+    /// The finished stream.
+    pub fn finish(self) -> Vec<u8> {
+        infallible(self.encoder.finish()).finish()
+    }
+}
+
+/// CCITT Group 4 (K = −1) of a buffer holding 0 (black) or 255 (white) per pixel,
+/// for a dictionary saying `/BlackIs1 false`.
+pub fn encode_ccitt_g4(gray: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    expect_buffer_len(gray, width, height, 1, "encode_ccitt_g4")?;
+    let mut rows = CcittRows::new(width)?;
+    for row in gray.chunks_exact(width as usize) {
+        rows.push(row)?;
+    }
+    Ok(rows.finish())
 }
 
 #[cfg(test)]
@@ -305,6 +474,37 @@ mod tests {
         assert_eq!(decoded.width(), width);
         assert_eq!(decoded.height(), height);
         assert!(psnr(&samples, decoded.as_raw()) >= 35.0);
+    }
+
+    #[test]
+    fn jpeg_rows_are_asked_once_each_at_a_size_that_is_no_multiple_of_an_mcu() {
+        let (w, h) = (37u32, 21u32);
+        let mut asked = 0u32;
+        let bytes = encode_jpeg_rows(w, h, 3, 85, Subsampling::Half, &mut |row| {
+            for (i, b) in row.iter_mut().enumerate() {
+                *b = ((asked * 7 + i as u32) % 251) as u8;
+            }
+            asked += 1;
+            Ok(())
+        })
+        .expect("encodes");
+        assert_eq!(asked, h);
+        let decoded = image::load_from_memory(&bytes).expect("valid jpeg");
+        assert_eq!((decoded.width(), decoded.height()), (w, h));
+    }
+
+    #[test]
+    fn a_row_source_that_fails_ends_the_jpeg_with_its_error() {
+        let mut asked = 0;
+        let result = encode_jpeg_rows(16, 16, 1, 75, Subsampling::Full, &mut |_| {
+            asked += 1;
+            if asked == 5 {
+                Err(Error::Image("no more rows".to_string()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(Error::Image(m)) if m == "no more rows"));
     }
 
     #[test]

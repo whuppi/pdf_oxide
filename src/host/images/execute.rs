@@ -1,34 +1,53 @@
-//! Carry out a decision: decode, resample, encode, rewrite the dictionary,
-//! stage the replacement — and the driver that runs the five stages over a
-//! document. One image (plus its soft mask) is in memory at a time.
+//! Carry out a decision: read the image's rows, resample them, encode them,
+//! rewrite the dictionary, stage the replacement — and the driver that runs
+//! the five stages over a document.
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
+//!
+//! An image is never held whole. Its rows come from the row cursor of
+//! `host::images::stream` (a raw-sample stream a strip at a time, a codec's
+//! raster, a fax bitmap at one bit a pixel), pass one at a time through the
+//! row resampler, and go straight into an encoder that takes rows. What is
+//! held is a strip or the codec's raster, the resampler's few rows and the
+//! encoded output of the one image being rewritten, which is the unit the
+//! editor stages.
 
 use std::collections::HashMap;
+use std::io::Read;
 
 use bytes::Bytes;
 
-use crate::decoders::CcittParams;
+use crate::cancel::CancelCheck;
 use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;
 use crate::error::{Error, Result};
-use crate::extractors::images::decode_cmyk_jpeg_to_raw_cmyk;
-use crate::extractors::{extract_image_from_xobject, ImageData, PixelFormat};
-use crate::object::{Object, ObjectRef};
+use crate::extractors::images::{
+    decode_cmyk_jpeg_to_raw_cmyk, extract_image_from_xobject_at, row_geometry, ImageData,
+    PdfFilter, PixelFormat,
+};
+use crate::object::{Object, ObjectRef, StreamBody};
 
-use super::classify::{classify, filter_names, ColorModel, Encoding, Kind};
-use super::encode::{encode_ccitt_g4, encode_flate_predicted, encode_jpeg};
+use super::classify::{classify_stored, filter_names, ColorModel, Encoding, Kind};
+use super::encode::{encode_jpeg_rows, CcittRows, FlateRows};
 use super::inventory::document_images;
 use super::policy::{decide, ppi_min, Decision, KeepReason, Output, Policy, Use};
 use super::report::{Action, Outcome, Report};
-use super::resample::{resample_bilevel, resample_continuous};
+use super::resample::RowResampler;
+use super::stream::{ImageRows, Output as RowOutput};
+
+/// The leading bytes of a JPEG that its quality is read from: the
+/// quantization tables precede the first scan.
+const HEAD_BYTES: u64 = 1024 * 1024;
+
+/// Rows of a CMYK strip are read to about this many bytes at a time.
+const STRIP_BYTES: usize = 256 * 1024;
 
 /// Run the pipeline over every image drawn on the editor's visible pages
 /// and stage each replacement for the next save.
 pub fn reduce_images(
     editor: &mut DocumentEditor,
     policy: &Policy,
-    cancel: &crate::cancel::CancelCheck,
+    cancel: &CancelCheck,
 ) -> Result<Report> {
     let pages: Vec<usize> = editor
         .page_order_visible()
@@ -42,14 +61,14 @@ pub fn reduce_images(
         let Object::Stream { dict, body } = &object else {
             return Ok(());
         };
-        let data = body.read_whole_raw()?;
-        let kind = classify(editor.source(), dict, &data);
+        let stored = body.decrypted_len()?;
+        let kind = classify_stored(editor.source(), dict, stored, &head(editor.source(), dict, body)?);
         let uses: Vec<Use> = entry.placements.iter().map(|&ctm| Use { ctm }).collect();
         let mask_before = match kind.masks.soft_mask {
             Some(r) => stream_len(editor, r)?,
             None => 0,
         };
-        let bytes_before = data.len() as u64 + mask_before;
+        let bytes_before = stored + mask_before;
         let mut outcome = Outcome {
             object_id: entry.object.id,
             uses: uses.len() as u32,
@@ -69,17 +88,14 @@ pub fn reduce_images(
                     Some(r) => Some((r, staged_or_source(editor, r)?)),
                     None => None,
                 };
-                // The data was read once, for `classify`; the decode reads it
-                // from memory instead of asking the source for it again.
-                let held = Object::stream(dict.clone(), data);
                 match apply(
                     editor.source(),
-                    &held,
-                    entry.object,
+                    &object,
                     &kind,
                     mask.as_ref(),
                     target,
                     output,
+                    cancel,
                 ) {
                     Ok(applied) if saves_enough(applied.bytes, bytes_before, policy.min_savings) => {
                         outcome.action = if target.is_some() {
@@ -96,7 +112,11 @@ pub fn reduce_images(
                         }
                     },
                     Ok(_) => outcome.keep_reason = Some(KeepReason::BelowMinSavings),
-                    Err(_) => outcome.keep_reason = Some(KeepReason::Undecodable),
+                    Err(_) => {
+                        // A cancelled run is not an image that cannot be read.
+                        cancel.check()?;
+                        outcome.keep_reason = Some(KeepReason::Undecodable);
+                    },
                 }
             },
         }
@@ -104,6 +124,21 @@ pub fn reduce_images(
         Ok(())
     })?;
     Ok(report)
+}
+
+/// The first bytes of a bare JPEG stream, which are all its quality is read
+/// from; nothing for any other stream.
+fn head(doc: &PdfDocument, dict: &HashMap<String, Object>, body: &StreamBody) -> Result<Vec<u8>> {
+    let filters = filter_names(doc, dict);
+    if filters.len() != 1 || !matches!(PdfFilter::from_name(&filters[0]), PdfFilter::DCTDecode) {
+        return Ok(Vec::new());
+    }
+    let mut head = Vec::new();
+    body.raw_reader()?
+        .take(HEAD_BYTES)
+        .read_to_end(&mut head)
+        .map_err(crate::encryption::stream::from_io)?;
+    Ok(head)
 }
 
 /// Strictly smaller, and by at least `min_savings` of the stored bytes.
@@ -135,25 +170,394 @@ struct Applied {
     height: u32,
 }
 
-/// Decoded samples in the working form the encoders take.
-struct Samples {
-    data: Vec<u8>,
-    /// 1 (gray or bilevel 0/255), 3 (RGB) or 4 (CMYK).
-    channels: u8,
-    /// Samples are 0/255 only; resampling thresholds instead of blending.
-    bilevel: bool,
+/// What a row holds per pixel on its way to the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// One byte, 0 or 255; resampling thresholds instead of blending.
+    Bilevel,
+    /// One byte.
+    Gray,
+    /// Three bytes.
+    Rgb,
+    /// Four bytes, C M Y K.
+    Cmyk,
+}
+
+impl Shape {
+    fn channels(self) -> u8 {
+        match self {
+            Self::Bilevel | Self::Gray => 1,
+            Self::Rgb => 3,
+            Self::Cmyk => 4,
+        }
+    }
+
+    /// `raw`, one row of this shape, as the four lanes a pixel the resampler
+    /// takes.
+    fn lanes(self, raw: &[u8], out: &mut [u8]) {
+        match self {
+            Self::Bilevel | Self::Gray => {
+                for (&g, px) in raw.iter().zip(out.chunks_exact_mut(4)) {
+                    px.copy_from_slice(&[g, 0, 0, 255]);
+                }
+            },
+            Self::Rgb => {
+                for (rgb, px) in raw.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
+                    px[..3].copy_from_slice(rgb);
+                    px[3] = 255;
+                }
+            },
+            Self::Cmyk => out.copy_from_slice(raw),
+        }
+    }
+
+    /// The inverse of [`Self::lanes`] over resampled lanes.
+    fn pack(self, lanes: &[u8], out: &mut [u8]) {
+        match self {
+            Self::Bilevel => {
+                for (px, g) in lanes.chunks_exact(4).zip(out.iter_mut()) {
+                    *g = if px[0] >= 128 { 255 } else { 0 };
+                }
+            },
+            Self::Gray => {
+                for (px, g) in lanes.chunks_exact(4).zip(out.iter_mut()) {
+                    *g = px[0];
+                }
+            },
+            Self::Rgb => {
+                for (px, rgb) in lanes.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+                    rgb.copy_from_slice(&px[..3]);
+                }
+            },
+            Self::Cmyk => out.copy_from_slice(lanes),
+        }
+    }
+}
+
+/// Where an image's rows come from, in the shape the encoder is given.
+enum Source {
+    /// An image read as RGBA, its samples cut to the shape.
+    Image { rows: ImageRows, shape: Shape, row: Vec<u8> },
+    /// A gray mask read as luma; `invert` writes 0 where the stencil paints.
+    Luma { rows: ImageRows, invert: bool },
+    /// A CMYK image, its samples as stored.
+    Cmyk(CmykRows),
+}
+
+impl Source {
+    fn open(
+        doc: &PdfDocument,
+        object: &Object,
+        kind: &Kind,
+        shape: Shape,
+        target: Option<(u32, u32)>,
+    ) -> Result<Self> {
+        if shape == Shape::Cmyk {
+            return Ok(Self::Cmyk(CmykRows::open(doc, object, kind)?));
+        }
+        if kind.image_mask {
+            return Ok(Self::Luma {
+                rows: ImageRows::open_stencil(doc, object)?,
+                invert: true,
+            });
+        }
+        let rows = ImageRows::open(doc, object, &HashMap::new(), target, RowOutput::Rgba, None)?;
+        let (width, _) = rows.size();
+        Ok(Self::Image {
+            rows,
+            shape,
+            row: vec![0u8; width as usize * 4],
+        })
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Image { rows, .. } | Self::Luma { rows, .. } => rows.size(),
+            Self::Cmyk(rows) => rows.size(),
+        }
+    }
+
+    /// The next row into `out`: `width * channels` bytes.
+    fn read(&mut self, doc: &PdfDocument, out: &mut [u8]) -> Result<()> {
+        match self {
+            Self::Image { rows, shape, row } => {
+                rows.read(doc, row)?;
+                if *shape == Shape::Rgb {
+                    for (px, rgb) in row.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+                        rgb.copy_from_slice(&px[..3]);
+                    }
+                } else {
+                    for (px, g) in row.chunks_exact(4).zip(out.iter_mut()) {
+                        *g = px[0];
+                    }
+                }
+                Ok(())
+            },
+            Self::Luma { rows, invert } => {
+                rows.read(doc, out)?;
+                if *invert {
+                    for g in out.iter_mut() {
+                        *g = 255 - *g;
+                    }
+                }
+                Ok(())
+            },
+            Self::Cmyk(rows) => rows.read(doc, out),
+        }
+    }
+}
+
+/// The samples of a CMYK image as stored, not converted to RGB.
+enum CmykRows {
+    /// A JPEG's raster, which the codec returns whole.
+    Raster { pixels: Vec<u8>, width: u32, height: u32, next: u32 },
+    /// A raw-sample stream read through its filters a strip of rows at a time.
+    Strips(CmykStrips),
+}
+
+struct CmykStrips {
+    /// The stream's dictionary without its filters, which `reader` applies.
+    dict: HashMap<String, Object>,
+    reader: Box<dyn Read>,
+    row_bytes: usize,
+    strip_rows: u32,
     width: u32,
     height: u32,
+    /// CMYK samples of the rows `first..first + count`.
+    pixels: Vec<u8>,
+    first: u32,
+    count: u32,
+    next: u32,
+}
+
+impl CmykRows {
+    fn open(doc: &PdfDocument, object: &Object, kind: &Kind) -> Result<Self> {
+        let Object::Stream { dict, body } = object else {
+            return Err(Error::Image("image XObject is not a stream".to_string()));
+        };
+        match kind.encoding {
+            Encoding::Jpeg => {
+                let image = extract_image_from_xobject_at(Some(doc), object, None, None, None)?;
+                let ImageData::Jpeg(bytes) = image.data() else {
+                    return Err(Error::Image("CMYK JPEG decoded to another model".to_string()));
+                };
+                let pixels = decode_cmyk_jpeg_to_raw_cmyk(bytes)?;
+                let (width, height) = (image.width(), image.height());
+                if width == 0 || height == 0 || pixels.len() != width as usize * height as usize * 4 {
+                    return Err(Error::Image(format!(
+                        "decoded {} bytes for {width}x{height}x4",
+                        pixels.len()
+                    )));
+                }
+                Ok(Self::Raster { pixels, width, height, next: 0 })
+            },
+            Encoding::Raw => {
+                let geometry = row_geometry(Some(doc), dict, None)?;
+                let mut plain = dict.clone();
+                plain.remove("Filter");
+                plain.remove("DecodeParms");
+                let owned = body.clone();
+                let reader = crate::decoders::stream::reader_in(dict, body.origin(), move || {
+                    owned.owned_reader()
+                })?;
+                let strip_rows = u32::try_from((STRIP_BYTES / (geometry.width as usize * 4)).max(1))
+                    .unwrap_or(1)
+                    .min(geometry.height);
+                Ok(Self::Strips(CmykStrips {
+                    dict: plain,
+                    reader,
+                    row_bytes: geometry.row_bytes,
+                    strip_rows,
+                    width: geometry.width,
+                    height: geometry.height,
+                    pixels: Vec::new(),
+                    first: 0,
+                    count: 0,
+                    next: 0,
+                }))
+            },
+            _ => Err(Error::Image("CMYK image in a codec without a decoder".to_string())),
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Raster { width, height, .. } => (*width, *height),
+            Self::Strips(s) => (s.width, s.height),
+        }
+    }
+
+    fn read(&mut self, doc: &PdfDocument, out: &mut [u8]) -> Result<()> {
+        match self {
+            Self::Raster { pixels, width, height, next } => {
+                if *next >= *height {
+                    return Err(Error::Image("image has no more rows".to_string()));
+                }
+                let stride = *width as usize * 4;
+                let at = *next as usize * stride;
+                out.copy_from_slice(&pixels[at..at + stride]);
+                *next += 1;
+                Ok(())
+            },
+            Self::Strips(s) => {
+                if s.next >= s.height {
+                    return Err(Error::Image("image has no more rows".to_string()));
+                }
+                if s.next >= s.first + s.count {
+                    s.fill(doc)?;
+                }
+                let stride = s.width as usize * 4;
+                let at = (s.next - s.first) as usize * stride;
+                out.copy_from_slice(&s.pixels[at..at + stride]);
+                s.next += 1;
+                Ok(())
+            },
+        }
+    }
+}
+
+impl CmykStrips {
+    /// Decodes the strip that starts at row `next`.
+    fn fill(&mut self, doc: &PdfDocument) -> Result<()> {
+        let rows = self.strip_rows.min(self.height - self.next);
+        let mut data = vec![0u8; rows as usize * self.row_bytes];
+        // A stream shorter than its declared size is padded with zero samples.
+        let mut filled = 0;
+        while filled < data.len() {
+            match self.reader.read(&mut data[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+                Err(e) => return Err(crate::encryption::stream::from_io(e)),
+            }
+        }
+        let mut dict = self.dict.clone();
+        dict.insert("Height".to_string(), Object::Integer(i64::from(rows)));
+        let strip = Object::stream(dict, data);
+        let image = extract_image_from_xobject_at(Some(doc), &strip, None, None, None)?;
+        match image.data() {
+            ImageData::Raw { pixels, format: PixelFormat::CMYK }
+                if pixels.len() == rows as usize * self.width as usize * 4 =>
+            {
+                self.pixels.clear();
+                self.pixels.extend_from_slice(pixels);
+            },
+            _ => return Err(Error::Image("CMYK image decoded to another model".to_string())),
+        }
+        self.first = self.next;
+        self.count = rows;
+        Ok(())
+    }
+}
+
+/// An image's rows at the size they are written: read, resampled when the
+/// size differs from the source's, one row at a time.
+struct Pipe<'a> {
+    doc: &'a PdfDocument,
+    cancel: &'a CancelCheck,
+    source: Source,
+    shape: Shape,
+    width: u32,
+    height: u32,
+    resampler: Option<RowResampler>,
+    /// The next row to give.
+    next: u32,
+    /// One source row.
+    raw: Vec<u8>,
+    /// One source row, and one resampled row, as lanes.
+    lanes_in: Vec<u8>,
+    lanes_out: Vec<u8>,
+}
+
+impl<'a> Pipe<'a> {
+    /// `target` is the size to write; `None` keeps the source's. A codec that
+    /// decodes in reduced form has produced at least that size.
+    fn new(
+        doc: &'a PdfDocument,
+        cancel: &'a CancelCheck,
+        source: Source,
+        shape: Shape,
+        target: Option<(u32, u32)>,
+    ) -> Self {
+        let (src_w, src_h) = source.size();
+        let (width, height) = target.unwrap_or((src_w, src_h));
+        let resampler = ((width, height) != (src_w, src_h))
+            .then(|| RowResampler::new(src_w, src_h, width, height));
+        let channels = shape.channels() as usize;
+        Self {
+            doc,
+            cancel,
+            source,
+            shape,
+            width,
+            height,
+            resampler,
+            next: 0,
+            raw: vec![0u8; src_w as usize * channels],
+            lanes_in: vec![0u8; src_w as usize * 4],
+            lanes_out: vec![0u8; width as usize * 4],
+        }
+    }
+
+    /// The next row into `out`: `width * channels` bytes.
+    fn pull(&mut self, out: &mut [u8]) -> Result<()> {
+        self.cancel.check()?;
+        let Some(resampler) = self.resampler.as_mut() else {
+            return self.source.read(self.doc, out);
+        };
+        let row = self.next;
+        let (start, stop) = resampler.source_rows_of(row);
+        while resampler.next_source_row() < stop {
+            self.source.read(self.doc, &mut self.raw)?;
+            if resampler.next_source_row() < start {
+                resampler.skip();
+            } else {
+                self.shape.lanes(&self.raw, &mut self.lanes_in);
+                resampler.feed(&self.lanes_in);
+            }
+        }
+        if self.shape == Shape::Cmyk {
+            resampler.take_lanes(row, &mut self.lanes_out);
+        } else {
+            resampler.take(row, &mut self.lanes_out);
+        }
+        self.shape.pack(&self.lanes_out, out);
+        self.next += 1;
+        Ok(())
+    }
+
+    /// Every row, into a Flate stream with predictors.
+    fn flate(&mut self) -> Result<super::encode::FlateEncoded> {
+        let channels = self.shape.channels();
+        let mut encoder = FlateRows::new(self.width, channels)?;
+        let mut row = vec![0u8; self.width as usize * channels as usize];
+        for _ in 0..self.height {
+            self.pull(&mut row)?;
+            encoder.push(&row)?;
+        }
+        encoder.finish()
+    }
+
+    /// Every row, as CCITT Group 4.
+    fn ccitt(&mut self) -> Result<Vec<u8>> {
+        let mut encoder = CcittRows::new(self.width)?;
+        let mut row = vec![0u8; self.width as usize];
+        for _ in 0..self.height {
+            self.pull(&mut row)?;
+            encoder.push(&row)?;
+        }
+        Ok(encoder.finish())
+    }
 }
 
 fn apply(
     doc: &PdfDocument,
     object: &Object,
-    r: ObjectRef,
     kind: &Kind,
     mask: Option<&(ObjectRef, Object)>,
     target: Option<(u32, u32)>,
     output: Output,
+    cancel: &CancelCheck,
 ) -> Result<Applied> {
     let Object::Stream { dict, .. } = object else {
         return Err(Error::Image("image XObject is not a stream".to_string()));
@@ -165,11 +569,15 @@ fn apply(
             ..
         }
     );
-    let mut samples = decode(doc, object, r, kind, convert_cmyk)?;
-    if let Some((tw, th)) = target {
-        samples = resample(samples, tw, th)?;
-    }
-    let (w, h) = (samples.width, samples.height);
+    let shape = match kind.color {
+        ColorModel::Bilevel => Shape::Bilevel,
+        ColorModel::Gray => Shape::Gray,
+        ColorModel::Cmyk if !convert_cmyk => Shape::Cmyk,
+        _ => Shape::Rgb,
+    };
+    let source = Source::open(doc, object, kind, shape, target)?;
+    let mut pipe = Pipe::new(doc, cancel, source, shape, target);
+    let (w, h) = (pipe.width, pipe.height);
 
     let mut new_dict = dict.clone();
     new_dict.remove("Decode");
@@ -183,7 +591,9 @@ fn apply(
             convert_cmyk,
             subsampling,
         } => {
-            let bytes = encode_jpeg(&samples.data, w, h, samples.channels, quality, subsampling)?;
+            let bytes = encode_jpeg_rows(w, h, shape.channels(), quality, subsampling, &mut |row| {
+                pipe.pull(row)
+            })?;
             new_dict.insert("Filter".to_string(), Object::Name("DCTDecode".to_string()));
             new_dict.insert("BitsPerComponent".to_string(), Object::Integer(8));
             if convert_cmyk {
@@ -194,7 +604,7 @@ fn apply(
             bytes
         },
         Output::FlatePredicted => {
-            let encoded = encode_flate_predicted(&samples.data, w, h, samples.channels)?;
+            let encoded = pipe.flate()?;
             new_dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
             new_dict.insert("DecodeParms".to_string(), predictor_parms(&encoded));
             new_dict.insert("BitsPerComponent".to_string(), Object::Integer(8));
@@ -204,7 +614,7 @@ fn apply(
             encoded.bytes
         },
         Output::CcittG4 => {
-            let bytes = encode_ccitt_g4(&samples.data, w, h)?;
+            let bytes = pipe.ccitt()?;
             new_dict.insert("Filter".to_string(), Object::Name("CCITTFaxDecode".to_string()));
             new_dict.insert("DecodeParms".to_string(), ccitt_parms(w, h));
             new_dict.insert("BitsPerComponent".to_string(), Object::Integer(1));
@@ -217,7 +627,7 @@ fn apply(
 
     let mask = match mask {
         Some((mask_ref, mask_obj)) => {
-            let (obj, len) = rewrite_soft_mask(doc, mask_obj, *mask_ref, w, h)?;
+            let (obj, len) = rewrite_soft_mask(doc, cancel, mask_obj, w, h)?;
             total += len;
             Some((*mask_ref, obj))
         },
@@ -232,205 +642,21 @@ fn apply(
     })
 }
 
-/// Decode to the working form. Continuous-tone images go through the
-/// extractor (Indexed expanded, `/Decode` folded, 16-bit collapsed, CMYK
-/// JPEG through the Adobe-aware path); bilevel images are unpacked here
-/// because the extractor has no path for a stencil mask.
-fn decode(
-    doc: &PdfDocument,
-    object: &Object,
-    r: ObjectRef,
-    kind: &Kind,
-    convert_cmyk: bool,
-) -> Result<Samples> {
-    if kind.color == ColorModel::Bilevel {
-        return decode_bilevel(doc, object, kind);
-    }
-    let image = extract_image_from_xobject(Some(doc), object, Some(r), None)?;
-    if kind.color == ColorModel::Cmyk && !convert_cmyk {
-        let (data, width, height) = match image.data() {
-            ImageData::Raw {
-                pixels,
-                format: PixelFormat::CMYK,
-            } => (pixels.clone(), image.width(), image.height()),
-            ImageData::Raw { .. } => {
-                return Err(Error::Image("CMYK image decoded to another model".to_string()))
-            },
-            ImageData::Jpeg(bytes) => {
-                (decode_cmyk_jpeg_to_raw_cmyk(bytes)?, image.width(), image.height())
-            },
-        };
-        return checked(Samples {
-            data,
-            channels: 4,
-            bilevel: false,
-            width,
-            height,
-        });
-    }
-    let dynamic = image.to_dynamic_image()?;
-    let (width, height) = (dynamic.width(), dynamic.height());
-    match kind.color {
-        ColorModel::Gray => checked(Samples {
-            data: dynamic.to_luma8().into_raw(),
-            channels: 1,
-            bilevel: false,
-            width,
-            height,
-        }),
-        _ => checked(Samples {
-            data: dynamic.to_rgb8().into_raw(),
-            channels: 3,
-            bilevel: false,
-            width,
-            height,
-        }),
-    }
-}
-
-fn checked(s: Samples) -> Result<Samples> {
-    let expected = s.width as usize * s.height as usize * s.channels as usize;
-    if s.width == 0 || s.height == 0 || s.data.len() != expected {
-        return Err(Error::Image(format!(
-            "decoded {} bytes for {}x{}x{}",
-            s.data.len(),
-            s.width,
-            s.height,
-            s.channels
-        )));
-    }
-    Ok(s)
-}
-
-/// Unpack a 1-bit image to one byte per pixel, 0 = black (or "paint" for a
-/// stencil mask) and 255 = white, with `/Decode [1 0]` applied.
-///
-/// Both DeviceGray and a stencil mask read a 0 bit as black/paint under the
-/// default `/Decode`. A CCITT stream is decoded first; upstream's decoder
-/// returns 1 = black (0 = black when `/BlackIs1 true`), which is the
-/// complement of the filter's own output bits in both cases.
-fn decode_bilevel(doc: &PdfDocument, object: &Object, kind: &Kind) -> Result<Samples> {
-    let Object::Stream { dict, body } = object else {
-        return Err(Error::Image("image XObject is not a stream".to_string()));
-    };
-    let (width, height) = (kind.width, kind.height);
-    let row_bytes = (width as usize).div_ceil(8);
-    let (packed, complement) = match kind.encoding {
-        Encoding::Raw => (object.decode_stream_data()?, false),
-        Encoding::Ccitt => {
-            let filters = filter_names(doc, dict);
-            if filters.len() != 1 {
-                return Err(Error::Image("CCITT behind another filter".to_string()));
-            }
-            let params = ccitt_params_of(doc, dict, width, height);
-            let data = body.read_whole_raw()?;
-            (crate::extractors::ccitt_bilevel::decompress_ccitt(&data, &params)?, true)
-        },
-        _ => return Err(Error::Image("bilevel image in a codec without a decoder".to_string())),
-    };
-    if packed.len() < row_bytes * height as usize {
-        return Err(Error::Image("bilevel data shorter than its dimensions".to_string()));
-    }
-    let inverted = dict
-        .get("Decode")
-        .and_then(|d| doc.resolve_object(d).ok())
-        .and_then(|d| {
-            d.as_array()
-                .and_then(|a| a.first().and_then(|v| v.as_real()))
-        })
-        == Some(1.0);
-    let mut out = Vec::with_capacity(width as usize * height as usize);
-    for row in 0..height as usize {
-        for col in 0..width as usize {
-            let byte = packed[row * row_bytes + col / 8];
-            let mut bit = (byte >> (7 - (col % 8))) & 1;
-            if complement {
-                bit ^= 1;
-            }
-            if inverted {
-                bit ^= 1;
-            }
-            out.push(if bit == 0 { 0 } else { 255 });
-        }
-    }
-    Ok(Samples {
-        data: out,
-        channels: 1,
-        bilevel: true,
-        width,
-        height,
-    })
-}
-
-fn ccitt_params_of(
-    doc: &PdfDocument,
-    dict: &HashMap<String, Object>,
-    width: u32,
-    height: u32,
-) -> CcittParams {
-    let parms = dict
-        .get("DecodeParms")
-        .and_then(|p| doc.resolve_object(p).ok())
-        .and_then(|p| match p {
-            Object::Dictionary(d) => Some(d),
-            Object::Array(items) => items
-                .last()
-                .and_then(|o| doc.resolve_object(o).ok())
-                .and_then(|o| o.as_dict().cloned()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let int = |key: &str| parms.get(key).and_then(|o| o.as_integer());
-    let flag = |key: &str| parms.get(key).and_then(|o| o.as_bool());
-    CcittParams {
-        k: int("K").unwrap_or(0),
-        columns: int("Columns").map_or(width.max(1), |c| c.max(1) as u32),
-        rows: Some(int("Rows").map_or(height, |r| r.max(0) as u32)),
-        black_is_1: flag("BlackIs1").unwrap_or(false),
-        end_of_line: flag("EndOfLine").unwrap_or(false),
-        encoded_byte_align: flag("EncodedByteAlign").unwrap_or(false),
-        end_of_block: flag("EndOfBlock").unwrap_or(true),
-    }
-}
-
-fn resample(s: Samples, tw: u32, th: u32) -> Result<Samples> {
-    if tw == s.width && th == s.height {
-        return Ok(s);
-    }
-    let data = if s.bilevel {
-        resample_bilevel(&s.data, s.width, s.height, tw, th)?
-    } else {
-        resample_continuous(&s.data, s.width, s.height, s.channels, tw, th)?
-    };
-    Ok(Samples {
-        data,
-        channels: s.channels,
-        bilevel: s.bilevel,
-        width: tw,
-        height: th,
-    })
-}
-
-/// Decode the soft mask, bring it to the parent's new size, store it as
+/// Read the soft mask's rows at the parent's new size and store them as
 /// Flate-predicted 8-bit gray. Returns the object and its stored length.
 fn rewrite_soft_mask(
     doc: &PdfDocument,
+    cancel: &CancelCheck,
     mask: &Object,
-    r: ObjectRef,
     w: u32,
     h: u32,
 ) -> Result<(Object, u64)> {
     let Object::Stream { dict, .. } = mask else {
         return Err(Error::Image("soft mask is not a stream".to_string()));
     };
-    let image = extract_image_from_xobject(Some(doc), mask, Some(r), None)?;
-    let dynamic = image.to_dynamic_image()?;
-    let (mw, mh) = (dynamic.width(), dynamic.height());
-    let mut gray = dynamic.to_luma8().into_raw();
-    if (mw, mh) != (w, h) {
-        gray = resample_continuous(&gray, mw, mh, 1, w, h)?;
-    }
-    let encoded = encode_flate_predicted(&gray, w, h, 1)?;
+    let rows = ImageRows::open(doc, mask, &HashMap::new(), Some((w, h)), RowOutput::Luma, None)?;
+    let source = Source::Luma { rows, invert: false };
+    let encoded = Pipe::new(doc, cancel, source, Shape::Gray, Some((w, h))).flate()?;
     let mut new_dict = dict.clone();
     new_dict.remove("Decode");
     new_dict.insert("Width".to_string(), Object::Integer(w as i64));
@@ -475,4 +701,3 @@ fn ccitt_parms(w: u32, h: u32) -> Object {
     d.insert("BlackIs1".to_string(), Object::Boolean(false));
     Object::Dictionary(d)
 }
-

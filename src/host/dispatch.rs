@@ -148,22 +148,6 @@ pub struct BookmarkSplit {
     pub end_page: usize,
 }
 
-/// An image extracted from a PDF page.
-pub struct ExtractedImage {
-    /// Image width in pixels.
-    pub width: u32,
-    /// Image height in pixels.
-    pub height: u32,
-    /// Image format (e.g. "jpeg", "raw").
-    pub format: String,
-    /// Color space (e.g. "DeviceRGB").
-    pub color_space: String,
-    /// Bits per color component.
-    pub bits_per_component: u32,
-    /// Raw image bytes.
-    pub data: Vec<u8>,
-}
-
 /// Metadata snapshot from a DocumentEditor.
 pub struct EditorMetadataResult {
     /// Current page count in the editor.
@@ -707,67 +691,6 @@ pub fn doc_export_form_data<W: std::io::Write>(
         writer.write_all(chunk).map_err(|e| Error::InvalidPdf(e.to_string()))?;
     }
     Ok(())
-}
-
-/// Extract all images from a page as decoded pixel data.
-pub fn extract_images(doc: &mut PdfDocument, page: usize) -> Result<Vec<ExtractedImage>> {
-    let images = doc.extract_images(page)?;
-    Ok(images.into_iter().map(|img| {
-        let (fmt, data) = match img.data() {
-            crate::extractors::ImageData::Jpeg(bytes) => ("jpeg".to_string(), bytes.to_vec()),
-            crate::extractors::ImageData::Raw { pixels, .. } => ("raw".to_string(), pixels.to_vec()),
-        };
-        ExtractedImage {
-            width: img.width() as u32,
-            height: img.height() as u32,
-            format: fmt,
-            color_space: format!("{:?}", img.color_space()),
-            bits_per_component: img.bits_per_component() as u32,
-            data,
-        }
-    }).collect())
-}
-
-/// O(1)-memory streaming image extraction.
-///
-/// Extracts images one at a time and writes each as a length-prefixed
-/// binary frame to the writer. Each image is dropped after writing.
-/// At most one image in memory at any time.
-///
-/// Frame format: [len: u32 LE] [binary-encoded image response]
-/// End marker:   [0x00000000]
-pub fn extract_images_streamed<W: std::io::Write>(
-    doc: &mut PdfDocument,
-    page: usize,
-    writer: &mut W,
-    cancel: &crate::cancel::CancelCheck,
-) -> Result<usize> {
-    use crate::host::binary_codec::ResponseWriter;
-    cancel.check()?;
-    let images = doc.extract_images(page)?;
-    let count = images.len();
-    cancel.each(images, |img| {
-        let (fmt, data) = match img.data() {
-            crate::extractors::ImageData::Jpeg(bytes) => ("jpeg", bytes.to_vec()),
-            crate::extractors::ImageData::Raw { pixels, .. } => ("raw", pixels.to_vec()),
-        };
-        let mut w = ResponseWriter::ok();
-        w.put_i32("width", img.width() as i32);
-        w.put_i32("height", img.height() as i32);
-        w.put_str("format", fmt);
-        w.put_str("colorSpace", &format!("{:?}", img.color_space()));
-        w.put_i32("bitsPerComponent", img.bits_per_component() as i32);
-        w.put_bytes("data", &data);
-        let frame = w.finish();
-        let len_bytes = (frame.len() as u32).to_le_bytes();
-        writer.write_all(&len_bytes).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-        writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-        // image data dropped here — only one image in memory at a time
-        Ok(())
-    })?;
-    // A zero-length frame terminates the stream.
-    writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-    Ok(count)
 }
 
 // ═══════════════════════════════════════════════════════════════════

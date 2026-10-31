@@ -3,10 +3,9 @@
 
 use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::BoxedWriter;
-use crate::host::dispatch;
 use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
-use crate::host::ops::support::{page_of, pages_of, req_handle};
+use crate::host::ops::support::{pages_of, req_handle};
 
 op_unit!(RENDER, "render", pdf_op_render_anchor, |ctx| {
     let sink = ctx.take_sink(0);
@@ -36,19 +35,9 @@ fn handle_render_streamed(
         None => return ResponseWriter::error("document not found"),
     };
 
-    let page_indices = req.get_int_list("pageIndices").unwrap_or(&[]);
-    // Empty list = all pages (Dart convention: PdfPages.all() sends []).
-    let count = match doc.page_count() {
-        Ok(c) => c,
-        Err(e) => return ResponseWriter::error_of(&e),
-    };
-    let pages: Vec<usize> = if page_indices.is_empty() {
-        (0..count).collect()
-    } else {
-        match pages_of(page_indices, count) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        }
+    let pages = match requested_pages(doc, req) {
+        Ok(pages) => pages,
+        Err(resp) => return resp,
     };
     let Some(mut writer) = sink_writer else {
         return ResponseWriter::error_kind(
@@ -134,41 +123,49 @@ fn handle_extract_images_streamed(
         None => return ResponseWriter::error("document not found"),
     };
 
-    let count = match doc.page_count() {
-        Ok(c) => c,
-        Err(e) => return ResponseWriter::error_of(&e),
-    };
-    let page = match page_of(req.get_i32("page").unwrap_or(0), count) {
-        Ok(i) => i,
+    let pages = match requested_pages(doc, req) {
+        Ok(pages) => pages,
         Err(resp) => return resp,
     };
-
-    if let Some(mut writer) = sink_writer {
-        match dispatch::extract_images_streamed(doc, page, &mut writer, cancel) {
+    let Some(mut writer) = sink_writer else {
+        return ResponseWriter::error_kind(
+            ErrorKind::InvalidArgument,
+            "extractImages writes its images to a sink",
+        );
+    };
+    #[cfg(feature = "rendering")]
+    {
+        match crate::host::extract_stream::extract_images_streamed(doc, &pages, &mut writer, cancel)
+        {
             Ok(count) => {
                 let mut w = ResponseWriter::ok();
                 w.put_bool("streamed", true);
                 w.put_i32("itemCount", count as i32);
                 w.finish()
-            }
+            },
             Err(e) => ResponseWriter::error_of(&e),
         }
+    }
+    #[cfg(not(feature = "rendering"))]
+    {
+        let _ = (&mut writer, &pages, doc, cancel);
+        ResponseWriter::error("Image extraction not enabled")
+    }
+}
+
+/// The pages a request names in `pageIndices`; an empty list is all pages
+/// (Dart's `PdfPages.all()` sends `[]`).
+fn requested_pages(
+    doc: &mut crate::document::PdfDocument,
+    req: &Request<'_>,
+) -> Result<Vec<usize>, Vec<u8>> {
+    let page_indices = req.get_int_list("pageIndices").unwrap_or(&[]);
+    let count = doc
+        .page_count()
+        .map_err(|e| ResponseWriter::error_of(&e))?;
+    if page_indices.is_empty() {
+        Ok((0..count).collect())
     } else {
-        match dispatch::extract_images(doc, page) {
-            Ok(result) => {
-                let mut w = ResponseWriter::ok();
-                w.put_map_list("images", result.len(), |i, item| {
-                    let img = &result[i];
-                    item.put_i32("width", img.width as i32);
-                    item.put_i32("height", img.height as i32);
-                    item.put_str("format", &img.format);
-                    item.put_str("colorSpace", &img.color_space);
-                    item.put_i32("bitsPerComponent", img.bits_per_component as i32);
-                    item.put_bytes("data", &img.data);
-                });
-                w.finish()
-            }
-            Err(e) => ResponseWriter::error_of(&e),
-        }
+        pages_of(page_indices, count)
     }
 }

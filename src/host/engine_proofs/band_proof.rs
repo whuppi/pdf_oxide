@@ -325,7 +325,7 @@ fn image_fixture() -> Fixture {
 
 /// Deterministic pixels with enough detail at every scale that a wrong row,
 /// a wrong column or a half-sample shift changes a byte.
-fn detailed_rgb(width: u32, height: u32) -> Vec<u8> {
+pub(super) fn detailed_rgb(width: u32, height: u32) -> Vec<u8> {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
     for y in 0..height {
@@ -344,7 +344,7 @@ fn detailed_rgb(width: u32, height: u32) -> Vec<u8> {
 }
 
 /// A bilevel picture, `true` black: a checker with a disc cut out of it.
-fn bilevel(width: u32, height: u32) -> Vec<Vec<bool>> {
+pub(super) fn bilevel(width: u32, height: u32) -> Vec<Vec<bool>> {
     let (cx, cy, r) = (width as i64 / 2, height as i64 / 2, width.min(height) as i64 / 3);
     (0..height as i64)
         .map(|y| {
@@ -360,7 +360,7 @@ fn bilevel(width: u32, height: u32) -> Vec<Vec<bool>> {
 }
 
 /// The picture as CCITT Group 4 (T.6) data.
-fn group4(picture: &[Vec<bool>]) -> Vec<u8> {
+pub(super) fn group4(picture: &[Vec<bool>]) -> Vec<u8> {
     let width = picture[0].len() as u32;
     let mut encoder = fax::encoder::Encoder::new(fax::VecWriter::new());
     for row in picture {
@@ -374,7 +374,7 @@ fn group4(picture: &[Vec<bool>]) -> Vec<u8> {
 
 /// The picture as an embedded JBIG2 stream: a page-information segment and
 /// one immediate generic region coded with MMR, which is T.6.
-fn jbig2(picture: &[Vec<bool>]) -> Vec<u8> {
+pub(super) fn jbig2(picture: &[Vec<bool>]) -> Vec<u8> {
     let (width, height) = (picture[0].len() as u32, picture.len() as u32);
     let mut page = Vec::new();
     for v in [width, height, 0, 0] {
@@ -397,7 +397,7 @@ fn jbig2(picture: &[Vec<bool>]) -> Vec<u8> {
     out
 }
 
-fn packed_bits(picture: &[Vec<bool>], black_is_one: bool) -> Vec<u8> {
+pub(super) fn packed_bits(picture: &[Vec<bool>], black_is_one: bool) -> Vec<u8> {
     let row_bytes = picture[0].len().div_ceil(8);
     let mut out = vec![0u8; row_bytes * picture.len()];
     for (y, row) in picture.iter().enumerate() {

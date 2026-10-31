@@ -3700,6 +3700,29 @@ impl<'doc> PdfImageHandle<'doc> {
         self.indexed_base
     }
 
+    // ── pdf_manipulator patch: the stream and its colour-space resources, for the host row pipeline ──
+    /// The image stream as it is stored, its reference when it has one, and
+    /// the resource colour spaces it is read with. Nothing is decoded.
+    pub(crate) fn stream_parts(
+        &self,
+    ) -> Result<(
+        crate::object::Object,
+        Option<ObjectRef>,
+        &std::collections::HashMap<String, crate::object::Object>,
+    )> {
+        match &self.source {
+            PdfImageSource::XObject(obj_ref) => Ok((
+                self.doc.load_object(*obj_ref)?,
+                Some(*obj_ref),
+                &self.color_space_resources,
+            )),
+            PdfImageSource::Inline { stream_object, .. } => {
+                Ok((stream_object.clone(), None, &self.color_space_resources))
+            },
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     // ── pdf_manipulator patch: identity and placement for the host image pipeline ──
     /// The XObject this handle was built from; `None` for an inline image.
     pub fn object_ref(&self) -> Option<ObjectRef> {

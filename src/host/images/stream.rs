@@ -516,7 +516,7 @@ impl ImageRows {
     }
 
     /// Reads the next row into `out`, `width * output.bytes()` bytes.
-    fn read(&mut self, doc: &crate::document::PdfDocument, out: &mut [u8]) -> Result<()> {
+    pub(crate) fn read(&mut self, doc: &crate::document::PdfDocument, out: &mut [u8]) -> Result<()> {
         let y = self.next;
         if y >= self.height {
             return Err(Error::Image("image has no more rows".to_string()));
@@ -768,8 +768,13 @@ impl ImageCursor {
         }
     }
 
-    /// Reads the next full-size row, masks applied and premultiplied.
-    fn pull(&mut self, doc: &crate::document::PdfDocument, out: &mut [u8]) -> Result<()> {
+    /// Reads the next full-size row as straight RGBA8, its masks applied to
+    /// the alpha.
+    pub(crate) fn read_straight(
+        &mut self,
+        doc: &crate::document::PdfDocument,
+        out: &mut [u8],
+    ) -> Result<()> {
         let y = self.base.next;
         let (w, h) = self.base.size();
         self.base.read(doc, out)?;
@@ -779,6 +784,17 @@ impl ImageCursor {
                 mask.failed = true;
             }
         }
+        Ok(())
+    }
+
+    /// Whether the image has a mask that is read with it.
+    pub(crate) fn has_masks(&self) -> bool {
+        !self.masks.is_empty()
+    }
+
+    /// Reads the next full-size row, masks applied and premultiplied.
+    fn pull(&mut self, doc: &crate::document::PdfDocument, out: &mut [u8]) -> Result<()> {
+        self.read_straight(doc, out)?;
         premultiply_in_place(out);
         Ok(())
     }

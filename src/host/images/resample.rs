@@ -222,6 +222,29 @@ impl RowResampler {
     /// of the rows it spans skipped.
     pub fn take(&mut self, dst_row: u32, out: &mut [u8]) {
         debug_assert_eq!(out.len(), self.dst_w as usize * 4);
+        let sums = self.weighted(dst_row);
+        for (pixel, dst) in sums.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+            let a = (pixel[3] + 0.5).clamp(0.0, 255.0) as u8;
+            for c in 0..3 {
+                // A premultiplied colour never exceeds its alpha.
+                dst[c] = ((pixel[c] + 0.5).clamp(0.0, 255.0) as u8).min(a);
+            }
+            dst[3] = a;
+        }
+    }
+
+    /// [`Self::take`] for four independent samples a pixel (CMYK): the lanes
+    /// are rounded as they are, with no colour held under an alpha.
+    pub fn take_lanes(&mut self, dst_row: u32, out: &mut [u8]) {
+        debug_assert_eq!(out.len(), self.dst_w as usize * 4);
+        for (sum, dst) in self.weighted(dst_row).iter().zip(out.iter_mut()) {
+            *dst = (sum + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    /// Destination row `dst_row` as the weighted sum of the rows it spans;
+    /// rows before them leave the ring.
+    fn weighted(&mut self, dst_row: u32) -> Vec<f32> {
         let (start, end) = self.source_rows_of(dst_row);
         while self.ring.front().is_some_and(|(index, _)| *index < start) {
             if let Some((_, buffer)) = self.ring.pop_front() {
@@ -239,14 +262,7 @@ impl RowResampler {
                 *sum += w * v;
             }
         }
-        for (pixel, dst) in sums.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
-            let a = (pixel[3] + 0.5).clamp(0.0, 255.0) as u8;
-            for c in 0..3 {
-                // A premultiplied colour never exceeds its alpha.
-                dst[c] = ((pixel[c] + 0.5).clamp(0.0, 255.0) as u8).min(a);
-            }
-            dst[3] = a;
-        }
+        sums
     }
 
     /// Forgets every row given, to start again from source row 0.

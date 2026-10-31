@@ -23,6 +23,10 @@ pub mod lane_state;
 pub mod ops;
 pub(crate) mod page_prune;
 #[cfg(feature = "rendering")]
+pub(crate) mod chunked;
+#[cfg(feature = "rendering")]
+pub(crate) mod extract_stream;
+#[cfg(feature = "rendering")]
 pub(crate) mod render_stream;
 pub(crate) mod resource_prune;
 pub(crate) mod row_space;

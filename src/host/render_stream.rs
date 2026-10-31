@@ -10,18 +10,8 @@
 //! frames of at most [`DATA_FRAME_BYTES`], so neither the raster nor its
 //! encoded form is ever held whole.
 //!
-//! Wire, after the sink's own length prefix, one frame per
-//! `[len: u32 LE][binary response]`:
-//!
-//! ```text
-//! page:   header { kind = "header", page, width, height, format }
-//!         data   { kind = "data", data: bytes }   (zero or more, each <= 256 KiB)
-//!         end    { kind = "end" }
-//! ...one such page per rendered page, then the terminator [0u32].
-//! ```
-//!
-//! A failure mid-page ends the stream with the op's error response and no
-//! end frame for that page; the reader closes what it had open.
+//! Wire: the chunked framing of `host::chunked`, one item per page, whose
+//! header is `{ kind = "header", page, width, height, format }`.
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -30,14 +20,11 @@ use std::rc::Rc;
 use crate::cancel::CancelCheck;
 use crate::document::PdfDocument;
 use crate::error::{Error, Result};
-use crate::host::binary_codec::ResponseWriter;
+use crate::host::chunked::{png_error, Encoded, Framer, PNG_CHUNK_BYTES};
 use crate::rendering::{fit_options, render_page_rows, RenderOptions, RowSink};
 
-/// The most payload bytes one data frame carries.
-pub const DATA_FRAME_BYTES: usize = 256 * 1024;
-
-/// IDAT chunk size the PNG encoder buffers before it writes a chunk.
-const PNG_CHUNK_BYTES: usize = 32 * 1024;
+#[cfg(test)]
+pub use crate::host::chunked::DATA_FRAME_BYTES;
 
 /// How large a rendered page is, by the kind the wire names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,10 +94,7 @@ pub fn render_pages_streamed<W: Write>(
     writer: &mut W,
     cancel: &CancelCheck,
 ) -> Result<usize> {
-    let mut framer = Framer {
-        out: writer,
-        buf: Vec::new(),
-    };
+    let mut framer = Framer::new(writer);
     cancel.each(pages.iter().copied(), |page| {
         let options = size.options_for(doc, page)?;
         let mut sink = PageSink {
@@ -124,85 +108,8 @@ pub fn render_pages_streamed<W: Write>(
         render_page_rows(doc, page, &options, &mut sink, cancel)?;
         sink.finish()
     })?;
-    // A zero-length frame terminates the stream.
-    framer
-        .out
-        .write_all(&0u32.to_le_bytes())
-        .map_err(Error::Io)?;
+    framer.terminate()?;
     Ok(pages.len())
-}
-
-/// Cuts what it is given into data frames of at most [`DATA_FRAME_BYTES`].
-struct Framer<'a, W: Write> {
-    out: &'a mut W,
-    buf: Vec<u8>,
-}
-
-impl<W: Write> Framer<'_, W> {
-    fn send(&mut self, frame: ResponseWriter) -> io::Result<()> {
-        let frame = frame.finish();
-        self.out.write_all(&(frame.len() as u32).to_le_bytes())?;
-        self.out.write_all(&frame)
-    }
-
-    fn send_data(&mut self) -> io::Result<()> {
-        let mut frame = ResponseWriter::ok();
-        frame.put_str("kind", "data");
-        frame.put_bytes("data", &self.buf);
-        self.buf.clear();
-        self.send(frame)
-    }
-
-    fn push(&mut self, mut data: &[u8]) -> io::Result<()> {
-        while !data.is_empty() {
-            let room = DATA_FRAME_BYTES - self.buf.len();
-            let take = room.min(data.len());
-            self.buf.extend_from_slice(&data[..take]);
-            data = &data[take..];
-            if self.buf.len() == DATA_FRAME_BYTES {
-                self.send_data()?;
-            }
-        }
-        Ok(())
-    }
-
-    fn header(&mut self, page: usize, width: u32, height: u32, format: RenderFormat) -> io::Result<()> {
-        let mut frame = ResponseWriter::ok();
-        frame.put_str("kind", "header");
-        frame.put_i32("page", page as i32);
-        frame.put_i32("width", width as i32);
-        frame.put_i32("height", height as i32);
-        frame.put_str("format", format.name());
-        self.send(frame)
-    }
-
-    /// Writes what is buffered and the end frame.
-    fn end(&mut self) -> io::Result<()> {
-        if !self.buf.is_empty() {
-            self.send_data()?;
-        }
-        let mut frame = ResponseWriter::ok();
-        frame.put_str("kind", "end");
-        self.send(frame)
-    }
-}
-
-/// The bytes the PNG encoder has produced and the page sink has not yet
-/// passed to the [`Framer`]. The encoder owns its writer for `'static`, so
-/// it cannot hold the sink's writer itself; the sink drains this after
-/// every row, so it never holds more than one row's encoding.
-#[derive(Clone)]
-struct Encoded(Rc<RefCell<Vec<u8>>>);
-
-impl Write for Encoded {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(data);
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// One page's rows on their way to the wire.
@@ -238,8 +145,14 @@ impl<W: Write> PageSink<'_, '_, W> {
 
 impl<W: Write> RowSink for PageSink<'_, '_, W> {
     fn begin(&mut self, width: u32, height: u32) -> Result<()> {
+        let (page, format) = (self.page, self.format);
         self.framer
-            .header(self.page, width, height, self.format)
+            .header(|frame| {
+                frame.put_i32("page", page as i32);
+                frame.put_i32("width", width as i32);
+                frame.put_i32("height", height as i32);
+                frame.put_str("format", format.name());
+            })
             .map_err(Error::Io)?;
         self.width = width as usize;
         if self.format == RenderFormat::Png {
@@ -270,12 +183,5 @@ impl<W: Write> RowSink for PageSink<'_, '_, W> {
             }
         }
         Ok(())
-    }
-}
-
-fn png_error(e: png::EncodingError) -> Error {
-    match e {
-        png::EncodingError::IoError(e) => Error::Io(e),
-        other => Error::InvalidPdf(format!("PNG encoding failed: {other}")),
     }
 }

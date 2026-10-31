@@ -21,7 +21,11 @@ mod editor_packed;
 mod editor_trailer;
 mod filter_readers;
 #[cfg(feature = "rendering")]
+mod extract_proof;
+#[cfg(feature = "rendering")]
 mod group_proof;
+#[cfg(feature = "rendering")]
+mod reduce_proof;
 mod editor_pages;
 mod editor_resource_prune;
 mod editor_save;
