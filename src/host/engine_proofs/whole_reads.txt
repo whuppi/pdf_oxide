@@ -10,9 +10,10 @@ editor::document_editor::get_annotation_appearances
 editor::document_editor::get_page_content_bytes
 editor::document_editor::get_page_images
 editor::document_editor::write_stream_copy
-extractors::images::decode_jbig2_image
-extractors::images::decode_jpx_image
-extractors::images::extract_image_from_xobject_at
+extractors::images::decode_jbig2_bits # the JBIG2 bitstream is the decoder's input; the bitmap is kept at one bit a pixel
+extractors::images::decode_jbig2_image # the off-render image extraction (reducer, PNG export) wants one 8-bit raster; the render path reads decode_jbig2_bits
+extractors::images::decode_jpx_image # the codestream is the codec's input, and its decoder returns the raster at the reduction the footprint covers
+extractors::images::extract_image_from_xobject_at # a codec image's compressed bytes are the decoder's input (DCT, JPX, CCITT); a raw-sample image is read by the row cursor, not here
 extractors::images::resolve_icc_profile_from_obj
 extractors::images::resolve_indexed_palette
 extractors::xmp::extract
@@ -22,8 +23,9 @@ fonts::font_dict::from_dict
 fonts::font_dict::parse_descendant_fonts
 fonts::font_dict::resolve_encoding_writing_mode
 host::attachments::attachment_bytes
-host::images::execute::decode_bilevel
-host::images::execute::reduce_images
+host::images::execute::decode_bilevel # the reducer re-encodes a whole image
+host::images::execute::reduce_images # the reducer re-encodes a whole image
+host::images::stream::open_stencil # a /Mask stencil is one bit a pixel; its packed rows are kept and read in step with the image
 object::decode_stream_data
 object::read_whole_raw
 objstm::decode_object_stream
@@ -40,8 +42,7 @@ rendering::page_renderer::parse_type0_transfer_function
 rendering::page_renderer::parse_type4_transfer_function
 rendering::page_renderer::project_iccbased_to_rgb
 rendering::page_renderer::render_annotations
-rendering::page_renderer::render_image
-rendering::page_renderer::render_image_mask
+rendering::page_renderer::render_image_mask # a stencil is one bit a pixel; its packed rows are kept and only the samples a band reaches become pixels
 rendering::page_renderer::render_xobject
 rendering::resolution::color::evaluate_type0_sampled
 rendering::resolution::color::evaluate_type4

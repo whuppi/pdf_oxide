@@ -8,6 +8,10 @@
 //! `classify` (what an image is), `policy` (what to do with it, a pure
 //! decision), `execute` (do it), `report` (say what happened). `inventory`
 //! is core because `editorPageImages` needs it without any codec.
+//!
+//! Two more files serve the page render rather than the reducer: `stream`
+//! reads an image's rows as the page's bands ask for them, and `resample`
+//! also holds the row-at-a-time resampler those rows go through.
 
 pub mod inventory;
 
@@ -23,3 +27,5 @@ pub mod policy;
 pub mod report;
 #[cfg(feature = "rendering")]
 pub mod resample;
+#[cfg(feature = "rendering")]
+pub mod stream;

@@ -473,6 +473,57 @@ impl PdfImage {
         }
     }
 
+    // ── pdf_manipulator patch: a JPEG decodes at the largest reduction that still covers its footprint ──
+    /// [`Self::to_dynamic_image`] for an image painted at `target` device
+    /// pixels: a gray or RGB baseline or progressive JPEG decodes through the
+    /// inverse DCT at 1/2, 1/4 or 1/8 size when that still holds at least
+    /// `target` samples each way, so the raster is of the footprint's order,
+    /// not the file's. Everything else, and a JPEG that needs no reduction,
+    /// decodes exactly as `to_dynamic_image` does.
+    pub fn to_dynamic_image_covering(&self, target: Option<(u32, u32)>) -> Result<image::DynamicImage> {
+        let (ImageData::Jpeg(jpeg_data), Some((want_w, want_h))) = (&self.data, target) else {
+            return self.to_dynamic_image();
+        };
+        if self.color_space.components() == 4 {
+            return self.to_dynamic_image();
+        }
+        let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX).max(1);
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg_data));
+        if decoder.read_info().is_err() {
+            return self.to_dynamic_image();
+        }
+        let Some(info) = decoder.info() else {
+            return self.to_dynamic_image();
+        };
+        let (full_w, full_h) = (info.width, info.height);
+        let (w, h) = decoder.scale(clamp(want_w), clamp(want_h)).map_err(|e| {
+            Error::Decode(format!("Failed to scale JPEG: {e}"))
+        })?;
+        if (w, h) == (full_w, full_h) {
+            return self.to_dynamic_image();
+        }
+        let pixels = decoder
+            .decode()
+            .map_err(|e| Error::Decode(format!("Failed to decode JPEG: {e}")))?;
+        let format = decoder.info().map(|i| i.pixel_format);
+        let (w, h) = (u32::from(w), u32::from(h));
+        let invalid = || Error::Decode("Invalid JPEG dimensions".to_string());
+        match format {
+            Some(jpeg_decoder::PixelFormat::L8) => {
+                image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(w, h, pixels)
+                    .map(image::DynamicImage::ImageLuma8)
+                    .ok_or_else(invalid)
+            },
+            Some(jpeg_decoder::PixelFormat::RGB24) => {
+                image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(w, h, pixels)
+                    .map(image::DynamicImage::ImageRgb8)
+                    .ok_or_else(invalid)
+            },
+            _ => self.to_dynamic_image(),
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Convert this PDF image to a `DynamicImage`.
     pub fn to_dynamic_image(&self) -> Result<image::DynamicImage> {
         match &self.data {
@@ -1012,79 +1063,9 @@ pub fn extract_image_from_xobject_at(
         .and_then(|obj| obj.as_integer())
         .unwrap_or(8) as u8;
 
-    // ISO 32000-1:2008 Table 89, /ColorSpace: "Required for images, except
-    // those that use the JPXDecode filter … If ColorSpace is absent, the
-    // colour space specifications in the JPEG2000 data shall be used."
-    //
-    // So an absent /ColorSpace is legal on a JPX image, and erroring on it
-    // rejected a valid file outright: a page whose only content was one such
-    // image rendered completely blank, where MuPDF, pdfium, poppler and
-    // Ghostscript all paint it and agree on its tone to within 0.81 of a grey
-    // level. `decode_jpx_image` already ignores this value and derives the
-    // pixel format from the codestream's own component count, so the
-    // placeholder below is never read for that path — it exists only to
-    // satisfy the shared prologue.
-    let jpx_without_color_space = dict.get("ColorSpace").is_none()
-        && match dict.get("Filter") {
-            Some(Object::Name(n)) => n.eq_ignore_ascii_case("JPXDecode"),
-            Some(Object::Array(fs)) => fs
-                .iter()
-                .filter_map(|f| f.as_name())
-                .any(|n| n.eq_ignore_ascii_case("JPXDecode")),
-            _ => false,
-        };
-    let device_rgb = Object::Name("DeviceRGB".to_string());
-    let color_space_obj = match dict.get("ColorSpace") {
-        Some(cs) => cs,
-        None if jpx_without_color_space => &device_rgb,
-        None => return Err(Error::Image("Image missing /ColorSpace".to_string())),
-    };
-
-    let resolved_color_space = if let Some(d) = doc {
-        let res = if let Some(obj_ref) = color_space_obj.as_reference() {
-            d.load_object(obj_ref)?
-        } else {
-            color_space_obj.clone()
-        };
-        if let Object::Name(ref name) = res {
-            if let Some(map) = color_space_map {
-                map.get(name).cloned().unwrap_or(res)
-            } else {
-                res
-            }
-        } else {
-            res
-        }
-    } else {
-        color_space_obj.clone()
-    };
-
-    // For array-form color spaces (e.g. [/ICCBased <ref>], [/Indexed <base> <hi> <palette_ref>])
-    // the second element is commonly an indirect reference to the ICC profile
-    // stream / palette. `parse_color_space` only inspects the immediate
-    // `Object::Stream` dict, so an unresolved reference silently falls back to
-    // `N = 3` and a CMYK (N = 4) image is labelled as RGB. Resolve the stream
-    // reference here so the component count reflects the real profile.
-    let resolved_color_space =
-        if let (Some(doc_mut), Object::Array(arr)) = (doc, &resolved_color_space) {
-            if arr.len() > 1 {
-                if let Some(second_ref) = arr[1].as_reference() {
-                    if let Ok(resolved_second) = doc_mut.load_object(second_ref) {
-                        let mut new_arr = arr.clone();
-                        new_arr[1] = resolved_second;
-                        Object::Array(new_arr)
-                    } else {
-                        resolved_color_space
-                    }
-                } else {
-                    resolved_color_space
-                }
-            } else {
-                resolved_color_space
-            }
-        } else {
-            resolved_color_space
-        };
+    // ── pdf_manipulator patch: the colour space resolves in one place, shared with the row geometry ──
+    let resolved_color_space = resolve_image_color_space(doc, dict, color_space_map)?;
+    // ── end pdf_manipulator patch ──
 
     let color_space = parse_color_space(&resolved_color_space)?;
     // For Indexed color spaces, resolve the base color space and palette now so we
@@ -1467,6 +1448,153 @@ pub fn extract_image_from_xobject_at(
 
     Ok(image)
 }
+
+// ── pdf_manipulator patch: the colour space resolves in one place, shared with the row geometry ──
+/// The image's `/ColorSpace`, resolved to the object `parse_color_space`
+/// reads: a named space looked up in the page's colour-space map, an
+/// indirect entry loaded, and the second element of an array space (the ICC
+/// profile stream or the palette) loaded too.
+fn resolve_image_color_space(
+    doc: Option<&crate::document::PdfDocument>,
+    dict: &std::collections::HashMap<String, crate::object::Object>,
+    color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
+) -> Result<crate::object::Object> {
+    use crate::object::Object;
+
+    // ISO 32000-1:2008 Table 89, /ColorSpace: "Required for images, except
+    // those that use the JPXDecode filter … If ColorSpace is absent, the
+    // colour space specifications in the JPEG2000 data shall be used."
+    //
+    // So an absent /ColorSpace is legal on a JPX image, and erroring on it
+    // rejected a valid file outright: a page whose only content was one such
+    // image rendered completely blank, where MuPDF, pdfium, poppler and
+    // Ghostscript all paint it and agree on its tone to within 0.81 of a grey
+    // level. `decode_jpx_image` already ignores this value and derives the
+    // pixel format from the codestream's own component count, so the
+    // placeholder below is never read for that path — it exists only to
+    // satisfy the shared prologue.
+    let jpx_without_color_space = dict.get("ColorSpace").is_none()
+        && match dict.get("Filter") {
+            Some(Object::Name(n)) => n.eq_ignore_ascii_case("JPXDecode"),
+            Some(Object::Array(fs)) => fs
+                .iter()
+                .filter_map(|f| f.as_name())
+                .any(|n| n.eq_ignore_ascii_case("JPXDecode")),
+            _ => false,
+        };
+    let device_rgb = Object::Name("DeviceRGB".to_string());
+    let color_space_obj = match dict.get("ColorSpace") {
+        Some(cs) => cs,
+        None if jpx_without_color_space => &device_rgb,
+        None => return Err(Error::Image("Image missing /ColorSpace".to_string())),
+    };
+
+    let resolved_color_space = if let Some(d) = doc {
+        let res = if let Some(obj_ref) = color_space_obj.as_reference() {
+            d.load_object(obj_ref)?
+        } else {
+            color_space_obj.clone()
+        };
+        if let Object::Name(ref name) = res {
+            if let Some(map) = color_space_map {
+                map.get(name).cloned().unwrap_or(res)
+            } else {
+                res
+            }
+        } else {
+            res
+        }
+    } else {
+        color_space_obj.clone()
+    };
+
+    // For array-form color spaces (e.g. [/ICCBased <ref>], [/Indexed <base> <hi> <palette_ref>])
+    // the second element is commonly an indirect reference to the ICC profile
+    // stream / palette. `parse_color_space` only inspects the immediate
+    // `Object::Stream` dict, so an unresolved reference silently falls back to
+    // `N = 3` and a CMYK (N = 4) image is labelled as RGB. Resolve the stream
+    // reference here so the component count reflects the real profile.
+    Ok(if let (Some(doc_mut), Object::Array(arr)) = (doc, &resolved_color_space) {
+        if arr.len() > 1 {
+            if let Some(second_ref) = arr[1].as_reference() {
+                if let Ok(resolved_second) = doc_mut.load_object(second_ref) {
+                    let mut new_arr = arr.clone();
+                    new_arr[1] = resolved_second;
+                    Object::Array(new_arr)
+                } else {
+                    resolved_color_space
+                }
+            } else {
+                resolved_color_space
+            }
+        } else {
+            resolved_color_space
+        }
+    } else {
+        resolved_color_space
+    })
+}
+
+/// The geometry of an image stream's decoded sample rows: the width and
+/// height the dictionary declares and the byte length of one row of the data
+/// its filters yield. A row is `/Width` samples of the colour space's
+/// components at `/BitsPerComponent` bits each, padded to a whole byte
+/// (ISO 32000-1 §8.9.3), which is the row stride the extractor unpacks with.
+pub(crate) struct RowGeometry {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) row_bytes: usize,
+    /// The colour space's component count, which a colour-key `/Mask` states
+    /// its ranges for.
+    pub(crate) components: usize,
+}
+
+/// [`RowGeometry`] of the image stream described by `dict`, read the way
+/// [`extract_image_from_xobject_at`] reads it, so that `row_bytes * height`
+/// is exactly the data it expects for a raw-sample image.
+pub(crate) fn row_geometry(
+    doc: Option<&crate::document::PdfDocument>,
+    dict: &std::collections::HashMap<String, crate::object::Object>,
+    color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
+) -> Result<RowGeometry> {
+    let resolve_int = |obj: &crate::object::Object| -> Option<i64> {
+        if let (Some(d), Some(r)) = (doc, obj.as_reference()) {
+            d.load_object(r).ok().and_then(|o| o.as_integer())
+        } else {
+            obj.as_integer()
+        }
+    };
+    let dimension = |key: &str| -> Result<u32> {
+        let value = dict
+            .get(key)
+            .and_then(resolve_int)
+            .ok_or_else(|| Error::Image(format!("Image missing /{key}")))?;
+        match u32::try_from(value) {
+            Ok(v) if v > 0 => Ok(v),
+            _ => Err(Error::Image(format!("Image /{key} must be a positive integer"))),
+        }
+    };
+    let width = dimension("Width")?;
+    let height = dimension("Height")?;
+    let bits = dict
+        .get("BitsPerComponent")
+        .and_then(|obj| obj.as_integer())
+        .unwrap_or(8);
+    let bits = usize::try_from(bits)
+        .ok()
+        .filter(|b| *b > 0)
+        .ok_or_else(|| Error::Image("Image /BitsPerComponent must be positive".to_string()))?;
+    let resolved = resolve_image_color_space(doc, dict, color_space_map)?;
+    let color_space = parse_color_space(&resolved)?;
+    let ncomp = devicen_ink_count(&resolved).unwrap_or_else(|| color_space.components());
+    let row_bytes = (width as usize)
+        .checked_mul(ncomp)
+        .and_then(|samples| samples.checked_mul(bits))
+        .map(|bits| bits.div_ceil(8))
+        .ok_or_else(|| Error::Image("Image row size overflows".to_string()))?;
+    Ok(RowGeometry { width, height, row_bytes, components: color_space.components() })
+}
+// ── end pdf_manipulator patch ──
 
 /// Extract and parse an `ICCBased` colour-space's profile stream.
 ///
@@ -2379,32 +2507,108 @@ pub(crate) fn decode_jbig2_stencil(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>> {
-    let ImageData::Raw { pixels, .. } =
-        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-        decode_jbig2_image(stream, dict, doc, width, height)?
-        // ── end pdf_manipulator patch ──
-    else {
-        return Err(Error::Image("JBIG2 stencil decode returned no samples".to_string()));
-    };
+    // ── pdf_manipulator patch: the decoder pushes pixels, which are kept one bit each ──
+    decode_jbig2_bits(stream, dict, doc, width, height, false)
+    // ── end pdf_manipulator patch ──
+}
+
+// ── pdf_manipulator patch: the decoder pushes pixels, which are kept one bit each ──
+/// Decode a JBIG2 image into packed 1-bit rows, `((width + 7) / 8) * height`
+/// bytes, MSB first, a black pixel as sample 0 and a white one as sample 1.
+///
+/// The decoder pushes its pixels, so the raster cannot be produced a row at a
+/// time on demand; kept at one bit a pixel it is an eighth of the 8-bit gray
+/// raster [`decode_jbig2_image`] builds. A row the decoder did not reach stays
+/// 0xFF, white.
+#[cfg(feature = "rendering")]
+pub(crate) fn decode_jbig2_bits(
+    xobject: &crate::object::Object,
+    dict: &std::collections::HashMap<String, crate::object::Object>,
+    doc: Option<&crate::document::PdfDocument>,
+    width: u32,
+    height: u32,
+    apply_decode: bool,
+) -> Result<Vec<u8>> {
+    let jbig2_bytes: Vec<u8> = xobject.decode_stream_data()?;
+    let globals: Option<Vec<u8>> = (|| -> Option<Vec<u8>> {
+        let dp = dict.get("DecodeParms")?.as_dict()?;
+        let globals_ref = dp.get("JBIG2Globals")?.as_reference()?;
+        let d = doc.as_ref()?;
+        let globals_obj = d.load_object(globals_ref).ok()?;
+        globals_obj.decode_stream_data().ok()
+    })();
+
+    let image = hayro_jbig2::Image::new_embedded(&jbig2_bytes, globals.as_deref())
+        .map_err(|e| Error::Image(format!("JBIG2 decode error: {e}")))?;
 
     let row_bytes = (width as usize).div_ceil(8);
-    // 0xFF = every sample 1 = "leave the previous contents unchanged", so a
-    // row the decoder did not reach masks nothing out rather than erasing the
-    // base image.
-    let mut packed = vec![0xFFu8; row_bytes * height as usize];
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let Some(&g) = pixels.get(y * width as usize + x) else {
-                continue;
-            };
-            if g < 128 {
-                // black -> sample 0
-                packed[y * row_bytes + x / 8] &= !(0x80 >> (x % 8));
+    let total = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::Image("JBIG2 raster size overflows".to_string()))?;
+    let mut packed = Vec::new();
+    packed
+        .try_reserve_exact(total)
+        .map_err(|_| Error::Image(format!("Unable to allocate {total} JBIG2 bytes")))?;
+    packed.resize(total, 0xFF);
+
+    struct BitCollector<'a> {
+        packed: &'a mut [u8],
+        width: usize,
+        row_bytes: usize,
+        row: usize,
+        column: usize,
+    }
+
+    impl BitCollector<'_> {
+        fn put(&mut self, black: bool, count: usize) {
+            for _ in 0..count {
+                if black && self.column < self.width && (self.row + 1) * self.row_bytes <= self.packed.len() {
+                    self.packed[self.row * self.row_bytes + self.column / 8] &=
+                        !(0x80 >> (self.column % 8));
+                }
+                self.column += 1;
             }
+        }
+    }
+
+    impl hayro_jbig2::Decoder for BitCollector<'_> {
+        fn push_pixel(&mut self, black: bool) {
+            self.put(black, 1);
+        }
+
+        // chunk_count is the number of 8-pixel groups, not individual pixels.
+        fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+            self.put(black, chunk_count as usize * 8);
+        }
+
+        fn next_line(&mut self) {
+            self.row += 1;
+            self.column = 0;
+        }
+    }
+
+    let mut collector = BitCollector {
+        packed: &mut packed,
+        width: width as usize,
+        row_bytes,
+        row: 0,
+        column: 0,
+    };
+    image
+        .decode(&mut collector)
+        .map_err(|e| Error::Image(format!("JBIG2 pixel decode error: {e}")))?;
+
+    // A /Decode that reverses the polarity is part of an image (Table 90,
+    // and Table 145 for a soft mask): scanners write `[1 0]` to normalise
+    // what their encoder emitted. A stencil applies its own /Decode.
+    if apply_decode && decode_array_inverts_1bpc(dict.get("Decode")) {
+        for b in &mut packed {
+            *b = !*b;
         }
     }
     Ok(packed)
 }
+// ── end pdf_manipulator patch ──
 
 #[cfg(feature = "rendering")]
 fn decode_jbig2_image(

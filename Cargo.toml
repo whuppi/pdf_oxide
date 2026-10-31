@@ -303,7 +303,9 @@ pdfium-render = { version = "0.9", optional = true }
 # ── pdf_manipulator patch: local fork; page bands need exact seams and gradients ──
 tiny-skia = { path = "../tiny_skia", optional = true }
 # ── end pdf_manipulator patch ──
-fast_image_resize = { version = "6", optional = true }                          # SIMD-accelerated image downscaling
+# ── pdf_manipulator patch: the render path resamples image rows itself (host/images/resample.rs) ──
+# fast_image_resize needed a whole decoded image to resize; it is not used.
+# ── end pdf_manipulator patch ──
 hayro-jbig2 = { version = "0.3", optional = true, default-features = false }    # Pure-Rust JBIG2 decoder (Apache-2.0 OR MIT)
 hayro-jpeg2000 = { version = "0.4", optional = true, default-features = false } # Pure-Rust JPEG 2000 decoder, no_std + WASM-safe (Apache-2.0 OR MIT)
 fontdb = { version = "0.24", optional = true }
@@ -526,7 +528,6 @@ jpeg2000 = ["dep:hayro-jpeg2000"]
 # Page rendering to images (pure Rust via tiny-skia)
 rendering = [
     "dep:tiny-skia",
-    "dep:fast_image_resize",
     "system-fonts",
     "dep:hayro-jbig2",
     "jpeg2000",

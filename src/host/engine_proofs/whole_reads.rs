@@ -90,7 +90,8 @@ fn only_the_listed_functions_read_a_stream_whole() {
     callers_under(&src, &src, &mut found);
     let listed: BTreeSet<String> = include_str!("whole_reads.txt")
         .lines()
-        .map(str::trim)
+        // A line is the caller, then an optional `# why it reads whole`.
+        .map(|l| l.split('#').next().unwrap_or("").trim())
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();

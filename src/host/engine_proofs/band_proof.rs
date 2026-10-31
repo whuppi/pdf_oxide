@@ -323,6 +323,316 @@ fn image_fixture() -> Fixture {
     fixture
 }
 
+/// Deterministic pixels with enough detail at every scale that a wrong row,
+/// a wrong column or a half-sample shift changes a byte.
+fn detailed_rgb(width: u32, height: u32) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
+    for y in 0..height {
+        for x in 0..width {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let noise = (state >> 59) as u32;
+            let stripe = if (x / 9 + y / 7) % 2 == 0 { 40 } else { 0 };
+            pixels.push(((x * 255 / width) + noise + stripe).min(255) as u8);
+            pixels.push(((y * 255 / height) + noise).min(255) as u8);
+            pixels.push((((x + y) * 255 / (width + height)) + stripe).min(255) as u8);
+        }
+    }
+    pixels
+}
+
+/// A bilevel picture, `true` black: a checker with a disc cut out of it.
+fn bilevel(width: u32, height: u32) -> Vec<Vec<bool>> {
+    let (cx, cy, r) = (width as i64 / 2, height as i64 / 2, width.min(height) as i64 / 3);
+    (0..height as i64)
+        .map(|y| {
+            (0..width as i64)
+                .map(|x| {
+                    let checker = (x / 6 + y / 6) % 2 == 0;
+                    let disc = (x - cx).pow(2) + (y - cy).pow(2) < r * r;
+                    checker ^ disc
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The picture as CCITT Group 4 (T.6) data.
+fn group4(picture: &[Vec<bool>]) -> Vec<u8> {
+    let width = picture[0].len() as u32;
+    let mut encoder = fax::encoder::Encoder::new(fax::VecWriter::new());
+    for row in picture {
+        let pels = row
+            .iter()
+            .map(|&black| if black { fax::Color::Black } else { fax::Color::White });
+        encoder.encode_line(pels, width).expect("encodes");
+    }
+    encoder.finish().expect("finishes").finish()
+}
+
+/// The picture as an embedded JBIG2 stream: a page-information segment and
+/// one immediate generic region coded with MMR, which is T.6.
+fn jbig2(picture: &[Vec<bool>]) -> Vec<u8> {
+    let (width, height) = (picture[0].len() as u32, picture.len() as u32);
+    let mut page = Vec::new();
+    for v in [width, height, 0, 0] {
+        page.extend_from_slice(&v.to_be_bytes());
+    }
+    page.extend_from_slice(&[0, 0, 0]);
+    let mut region = Vec::new();
+    for v in [width, height, 0, 0] {
+        region.extend_from_slice(&v.to_be_bytes());
+    }
+    region.extend_from_slice(&[0, 0x01]);
+    region.extend_from_slice(&group4(picture));
+    let mut out = Vec::new();
+    for (number, kind, data) in [(0u32, 48u8, page), (1u32, 38u8, region)] {
+        out.extend_from_slice(&number.to_be_bytes());
+        out.extend_from_slice(&[kind, 0x00, 0x01]);
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&data);
+    }
+    out
+}
+
+fn packed_bits(picture: &[Vec<bool>], black_is_one: bool) -> Vec<u8> {
+    let row_bytes = picture[0].len().div_ceil(8);
+    let mut out = vec![0u8; row_bytes * picture.len()];
+    for (y, row) in picture.iter().enumerate() {
+        for (x, &black) in row.iter().enumerate() {
+            if black == black_is_one {
+                out[y * row_bytes + x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    out
+}
+
+/// The transforms an image meets, one fixture each. Together with the dpis
+/// they reach every class: a pure scale down and up, a quarter turn, an
+/// eighth turn, a shear, a vertical and a horizontal flip.
+const TRANSFORMS: [(&str, &str); 6] = [
+    ("scale", "150 0 0 112 25 40"),
+    ("rot90", "0 150 -112 0 140 25"),
+    ("rot45", "106 106 -80 80 100 20"),
+    ("shear", "150 0 40 112 20 40"),
+    ("flip_v", "150 0 0 -112 25 150"),
+    ("flip_h", "-150 0 0 112 175 40"),
+];
+
+fn image_object(number: u32, dict: &str, data: &[u8]) -> Vec<u8> {
+    stream_object(number, &format!("/Type /XObject /Subtype /Image {dict}"), data)
+}
+
+/// Every image kind at every transform class, as the plan's identity proof
+/// asks: raw samples, a soft mask, a stencil `/Mask`, a colour key, an inline
+/// image, a stencil painted in the fill colour, and each codec.
+fn image_fixtures() -> Vec<Fixture> {
+    let rgb = detailed_rgb(400, 300);
+    let mut all = Vec::new();
+
+    for (name, matrix) in TRANSFORMS {
+        let mut fixture =
+            Fixture::new(name, &format!("q {matrix} cm /Im Do Q\n"));
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![image_object(
+            5,
+            "/Width 400 /Height 300 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+            &rgb,
+        )];
+        all.push(fixture);
+    }
+
+    // Gray and sub-byte samples through a Flate filter, and an Indexed palette.
+    {
+        use std::io::Write;
+        let gray: Vec<u8> = (0..300u32 * 200).map(|i| ((i % 300) * 255 / 300) as u8 ^ (i / 300) as u8).collect();
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&gray).expect("compresses");
+        let flate = z.finish().expect("finishes");
+        let two_bit: Vec<u8> = (0..(300 / 4) * 200).map(|i| (i * 37 % 251) as u8).collect();
+        let palette: Vec<u8> = (0..16u8).flat_map(|i| [i * 16, 255 - i * 16, i * 8]).collect();
+        let nibbles: Vec<u8> = (0..(300 / 2) * 200).map(|i| (i * 53 % 256) as u8).collect();
+        let mut fixture = Fixture::new(
+            "kinds",
+            "q 90 0 0 60 10 120 cm /G Do Q\nq 90 0 0 60 105 120 cm /T Do Q\n\
+             q 60 40 -40 60 60 20 cm /P Do Q\n",
+        );
+        fixture.resources = "/XObject << /G 5 0 R /T 6 0 R /P 7 0 R >>".to_string();
+        fixture.extra = vec![
+            image_object(
+                5,
+                "/Width 300 /Height 200 /ColorSpace /DeviceGray /BitsPerComponent 8 \
+                 /Filter /FlateDecode",
+                &flate,
+            ),
+            image_object(
+                6,
+                "/Width 300 /Height 200 /ColorSpace /DeviceGray /BitsPerComponent 2 \
+                 /Decode [1 0]",
+                &two_bit,
+            ),
+            image_object(
+                7,
+                &format!(
+                    "/Width 300 /Height 200 /ColorSpace [/Indexed /DeviceRGB 15 <{}>] \
+                     /BitsPerComponent 4",
+                    palette.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                ),
+                &nibbles,
+            ),
+        ];
+        all.push(fixture);
+    }
+
+    // A soft mask of another size, under a scale and under an eighth turn.
+    {
+        let soft: Vec<u8> = (0..100u32 * 80).map(|i| ((i % 100) * 255 / 100) as u8 ^ ((i / 100) * 3) as u8).collect();
+        let mut fixture = Fixture::new(
+            "softmask",
+            "0.8 0.8 0.2 rg 0 0 200 200 re f\n\
+             q 120 0 0 90 10 100 cm /Im Do Q\nq 70 70 -50 50 120 20 cm /Im Do Q\n",
+        );
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![
+            image_object(
+                5,
+                "/Width 400 /Height 300 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R",
+                &rgb,
+            ),
+            image_object(6, "/Width 100 /Height 80 /ColorSpace /DeviceGray /BitsPerComponent 8", &soft),
+        ];
+        all.push(fixture);
+    }
+
+    // A stencil /Mask with no colour space, which the stencil reader takes.
+    {
+        let picture = bilevel(64, 48);
+        let mut fixture = Fixture::new(
+            "stencilmask",
+            "0.2 0.6 0.8 rg 0 0 200 200 re f\n\
+             q 120 0 0 90 10 100 cm /Im Do Q\nq 70 70 -50 50 120 20 cm /Im Do Q\n",
+        );
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![
+            image_object(
+                5,
+                "/Width 400 /Height 300 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask 6 0 R",
+                &rgb,
+            ),
+            image_object(
+                6,
+                "/Width 64 /Height 48 /ImageMask true /BitsPerComponent 1",
+                &packed_bits(&picture, false),
+            ),
+        ];
+        all.push(fixture);
+    }
+
+    // A colour key.
+    {
+        let mut fixture = Fixture::new(
+            "colourkey",
+            "0.9 0.3 0.3 rg 0 0 200 200 re f\n\
+             q 120 0 0 90 10 100 cm /Im Do Q\nq 70 70 -50 50 120 20 cm /Im Do Q\n",
+        );
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![image_object(
+            5,
+            "/Width 400 /Height 300 /ColorSpace /DeviceRGB /BitsPerComponent 8 \
+             /Mask [0 120 0 255 0 255]",
+            &rgb,
+        )];
+        all.push(fixture);
+    }
+
+    // An inline image, hex coded, at a scale and at an eighth turn.
+    {
+        let data: String = detailed_rgb(24, 18).iter().map(|b| format!("{b:02x}")).collect();
+        let fixture = Fixture::new(
+            "inline",
+            &format!(
+                "q 120 0 0 90 10 100 cm BI /W 24 /H 18 /CS /RGB /BPC 8 /F /AHx ID {data}> EI Q\n\
+                 q 70 70 -50 50 120 20 cm BI /W 24 /H 18 /CS /RGB /BPC 8 /F /AHx ID {data}> EI Q\n"
+            ),
+        );
+        all.push(fixture);
+    }
+
+    // A stencil painted in the fill colour.
+    {
+        let picture = bilevel(200, 150);
+        let mut fixture = Fixture::new(
+            "stencil",
+            "0.7 0.1 0.4 rg q 150 0 0 112 25 40 cm /St Do Q\n\
+             0.1 0.5 0.2 rg q 70 70 -50 50 120 20 cm /St Do Q\n",
+        );
+        fixture.resources = "/XObject << /St 5 0 R >>".to_string();
+        fixture.extra = vec![image_object(
+            5,
+            "/Width 200 /Height 150 /ImageMask true /BitsPerComponent 1",
+            &packed_bits(&picture, false),
+        )];
+        all.push(fixture);
+    }
+
+    // The codecs, each at a scale and at an eighth turn.
+    let codec_content = "q 150 0 0 112 25 40 cm /Im Do Q\nq 70 70 -50 50 120 20 cm /Im Do Q\n";
+    {
+        let mut jpeg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpeg, 85)
+            .encode(&detailed_rgb(320, 240), 320, 240, jpeg_encoder::ColorType::Rgb)
+            .expect("encodes");
+        let mut fixture = Fixture::new("dct", codec_content);
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![image_object(
+            5,
+            "/Width 320 /Height 240 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+            &jpeg,
+        )];
+        all.push(fixture);
+    }
+    {
+        let jp2: &[u8] = include_bytes!("../../../tests/fixtures/jpx/sample_gray.jp2");
+        let decoded = crate::decoders::jpx::decode_jpx_at(jp2, None).expect("decodes");
+        let mut fixture = Fixture::new("jpx", codec_content);
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![image_object(
+            5,
+            &format!(
+                "/Width {} /Height {} /Filter /JPXDecode",
+                decoded.width, decoded.height
+            ),
+            jp2,
+        )];
+        all.push(fixture);
+    }
+    {
+        let picture = bilevel(256, 192);
+        let mut fixture = Fixture::new("ccitt", codec_content);
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![image_object(
+            5,
+            "/Width 256 /Height 192 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 256 /Rows 192 >>",
+            &group4(&picture),
+        )];
+        all.push(fixture);
+        let mut fixture = Fixture::new("jbig2", codec_content);
+        fixture.resources = "/XObject << /Im 5 0 R >>".to_string();
+        fixture.extra = vec![image_object(
+            5,
+            "/Width 256 /Height 192 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter /JBIG2Decode",
+            &jbig2(&picture),
+        )];
+        all.push(fixture);
+    }
+    all
+}
+
 fn render(doc: &PdfDocument, dpi: u32, rows: Option<u32>) -> (u32, u32, Vec<u8>) {
     let mut renderer = PageRenderer::new(RenderOptions::with_dpi(dpi).with_transparent_background());
     renderer.forced_rows = rows;
@@ -436,6 +746,17 @@ fn bands_equal_the_whole_canvas_on_forms_annotations_and_images() {
         .iter()
         .filter(|f| ["forms", "annotations", "images"].contains(&f.name))
     {
+        prove(fixture);
+    }
+}
+
+/// An image read through open row cursors is the same image in every cut:
+/// each transform class, each kind of mask, an inline image and each codec,
+/// at every dpi and every band height. No Dart battery sees it: the band
+/// height is an internal knob no API sets.
+#[test]
+fn bands_equal_the_whole_canvas_on_images_at_every_transform_class() {
+    for fixture in &image_fixtures() {
         prove(fixture);
     }
 }

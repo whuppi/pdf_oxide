@@ -25,6 +25,11 @@ use crate::rendering::band::{
     demultiply_in_place, fills_counted, group_depth, BandContext, BandPlan, Window,
 };
 // ── end pdf_manipulator patch ──
+// ── pdf_manipulator patch: an image is read from its open decode ──
+use crate::host::images::stream::{
+    stencil_region, CursorKey as ImageCursorKey, CursorTable, ImageCursor,
+};
+// ── end pdf_manipulator patch ──
 use crate::rendering::path_rasterizer::PathRasterizer;
 use crate::rendering::resolution::{
     DeviceColor, IccTransformCache, LogicalColor, PaintIntent, PaintKind, PaintSide,
@@ -313,6 +318,10 @@ pub struct PageRenderer {
     /// Outlines the current text object's clip-mode shows produced, counted
     /// wherever they fell; zero is a text clip with nothing to clip to.
     text_clip_outlines: std::cell::Cell<u64>,
+    /// The page's images that are open: each is read from its first row to
+    /// its last across the bands, and dropped when the page is done or when
+    /// the table needs the room.
+    image_cursors: CursorTable,
     // ── end pdf_manipulator patch ──
 }
 
@@ -369,6 +378,7 @@ impl PageRenderer {
             band: BandContext::whole(0, 0),
             forced_rows: None,
             text_clip_outlines: std::cell::Cell::new(0),
+            image_cursors: CursorTable::default(),
             // ── end pdf_manipulator patch ──
         }
     }
@@ -535,6 +545,8 @@ impl PageRenderer {
         // amortising transform construction across paints within a
         // single page.
         self.icc_transform_cache.clear();
+        // An image's open decode lasts one page.
+        self.image_cursors.clear();
         // Reset the H3b silent-K=0 warning latch so a new page's first
         // RGB-to-CMYK fallback under a declared-but-unparseable
         // /OutputIntents profile logs once on the new page (instead
@@ -726,6 +738,7 @@ impl PageRenderer {
 
             on_band(top, &mut pixmap)?;
         }
+        self.image_cursors.clear();
 
         Ok((width, height))
     }
@@ -4759,7 +4772,16 @@ impl PageRenderer {
         Some((fit(edge_w, page.0), fit(edge_h, page.1)))
     }
 
+    // ── pdf_manipulator patch: an image is drawn from the rows its band reaches ──
     /// Render an image XObject.
+    ///
+    /// The image is read through a cursor that stays open for the page, so a
+    /// band reads only the rows it reaches and no band holds the image whole
+    /// (see `host::images::stream`). A pure scale-down is resampled one row at
+    /// a time to its device size and blitted 1:1; any other transform is drawn
+    /// by tiny-skia from the rectangle of source samples the band reaches,
+    /// with the rows and columns its filter taps need beside it, under the
+    /// whole-page transform, so the pixels equal those of one whole raster.
     fn render_image(
         &mut self,
         pixmap: &mut Pixmap,
@@ -4772,409 +4794,155 @@ impl PageRenderer {
         mask_obj: Option<Object>,
         gs: &GraphicsState,
     ) -> Result<()> {
-        use crate::extractors::images::extract_image_from_xobject_at;
-
-        // Use robust image extractor to handle various formats and color spaces
-        let color_space_map = self.color_spaces.clone();
-        // Tell the extractor how large this image will actually be painted, so
-        // a format that can decode progressively (JPEG 2000) stops at the
-        // resolution level that covers it instead of decoding samples that the
-        // resampler below would immediately discard.
+        // Tell the decoder how large this image will actually be painted, so
+        // a format that can decode in reduced form (a JPEG, JPEG 2000) stops
+        // at the reduction that covers it instead of decoding samples that
+        // the resampler would immediately discard.
         let target = Self::device_footprint(transform, (self.band.width, self.band.page_height));
-        let pdf_image = extract_image_from_xobject_at(
-            Some(doc),
-            xobject,
+        let key = ImageCursorKey::new(
             obj_ref,
-            Some(&color_space_map),
-            target,
-        )?;
-        let dynamic_image = pdf_image.to_dynamic_image()?;
-        let mut rgba_image = dynamic_image.to_rgba8();
-
-        // Handle /Mask (stencil mask image) — PDF spec section 8.9.6.2
-        // The mask is a separate image whose samples define opacity (1=opaque, 0=transparent)
-        if let Some(mask_ref) = mask_obj {
-            if let Some(ref_obj) = mask_ref.as_reference() {
-                if let Ok(mask_stream) = doc.load_object(ref_obj) {
-                    // Try to decode the mask as an image
-                    match extract_image_from_xobject_at(
-                        Some(doc),
-                        &mask_stream,
-                        Some(ref_obj),
-                        Some(&color_space_map),
-                        // A /Mask is mapped to the same unit square as the
-                        // image it masks (pdf.md:23985), so it is painted at
-                        // the same footprint and needs no more detail.
-                        target,
-                    ) {
-                        Ok(mask_image) => {
-                            if let Ok(mask_dyn) = mask_image.to_dynamic_image() {
-                                let mask_gray = mask_dyn.to_luma8();
-                                let mw = mask_gray.width();
-                                let mh = mask_gray.height();
-                                let iw = rgba_image.width();
-                                let ih = rgba_image.height();
-                                if fold_mask_into_alpha(&mut rgba_image, &mask_gray) {
-                                    log::debug!(
-                                        "Applied image Mask ({}x{}) to image ({}x{})",
-                                        mw,
-                                        mh,
-                                        iw,
-                                        ih
-                                    );
-                                } else {
-                                    // No mask sample to test: leave the base
-                                    // image fully opaque rather than guessing.
-                                    log::warn!(
-                                        "Ignoring image Mask: it is {mw}x{mh} and carries \
-                                         no sample to test"
-                                    );
-                                }
-                            }
-                        },
-                        Err(_) => {
-                            // Fallback: decode stencil mask (ImageMask=true) directly from stream
-                            if let Object::Stream { ref dict, .. } = mask_stream {
-                                let mask_dict = dict;
-                                let is_image_mask = mask_dict
-                                    .get("ImageMask")
-                                    .map(|o| matches!(o, Object::Boolean(true)))
-                                    .unwrap_or(false);
-                                if is_image_mask {
-                                    // `as u32` turns a negative /Width into a
-                                    // near-u32::MAX stride that passes the
-                                    // check below.
-                                    let mw = mask_dict
-                                        .get("Width")
-                                        .and_then(|o| o.as_integer())
-                                        .and_then(|v| u32::try_from(v).ok())
-                                        .unwrap_or(0);
-                                    let mh = mask_dict
-                                        .get("Height")
-                                        .and_then(|o| o.as_integer())
-                                        .and_then(|v| u32::try_from(v).ok())
-                                        .unwrap_or(0);
-                                    if mw > 0 && mh > 0 {
-                                        if let Ok(raw_mask_data) =
-                                            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                                            mask_stream.decode_stream_data()
-                                            // ── end pdf_manipulator patch ──
-                                        {
-                                            // CCITT data may be pass-through (not decompressed).
-                                            // Check if we need to decompress Group 4 CCITT.
-                                            let expected_bytes =
-                                                ((mw as usize + 7) / 8) * mh as usize;
-                                            // The filter name is authoritative about whether the
-                                            // bytes are still compressed; the size heuristic below
-                                            // is only a guess, and on a small stencil the
-                                            // compressed form can be the larger of the two.
-                                            let filter_is_jbig2 = mask_dict
-                                                .get("Filter")
-                                                .map(|f| match f {
-                                                    Object::Name(n) => n == "JBIG2Decode",
-                                                    Object::Array(a) => a.iter().any(|o| {
-                                                        o.as_name() == Some("JBIG2Decode")
-                                                    }),
-                                                    _ => false,
-                                                })
-                                                .unwrap_or(false);
-                                            let mask_data = if filter_is_jbig2 {
-                                                // The stream decoder passes JBIG2 through
-                                                // untouched, so without this the compressed
-                                                // bitstream reached the stencil loop and almost
-                                                // every sample fell past the end of the buffer —
-                                                // the mask was ignored and a scanned page
-                                                // rendered as the raw grey scan with nothing
-                                                // knocked out.
-                                                match crate::extractors::images::decode_jbig2_stencil(
-                                                    &mask_stream,
-                                                    mask_dict,
-                                                    Some(doc),
-                                                    mw,
-                                                    mh,
-                                                ) {
-                                                    Ok(packed) => {
-                                                        log::debug!(
-                                                            "JBIG2 stencil mask decoded: {} → {} bytes",
-                                                            raw_mask_data.len(),
-                                                            packed.len()
-                                                        );
-                                                        packed
-                                                    },
-                                                    Err(e) => {
-                                                        log::debug!("JBIG2 mask decode failed: {e}; leaving the base image visible");
-                                                        raw_mask_data
-                                                    },
-                                                }
-                                            } else if raw_mask_data.len() < expected_bytes / 2 {
-                                                // Data is still compressed — try Group 4 CCITT decompression
-                                                let k = mask_dict
-                                                    .get("DecodeParms")
-                                                    .and_then(|o| o.as_dict())
-                                                    .and_then(|d| d.get("K"))
-                                                    .and_then(|o| o.as_integer())
-                                                    .unwrap_or(0);
-                                                if k == -1 {
-                                                    #[allow(deprecated)]
-                                                    let ccitt_result = crate::extractors::ccitt_bilevel::decompress_ccitt_group4(&raw_mask_data, mw, mh);
-                                                    match ccitt_result {
-                                                        Ok(mut decompressed) => {
-                                                            log::debug!("CCITT Group4 decompressed mask: {} → {} bytes", raw_mask_data.len(), decompressed.len());
-                                                            // The CCITT decoder emits 1 for an
-                                                            // inked pixel. That is the complement
-                                                            // of the sample value the stencil rule
-                                                            // below is written against: Table 11
-                                                            // makes `BlackIs1` false the normal
-                                                            // PDF convention, in which 0 is black,
-                                                            // and §8.9.6.2 gives sample 0 the
-                                                            // meaning "mark the page". Normalise
-                                                            // here so one polarity rule serves
-                                                            // both this branch and a mask whose
-                                                            // filter the stream decoder already
-                                                            // applied.
-                                                            for b in &mut decompressed {
-                                                                *b = !*b;
-                                                            }
-                                                            decompressed
-                                                        },
-                                                        Err(e) => {
-                                                            log::debug!("CCITT decompression failed: {}, using raw data", e);
-                                                            raw_mask_data
-                                                        },
-                                                    }
-                                                } else {
-                                                    raw_mask_data
-                                                }
-                                            } else {
-                                                raw_mask_data
-                                            };
-                                            // ISO 32000-1:2008 §8.9.6.2
-                                            // (`docs/spec/pdf.md:14903`), verbatim:
-                                            //
-                                            //   "…(the default for an image mask), a
-                                            //   sample value of 0 shall mark the page
-                                            //   with the current colour, and a 1 shall
-                                            //   leave the previous contents unchanged.
-                                            //   If the Decode array is [ 1 0 ], these
-                                            //   meanings shall be reversed."
-                                            //
-                                            // For an explicit /Mask "mark the page" means
-                                            // the base image shows through, so under the
-                                            // default /Decode [0 1] a sample of **0 is
-                                            // opaque** and 1 masks out.
-                                            //
-                                            // This painted the complement: it took bit 1
-                                            // as opaque, under a comment citing the very
-                                            // clause that refutes it — which is why a
-                                            // reader checking the citation against the
-                                            // code saw two things agree and both be
-                                            // wrong.
-                                            //
-                                            // /Decode is read here rather than fixed
-                                            // separately because the two compose: a
-                                            // /Decode [1 0] mask rendered correctly
-                                            // *by accident*, two errors cancelling, so
-                                            // correcting the polarity alone would have
-                                            // broken those files.
-                                            let decode_reverses = mask_dict
-                                                .get("Decode")
-                                                .and_then(|o| o.as_array())
-                                                .map(|a| {
-                                                    a.first()
-                                                        .map(|o| {
-                                                            o.as_real()
-                                                                .or_else(|| {
-                                                                    o.as_integer().map(|i| i as f64)
-                                                                })
-                                                                .unwrap_or(0.0)
-                                                                >= 0.5
-                                                        })
-                                                        .unwrap_or(false)
-                                                })
-                                                .unwrap_or(false);
-                                            // 1-bit mask: each byte has 8 pixels, MSB first
-                                            let iw = rgba_image.width();
-                                            let ih = rgba_image.height();
-                                            let row_bytes = (mw as usize + 7) / 8;
-                                            for y in 0..ih {
-                                                let my = ((y as u64 * mh as u64 / ih as u64) as u32)
-                                                    .min(mh - 1)
-                                                    as usize;
-                                                for x in 0..iw {
-                                                    let mx = ((x as u64 * mw as u64 / iw as u64)
-                                                        as u32)
-                                                        .min(mw - 1)
-                                                        as usize;
-                                                    let byte_idx = my * row_bytes + mx / 8;
-                                                    let bit_idx = 7 - (mx % 8);
-                                                    let mask_val = if byte_idx < mask_data.len() {
-                                                        let bit =
-                                                            (mask_data[byte_idx] >> bit_idx) & 1;
-                                                        let opaque = if decode_reverses {
-                                                            bit == 1
-                                                        } else {
-                                                            bit == 0
-                                                        };
-                                                        if opaque {
-                                                            255u8
-                                                        } else {
-                                                            0u8
-                                                        }
-                                                    } else {
-                                                        // Past the end of the stream there is no
-                                                        // sample to test, so the mask cannot be
-                                                        // honoured here. Leave the base image
-                                                        // visible — the same result an absent
-                                                        // /Mask gives. Resolving the other way
-                                                        // looks conservative and is not: alpha 0
-                                                        // *hides* the base image, so an
-                                                        // undecodable mask would erase the very
-                                                        // content it was only meant to refine.
-                                                        //
-                                                        // This is load-bearing for JBIG2 masks,
-                                                        // which reach here still compressed (the
-                                                        // decode happens on the other branch),
-                                                        // so almost every pixel is past the end:
-                                                        // a scanned book renders as blank pages.
-                                                        255u8
-                                                    };
-                                                    let pixel = rgba_image.get_pixel_mut(x, y);
-                                                    pixel[3] = ((pixel[3] as u32 * mask_val as u32)
-                                                        / 255)
-                                                        as u8;
-                                                }
-                                            }
-                                            log::debug!("Applied stencil ImageMask ({}x{}) to image ({}x{})", mw, mh, iw, ih);
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                    }
-                }
-            } else if let Object::Array(mask_array) = &mask_ref {
-                // Colour-key masking (ISO 32000-1 §8.9.6.4): the /Mask is an
-                // array of 2 × ncomp integers [min1 max1 min2 max2 ...] in the
-                // image's pre-Decode colour-component space. A source pixel whose
-                // raw component samples all fall within their [min,max] range is
-                // made fully transparent.
-                let ncomp = pdf_image.color_space().components();
-                if !pdf_image.samples_are_raw() {
-                    // The extractor mapped a non-default /Decode into the
-                    // stored samples, so they are no longer in the space the
-                    // /Mask ranges are expressed in. Masking them here would
-                    // hide the wrong pixels; skip and say so rather than
-                    // silently inverting the transparent region.
-                    log::warn!(
-                        "Skipping colour-key /Mask: the stored samples are no longer in the \
-                         raw sample space the mask ranges are expressed in"
-                    );
-                } else {
-                    match parse_color_key_mask(mask_array, ncomp) {
-                        Some(ranges) => {
-                            apply_color_key_mask(&pdf_image, &ranges, &mut rgba_image);
-                        },
-                        None => {
-                            log::debug!(
-                                "Ignoring malformed color-key /Mask array (ncomp={})",
-                                ncomp
-                            );
-                        },
-                    }
-                }
-            }
+            xobject,
+            [transform.sx, transform.kx, transform.tx, transform.ky, transform.sy, transform.ty],
+        );
+        let mut cursor = match self.image_cursors.take(&key) {
+            Some(cursor) => cursor,
+            None => ImageCursor::open(
+                doc,
+                xobject,
+                &self.color_spaces,
+                smask_obj.as_ref(),
+                mask_obj.as_ref(),
+                target,
+            )?,
+        };
+        let drawn = Self::draw_image_rows(pixmap, &mut cursor, doc, transform, clip_mask, gs);
+        // A cursor that failed part way is in no state to continue from.
+        if drawn.is_ok() {
+            self.image_cursors.put(key, cursor);
         }
+        drawn
+    }
 
-        // Handle SMask if present
-        if let Some(smask_ref) = smask_obj {
-            if let Ok(resolved_smask) = doc.resolve_object(&smask_ref) {
-                let smask_obj_ref = smask_ref.as_reference();
-                if let Ok(smask_image) = extract_image_from_xobject_at(
-                    Some(doc),
-                    &resolved_smask,
-                    smask_obj_ref,
-                    Some(&color_space_map),
-                    // As for /Mask above: an /SMask shares the base image's
-                    // unit square, so it shares its footprint.
-                    target,
-                ) {
-                    if let Ok(smask_dyn) = smask_image.to_dynamic_image() {
-                        let smask_gray = smask_dyn.to_luma8();
-                        if !fold_mask_into_alpha(&mut rgba_image, &smask_gray) {
-                            log::warn!(
-                                "Ignoring image SMask: it is {}x{} and carries no sample \
-                                 to test",
-                                smask_gray.width(),
-                                smask_gray.height()
-                            );
-                        }
-                    }
-                }
-            }
+    /// The rectangle of an image's `width x height` samples that the window
+    /// of `pixmap` samples from under `image_transform`, with room on every
+    /// side for the taps of a bicubic filter. `None` when nothing is reached
+    /// or the transform cannot be inverted.
+    fn source_rect(
+        pixmap: &Pixmap,
+        image_transform: Transform,
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let inverse = image_transform.invert()?;
+        let (ox, oy) = pixmap.origin();
+        let (left, top) = (ox as f32 - 1.0, oy as f32 - 1.0);
+        let (right, bottom) = (left + pixmap.width() as f32 + 2.0, top + pixmap.height() as f32 + 2.0);
+        let mut corners = [
+            tiny_skia::Point::from_xy(left, top),
+            tiny_skia::Point::from_xy(right, top),
+            tiny_skia::Point::from_xy(left, bottom),
+            tiny_skia::Point::from_xy(right, bottom),
+        ];
+        inverse.map_points(&mut corners);
+        if corners.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return None;
         }
+        let low = |f: fn(&tiny_skia::Point) -> f32| corners.iter().map(f).fold(f32::INFINITY, f32::min);
+        let high = |f: fn(&tiny_skia::Point) -> f32| {
+            corners.iter().map(f).fold(f32::NEG_INFINITY, f32::max)
+        };
+        // A bicubic tap reaches two samples either side of the one under the
+        // pixel centre; one more covers the rounding of the inverse.
+        const MARGIN: f32 = 3.0;
+        let clamp = |v: f32, size: u32| v.clamp(0.0, size as f32) as u32;
+        let (x0, x1) = (clamp((low(|p| p.x) - MARGIN).floor(), width), clamp((high(|p| p.x) + MARGIN).ceil(), width));
+        let (y0, y1) = (clamp((low(|p| p.y) - MARGIN).floor(), height), clamp((high(|p| p.y) + MARGIN).ceil(), height));
+        (x0 < x1 && y0 < y1).then_some((x0, x1, y0, y1))
+    }
 
-        let src_w = rgba_image.width();
-        let src_h = rgba_image.height();
+    /// Draws the whole `size` image under `transform` from `rows`, the
+    /// premultiplied RGBA8 (`width` pixels each) of the part of it that sits
+    /// at `origin` in the image's own plane. The shape is the whole image's,
+    /// so its edges are those of a draw from the whole raster.
+    fn draw_rows(
+        pixmap: &mut Pixmap,
+        rows: &[u8],
+        width: u32,
+        origin: (i32, i32),
+        size: (u32, u32),
+        paint: &PixmapPaint,
+        transform: Transform,
+        clip_mask: Option<&tiny_skia::Mask>,
+    ) {
+        let height = (rows.len() / 4 / width.max(1) as usize) as u32;
+        let (Some(mut strip), Some(area)) = (
+            Pixmap::new_at(width, height, origin),
+            tiny_skia::Rect::from_xywh(0.0, 0.0, size.0 as f32, size.1 as f32),
+        ) else {
+            return;
+        };
+        if strip.data().len() != rows.len() {
+            return;
+        }
+        strip.data_mut().copy_from_slice(rows);
+        pixmap.draw_pixmap_in(area, strip.as_ref(), paint, transform, clip_mask);
+    }
 
+    fn draw_image_rows(
+        pixmap: &mut Pixmap,
+        cursor: &mut ImageCursor,
+        doc: &PdfDocument,
+        transform: Transform,
+        clip_mask: Option<&tiny_skia::Mask>,
+        gs: &GraphicsState,
+    ) -> Result<()> {
+        let (src_w, src_h) = cursor.size();
         let image_transform = image_unit_square_transform(transform, src_w, src_h);
         let mut paint = pixmap_paint_for_image_blit(image_transform, gs.fill_alpha, &gs.blend_mode);
 
-        // Fast path: SIMD pre-resize when the transform is a pure scale+translate and
-        // the image is being downscaled.  fast_image_resize (AVX2/SSE4.1/NEON) resizes
-        // to exact output dimensions; we then blit the already-correct pixels at the
-        // right position with a translate-only transform and Nearest quality (no second
-        // resampling pass).  For rotated/sheared transforms or upscaling, fall through
-        // to the tiny-skia bilinear/bicubic path (already selected by the helper above).
+        // A pure scale-down is resampled to its device size and then blitted
+        // 1:1; a rotated or sheared image, or an enlargement, is left to
+        // tiny-skia's bilinear or bicubic filter.
         let use_fast = image_transform.kx.abs() <= 1e-4
             && image_transform.ky.abs() <= 1e-4
             && image_transform.sx > 0.0
             && image_transform.sy > 0.0
             && (image_transform.sx < 0.9 || image_transform.sy < 0.9);
 
-        // `tiny_skia::Pixmap` stores **premultiplied** RGBA and
-        // `Pixmap::from_vec` takes the bytes verbatim, while the `image` crate
-        // produces **straight** alpha. Handing straight bytes over means a
-        // fully transparent pixel keeps its full colour, and the compositor
-        // then *adds* that colour where nothing should paint: a masked-out
-        // region came out as the base colour blended over the backdrop instead
-        // of the backdrop alone.
-        //
-        // Premultiplying here also puts the conversion *before* the resample,
-        // which is the correct order — resampling straight alpha bleeds colour
-        // across an alpha edge from pixels that contribute none.
-        let mut rgba_raw = rgba_image.into_raw();
-        premultiply_rgba_in_place(&mut rgba_raw);
-
-        let (blit_w, blit_h, blit_data, blit_transform) = if use_fast {
+        if use_fast {
             let dst_w = ((image_transform.sx * src_w as f32).round() as u32).max(1);
             let dst_h = ((image_transform.sy * src_h as f32).round() as u32).max(1);
-            let resized = resize_rgba(&rgba_raw, src_w, src_h, dst_w, dst_h);
-            if let Some(pixels) = resized {
-                // SIMD pre-resize produced the exact output dimensions —
-                // the subsequent blit is 1:1, so override to Nearest to
-                // skip a second resampling pass.
-                paint.quality = tiny_skia::FilterQuality::Nearest;
-                let t = Transform::from_translate(image_transform.tx, image_transform.ty);
-                (dst_w, dst_h, pixels, t)
-            } else {
-                // fast_image_resize failed; fall back to tiny_skia
-                // resampling with the helper's chosen quality.
-                (src_w, src_h, rgba_raw, image_transform)
+            cursor.scale_to(dst_w, dst_h);
+            // The resampled rows are blitted 1:1, so there is no filter to
+            // take taps from rows beside them.
+            paint.quality = tiny_skia::FilterQuality::Nearest;
+            let (_, oy) = pixmap.origin();
+            let top = oy as f32 - image_transform.ty;
+            let bottom = top + pixmap.height() as f32;
+            let first = (top.floor() - 1.0).clamp(0.0, dst_h as f32) as u32;
+            let end = (bottom.ceil() + 1.0).clamp(0.0, dst_h as f32) as u32;
+            if first >= end {
+                return Ok(());
             }
-        } else {
-            // Rotated / sheared / upscaling path: let tiny_skia resample
-            // with the helper's chosen quality.
-            (src_w, src_h, rgba_raw, image_transform)
-        };
-
-        if let Some(img_pixmap) = tiny_skia::IntSize::from_wh(blit_w, blit_h)
-            .and_then(|size| Pixmap::from_vec(blit_data, size))
-        {
-            pixmap.draw_pixmap(0, 0, img_pixmap.as_ref(), &paint, blit_transform, clip_mask);
+            let rows = cursor.scaled_rows(doc, first, end)?;
+            let place = Transform::from_translate(image_transform.tx, image_transform.ty);
+            Self::draw_rows(pixmap, &rows, dst_w, (0, first as i32), (dst_w, dst_h), &paint, place, clip_mask);
+        } else if let Some((x0, x1, y0, y1)) = Self::source_rect(pixmap, image_transform, src_w, src_h) {
+            let rows = cursor.region(doc, x0, x1, y0, y1)?;
+            Self::draw_rows(
+                pixmap,
+                &rows,
+                x1 - x0,
+                (x0 as i32, y0 as i32),
+                (src_w, src_h),
+                &paint,
+                image_transform,
+                clip_mask,
+            );
         }
-
         Ok(())
     }
+    // ── end pdf_manipulator patch ──
 
     /// Return CCITT parameters for an ImageMask stream, if present.
     ///
@@ -5435,45 +5203,27 @@ impl PageRenderer {
         // Rasterise the stencil into a full-opacity pixmap, then let the
         // existing blit put it into device space so the mask lands exactly
         // where the flat-colour path would have painted.
-        let mut stencil = vec![0u8; (width as usize) * (height as usize) * 4];
-        for y in 0..height as usize {
-            let row = y * row_bytes;
-            for x in 0..width as usize {
-                let byte = raw.get(row + x / 8).copied().unwrap_or(0);
-                let bit = (byte >> (7 - (x % 8))) & 1;
-                let paints = if invert { bit == 1 } else { bit == 0 };
-                if paints {
-                    let o = (y * width as usize + x) * 4;
-                    stencil[o] = 255;
-                    stencil[o + 1] = 255;
-                    stencil[o + 2] = 255;
-                    stencil[o + 3] = 255;
-                }
-            }
-        }
-        let Some(stencil_pixmap) = Pixmap::from_vec(
-            stencil,
-            tiny_skia::IntSize::from_wh(width, height).ok_or_else(|| {
-                Error::Image(format!("ImageMask has an unusable size {width}x{height}"))
-            })?,
-        ) else {
-            return Ok(None);
-        };
-
         // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
         let Some(mut coverage) = Pixmap::new_like(pixmap) else {
         // ── end pdf_manipulator patch ──
             return Ok(None);
         };
         let image_transform = image_unit_square_transform(transform, width, height);
-        coverage.draw_pixmap(
-            0,
-            0,
-            stencil_pixmap.as_ref(),
-            &pixmap_paint_for_image_blit(image_transform, 1.0, "Normal"),
-            image_transform,
-            clip_mask,
-        );
+        // ── pdf_manipulator patch: only the stencil samples the band reaches become pixels ──
+        if let Some((x0, x1, y0, y1)) = Self::source_rect(pixmap, image_transform, width, height) {
+            let rows = stencil_region(raw, row_bytes, invert, [255; 4], x0, x1, y0, y1);
+            Self::draw_rows(
+                &mut coverage,
+                &rows,
+                x1 - x0,
+                (x0 as i32, y0 as i32),
+                (width, height),
+                &pixmap_paint_for_image_blit(image_transform, 1.0, "Normal"),
+                image_transform,
+                clip_mask,
+            );
+        }
+        // ── end pdf_manipulator patch ──
 
         // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
         let Some(mut mask) = tiny_skia::Mask::new_like(pixmap) else {
@@ -5514,7 +5264,7 @@ impl PageRenderer {
             .as_dict()
             .ok_or_else(|| Error::Image("ImageMask XObject is not a stream".to_string()))?;
 
-        let (width, height, row_bytes, expected, rgba_len) = Self::image_mask_layout(dict)?;
+        let (width, height, row_bytes, expected, _) = Self::image_mask_layout(dict)?;
 
         // PDF §8.9.6.4: ImageMask BitsPerComponent must be 1 when present.
         // Some producers omit it; default to 1.
@@ -5644,40 +5394,27 @@ impl PageRenderer {
             )));
         }
 
-        let mut rgba = Vec::new();
-        rgba.try_reserve_exact(rgba_len)
-            .map_err(|_| Error::Image(format!("Unable to allocate {rgba_len} ImageMask bytes")))?;
-        rgba.resize(rgba_len, 0);
-        for y in 0..height {
-            let row_off = (y as usize) * row_bytes;
-            for x in 0..width {
-                let byte_idx = row_off + (x / 8) as usize;
-                let bit_idx = 7 - (x % 8);
-                let bit = (raw[byte_idx] >> bit_idx) & 1 == 1;
-                let opaque = if invert { bit } else { !bit };
-                if opaque {
-                    let off = ((y as usize * width as usize) + x as usize) * 4;
-                    rgba[off] = pr;
-                    rgba[off + 1] = pg;
-                    rgba[off + 2] = pb;
-                    rgba[off + 3] = pa;
-                }
-            }
-        }
-
         let image_transform = image_unit_square_transform(transform, width, height);
         // Opacity is 1.0 because fill_alpha is already baked into the
-        // stencil pixels by the loop above; blend mode + scale-driven
-        // quality come from the shared helper.
+        // stencil pixels; blend mode + scale-driven quality come from the
+        // shared helper.
         let paint = pixmap_paint_for_image_blit(image_transform, 1.0, &gs.blend_mode);
 
-        if let Some(stencil_pixmap) = Pixmap::from_vec(
-            rgba,
-            tiny_skia::IntSize::from_wh(width, height)
-                .ok_or_else(|| Error::Image("ImageMask invalid dimensions".to_string()))?,
-        ) {
-            pixmap.draw_pixmap(0, 0, stencil_pixmap.as_ref(), &paint, image_transform, clip_mask);
+        // ── pdf_manipulator patch: only the stencil samples the band reaches become pixels ──
+        if let Some((x0, x1, y0, y1)) = Self::source_rect(pixmap, image_transform, width, height) {
+            let rows = stencil_region(&raw, row_bytes, invert, [pr, pg, pb, pa], x0, x1, y0, y1);
+            Self::draw_rows(
+                pixmap,
+                &rows,
+                x1 - x0,
+                (x0 as i32, y0 as i32),
+                (width, height),
+                &paint,
+                image_transform,
+                clip_mask,
+            );
         }
+        // ── end pdf_manipulator patch ──
 
         Ok(())
     }
@@ -10990,38 +10727,6 @@ fn parse_ext_g_state(
     parse_ext_g_state_inner(state_obj, doc)
 }
 
-/// Resize an RGBA (straight-alpha) byte buffer using SIMD-accelerated bilinear filtering.
-///
-/// Returns `None` on failure (zero dimensions, SIMD dispatch error) so callers
-/// can fall back to tiny_skia's own resampling path.
-fn resize_rgba(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Option<Vec<u8>> {
-    use fast_image_resize::images::Image;
-    use fast_image_resize::pixels::PixelType;
-    use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
-
-    // from_slice_u8 needs a mutable slice; copy into a local buffer.
-    let mut buf = src.to_vec();
-    let src_img = Image::from_slice_u8(src_w, src_h, &mut buf, PixelType::U8x4).ok()?;
-    let mut dst_img = Image::new(dst_w, dst_h, PixelType::U8x4);
-    Resizer::new()
-        .resize(
-            &src_img,
-            &mut dst_img,
-            // The caller premultiplies before resampling (see the comment at the
-            // blit site). fast_image_resize's `use_alpha` defaults to true,
-            // which means "premultiply, resize, un-premultiply" -- applied to a
-            // buffer that is already premultiplied it divides the alpha back
-            // out, handing tiny_skia straight-alpha RGB in a buffer it reads as
-            // premultiplied. Opaque images are unaffected either way; one with
-            // a soft mask washes out as it shrinks.
-            &ResizeOptions::new()
-                .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
-                .use_alpha(false),
-        )
-        .ok()?;
-    Some(dst_img.into_vec())
-}
-
 /// The clip a current path made of a single `m` describes.
 ///
 /// ISO 32000-1:2008 8.5.3.3.1: "A single-point open subpath (specified by a
@@ -11162,83 +10867,10 @@ fn axis_tile_range(
 /// image where the PDF demands.
 ///
 /// Shared by `render_image` and `render_image_mask`.
-/// Convert straight (non-premultiplied) RGBA8 to premultiplied, in place.
-///
-/// `tiny_skia` stores premultiplied alpha throughout, and `Pixmap::from_vec`
-/// performs no conversion. Every buffer handed to it must therefore already
-/// satisfy `r,g,b <= a`; a straight-alpha buffer does not, and the compositor's
-/// arithmetic on an invalid premultiplied colour adds light rather than
-/// blending. The visible form is a masked-out region showing the base image's
-/// colour over the backdrop instead of the backdrop alone.
-fn premultiply_rgba_in_place(data: &mut [u8]) {
-    let (pixels, _remainder) = data.as_chunks_mut::<4>();
-    for px in pixels {
-        let a = px[3] as u32;
-        if a == 255 {
-            continue;
-        }
-        if a == 0 {
-            px[0] = 0;
-            px[1] = 0;
-            px[2] = 0;
-            continue;
-        }
-        // Rounded, so a round trip through premultiply/unpremultiply does not
-        // drift downward on every pass.
-        px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
-        px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
-        px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
-    }
-}
-
 fn image_unit_square_transform(parent: Transform, src_w: u32, src_h: u32) -> Transform {
     parent
         .pre_translate(0.0, 1.0)
         .pre_scale(1.0 / src_w as f32, -1.0 / src_h as f32)
-}
-
-/// Fold a single-channel mask into a base image's alpha channel,
-/// resampling the mask onto the base grid nearest-neighbour.
-///
-/// ISO 32000-1:2008 §8.9.6.3 maps a base image and its mask to the same
-/// unit square, so the two need not share a resolution and the mask must be
-/// resampled onto the base's grid. `/Mask` stencils and `/SMask` soft masks
-/// both reduce to this one operation — multiply the existing alpha by the
-/// mask sample — and were written out twice, which is why only one copy
-/// carried the guards below.
-///
-/// Two properties this owns so no caller has to remember them:
-///
-/// - **A zero-dimension mask carries no sample to test.** §8.9.5.1 mandates
-///   the image-to-user matrix `[1/w 0 0 -1/h 0 1]`, undefined at `w = 0`, so
-///   zero is invalid rather than valid-but-empty. Refusing leaves the base
-///   image untouched; indexing would compute `mw - 1` on `0u32`, which
-///   underflows to `u32::MAX` in release and then indexes out of bounds.
-/// - **Coordinates are computed in `u64`.** `x * mw` overflows `u32` once
-///   the base and the mask are both wide.
-///
-/// Returns whether the mask was applied, so the caller can log either way.
-#[must_use]
-fn fold_mask_into_alpha(rgba_image: &mut image::RgbaImage, mask_gray: &image::GrayImage) -> bool {
-    let (mw, mh) = (mask_gray.width(), mask_gray.height());
-    let (iw, ih) = (rgba_image.width(), rgba_image.height());
-    if mw == 0 || mh == 0 {
-        return false;
-    }
-    if iw == 0 || ih == 0 {
-        // Nothing to paint onto; not a failure of the mask.
-        return true;
-    }
-    for y in 0..ih {
-        let my = ((y as u64 * mh as u64 / ih as u64) as u32).min(mh - 1);
-        for x in 0..iw {
-            let mx = ((x as u64 * mw as u64 / iw as u64) as u32).min(mw - 1);
-            let sample = mask_gray.get_pixel(mx, my)[0];
-            let pixel = rgba_image.get_pixel_mut(x, y);
-            pixel[3] = ((pixel[3] as u32 * sample as u32) / 255) as u8;
-        }
-    }
-    true
 }
 
 /// Build the `PixmapPaint` used to blit an already-flipped image into
@@ -11345,7 +10977,7 @@ fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
 /// Returns `None` for any malformed array — wrong length for `ncomp`, a
 /// non-integer entry, a negative bound, or `min > max` — so the caller can fall
 /// back to no masking rather than guess.
-fn parse_color_key_mask(arr: &[Object], ncomp: usize) -> Option<Vec<(u32, u32)>> {
+pub(crate) fn parse_color_key_mask(arr: &[Object], ncomp: usize) -> Option<Vec<(u32, u32)>> {
     if ncomp == 0 || arr.len() != ncomp * 2 {
         return None;
     }
@@ -11365,7 +10997,7 @@ fn parse_color_key_mask(arr: &[Object], ncomp: usize) -> Option<Vec<(u32, u32)>>
 /// corresponding colour-key `(min, max)` ranges, meaning the pixel must be made
 /// fully transparent (ISO 32000-1 §8.9.6.4). Returns `false` on any length
 /// mismatch so a bad range set never masks.
-fn color_key_pixel_masked(components: &[u8], ranges: &[(u32, u32)]) -> bool {
+pub(crate) fn color_key_pixel_masked(components: &[u8], ranges: &[(u32, u32)]) -> bool {
     if components.is_empty() || components.len() != ranges.len() {
         return false;
     }
@@ -11373,53 +11005,6 @@ fn color_key_pixel_masked(components: &[u8], ranges: &[(u32, u32)]) -> bool {
         .iter()
         .zip(ranges.iter())
         .all(|(&c, &(lo, hi))| (c as u32) >= lo && (c as u32) <= hi)
-}
-
-/// Apply a colour-key `/Mask` to an already-decoded RGBA image by zeroing the
-/// alpha of every source pixel whose raw component samples all fall within the
-/// mask ranges.
-///
-/// Colour-key masking is defined against the raw pre-Decode samples. Those are
-/// only recoverable from an 8-bit `ImageData::Raw` buffer whose per-pixel byte
-/// count matches `ranges.len()`. For anything else (JPEG, non-8-bit depths, or a
-/// palette-expanded Indexed image whose original indices are lost) the ranges
-/// cannot be mapped onto the decoded pixels, so masking is skipped rather than
-/// applied incorrectly.
-fn apply_color_key_mask(
-    image: &crate::extractors::images::PdfImage,
-    ranges: &[(u32, u32)],
-    rgba: &mut image::RgbaImage,
-) {
-    use crate::extractors::images::ImageData;
-
-    let ncomp = ranges.len();
-    let ImageData::Raw { pixels, format } = image.data() else {
-        log::debug!("color-key /Mask: non-raw (e.g. JPEG) image, skipping");
-        return;
-    };
-    if image.bits_per_component() != 8 || format.bytes_per_pixel() != ncomp {
-        log::debug!(
-            "color-key /Mask: unsupported layout (bpc={}, bpp={}, ncomp={}), skipping",
-            image.bits_per_component(),
-            format.bytes_per_pixel(),
-            ncomp
-        );
-        return;
-    }
-    let w = rgba.width() as usize;
-    let h = rgba.height() as usize;
-    if pixels.len() < w * h * ncomp {
-        log::debug!("color-key /Mask: sample buffer too small, skipping");
-        return;
-    }
-    for y in 0..h {
-        for x in 0..w {
-            let base = (y * w + x) * ncomp;
-            if color_key_pixel_masked(&pixels[base..base + ncomp], ranges) {
-                rgba.get_pixel_mut(x as u32, y as u32)[3] = 0;
-            }
-        }
-    }
 }
 
 // Test-only counter that records how many `apply_pending_clip` calls actually
