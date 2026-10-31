@@ -37,11 +37,8 @@ use crate::object::Object;
 use std::collections::HashMap;
 use tiny_skia::{Mask, Pixmap, Transform};
 
-/// Hard cap on the number of triangles rasterised for one shading. Meshes
-/// this large are almost always malformed; the cap bounds worst-case work.
-const MAX_TRIANGLES: usize = 4_000_000;
-/// Hard cap on Coons/tensor patches decoded for one shading.
-const MAX_PATCHES: usize = 500_000;
+// ── pdf_manipulator patch: a mesh is streamed, so its size needs no cap ──
+// ── end pdf_manipulator patch ──
 /// Upper bound on the per-patch subdivision grid (N×N cells).
 const MAX_SUBDIV: usize = 10;
 /// Upper bound on the Type 1 domain sampling grid (N×N nodes).
@@ -107,7 +104,8 @@ pub(crate) fn render_mesh_shading(
     match shading_type {
         1 => render_function_based(pixmap, shading, transform, clip_mask, &to_rgba),
         4..=7 => {
-            let data = match shading_obj.decode_stream_data() {
+            // ── pdf_manipulator patch: a mesh is streamed, one triangle or patch at a time ──
+            let data = match crate::host::content::parts::decoded_reader(shading_obj) {
                 Ok(d) => d,
                 Err(e) => {
                     log::debug!("Mesh shading type {shading_type}: stream decode failed: {e}");
@@ -123,20 +121,21 @@ pub(crate) fn render_mesh_shading(
             };
             match shading_type {
                 4 => {
-                    let tris = decode_type4_stream(&data, &params, MAX_TRIANGLES);
-                    rasterize_raw_triangles(pixmap, &tris, transform, clip_mask, &to_rgba);
+                    let tris = Type4Triangles::new(BitReader::new(data), &params);
+                    rasterize_raw_triangles(pixmap, tris, transform, clip_mask, &to_rgba);
                 },
                 5 => {
-                    let tris = decode_type5_stream(&data, &params, MAX_TRIANGLES);
-                    rasterize_raw_triangles(pixmap, &tris, transform, clip_mask, &to_rgba);
+                    let tris = Type5Triangles::new(BitReader::new(data), &params);
+                    rasterize_raw_triangles(pixmap, tris, transform, clip_mask, &to_rgba);
                 },
                 6 | 7 => {
                     let is_tensor = shading_type == 7;
-                    let patches = decode_patches(&data, is_tensor, &params, MAX_PATCHES);
-                    render_patches(pixmap, &patches, is_tensor, transform, clip_mask, &to_rgba);
+                    let patches = Patches::new(BitReader::new(data), is_tensor, &params);
+                    render_patches(pixmap, patches, is_tensor, transform, clip_mask, &to_rgba);
                 },
                 _ => unreachable!(),
             }
+            // ── end pdf_manipulator patch ──
             Ok(())
         },
         other => {
@@ -150,44 +149,58 @@ pub(crate) fn render_mesh_shading(
 // Bit-packed stream reader (MSB-first, no per-field byte alignment).
 // ===========================================================================
 
-/// Sequential MSB-first bit reader over a byte slice. Every read is
-/// bounded: once the cursor passes the end of the buffer, reads return
-/// `None` and decoding stops gracefully.
-struct BitReader<'a> {
-    data: &'a [u8],
+// ── pdf_manipulator patch: a mesh is streamed, one triangle or patch at a time ──
+/// Sequential MSB-first bit reader over a byte source, read in 4 KiB chunks.
+/// Every read is bounded: once the source ends or fails, reads return `None`
+/// and decoding stops gracefully.
+struct BitReader<R: std::io::Read> {
+    source: R,
+    chunk: Box<[u8; 4096]>,
+    len: usize,
     bit_pos: usize,
 }
 
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, bit_pos: 0 }
+impl<R: std::io::Read> BitReader<R> {
+    fn new(source: R) -> Self {
+        Self {
+            source,
+            chunk: Box::new([0; 4096]),
+            len: 0,
+            bit_pos: 0,
+        }
     }
 
-    /// Total bits remaining.
-    fn remaining(&self) -> usize {
-        (self.data.len() * 8).saturating_sub(self.bit_pos)
+    /// The next bit, MSB first, or `None` at the end of the source.
+    fn read_bit(&mut self) -> Option<u64> {
+        if self.bit_pos >> 3 >= self.len {
+            self.len = loop {
+                match self.source.read(&mut self.chunk[..]) {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => break n,
+                }
+            };
+            self.bit_pos = 0;
+        }
+        let byte = self.chunk[self.bit_pos >> 3];
+        let bit = (byte >> (7 - (self.bit_pos & 7))) & 1;
+        self.bit_pos += 1;
+        Some(u64::from(bit))
     }
 
     /// Read `nbits` (0..=32) as an unsigned integer, MSB first. Returns
     /// `None` when fewer than `nbits` remain.
     fn read_bits(&mut self, nbits: u32) -> Option<u64> {
-        let nbits = nbits as usize;
-        if nbits == 0 {
-            return Some(0);
-        }
-        if nbits > 32 || self.remaining() < nbits {
+        if nbits > 32 {
             return None;
         }
         let mut value: u64 = 0;
         for _ in 0..nbits {
-            let byte = self.data[self.bit_pos >> 3];
-            let bit = (byte >> (7 - (self.bit_pos & 7))) & 1;
-            value = (value << 1) | bit as u64;
-            self.bit_pos += 1;
+            value = (value << 1) | self.read_bit()?;
         }
         Some(value)
     }
 }
+// ── end pdf_manipulator patch ──
 
 /// Map a raw `nbits`-wide unsigned integer onto `[lo, hi]` per a `/Decode`
 /// pair (§8.7.4.5.5). `2^nbits - 1` is the maximum representable value.
@@ -264,7 +277,7 @@ impl MeshParams {
     }
 
     /// Read one `(x, y, comps)` vertex body (no flag) from the reader.
-    fn read_vertex(&self, reader: &mut BitReader) -> Option<RawVertex> {
+    fn read_vertex<R: std::io::Read>(&self, reader: &mut BitReader<R>) -> Option<RawVertex> {
         let rx = reader.read_bits(self.bits_per_coord)?;
         let ry = reader.read_bits(self.bits_per_coord)?;
         let x = decode_value(rx, self.bits_per_coord, self.decode[0].0, self.decode[0].1);
@@ -274,7 +287,7 @@ impl MeshParams {
     }
 
     /// Read the colour components (no coordinates) from the reader.
-    fn read_color(&self, reader: &mut BitReader) -> Option<Vec<f32>> {
+    fn read_color<R: std::io::Read>(&self, reader: &mut BitReader<R>) -> Option<Vec<f32>> {
         let n = self.ncomps();
         let mut comps = Vec::with_capacity(n);
         for i in 0..n {
@@ -298,103 +311,140 @@ struct RawVertex {
 // Type 4 — free-form Gouraud triangles.
 // ===========================================================================
 
-/// Decode a Type 4 free-form Gouraud-triangle stream into raw triangles.
+// ── pdf_manipulator patch: a mesh is streamed, one triangle or patch at a time ──
+/// A Type 4 free-form Gouraud-triangle stream, read one triangle at a time.
 /// The per-vertex edge flag stitches successive triangles: flag 0 starts a
 /// fresh triangle (its two successors complete it); flags 1/2 reuse an edge
 /// of the previous triangle (§8.7.4.5.5, Table 84).
-fn decode_type4_stream(data: &[u8], p: &MeshParams, max_tris: usize) -> Vec<[RawVertex; 3]> {
-    let mut reader = BitReader::new(data);
-    let mut tris: Vec<[RawVertex; 3]> = Vec::new();
-    // Previous triangle vertices (va, vb, vc) for shared-edge flags.
-    let mut prev: Option<[RawVertex; 3]> = None;
+struct Type4Triangles<'p, R: std::io::Read> {
+    reader: BitReader<R>,
+    p: &'p MeshParams,
+    /// Previous triangle vertices (va, vb, vc) for shared-edge flags.
+    prev: Option<[RawVertex; 3]>,
+    done: bool,
+}
 
-    while reader.remaining() >= p.bits_per_flag as usize && tris.len() < max_tris {
-        let flag = match reader.read_bits(p.bits_per_flag) {
-            Some(f) => f,
-            None => break,
-        };
-        let v = match p.read_vertex(&mut reader) {
-            Some(v) => v,
-            None => break,
-        };
+impl<'p, R: std::io::Read> Type4Triangles<'p, R> {
+    fn new(reader: BitReader<R>, p: &'p MeshParams) -> Self {
+        Self {
+            reader,
+            p,
+            prev: None,
+            done: false,
+        }
+    }
 
+    fn read_triangle(&mut self) -> Option<[RawVertex; 3]> {
+        let p = self.p;
+        let flag = self.reader.read_bits(p.bits_per_flag)?;
+        let v = p.read_vertex(&mut self.reader)?;
         let tri = if flag == 0 {
             // New triangle: read the two remaining vertices (their flags are
             // 0 per spec and are consumed and ignored).
-            let _f2 = reader.read_bits(p.bits_per_flag);
-            let v2 = match p.read_vertex(&mut reader) {
-                Some(v) => v,
-                None => break,
-            };
-            let _f3 = reader.read_bits(p.bits_per_flag);
-            let v3 = match p.read_vertex(&mut reader) {
-                Some(v) => v,
-                None => break,
-            };
+            let _f2 = self.reader.read_bits(p.bits_per_flag);
+            let v2 = p.read_vertex(&mut self.reader)?;
+            let _f3 = self.reader.read_bits(p.bits_per_flag);
+            let v3 = p.read_vertex(&mut self.reader)?;
             [v, v2, v3]
         } else {
-            let prev_tri = match &prev {
-                Some(t) => t,
-                // A shared-edge flag with no predecessor is malformed; stop.
-                None => break,
-            };
+            // A shared-edge flag with no predecessor is malformed; stop.
+            let prev_tri = self.prev.as_ref()?;
             match flag {
                 // Share the (vb, vc) edge of the previous triangle.
                 1 => [prev_tri[1].clone(), prev_tri[2].clone(), v],
                 // Share the (va, vc) edge of the previous triangle.
                 2 => [prev_tri[0].clone(), prev_tri[2].clone(), v],
-                _ => break,
+                _ => return None,
             }
         };
-
-        prev = Some(tri.clone());
-        tris.push(tri);
+        self.prev = Some(tri.clone());
+        Some(tri)
     }
-    tris
 }
+
+impl<R: std::io::Read> Iterator for Type4Triangles<'_, R> {
+    type Item = [RawVertex; 3];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let tri = self.read_triangle();
+        self.done = tri.is_none();
+        tri
+    }
+}
+// ── end pdf_manipulator patch ──
 
 // ===========================================================================
 // Type 5 — lattice-form Gouraud triangles.
 // ===========================================================================
 
-/// Decode a Type 5 lattice-form stream (no flags) into raw triangles.
+// ── pdf_manipulator patch: a mesh is streamed, one triangle or patch at a time ──
+/// A Type 5 lattice-form stream (no flags), read one row at a time.
 /// Vertices are read row by row (`/VerticesPerRow` columns); each pair of
 /// adjacent rows forms a strip of two triangles per cell (§8.7.4.5.6).
-fn decode_type5_stream(data: &[u8], p: &MeshParams, max_tris: usize) -> Vec<[RawVertex; 3]> {
-    let vpr = p.vertices_per_row;
-    if vpr < 2 {
-        return Vec::new();
-    }
-    let mut reader = BitReader::new(data);
-    let mut tris: Vec<[RawVertex; 3]> = Vec::new();
-    let mut prev_row: Option<Vec<RawVertex>> = None;
+struct Type5Triangles<'p, R: std::io::Read> {
+    reader: BitReader<R>,
+    p: &'p MeshParams,
+    prev_row: Option<Vec<RawVertex>>,
+    /// The triangles of the strip between the last two rows, not yet yielded.
+    strip: std::collections::VecDeque<[RawVertex; 3]>,
+    done: bool,
+}
 
-    loop {
-        // Read a full row; a short final row ends the mesh.
+impl<'p, R: std::io::Read> Type5Triangles<'p, R> {
+    fn new(reader: BitReader<R>, p: &'p MeshParams) -> Self {
+        Self {
+            reader,
+            p,
+            prev_row: None,
+            strip: std::collections::VecDeque::new(),
+            done: p.vertices_per_row < 2,
+        }
+    }
+
+    /// Reads the next full row and queues the strip it closes. A short final
+    /// row ends the mesh.
+    fn read_row(&mut self) -> bool {
+        let vpr = self.p.vertices_per_row;
         let mut row = Vec::with_capacity(vpr);
         for _ in 0..vpr {
-            match p.read_vertex(&mut reader) {
+            match self.p.read_vertex(&mut self.reader) {
                 Some(v) => row.push(v),
-                None => break,
+                None => return false,
             }
         }
-        if row.len() < vpr {
-            break;
-        }
-        if let Some(top) = &prev_row {
+        if let Some(top) = &self.prev_row {
             for i in 0..vpr - 1 {
-                if tris.len() + 2 > max_tris {
-                    return tris;
-                }
                 // Two triangles per lattice cell.
-                tris.push([top[i].clone(), top[i + 1].clone(), row[i].clone()]);
-                tris.push([top[i + 1].clone(), row[i + 1].clone(), row[i].clone()]);
+                self.strip
+                    .push_back([top[i].clone(), top[i + 1].clone(), row[i].clone()]);
+                self.strip
+                    .push_back([top[i + 1].clone(), row[i + 1].clone(), row[i].clone()]);
             }
         }
-        prev_row = Some(row);
+        self.prev_row = Some(row);
+        true
     }
-    tris
 }
+
+impl<R: std::io::Read> Iterator for Type5Triangles<'_, R> {
+    type Item = [RawVertex; 3];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(tri) = self.strip.pop_front() {
+                return Some(tri);
+            }
+            if self.done {
+                return None;
+            }
+            self.done = !self.read_row();
+        }
+    }
+}
+// ── end pdf_manipulator patch ──
 
 // ===========================================================================
 // Types 6 & 7 — Coons / tensor-product patches.
@@ -411,29 +461,41 @@ struct Patch {
     colors: [Vec<f32>; 4],
 }
 
-/// Decode a Type 6 (Coons) or Type 7 (tensor) patch stream. Shared-edge
-/// flags reuse four boundary points and two corner colours of the previous
-/// patch (§8.7.4.5.7 Table 85 / §8.7.4.5.8 Table 86).
-fn decode_patches(data: &[u8], is_tensor: bool, p: &MeshParams, max_patches: usize) -> Vec<Patch> {
-    let mut reader = BitReader::new(data);
-    let mut patches: Vec<Patch> = Vec::new();
-    let mut prev: Option<Patch> = None;
-    let total_points = if is_tensor { 16 } else { 12 };
+// ── pdf_manipulator patch: a mesh is streamed, one triangle or patch at a time ──
+/// A Type 6 (Coons) or Type 7 (tensor) patch stream, read one patch at a
+/// time. Shared-edge flags reuse four boundary points and two corner colours
+/// of the previous patch (§8.7.4.5.7 Table 85 / §8.7.4.5.8 Table 86).
+struct Patches<'p, R: std::io::Read> {
+    reader: BitReader<R>,
+    is_tensor: bool,
+    p: &'p MeshParams,
+    prev: Option<Patch>,
+    done: bool,
+}
 
-    let read_point = |r: &mut BitReader| -> Option<Pt> {
-        let rx = r.read_bits(p.bits_per_coord)?;
-        let ry = r.read_bits(p.bits_per_coord)?;
+impl<'p, R: std::io::Read> Patches<'p, R> {
+    fn new(reader: BitReader<R>, is_tensor: bool, p: &'p MeshParams) -> Self {
+        Self {
+            reader,
+            is_tensor,
+            p,
+            prev: None,
+            done: false,
+        }
+    }
+
+    fn read_point(&mut self) -> Option<Pt> {
+        let p = self.p;
+        let rx = self.reader.read_bits(p.bits_per_coord)?;
+        let ry = self.reader.read_bits(p.bits_per_coord)?;
         Some((
             decode_value(rx, p.bits_per_coord, p.decode[0].0, p.decode[0].1),
             decode_value(ry, p.bits_per_coord, p.decode[1].0, p.decode[1].1),
         ))
-    };
+    }
 
-    while reader.remaining() >= p.bits_per_flag as usize && patches.len() < max_patches {
-        let flag = match reader.read_bits(p.bits_per_flag) {
-            Some(f) => f,
-            None => break,
-        };
+    fn read_patch(&mut self) -> Option<Patch> {
+        let flag = self.reader.read_bits(self.p.bits_per_flag)?;
 
         let mut boundary = [(0.0f32, 0.0f32); 12];
         let mut interior = [(0.0f32, 0.0f32); 4];
@@ -443,17 +505,14 @@ fn decode_patches(data: &[u8], is_tensor: bool, p: &MeshParams, max_patches: usi
         let (start_pt, start_color) = if flag == 0 {
             (0usize, 0usize)
         } else {
-            let prev_patch = match &prev {
-                Some(pp) => pp,
-                None => break,
-            };
+            let prev_patch = self.prev.as_ref()?;
             // Reuse four boundary points and two corner colours of the
             // previous patch, selected by the shared-edge flag.
             let (pts, cols): ([usize; 4], [usize; 2]) = match flag {
                 1 => ([3, 4, 5, 6], [1, 2]),
                 2 => ([6, 7, 8, 9], [2, 3]),
                 3 => ([9, 10, 11, 0], [3, 0]),
-                _ => break,
+                _ => return None,
             };
             for (dst, &src) in pts.iter().enumerate() {
                 boundary[dst] = prev_patch.boundary[src];
@@ -464,42 +523,18 @@ fn decode_patches(data: &[u8], is_tensor: bool, p: &MeshParams, max_patches: usi
         };
 
         // Read the remaining boundary points.
-        let mut ok = true;
-        for slot in boundary.iter_mut().take(12).skip(start_pt) {
-            match read_point(&mut reader) {
-                Some(pt) => *slot = pt,
-                None => {
-                    ok = false;
-                    break;
-                },
-            }
+        for slot in boundary.iter_mut().skip(start_pt) {
+            *slot = self.read_point()?;
         }
         // Tensor patches carry four extra interior points after the
         // boundary; Coons patches do not.
-        if ok && is_tensor && total_points == 16 {
+        if self.is_tensor {
             for slot in interior.iter_mut() {
-                match read_point(&mut reader) {
-                    Some(pt) => *slot = pt,
-                    None => {
-                        ok = false;
-                        break;
-                    },
-                }
+                *slot = self.read_point()?;
             }
         }
-        if ok {
-            for slot in colors.iter_mut().take(4).skip(start_color) {
-                match p.read_color(&mut reader) {
-                    Some(c) => *slot = c,
-                    None => {
-                        ok = false;
-                        break;
-                    },
-                }
-            }
-        }
-        if !ok {
-            break;
+        for slot in colors.iter_mut().skip(start_color) {
+            *slot = self.p.read_color(&mut self.reader)?;
         }
 
         let patch = Patch {
@@ -508,15 +543,28 @@ fn decode_patches(data: &[u8], is_tensor: bool, p: &MeshParams, max_patches: usi
             colors,
         };
         // Keep a copy for the next patch's shared-edge reference.
-        prev = Some(Patch {
+        self.prev = Some(Patch {
             boundary: patch.boundary,
             interior: patch.interior,
             colors: patch.colors.clone(),
         });
-        patches.push(patch);
+        Some(patch)
     }
-    patches
 }
+
+impl<R: std::io::Read> Iterator for Patches<'_, R> {
+    type Item = Patch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let patch = self.read_patch();
+        self.done = patch.is_none();
+        patch
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Cubic Bézier point at parameter `t` over four control points.
 fn bezier(p0: Pt, p1: Pt, p2: Pt, p3: Pt, t: f32) -> Pt {
@@ -588,7 +636,9 @@ fn coons_point(b: &[Pt; 12], s: f32, t: f32) -> Pt {
 /// interpolated bilinearly across the grid.
 fn render_patches(
     pixmap: &mut Pixmap,
-    patches: &[Patch],
+    // ── pdf_manipulator patch: a mesh is streamed, one triangle or patch at a time ──
+    patches: impl Iterator<Item = Patch>,
+    // ── end pdf_manipulator patch ──
     is_tensor: bool,
     transform: Transform,
     clip_mask: Option<&Mask>,
@@ -596,14 +646,6 @@ fn render_patches(
 ) {
     let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
     for patch in patches {
-        // Resolve the four corner colours (RGBA) once.
-        let c = [
-            to_rgba(&patch.colors[0]),
-            to_rgba(&patch.colors[1]),
-            to_rgba(&patch.colors[2]),
-            to_rgba(&patch.colors[3]),
-        ];
-
         // Adaptive subdivision from the device-space size of the corners.
         let corners = [
             patch.boundary[0],
@@ -619,14 +661,25 @@ fn render_patches(
                 extent = extent.max(d);
             }
         }
-        // Skip patches wholly outside the canvas (cheap corner test).
-        if dev
-            .iter()
-            .all(|p| p.0 < 0.0 || p.0 > w || p.1 < 0.0 || p.1 > h)
-            && !bbox_intersects_canvas(&dev, w, h)
-        {
+        // ── pdf_manipulator patch: a patch is dropped when its control points miss the band ──
+        // A cubic patch lies within the hull of its control points, which
+        // bulge past the corners, so the corners alone cannot say it misses.
+        let mut control: Vec<Pt> = patch.boundary.iter().map(|&p| map_pt(transform, p)).collect();
+        if is_tensor {
+            control.extend(patch.interior.iter().map(|&p| map_pt(transform, p)));
+        }
+        if !bbox_intersects_canvas(&control, w, h) {
             continue;
         }
+        // Resolve the four corner colours (RGBA) once, for a patch that
+        // reaches the band.
+        // ── end pdf_manipulator patch ──
+        let c = [
+            to_rgba(&patch.colors[0]),
+            to_rgba(&patch.colors[1]),
+            to_rgba(&patch.colors[2]),
+            to_rgba(&patch.colors[3]),
+        ];
         let n = ((extent / 16.0).ceil() as usize).clamp(1, MAX_SUBDIV);
 
         // Precompute grid nodes: device point + bilinear RGBA per (i, j).
@@ -776,18 +829,31 @@ fn render_function_based(
 /// barycentric colour interpolation.
 fn rasterize_raw_triangles(
     pixmap: &mut Pixmap,
-    tris: &[[RawVertex; 3]],
+    // ── pdf_manipulator patch: a mesh is streamed, one triangle or patch at a time ──
+    tris: impl Iterator<Item = [RawVertex; 3]>,
     transform: Transform,
     clip_mask: Option<&Mask>,
     to_rgba: &dyn Fn(&[f32]) -> (f32, f32, f32, f32),
 ) {
+    let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
     for tri in tris {
+        // A triangle that does not reach the band is dropped before its
+        // colours are resolved.
+        let corners = [
+            map_pt(transform, (tri[0].x, tri[0].y)),
+            map_pt(transform, (tri[1].x, tri[1].y)),
+            map_pt(transform, (tri[2].x, tri[2].y)),
+        ];
+        if !bbox_intersects_canvas(&corners, w, h) {
+            continue;
+        }
         let mut verts = [((0.0f32, 0.0f32), (0.0f32, 0.0f32, 0.0f32, 0.0f32)); 3];
         for (k, rv) in tri.iter().enumerate() {
-            verts[k] = (map_pt(transform, (rv.x, rv.y)), to_rgba(&rv.comps));
+            verts[k] = (corners[k], to_rgba(&rv.comps));
         }
         fill_gouraud_triangle(pixmap, clip_mask, verts[0], verts[1], verts[2]);
     }
+    // ── end pdf_manipulator patch ──
 }
 
 /// Map a shading-space point through the shading→device transform.
@@ -1247,7 +1313,7 @@ mod tests {
     fn bit_reader_reads_msb_first_and_bounds() {
         // 0b1011_0010, 0b1100_0000
         let data = [0b1011_0010u8, 0b1100_0000u8];
-        let mut r = BitReader::new(&data);
+        let mut r = BitReader::new(&data[..]);
         assert_eq!(r.read_bits(1), Some(1));
         assert_eq!(r.read_bits(3), Some(0b011));
         assert_eq!(r.read_bits(4), Some(0b0010));
@@ -1290,7 +1356,7 @@ mod tests {
                                 // Second triangle: flag 1 reuses edge (vb, vc) of the first.
         push_v(1, 255, 255, 255); // (1,1) colour 1
 
-        let tris = decode_type4_stream(&bytes, &params, 100);
+        let tris: Vec<_> = Type4Triangles::new(BitReader::new(&bytes[..]), &params).collect();
         assert_eq!(tris.len(), 2, "expected two triangles");
         // First triangle corners.
         assert!((tris[0][0].x - 0.0).abs() < 1e-4 && (tris[0][0].y - 0.0).abs() < 1e-4);
@@ -1321,7 +1387,7 @@ mod tests {
         for &x in &[0u8, 128, 255] {
             bytes.extend_from_slice(&[x, 255, 255]);
         }
-        let tris = decode_type5_stream(&bytes, &params, 100);
+        let tris: Vec<_> = Type5Triangles::new(BitReader::new(&bytes[..]), &params).collect();
         // (vpr-1) cells × 2 triangles = 4.
         assert_eq!(tris.len(), 4);
     }
@@ -1375,7 +1441,7 @@ mod tests {
         bytes.extend_from_slice(&[0, 255, 0, 255]); // flag0 (40,0) c=1
         bytes.extend_from_slice(&[0, 128, 255, 255]); // flag0 (20,40) c=1
 
-        let tris = decode_type4_stream(&bytes, &params, 100);
+        let tris: Vec<_> = Type4Triangles::new(BitReader::new(&bytes[..]), &params).collect();
         assert_eq!(tris.len(), 1);
 
         let mut pixmap = Pixmap::new(50, 50).unwrap();
@@ -1384,7 +1450,7 @@ mod tests {
             let v = c.first().copied().unwrap_or(0.0);
             (v, 0.0, 0.0, 1.0)
         };
-        rasterize_raw_triangles(&mut pixmap, &tris, Transform::identity(), None, &to_rgba);
+        rasterize_raw_triangles(&mut pixmap, tris.into_iter(), Transform::identity(), None, &to_rgba);
 
         // The triangle centroid (~20,13) must be painted red.
         let data = pixmap.data();

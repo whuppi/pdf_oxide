@@ -4,6 +4,8 @@
 //! why a battery in `test/ops/` cannot see what it proves. A proof a battery
 //! can make belongs there.
 
+#[cfg(feature = "rendering")]
+mod band_proof;
 mod content_inline;
 mod content_stream;
 mod determinism;

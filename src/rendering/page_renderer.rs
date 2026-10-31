@@ -20,6 +20,11 @@ use crate::document::PdfDocument;
 use crate::error::{Error, Result};
 use crate::object::{Object, ObjectRef};
 use crate::rendering::ext_gstate::{parse_ext_g_state_inner, ParsedExtGState};
+// ── pdf_manipulator patch: pages are rastered in bands ──
+use crate::rendering::band::{
+    demultiply_in_place, fills_counted, group_depth, BandContext, BandPlan,
+};
+// ── end pdf_manipulator patch ──
 use crate::rendering::path_rasterizer::PathRasterizer;
 use crate::rendering::resolution::{
     DeviceColor, IccTransformCache, LogicalColor, PaintIntent, PaintKind, PaintSide,
@@ -132,40 +137,9 @@ pub struct RenderOptions {
     /// exact (issue #480). Not part of the public API; set via
     /// `render_page_fit` only.
     pub(crate) scale_override: Option<f32>,
-    /// Largest output raster this render may allocate, in pixels.
-    ///
-    /// A page box times the requested scale is not bounded by anything in the
-    /// file, and some real documents are enormous: one 6 MB PDF in the wild
-    /// declares a 12608 x 16806 pt page carrying a 211.9 megapixel image,
-    /// which at 72 dpi is an 847 MB pixmap before a single copy is taken. With
-    /// the working buffers a render of it reached 11.6 GB and the process was
-    /// killed — and an OOM kill is a signal, so the caller gets no `Result` to
-    /// handle and the host simply dies.
-    ///
-    /// That is unacceptable where this library is meant to run. A browser tab
-    /// is commonly capped well under 4 GB and a mobile app is terminated long
-    /// before it, so an unbounded raster is the difference between the library
-    /// working on those targets and not.
-    ///
-    /// Over budget, the scale is reduced to fit rather than failing: a caller
-    /// asking for a thumbnail of a huge page wants the thumbnail, and a viewer
-    /// would do the same. Set it higher for a print pipeline, lower for a
-    /// constrained target.
-    pub max_output_pixels: u64,
+    // ── pdf_manipulator patch: no output cap; band rendering bounds the memory of a render ──
+    // ── end pdf_manipulator patch ──
 }
-
-/// Default output-raster budget: 16 megapixels, i.e. a 64 MB RGBA pixmap.
-///
-/// Sized to clear any realistic page while still bounding the pathological
-/// ones. A 4K display is 8.3 Mpx and A4 at 300 dpi is 8.7 Mpx, both well
-/// inside it; across a 2007-document corpus the largest page rasterises to
-/// 8.03 Mpx at 72 dpi, so nothing real is touched by this cap.
-///
-/// It is also the knob for constrained hosts, because it bounds the decode as
-/// well as the raster: on a 12608 x 16806 page carrying a JPEG 2000 image of
-/// the same size, peak RSS falls from 11.0 GB unbounded to 2.8 GB here, and to
-/// 799 MB at 4 Mpx. Lower it on mobile and WASM; raise it for print.
-pub const DEFAULT_MAX_OUTPUT_PIXELS: u64 = 16_000_000;
 
 impl Default for RenderOptions {
     fn default() -> Self {
@@ -177,7 +151,8 @@ impl Default for RenderOptions {
             jpeg_quality: 85,
             excluded_layers: HashSet::new(),
             scale_override: None,
-            max_output_pixels: DEFAULT_MAX_OUTPUT_PIXELS,
+            // ── pdf_manipulator patch: no output cap; band rendering bounds the memory of a render ──
+            // ── end pdf_manipulator patch ──
         }
     }
 }
@@ -329,6 +304,16 @@ pub struct PageRenderer {
     /// ignored (ISO 32000-1:2008 §9.6.5.2). `None` for `d0` glyphs and all
     /// ordinary content, which paint with their own colour operators.
     type3_fill_lock: Option<(f32, f32, f32)>,
+    // ── pdf_manipulator patch: pages are rastered in bands ──
+    /// The band being rendered: device coordinates are band-local, and this
+    /// says where the band sits in the page raster.
+    band: BandContext,
+    /// Forces the band height, for proofs that compare cuts of one page.
+    pub(crate) forced_rows: Option<u32>,
+    /// Outlines the current text object's clip-mode shows produced, counted
+    /// wherever they fell; zero is a text clip with nothing to clip to.
+    text_clip_outlines: std::cell::Cell<u64>,
+    // ── end pdf_manipulator patch ──
 }
 
 /// Maximum SMask materialisation recursion depth. A cyclic
@@ -380,6 +365,11 @@ impl PageRenderer {
             k_zero_warning_emitted: false,
             type3_depth: 0,
             type3_fill_lock: None,
+            // ── pdf_manipulator patch: pages are rastered in bands ──
+            band: BandContext::whole(0, 0),
+            forced_rows: None,
+            text_clip_outlines: std::cell::Cell::new(0),
+            // ── end pdf_manipulator patch ──
         }
     }
 
@@ -474,12 +464,68 @@ impl PageRenderer {
         self.render_page_with_options(page_num, doc)
     }
 
-    /// Render a page with specific options.
+    // ── pdf_manipulator patch: pages are rastered in bands ──
+    /// Render a page with specific options. The raster is collected from the
+    /// bands whole, as the caller of this API asked for an image in memory.
     pub fn render_page_with_options(
         &mut self,
         page_num: usize,
         doc: &PdfDocument,
     ) -> Result<RenderedImage> {
+        let total = std::cell::Cell::new(0usize);
+        let mut raster: Vec<u8> = Vec::new();
+        let (width, height) = self.render_bands(
+            doc,
+            page_num,
+            &|width, height| {
+                total.set(width as usize * height as usize * 4);
+                0..height
+            },
+            &crate::cancel::CancelCheck::none(),
+            &mut |_, band| {
+                raster
+                    .try_reserve_exact(total.get() - raster.len())
+                    .map_err(|_| Error::InvalidPdf("Failed to create pixmap".to_string()))?;
+                raster.extend_from_slice(band.data());
+                Ok(())
+            },
+        )?;
+        let size = tiny_skia::IntSize::from_wh(width, height)
+            .ok_or_else(|| Error::InvalidPdf("Failed to create pixmap".to_string()))?;
+        let pixmap = Pixmap::from_vec(raster, size)
+            .ok_or_else(|| Error::InvalidPdf("Failed to create pixmap".to_string()))?;
+
+        // Encode to output format
+        let data = match self.options.format {
+            ImageFormat::Png => encode_png(&pixmap)?,
+            ImageFormat::Jpeg => self.encode_jpeg(&pixmap)?,
+            ImageFormat::RawRgba8 => pixmap.take(),
+        };
+
+        Ok(RenderedImage {
+            data,
+            width,
+            height,
+            format: self.options.format,
+        })
+    }
+
+    /// Render the rows of a page that `select` names, band by band, handing
+    /// each finished band (premultiplied RGBA, the page's width) to
+    /// `on_band` with the page row of its top. `select` is called once with
+    /// the raster's `(width, height)`. Returns that size.
+    ///
+    /// The page's content is replayed for every band under a base transform
+    /// translated by minus the band's top, so a band holds only what the
+    /// budget allows and the page raster never exists whole.
+    pub(crate) fn render_bands(
+        &mut self,
+        doc: &PdfDocument,
+        page_num: usize,
+        select: &dyn Fn(u32, u32) -> std::ops::Range<u32>,
+        cancel: &crate::cancel::CancelCheck,
+        on_band: &mut dyn FnMut(u32, &mut Pixmap) -> Result<()>,
+    ) -> Result<(u32, u32)> {
         // Clear caches for new page
         self.fonts.clear();
         self.color_spaces.clear();
@@ -528,44 +574,14 @@ impl PageRenderer {
         // in the shared helper rather than at each call site.
         let rotation = page_info.rotation;
         let (page_w, page_h) = super::rotated_page_extent(&media_box, rotation);
-        let mut scale = self
+        let scale = self
             .options
             .scale_override
             .unwrap_or(self.options.dpi as f32 / 72.0);
 
-        // Hold the raster to the caller's budget. Nothing in the file bounds
-        // `page_box x scale`, so without this a single document can demand
-        // more memory than the machine has and take the process down by OOM
-        // rather than returning an error — and an OOM kill is a signal, so the
-        // caller gets no `Result` to handle. Reduce the scale instead of
-        // failing: the caller asked for an image of this page, and a smaller
-        // one is far more useful than a dead process.
-        //
-        // This lowers `scale` itself rather than the pixmap dimensions,
-        // because the page transform below is derived from `scale`. Shrinking
-        // only the buffer would crop the page to its top-left corner instead
-        // of scaling it down.
-        {
-            let budget = self.options.max_output_pixels.max(1);
-            let want = (f64::from(page_w) * f64::from(scale)).ceil()
-                * (f64::from(page_h) * f64::from(scale)).ceil();
-            if want > budget as f64 {
-                let shrunk = scale * (budget as f64 / want).sqrt() as f32;
-                // Keep a scale that still yields at least one pixel per axis.
-                let floor = 1.0 / page_w.max(page_h).max(1.0);
-                let shrunk = shrunk.max(floor);
-                log::warn!(
-                    "page raster {:.0}x{:.0} ({want:.0} px) exceeds the {budget} px budget; \
-                     rendering at scale {shrunk} instead of {scale}. Raise \
-                     RenderOptions::max_output_pixels to render at full size.",
-                    f64::from(page_w) * f64::from(scale),
-                    f64::from(page_h) * f64::from(scale),
-                );
-                scale = shrunk;
-            }
-        }
-        let scale = scale;
-
+        // Nothing in the file bounds `page_box x scale`, so the raster is
+        // never held whole: it is cut into bands below, and the output size is
+        // the caller's choice.
         let (width, height) = if self.options.scale_override.is_some() {
             // Float scale path: round to avoid off-by-one from exact fractional pixels.
             // Clamp to 1 so extreme aspect ratios never produce a 0-sized pixmap.
@@ -576,16 +592,7 @@ impl PageRenderer {
         } else {
             ((page_w * scale).ceil() as u32, (page_h * scale).ceil() as u32)
         };
-
-        // Create pixmap
-        let mut pixmap = Pixmap::new(width, height)
-            .ok_or_else(|| Error::InvalidPdf("Failed to create pixmap".to_string()))?;
-
-        // Fill background
-        if let Some(bg) = self.options.background {
-            let [r, g, b, a] = bg;
-            pixmap.fill(Color::from_rgba(r, g, b, a).unwrap_or(Color::WHITE));
-        }
+        let wanted = select(width, height);
 
         // Create base transform: PDF coordinates to pixel coordinates
         // PDF origin is bottom-left; we flip Y and apply page rotation.
@@ -641,44 +648,85 @@ impl PageRenderer {
         let needs_cmyk_sidecar = (self.force_cmyk_sidecar
             || doc.output_intent_cmyk_profile().is_some())
             && page_declares_transparency_or_overprint(doc, &resources);
-        if needs_cmyk_sidecar {
-            let spot_names = sidecar_mod::discover_page_spot_inks(doc, page_num);
-            self.cmyk_sidecar = Some(CmykSidecar::new(width, height, spot_names));
-        }
-
-        // Get page content stream
-        let content_data = doc.get_page_content_data(page_num)?;
-
-        // Parse content stream
-        let operators = match parse_content_stream(&content_data) {
-            Ok(ops) => ops,
-            Err(e) => {
-                return Err(e);
-            },
+        let spot_names = if needs_cmyk_sidecar {
+            sidecar_mod::discover_page_spot_inks(doc, page_num)
+        } else {
+            Vec::new()
         };
 
-        // Execute operators
-        self.execute_operators(&mut pixmap, transform, &operators, doc, page_num, &resources)?;
-
-        // Render annotations (if requested and present)
-        if self.options.render_annotations {
-            self.render_annotations(&mut pixmap, transform, doc, page_num)?;
-        }
-
-        // Encode to output format
-        let data = match self.options.format {
-            ImageFormat::Png => encode_png(&pixmap)?,
-            ImageFormat::Jpeg => self.encode_jpeg(&pixmap)?,
-            ImageFormat::RawRgba8 => pixmap.data().to_vec(),
+        // The sidecar's planes ride on every pixel of a band: four CMYK
+        // bytes and one per spot ink. The separation entry point reads the
+        // sidecar of the whole page after the render, so a page that keeps
+        // one is a single band.
+        let sidecar_bytes = if needs_cmyk_sidecar {
+            4 + spot_names.len()
+        } else {
+            0
         };
-
-        Ok(RenderedImage {
-            data,
+        let mut plan = BandPlan::new(
             width,
             height,
-            format: self.options.format,
-        })
+            4 + sidecar_bytes,
+            group_depth(doc, &resources),
+        );
+        if self.force_cmyk_sidecar && needs_cmyk_sidecar {
+            plan = plan.with_rows_per_band(height);
+        } else if let Some(rows) = self.forced_rows {
+            plan = plan.with_rows_per_band(rows);
+        }
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidPdf("Failed to create pixmap".to_string()));
+        }
+        for (top, rows) in plan.bands(wanted) {
+            cancel.check()?;
+            self.band = BandContext {
+                rows,
+                width,
+                page_height: height,
+            };
+            let mut pixmap = Pixmap::new(width, rows)
+                .ok_or_else(|| Error::InvalidPdf("Failed to create pixmap".to_string()))?;
+
+            // Fill background
+            if let Some(bg) = self.options.background {
+                let [r, g, b, a] = bg;
+                pixmap.fill(Color::from_rgba(r, g, b, a).unwrap_or(Color::WHITE));
+            }
+
+            self.cmyk_sidecar =
+                needs_cmyk_sidecar.then(|| CmykSidecar::new(width, rows, spot_names.clone()));
+
+            // Every device coordinate of this band is relative to its top.
+            let band_transform = transform.post_translate(0.0, -(top as f32));
+
+            let mut stream = doc.page_operators(page_num)?;
+            let mut operators = std::iter::from_fn(|| {
+                stream
+                    .next()
+                    .map(|operator| operator.map(std::borrow::Cow::Owned))
+            });
+            self.execute_operator_stream(
+                &mut pixmap,
+                band_transform,
+                &mut operators,
+                doc,
+                page_num,
+                &resources,
+                None,
+                None,
+            )?;
+
+            // Render annotations (if requested and present)
+            if self.options.render_annotations {
+                self.render_annotations(&mut pixmap, band_transform, doc, page_num)?;
+            }
+
+            on_band(top, &mut pixmap)?;
+        }
+
+        Ok((width, height))
     }
+    // ── end pdf_manipulator patch ──
 
     /// Load resources (fonts, color spaces) into local cache.
     fn load_resources(&mut self, doc: &PdfDocument, resources: &Object) -> Result<()> {
@@ -812,6 +860,34 @@ impl PageRenderer {
         initial_clip: Option<tiny_skia::Mask>,
         inherited: Option<&GraphicsState>,
     ) -> Result<()> {
+        // ── pdf_manipulator patch: operators are consumed as a stream ──
+        let mut stream = operators.iter().map(|op| Ok(std::borrow::Cow::Borrowed(op)));
+        self.execute_operator_stream(
+            pixmap,
+            base_transform,
+            &mut stream,
+            doc,
+            page_num,
+            resources,
+            initial_clip,
+            inherited,
+        )
+    }
+
+    /// [`Self::execute_operators_clipped`] over operators read one at a time,
+    /// so a page's content never has to be held whole.
+    fn execute_operator_stream(
+        &mut self,
+        pixmap: &mut Pixmap,
+        base_transform: Transform,
+        operators: &mut dyn Iterator<Item = Result<std::borrow::Cow<'_, Operator>>>,
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+        initial_clip: Option<tiny_skia::Mask>,
+        inherited: Option<&GraphicsState>,
+    ) -> Result<()> {
+        // ── end pdf_manipulator patch ──
         // Per-render snapshot lives on `self.excluded_layers_snapshot` (filled
         // by `render_page_with_options`). Recursive calls into this function
         // reuse the same `Arc` without any allocation. We snapshot it as a
@@ -923,7 +999,11 @@ impl PageRenderer {
         // at most once per unique name in scope.
         let mut ext_g_state_cache: std::collections::HashMap<String, ParsedExtGState> =
             std::collections::HashMap::new();
-        for op in operators {
+        // ── pdf_manipulator patch: operators are consumed as a stream ──
+        for item in operators {
+            let op_owned = item?;
+            let op: &Operator = &op_owned;
+            // ── end pdf_manipulator patch ──
             // While a Type 3 `d1` glyph stencil is being painted, colour-
             // setting operators are ignored so the glyph keeps the current
             // fill colour (ISO 32000-1:2008 §9.6.5.2).
@@ -1748,7 +1828,11 @@ impl PageRenderer {
                             &gs_stack,
                         );
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        if let Some(path) = current_path.finish() {
+                        // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
+                        if let Some(path) = current_path.finish().filter(|path| {
+                            !self.path_misses_band(path, base_transform, gs_stack.current(), true)
+                        }) {
+                            // ── end pdf_manipulator patch ──
                             let gs_clone = gs_stack.current().clone();
                             // Stroke side mirrors the path-fill routing —
                             // route through the pipeline so Type 4 Separation
@@ -1851,7 +1935,11 @@ impl PageRenderer {
                             &gs_stack,
                         );
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        if let Some(path) = current_path.finish() {
+                        // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
+                        if let Some(path) = current_path.finish().filter(|path| {
+                            !self.path_misses_band(path, base_transform, gs_stack.current(), false)
+                        }) {
+                            // ── end pdf_manipulator patch ──
                             let gs_clone = gs_stack.current().clone();
                             // Resolve the active fill colour through the
                             // pipeline (PostScript Type 4 tint transforms,
@@ -2023,7 +2111,11 @@ impl PageRenderer {
                         ) {
                             current_path.close();
                         }
-                        if let Some(path) = current_path.finish() {
+                        // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
+                        if let Some(path) = current_path.finish().filter(|path| {
+                            !self.path_misses_band(path, base_transform, gs_stack.current(), true)
+                        }) {
+                            // ── end pdf_manipulator patch ──
                             let gs_clone = gs_stack.current().clone();
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
                             let fill_rule = if matches!(op, Operator::CloseFillStrokeEvenOdd) {
@@ -2212,7 +2304,16 @@ impl PageRenderer {
                             &gs_stack,
                         );
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        if let Some(path) = current_path.finish() {
+                        // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
+                        if let Some(path) = current_path.finish().filter(|path| {
+                            !self.path_misses_band(
+                                path,
+                                base_transform,
+                                gs_stack.current(),
+                                matches!(op, Operator::FillStrokeEvenOdd),
+                            )
+                        }) {
+                            // ── end pdf_manipulator patch ──
                             let gs_clone = gs_stack.current().clone();
                             let transform = combine_transforms(base_transform, &gs_clone.ctm);
                             // One unified resolve covers both fill and the
@@ -2416,6 +2517,9 @@ impl PageRenderer {
                     // at ET). Any leftover from a malformed/unterminated prior
                     // block is discarded here.
                     text_clip_accum = None;
+                    // ── pdf_manipulator patch: whether a show has outlines does not depend on the band ──
+                    self.text_clip_outlines.set(0);
+                    // ── end pdf_manipulator patch ──
                     let gs = gs_stack.current_mut();
                     gs.text_matrix = Matrix::identity();
                     gs.text_line_matrix = Matrix::identity();
@@ -2436,6 +2540,16 @@ impl PageRenderer {
                             .0
                             .iter()
                             .any(|px| px[3] != 0);
+                        // ── pdf_manipulator patch: whether a show has outlines does not depend on the band ──
+                        // Outlines that all fell outside this band clip it to
+                        // nothing; only a text with no outline anywhere leaves
+                        // the clip alone.
+                        if !has_coverage && self.text_clip_outlines.get() != 0 {
+                            if let Some(slot) = clip_stack.last_mut() {
+                                *slot = tiny_skia::Mask::new(pixmap.width(), pixmap.height());
+                            }
+                        }
+                        // ── end pdf_manipulator patch ──
                         if has_coverage {
                             let text_mask = tiny_skia::Mask::from_pixmap(
                                 scratch.as_ref(),
@@ -3291,7 +3405,14 @@ impl PageRenderer {
                 // synthetic `Object::Stream`, and paint it through the same
                 // `render_image`/`render_image_mask` used for `Do` images.
                 Operator::InlineImage { dict, data } => {
-                    if excluded_layer_depth == 0 {
+                    // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
+                    if excluded_layer_depth == 0
+                        && !self.band.misses_unit_square(combine_transforms(
+                            base_transform,
+                            &gs_stack.current().ctm,
+                        ))
+                    {
+                        // ── end pdf_manipulator patch ──
                         let gs_clone = gs_stack.current().clone();
                         let transform = combine_transforms(base_transform, &gs_clone.ctm);
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
@@ -3555,6 +3676,26 @@ impl PageRenderer {
 
         Ok(())
     }
+
+    // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
+    /// True when painting `path` under the current graphics state (stroked
+    /// when `stroked`) cannot touch the band being rendered.
+    fn path_misses_band(
+        &self,
+        path: &tiny_skia::Path,
+        base_transform: Transform,
+        gs: &GraphicsState,
+        stroked: bool,
+    ) -> bool {
+        let transform = combine_transforms(base_transform, &gs.ctm);
+        if stroked {
+            self.band
+                .misses_stroke(path, transform, gs.line_width, gs.miter_limit)
+        } else {
+            self.band.misses_path(path, transform, 0.0)
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Returns `true` when the font currently selected in `gs` is a Type 3
     /// font. Type 3 glyphs are user-defined content streams, rendered by
@@ -4430,6 +4571,10 @@ impl PageRenderer {
                             // Check subtype
                             if let Some(subtype) = dict.get("Subtype").and_then(|o| o.as_name()) {
                                 match subtype {
+                                    // ── pdf_manipulator patch: a paint that misses the band draws nothing ──
+                                    "Image" if self.band.misses_unit_square(transform) => {},
+                                    "Form" if form_misses_band(&self.band, dict, transform) => {},
+                                    // ── end pdf_manipulator patch ──
                                     "Image" => {
                                         // ImageMask XObjects (1-bit stencil painted with
                                         // the current fill colour) take their fill from
@@ -4563,10 +4708,11 @@ impl PageRenderer {
     /// pixel is the most the rasteriser can represent, which makes this the
     /// useful decode and resample target.
     ///
-    /// The result is additionally capped by the pixmap: an image scaled far past
-    /// the page cannot show more detail than the page can hold. Returns `None`
-    /// when the transform is degenerate or non-finite, meaning "no useful bound".
-    fn device_footprint(transform: Transform, pixmap: &Pixmap) -> Option<(u32, u32)> {
+    /// The result is additionally capped by the page raster, of which the
+    /// pixmap is only one band: an image scaled far past the page cannot show
+    /// more detail than the page can hold. Returns `None` when the transform
+    /// is degenerate or non-finite, meaning "no useful bound".
+    fn device_footprint(transform: Transform, page: (u32, u32)) -> Option<(u32, u32)> {
         let edge_w = transform.sx.hypot(transform.ky).abs();
         let edge_h = transform.kx.hypot(transform.sy).abs();
         if !edge_w.is_finite() || !edge_h.is_finite() {
@@ -4582,7 +4728,7 @@ impl PageRenderer {
             }
         };
 
-        Some((fit(edge_w, pixmap.width()), fit(edge_h, pixmap.height())))
+        Some((fit(edge_w, page.0), fit(edge_h, page.1)))
     }
 
     /// Render an image XObject.
@@ -4606,7 +4752,7 @@ impl PageRenderer {
         // a format that can decode progressively (JPEG 2000) stops at the
         // resolution level that covers it instead of decoding samples that the
         // resampler below would immediately discard.
-        let target = Self::device_footprint(transform, pixmap);
+        let target = Self::device_footprint(transform, (self.band.width, self.band.page_height));
         let pdf_image = extract_image_from_xobject_at(
             Some(doc),
             xobject,
@@ -5599,31 +5745,9 @@ impl PageRenderer {
         inherited: Option<&GraphicsState>,
     ) -> Result<()> {
         // Parse /Matrix from form dict (default: identity)
-        let form_matrix = if let Some(Object::Array(arr)) = dict.get("Matrix") {
-            let get_f32 = |i: usize| -> f32 {
-                match arr.get(i) {
-                    Some(Object::Real(v)) => *v as f32,
-                    Some(Object::Integer(v)) => *v as f32,
-                    _ => {
-                        if i == 0 || i == 3 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    },
-                }
-            };
-            Transform::from_row(
-                get_f32(0),
-                get_f32(1),
-                get_f32(2),
-                get_f32(3),
-                get_f32(4),
-                get_f32(5),
-            )
-        } else {
-            Transform::identity()
-        };
+        // ── pdf_manipulator patch: a form's matrix is read in one place ──
+        let form_matrix = form_matrix(dict);
+        // ── end pdf_manipulator patch ──
 
         // Combine parent transform with form matrix
         let combined_transform = parent_transform.pre_concat(form_matrix);
@@ -6864,6 +6988,9 @@ impl PageRenderer {
             return;
         };
         let cov_gs = Self::coverage_only_gs(gs);
+        // ── pdf_manipulator patch: whether a show has outlines does not depend on the band ──
+        let fills_before = fills_counted();
+        // ── end pdf_manipulator patch ──
         // Coverage raster is permitted to fail silently — the visible-paint
         // call for the same show already surfaces any real error, and a
         // missing silhouette simply means no clip contribution.
@@ -6878,6 +7005,10 @@ impl PageRenderer {
             None,
             &self.fonts,
         );
+        // ── pdf_manipulator patch: whether a show has outlines does not depend on the band ──
+        self.text_clip_outlines
+            .set(self.text_clip_outlines.get() + (fills_counted() - fills_before));
+        // ── end pdf_manipulator patch ──
     }
 
     /// WS1.5b — `TJ` positioning-array counterpart of
@@ -6901,6 +7032,9 @@ impl PageRenderer {
             return;
         };
         let cov_gs = Self::coverage_only_gs(gs);
+        // ── pdf_manipulator patch: whether a show has outlines does not depend on the band ──
+        let fills_before = fills_counted();
+        // ── end pdf_manipulator patch ──
         let _ = self.text_rasterizer.render_tj_array(
             scratch,
             array,
@@ -6912,6 +7046,10 @@ impl PageRenderer {
             None,
             &self.fonts,
         );
+        // ── pdf_manipulator patch: whether a show has outlines does not depend on the band ──
+        self.text_clip_outlines
+            .set(self.text_clip_outlines.get() + (fills_counted() - fills_before));
+        // ── end pdf_manipulator patch ──
     }
 
     /// Rasterise the text-show coverage for a single `Tj` / `'` / `"`
@@ -10855,15 +10993,9 @@ fn encode_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
     // Demultiply: tiny_skia stores premultiplied RGBA; PNG expects straight alpha.
     let src = pixmap.data();
     let mut data = src.to_vec();
-    for chunk in data.as_chunks_mut::<4>().0 {
-        let a = chunk[3];
-        if a != 0 && a != 255 {
-            let a32 = a as u32;
-            chunk[0] = ((chunk[0] as u32 * 255 + a32 / 2) / a32).min(255) as u8;
-            chunk[1] = ((chunk[1] as u32 * 255 + a32 / 2) / a32).min(255) as u8;
-            chunk[2] = ((chunk[2] as u32 * 255 + a32 / 2) / a32).min(255) as u8;
-        }
-    }
+    // ── pdf_manipulator patch: one demultiply for every output ──
+    demultiply_in_place(&mut data);
+    // ── end pdf_manipulator patch ──
 
     use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     use image::ImageEncoder;
@@ -11596,6 +11728,65 @@ fn intersect_clips(
         (None, None) => None,
     }
 }
+
+// ── pdf_manipulator patch: a form's matrix is read in one place ──
+/// A form's `/Matrix` (default identity); an entry that is not a number reads
+/// as the identity's.
+fn form_matrix(dict: &std::collections::HashMap<String, Object>) -> Transform {
+    let Some(Object::Array(arr)) = dict.get("Matrix") else {
+        return Transform::identity();
+    };
+    let get_f32 = |i: usize| -> f32 {
+        match arr.get(i) {
+            Some(Object::Real(v)) => *v as f32,
+            Some(Object::Integer(v)) => *v as f32,
+            _ => {
+                if i == 0 || i == 3 {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+        }
+    };
+    Transform::from_row(get_f32(0), get_f32(1), get_f32(2), get_f32(3), get_f32(4), get_f32(5))
+}
+
+/// True when a form's `/BBox`, which clips it, lies wholly outside the band,
+/// so the form draws nothing here and need not be read. A form without a
+/// usable box is never culled.
+fn form_misses_band(
+    band: &BandContext,
+    dict: &std::collections::HashMap<String, Object>,
+    transform: Transform,
+) -> bool {
+    let Some(Object::Array(arr)) = dict.get("BBox") else {
+        return false;
+    };
+    let n = |i: usize| -> Option<f32> {
+        match arr.get(i) {
+            Some(Object::Real(v)) => Some(*v as f32),
+            Some(Object::Integer(v)) => Some(*v as f32),
+            _ => None,
+        }
+    };
+    let (Some(x0), Some(y0), Some(x1), Some(y1)) = (n(0), n(1), n(2), n(3)) else {
+        return false;
+    };
+    if (x1 - x0).abs() <= f32::EPSILON || (y1 - y0).abs() <= f32::EPSILON {
+        return false;
+    }
+    let Some(rect) = tiny_skia::Rect::from_ltrb(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+    else {
+        return false;
+    };
+    band.misses_path(
+        &PathBuilder::from_rect(rect),
+        transform.pre_concat(form_matrix(dict)),
+        0.0,
+    )
+}
+// ── end pdf_manipulator patch ──
 
 fn form_bbox_clip(
     dict: &std::collections::HashMap<String, Object>,

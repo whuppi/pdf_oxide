@@ -4755,11 +4755,13 @@ pub extern "C" fn pdf_certificate_free(handle: *mut std::ffi::c_void) {
 
 // ─── Rendering ──────────────────────────────────────────────────────────────
 
+// ── pdf_manipulator patch: no output cap; band rendering bounds the memory of a render ──
 #[cfg(feature = "rendering")]
 use crate::rendering::{
     self, ImageFormat as RenderImageFormat, RenderOptions as RustRenderOptions,
-    RenderedImage as RustRenderedImage, DEFAULT_MAX_OUTPUT_PIXELS as RENDER_MAX_OUTPUT_PIXELS,
+    RenderedImage as RustRenderedImage,
 };
+// ── end pdf_manipulator patch ──
 
 #[cfg(feature = "rendering")]
 pub struct FfiRenderedImage {
@@ -4885,7 +4887,8 @@ pub extern "C" fn pdf_render_page_with_options(
         // OCG layer filtering is exposed on the variant
         // `pdf_render_page_with_options_ex` below — keeping this ABI stable.
         let opts = RustRenderOptions {
-            max_output_pixels: RENDER_MAX_OUTPUT_PIXELS,
+            // ── pdf_manipulator patch: no output cap; band rendering bounds the memory of a render ──
+            // ── end pdf_manipulator patch ──
             dpi: dpi as u32,
             format: fmt,
             background,
@@ -4990,7 +4993,8 @@ pub extern "C" fn pdf_render_page_with_options_ex(
         }
 
         let opts = RustRenderOptions {
-            max_output_pixels: RENDER_MAX_OUTPUT_PIXELS,
+            // ── pdf_manipulator patch: no output cap; band rendering bounds the memory of a render ──
+            // ── end pdf_manipulator patch ──
             dpi: dpi as u32,
             format: fmt,
             background,

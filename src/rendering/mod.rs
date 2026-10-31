@@ -30,6 +30,9 @@
 //! 3. Rasterize paths, text, and images to tiny-skia pixmap
 //! 4. Convert to output format (PNG/JPEG)
 
+// ── pdf_manipulator patch: pages are rastered in bands ──
+pub mod band;
+// ── end pdf_manipulator patch ──
 pub(crate) mod blend_nonsep;
 pub(crate) mod ext_gstate;
 pub(crate) mod mesh_shading;
@@ -47,9 +50,10 @@ pub(crate) mod separation_renderer;
 pub mod sidecar;
 mod text_rasterizer;
 
-pub use page_renderer::{
-    ImageFormat, PageRenderer, RenderOptions, RenderedImage, DEFAULT_MAX_OUTPUT_PIXELS,
-};
+// ── pdf_manipulator patch: pages are rastered in bands ──
+pub use band::{render_page_rows, BandPlan, RowSink};
+pub use page_renderer::{ImageFormat, PageRenderer, RenderOptions, RenderedImage};
+// ── end pdf_manipulator patch ──
 pub use separation_renderer::{render_separation, render_separations, SeparationPlate};
 
 use crate::content::GraphicsState;
@@ -372,6 +376,9 @@ pub(crate) fn guarded_fill_path(
     transform: tiny_skia::Transform,
     clip_mask: Option<&tiny_skia::Mask>,
 ) {
+    // ── pdf_manipulator patch: a fill that misses the band was still a fill ──
+    band::count_fill();
+    // ── end pdf_manipulator patch ──
     if !rasterizable_on(path, transform, 0.0, pixmap.width(), pixmap.height()) {
         log::debug!("skipping unrasterizable draw: {:?}", path.bounds());
         return;
@@ -483,24 +490,24 @@ pub fn render_page(
     renderer.render_page(doc, page_num)
 }
 
+// ── pdf_manipulator patch: a region renders only the bands its crop touches ──
 /// Render a rectangular region of a page. `crop_rect_pt` is in PDF
-/// user-space points (origin bottom-left of the page). The crop is
-/// applied to the fully-rendered image at the requested DPI.
+/// user-space points (origin bottom-left of the page). Only the bands the
+/// crop touches are rendered; the crop is cut from their rows.
 pub fn render_page_region(
     doc: &crate::document::PdfDocument,
     page_num: usize,
     crop_rect_pt: (f32, f32, f32, f32),
     options: &RenderOptions,
 ) -> Result<RenderedImage> {
-    // Full-page render first — the crop is a post-process on the
-    // resulting raster. Wasteful if the crop is tiny, but matches
-    // the semantics of every PDF viewer and avoids a parallel
-    // clipped-raster code path in tiny-skia.
-    let full = render_page(doc, page_num, options)?;
-
     let (crop_x_pt, crop_y_pt, crop_w_pt, crop_h_pt) = crop_rect_pt;
     if crop_w_pt <= 0.0 || crop_h_pt <= 0.0 {
         return Err(crate::Error::InvalidPdf(format!("invalid crop rect: {crop_rect_pt:?}")));
+    }
+    if options.format == ImageFormat::RawRgba8 {
+        return Err(crate::Error::InvalidPdf(
+            "render_page_region encodes PNG or JPEG, not raw pixels".into(),
+        ));
     }
 
     let media = doc.get_page_media_box(page_num)?;
@@ -515,32 +522,57 @@ pub fn render_page_region(
     let crop_w_px = (crop_w_pt * scale).round().max(1.0) as u32;
     let crop_h_px = (crop_h_pt * scale).round().max(1.0) as u32;
 
-    // Decode, crop, re-encode using the `image` crate (already a dep).
-    let full_img = image::load_from_memory(&full.data)
-        .map_err(|e| crate::Error::InvalidPdf(format!("render output decode: {e}")))?;
-    let x = crop_x_px.min(full_img.width().saturating_sub(1));
-    let y = crop_y_px.min(full_img.height().saturating_sub(1));
-    let w = crop_w_px.min(full_img.width() - x);
-    let h = crop_h_px.min(full_img.height() - y);
-    let cropped = full_img.crop_imm(x, y, w, h);
+    // The crop clamped to the raster, known once the raster's size is.
+    let crop = std::cell::Cell::new((0u32, 0u32, 0u32, 0u32));
+    let mut pixels: Vec<u8> = Vec::new();
+    let mut renderer = PageRenderer::new(options.clone());
+    renderer.render_bands(
+        doc,
+        page_num,
+        &|full_w, full_h| {
+            let x = crop_x_px.min(full_w.saturating_sub(1));
+            let y = crop_y_px.min(full_h.saturating_sub(1));
+            let w = crop_w_px.min(full_w - x);
+            let h = crop_h_px.min(full_h - y);
+            crop.set((x, y, w, h));
+            y..y + h
+        },
+        &crate::cancel::CancelCheck::none(),
+        &mut |_, pixmap| {
+            let (x, _, w, _) = crop.get();
+            band::demultiply_in_place(pixmap.data_mut());
+            let row_bytes = pixmap.width() as usize * 4;
+            for row in pixmap.data().chunks_exact(row_bytes) {
+                pixels.extend_from_slice(&row[x as usize * 4..(x + w) as usize * 4]);
+            }
+            Ok(())
+        },
+    )?;
+    let (_, _, w, h) = crop.get();
 
     let mut buf = Vec::new();
     match options.format {
         ImageFormat::Jpeg => {
             use image::ImageEncoder;
+            let rgb: Vec<u8> = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|px| [px[0], px[1], px[2]])
+                .collect();
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
                 &mut buf,
                 options.jpeg_quality.clamp(1, 100),
             );
             encoder
-                .write_image(cropped.as_bytes(), w, h, cropped.color().into())
+                .write_image(&rgb, w, h, image::ExtendedColorType::Rgb8)
                 .map_err(|e| crate::Error::InvalidPdf(format!("jpeg encode: {e}")))?;
         },
         _ => {
             use image::codecs::png::{CompressionType, FilterType, PngEncoder};
             use image::ImageEncoder;
             PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Sub)
-                .write_image(cropped.as_bytes(), w, h, cropped.color().into())
+                .write_image(&pixels, w, h, image::ExtendedColorType::Rgba8)
                 .map_err(|e| crate::Error::InvalidPdf(format!("png encode: {e}")))?;
         },
     }
@@ -548,9 +580,10 @@ pub fn render_page_region(
         data: buf,
         width: w,
         height: h,
-        format: full.format,
+        format: options.format,
     })
 }
+// ── end pdf_manipulator patch ──
 
 /// Render a page to fit inside a target bounding box (in pixels),
 /// preserving aspect ratio. Picks the DPI that makes the larger of

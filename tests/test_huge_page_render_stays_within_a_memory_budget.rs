@@ -23,13 +23,16 @@
 //! defence, and the WASM and mobile targets have far less headroom than the
 //! machine that died.
 //!
-//! So the renderer holds the output to `RenderOptions::max_output_pixels`,
-//! reducing the scale to fit rather than failing: the caller wants an image of
-//! the page, and a smaller one beats a dead process.
+//! So the renderer never holds the raster whole: it renders the page in
+//! bands that stay inside a fixed budget and hands their rows to a sink, at
+//! the size the caller asked for. The page is neither scaled down nor
+//! cropped, and its size decides how long the render takes, not how much
+//! memory it needs.
 
 #![cfg(feature = "rendering")]
 
-use pdf_oxide::rendering::{render_page, RenderOptions, DEFAULT_MAX_OUTPUT_PIXELS};
+use pdf_oxide::cancel::CancelCheck;
+use pdf_oxide::rendering::{render_page, render_page_rows, RenderOptions, RowSink};
 use pdf_oxide::PdfDocument;
 
 /// A one-page document whose MediaBox is `w` x `h` points, with a black
@@ -70,92 +73,91 @@ fn page_sized(w: u32, h: u32) -> Vec<u8> {
     pdf
 }
 
-fn rendered(pdf: Vec<u8>, opts: &RenderOptions) -> image::DynamicImage {
+/// A sink that keeps no rows: it counts them, notes the largest piece it was
+/// handed and how many pixels are substantially darker than white.
+struct Tally {
+    /// The raster's width in pixels, to turn a piece's length into rows.
+    width: usize,
+    rows: usize,
+    largest_piece: usize,
+    dark: u64,
+}
+
+impl RowSink for Tally {
+    fn rows(&mut self, y: u32, rgba_straight: &[u8]) -> pdf_oxide::error::Result<()> {
+        assert_eq!(y as usize, self.rows, "rows arrive top to bottom without a gap");
+        self.largest_piece = self.largest_piece.max(rgba_straight.len());
+        self.rows += rgba_straight.len() / 4 / self.width;
+        for p in rgba_straight.chunks_exact(4) {
+            if p[3] > 0 && (u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3 < 128 {
+                self.dark += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Renders the page into a [`Tally`] for a raster `width` pixels wide.
+fn rendered_rows(pdf: Vec<u8>, opts: &RenderOptions, width: usize) -> (Tally, (u32, u32)) {
     let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF parses");
-    let img = render_page(&doc, 0, opts).expect("page renders");
-    image::load_from_memory(&img.data).expect("PNG decodes")
+    let mut tally = Tally {
+        width,
+        rows: 0,
+        largest_piece: 0,
+        dark: 0,
+    };
+    let size = render_page_rows(&doc, 0, opts, &mut tally, &CancelCheck::none()).expect("renders");
+    (tally, size)
 }
 
 fn rendered_dimensions(pdf: Vec<u8>, opts: &RenderOptions) -> (u32, u32) {
-    let px = rendered(pdf, opts);
-    (px.width(), px.height())
-}
-
-/// Fraction of pixels that are substantially darker than white.
-fn ink(px: &image::DynamicImage) -> f64 {
-    let rgba = px.to_rgba8();
-    let dark = rgba
-        .pixels()
-        .filter(|p| p[3] > 0 && (u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3 < 128)
-        .count();
-    dark as f64 / rgba.pixels().len() as f64
+    let doc = PdfDocument::from_bytes(pdf).expect("synthetic PDF parses");
+    let img = render_page(&doc, 0, opts).expect("page renders");
+    (img.width, img.height)
 }
 
 #[test]
-fn test_enormous_page_is_scaled_down_to_fit_the_budget() {
-    let mut opts = RenderOptions::default();
-    opts.max_output_pixels = 1_000_000;
+fn test_enormous_page_renders_at_its_natural_size_in_bounded_bands() {
+    // 5000 x 5000 pt at 72 dpi is 25 megapixels: a 100 MB raster if it were
+    // held whole.
+    let opts = RenderOptions::with_dpi(72);
+    let (tally, (w, h)) = rendered_rows(page_sized(5000, 5000), &opts, 5000);
 
-    // 5000 x 5000 pt is far over this budget at any resolution.
-    let (w, h) = rendered_dimensions(page_sized(5000, 5000), &opts);
-
-    let pixels = u64::from(w) * u64::from(h);
+    assert_eq!((w, h), (5000, 5000), "the page renders at the size asked for");
+    assert_eq!(tally.rows, 5000, "every row of the page reaches the sink");
     assert!(
-        pixels <= opts.max_output_pixels,
-        "raster {w}x{h} = {pixels} px exceeds the {} px budget; without the \
-         clamp the page allocates at its full natural size, and a genuinely \
-         large one takes the process down by OOM",
-        opts.max_output_pixels
+        tally.largest_piece <= 2 * 1024 * 1024,
+        "a band of {} bytes exceeds the 2 MiB band budget",
+        tally.largest_piece
     );
-
-    // It should still fill the budget rather than collapsing to a stub, and
-    // keep the page's square aspect ratio.
-    assert!(pixels > opts.max_output_pixels / 2, "raster {w}x{h} is far below the budget");
-    assert!(w.abs_diff(h) <= 1, "square page rendered as {w}x{h}");
 }
 
 #[test]
-fn test_over_budget_page_is_scaled_down_rather_than_cropped() {
-    // The whole page must still be in the picture. Shrinking only the output
-    // buffer, while leaving the page transform at the requested scale, would
-    // produce a raster of the right size holding the page's top-left corner —
-    // the right dimensions and the wrong image.
-    //
-    // The fixture's mark covers the middle ninth of the page, so a correctly
-    // scaled render inks about 1/9 of the raster wherever the budget lands,
-    // and a cropped one inks either none of it or all of it.
-    let mut opts = RenderOptions::default();
-    opts.max_output_pixels = 1_000_000;
+fn test_enormous_page_is_rendered_whole_rather_than_scaled_or_cropped() {
+    // The whole page must be in the picture at the requested scale. The
+    // fixture's mark covers the middle ninth of the page, so a correct render
+    // inks about 1/9 of the raster; one scaled into the wrong place, or
+    // cropped to a corner, inks none of it or all of it.
+    let opts = RenderOptions::with_dpi(72);
+    let (tally, (w, h)) = rendered_rows(page_sized(5000, 5000), &opts, 5000);
 
-    let coverage = ink(&rendered(page_sized(5000, 5000), &opts));
-
+    let coverage = tally.dark as f64 / (f64::from(w) * f64::from(h));
     assert!(
-        (0.06..0.17).contains(&coverage),
-        "expected the centre mark to cover about 1/9 of the raster, got {coverage:.4} — \
-         the page was cropped to a corner rather than scaled to fit"
+        (0.10..0.12).contains(&coverage),
+        "expected the centre mark to cover about 1/9 of the raster, got {coverage:.4}"
     );
 }
 
 #[test]
 fn test_ordinary_page_is_left_at_its_natural_size() {
-    // The counter-case: US Letter is a couple of megapixels at the default
-    // resolution, well inside the default budget, so nothing may be scaled
-    // away. Compare against an effectively unbudgeted render rather
-    // than hard-coding a size, so this keeps its meaning if the default dpi
-    // changes.
-    let natural = rendered_dimensions(page_sized(612, 792), &{
-        let mut o = RenderOptions::default();
-        o.max_output_pixels = u64::MAX;
-        o
-    });
-    let budgeted = rendered_dimensions(page_sized(612, 792), &RenderOptions::default());
+    // US Letter at the default 150 dpi: 612 x 792 pt, rounded up to whole
+    // pixels.
+    let scale = RenderOptions::default().dpi as f32 / 72.0;
+    let expected = ((612.0 * scale).ceil() as u32, (792.0 * scale).ceil() as u32);
 
     assert_eq!(
-        budgeted, natural,
-        "a page well inside the budget must render at its natural size"
-    );
-    assert!(
-        u64::from(natural.0) * u64::from(natural.1) < DEFAULT_MAX_OUTPUT_PIXELS,
-        "test premise: US Letter {natural:?} should be inside the default budget"
+        rendered_dimensions(page_sized(612, 792), &RenderOptions::default()),
+        expected,
+        "a page renders at its natural size"
     );
 }
