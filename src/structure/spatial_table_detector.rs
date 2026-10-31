@@ -180,23 +180,34 @@ impl TableDetectionConfig {
 ///   the wrapped value text. This exact shape is a reliable false-positive
 ///   signal. Sparse 2-column tables with *legitimately* missing right-hand
 ///   values (e.g. "Fax: ", "N/A" rows) are NOT rejected by this rule.
-fn is_valid_table(table: &Table) -> bool {
+// ── pdf_manipulator patch: empty cells are counted over the whole grid ──
+pub(crate) fn is_valid_table(table: &Table) -> bool {
     if table.rows.is_empty() || table.col_count == 0 {
         return false;
     }
 
+    // A cell merged across columns or rows leaves the rows after it with
+    // fewer cells than `col_count`. Counting only the empty cells that are
+    // present, against `rows * col_count`, made a grid of mostly nothing
+    // look full: 5 cells in 8 x 14, 4 of them empty, scored 0.04. The cells a
+    // table is made of are `rows * col_count`; the filled ones are the cells
+    // with text, and every other cell, present or merged away, is empty.
+    // Whole numbers, so a table exactly 60% empty is on the same side of the
+    // line on every platform.
     let total_cells = table.rows.len() * table.col_count;
-    let empty_cells = table
+    let filled_cells = table
         .rows
         .iter()
         .flat_map(|r| &r.cells)
-        .filter(|c| c.text.trim().is_empty())
-        .count();
-    let empty_ratio = empty_cells as f32 / total_cells.max(1) as f32;
+        .filter(|c| !c.text.trim().is_empty())
+        .count()
+        .min(total_cells);
+    let empty_cells = total_cells - filled_cells;
 
-    if empty_ratio > 0.6 {
+    if empty_cells * 5 > total_cells * 3 {
         return false;
     }
+    // ── end pdf_manipulator patch ──
 
     // Narrow false-positive signature: a 2-column "table" emitted from
     // label/value rows with faint cell backgrounds, where the right-hand
@@ -1530,10 +1541,23 @@ fn validate_table_structure_internal(grid: &GridStructure, config: &TableDetecti
     if cell_counts.is_empty() {
         return false;
     }
-    let most_common_count = *cell_counts
-        .iter()
-        .max_by_key(|&&count| cell_counts.iter().filter(|&&c| c == count).count())
-        .unwrap_or(&0);
+    // ── pdf_manipulator patch: the most common count is found by counting, not by comparing every pair ──
+    // The count held by the most rows; among equals the last in row order
+    // (what `max_by_key` over each row's frequency returns).
+    let mut frequency: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &count in &cell_counts {
+        *frequency.entry(count).or_insert(0) += 1;
+    }
+    let mut most_common_count = 0;
+    let mut best = 0;
+    for &count in &cell_counts {
+        let held = frequency[&count];
+        if held >= best {
+            best = held;
+            most_common_count = count;
+        }
+    }
+    // ── end pdf_manipulator patch ──
     if most_common_count == 0 {
         return false;
     }
@@ -1775,15 +1799,27 @@ impl<T: AsRef<[crate::elements::PathContent]> + ?Sized> Rulings for T {
 
 /// Clusters of the grid's rulings, split where a cluster's vertical lines
 /// stand in separate bands more than `v_split_gap` apart.
+#[cfg(test)]
 fn group_lines_into_clusters(
     rulings: &(impl Rulings + ?Sized),
     config: &TableDetectionConfig,
 ) -> Vec<LineCluster> {
+    group_lines_into_clusters_cancellable(rulings, config, &crate::cancel::CancelCheck::none())
+        .unwrap_or_default()
+}
+
+/// [`group_lines_into_clusters`] that stops with the cancelled error once
+/// `cancel` reports cancelled.
+fn group_lines_into_clusters_cancellable(
+    rulings: &(impl Rulings + ?Sized),
+    config: &TableDetectionConfig,
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<LineCluster>> {
     let grid = rulings.grid();
     let v_split_gap = config.v_split_gap;
     let mut result: Vec<LineCluster> = Vec::new();
 
-    for cluster in grid.clusters() {
+    for cluster in grid.clusters(cancel)? {
         // Y-ranges of the cluster's vertical lines.
         let mut v_ranges: Vec<(f32, f32)> = cluster
             .lines
@@ -1853,7 +1889,7 @@ fn group_lines_into_clusters(
         }
     }
 
-    result
+    Ok(result)
 }
 // ── end pdf_manipulator patch ──
 
@@ -1951,18 +1987,22 @@ fn detect_header_row_above(spans: &[TextSpan], row_ys: &[f32], col_xs: &[f32]) -
 /// [`detect_tables_in_cluster`] over each cluster, handed the spans that can
 /// matter to it: those meeting its box, and the band above it where a header
 /// row is looked for (at most one and a half median rows, so under twice the
-/// cluster's height).
+/// cluster's height). Each cluster's tables are kept only if they hold text
+/// ([`cluster_table_holds_text`]).
 fn detect_tables_in_clusters(
     spans: &[TextSpan],
     clusters: Vec<LineCluster>,
     config: &TableDetectionConfig,
-) -> Vec<Table> {
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<Table>> {
     if clusters.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let index = SpanIndex::new(spans);
     let mut tables = Vec::new();
     for cluster in clusters {
+        // One poll per cluster; the loops inside a cluster poll for themselves.
+        cancel.check()?;
         let b = cluster.bbox;
         let reach = SNAP_TOL + 1.0;
         let near = index.near(crate::geometry::Rect::new(
@@ -1971,17 +2011,24 @@ fn detect_tables_in_clusters(
             b.width + 2.0 * reach,
             b.height * 3.0 + 2.0 * reach,
         ));
-        tables.append(&mut detect_tables_in_cluster(&near, &cluster, config));
+        let mut found = detect_tables_in_cluster(&near, &cluster, config, cancel);
+        found.retain(cluster_table_holds_text);
+        tables.append(&mut found);
     }
-    tables
+    cancel.check()?;
+    Ok(tables)
 }
 // ── end pdf_manipulator patch ──
 
 // ── pdf_manipulator patch: the cluster's rulings are runs on the grid, not paths ──
+///
+/// A cancel mid-cluster returns no tables; the caller polls `cancel` after
+/// each cluster and reports the cancelled error.
 fn detect_tables_in_cluster(
     spans: &[TextSpan],
     cluster: &LineCluster,
     config: &TableDetectionConfig,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<Table> {
     const MIN_LINE_LENGTH: f32 = 5.0;
     let mut h_ys: Vec<f32> = Vec::new();
@@ -2020,19 +2067,37 @@ fn detect_tables_in_cluster(
     }
     let num_rows = row_ys.len() - 1;
     let num_cols = col_xs.len() - 1;
-    if num_cols < config.min_table_columns || num_cols > config.max_table_columns {
+    // ── pdf_manipulator patch: no limit on columns; the grid must hold text instead ──
+    // The limit dropped a real table of 16 columns without a word. A grid of
+    // many columns drawn by chance fails `cluster_table_holds_text` below.
+    if num_cols < config.min_table_columns {
         return Vec::new();
     }
+    // ── end pdf_manipulator patch ──
     let mut cells: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); num_cols]; num_rows];
     let mut assigned_any = false;
+    // ── pdf_manipulator patch: a span finds its row and column by search, and a cancel stops the loop ──
+    let mut stride = crate::cancel::Stride::new(cancel);
     for (orig_idx, span) in spans.iter().enumerate() {
+        if stride.tick().is_err() {
+            return Vec::new();
+        }
         if !assign_bbox.intersects(&span.bbox) {
             continue;
         }
         let cx = span.bbox.center().x;
         let cy = span.bbox.center().y;
-        let row_idx = (0..num_rows).find(|&r| cy <= row_ys[r] && cy >= row_ys[r + 1]);
-        let col_idx = (0..num_cols).find(|&c| cx >= col_xs[c] && cx <= col_xs[c + 1]);
+        // The first row (rows run top down, `row_ys` descends) and the first
+        // column (`col_xs` ascends) whose interval holds the point.
+        let row_idx = {
+            let r = row_ys[1..].partition_point(|&y| y > cy);
+            (r < num_rows && cy <= row_ys[r] && cy >= row_ys[r + 1]).then_some(r)
+        };
+        let col_idx = {
+            let c = col_xs[1..].partition_point(|&x| x < cx);
+            (c < num_cols && cx >= col_xs[c] && cx <= col_xs[c + 1]).then_some(c)
+        };
+        // ── end pdf_manipulator patch ──
         if let (Some(r), Some(c)) = (row_idx, col_idx) {
             cells[r][c].push(orig_idx);
             assigned_any = true;
@@ -2065,6 +2130,11 @@ fn detect_tables_in_cluster(
     let mut tables = Vec::new();
     let mut current_start_row = 0;
     while current_start_row < num_rows {
+        // ── pdf_manipulator patch: a cancel stops the cluster between its tables ──
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        // ── end pdf_manipulator patch ──
         if grid_full.is_row_empty(current_start_row) {
             current_start_row += 1;
             continue;
@@ -2091,16 +2161,19 @@ fn detect_tables_in_cluster(
                 // `current_start_row == 0`. Protect it from colspan merging.
                 let protected_header_rows =
                     usize::from(inserted_header_row && current_start_row == 0);
-                let mut table = grid_to_table(
+                // ── pdf_manipulator patch: a cancel inside the merge search ends the cluster ──
+                let merges = detect_merged_cells_visually(
                     &grid,
                     spans,
-                    Some(detect_merged_cells_visually(
-                        &grid,
-                        spans,
-                        cluster,
-                        protected_header_rows,
-                    )),
+                    cluster,
+                    protected_header_rows,
+                    cancel,
                 );
+                if cancel.is_cancelled() {
+                    return Vec::new();
+                }
+                // ── end pdf_manipulator patch ──
+                let mut table = grid_to_table(&grid, spans, Some(merges));
                 let mut min_y = f32::INFINITY;
                 let mut max_y = f32::NEG_INFINITY;
                 for r in &grid.rows {
@@ -2151,14 +2224,49 @@ fn detect_tables_in_cluster(
     tables
 }
 
+// ── pdf_manipulator patch: a cluster's grid must hold text to be a table ──
+/// Rows a table from the cluster path needs.
+const CLUSTER_MIN_ROWS: usize = 3;
+
+/// A table the cluster path builds is the cartesian product of every ruling
+/// x and y in a cluster of nearby rulings: nothing checks that the rulings
+/// meet. Dense line art, or noise, makes such a grid by chance; a drawn table
+/// fills most of its cells. So the cluster path keeps a table of at least
+/// [`CLUSTER_MIN_ROWS`] rows with text in at least half its cells (counted over
+/// `rows * col_count`, as [`is_valid_table`] counts).
+///
+/// This is a calibrated rule, not a structural one. A structural test (every
+/// row boundary a ruling across the table's width, every column boundary a
+/// ruling down its height) rejected all 338 grids the cluster path built on
+/// twelve random pages, but also the corpus's two cluster-path tables, whose
+/// verticals cover 25% and 27% of their height. These numbers keep the two (3
+/// rows, occupancy 1.00; 5 rows, 0.55). The 18 tables those pages made past
+/// every other filter were 17 of two rows and one of three rows at occupancy
+/// 0.27; a page of dense line art and text can still make a grid of three rows
+/// that is half full, and nothing here tells it from a drawn one.
+fn cluster_table_holds_text(table: &Table) -> bool {
+    let total = table.rows.len() * table.col_count;
+    let filled = table
+        .rows
+        .iter()
+        .flat_map(|r| &r.cells)
+        .filter(|c| !c.text.trim().is_empty())
+        .count();
+    table.rows.len() >= CLUSTER_MIN_ROWS && filled * 2 >= total
+}
+// ── end pdf_manipulator patch ──
+
 // ── pdf_manipulator patch: the cluster's rulings are runs on the grid, not paths ──
+///
+/// A cancel stops the search where it stands and returns what it has; the
+/// caller polls `cancel` and drops the result.
 fn detect_merged_cells_visually(
     grid: &GridStructure,
     spans: &[TextSpan],
     cluster: &LineCluster,
     protected_header_rows: usize,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<Vec<CellMergeInfo>> {
-    // ── end pdf_manipulator patch ──
     let num_rows = grid.cells.len();
     let num_cols = grid.columns.len();
     const LINE_TOLERANCE: f32 = 2.0;
@@ -2173,6 +2281,13 @@ fn detect_merged_cells_visually(
                 .collect()
         })
         .collect();
+    // Is there a ruling at this column boundary across this row, or at this
+    // row boundary across this column? Asked once per cell and boundary, so the
+    // cluster's rulings are indexed by the boundaries asked about, never
+    // scanned for each question.
+    let ruled_at = RuledAt::new(grid, cluster, LINE_TOLERANCE);
+    let mut stride = crate::cancel::Stride::new(cancel);
+    // ── end pdf_manipulator patch ──
     for r in 0..num_rows {
         // (C) WS0.3b — a header row reconstructed from the unruled strip ABOVE
         // the grid has no vertical rulings in its band, which would otherwise
@@ -2184,6 +2299,11 @@ fn detect_merged_cells_visually(
         }
         let mut c = 0;
         while c < num_cols {
+            // ── pdf_manipulator patch: a cancel stops the search ──
+            if stride.tick().is_err() {
+                return merge_info;
+            }
+            // ── end pdf_manipulator patch ──
             if merge_info[r][c].covered {
                 c += 1;
                 continue;
@@ -2195,19 +2315,13 @@ fn detect_merged_cells_visually(
             }
             let mut total_cell_width = grid.columns[c].x_max - grid.columns[c].x_min;
             for next_c in (c + 1)..num_cols {
-                let separator_x = grid.columns[next_c].x_min;
                 let y_min = grid.rows[r].y_min;
                 let y_max = grid.rows[r].y_max;
                 // ── pdf_manipulator patch: the cluster's rulings are runs on the grid ──
                 // Rendered extents: a stroke-width-encoded column rule
                 // crosses every row its drawn bar spans, not just the
                 // band around its geometric midline.
-                let has_separator = cluster.lines.iter().any(|line| {
-                    line.kind == LineKind::Vertical
-                        && (line.coord - separator_x).abs() < LINE_TOLERANCE
-                        && line.start < y_max
-                        && line.end > y_min
-                });
+                let has_separator = ruled_at.column_boundary_crosses(next_c, y_min, y_max);
                 // ── end pdf_manipulator patch ──
                 if !has_separator || (cell_text_width > total_cell_width + 2.0) {
                     colspan += 1;
@@ -2228,6 +2342,11 @@ fn detect_merged_cells_visually(
     for c in 0..num_cols {
         let mut r = 0;
         while r < num_rows {
+            // ── pdf_manipulator patch: a cancel stops the search ──
+            if stride.tick().is_err() {
+                return merge_info;
+            }
+            // ── end pdf_manipulator patch ──
             if merge_info[r][c].covered {
                 r += 1;
                 continue;
@@ -2235,7 +2354,6 @@ fn detect_merged_cells_visually(
             let mut rowspan = 1;
             let current_colspan = merge_info[r][c].colspan;
             for next_r in (r + 1)..num_rows {
-                let separator_y = grid.rows[next_r].y_max;
                 let x_min = grid.columns[c].x_min;
                 let x_max = grid.columns[c + current_colspan as usize - 1].x_max;
                 // ── pdf_manipulator patch: the cluster's rulings are runs on the grid ──
@@ -2243,12 +2361,7 @@ fn detect_merged_cells_visually(
                 // row rule encoded as a short vertical segment with a
                 // table-width stroke spans every column its drawn bar
                 // crosses.
-                let has_separator = cluster.lines.iter().any(|line| {
-                    line.kind == LineKind::Horizontal
-                        && (line.coord - separator_y).abs() < LINE_TOLERANCE
-                        && line.start < x_max
-                        && line.end > x_min
-                });
+                let has_separator = ruled_at.row_boundary_crosses(next_r, x_min, x_max);
                 // ── end pdf_manipulator patch ──
                 if !has_separator {
                     rowspan += 1;
@@ -2270,6 +2383,89 @@ fn detect_merged_cells_visually(
     }
     merge_info
 }
+
+// ── pdf_manipulator patch: merge search reads indexed rulings ──
+/// The vertical rulings at each column boundary of a grid and the horizontal
+/// ones at each row boundary: the runs within the tolerance of the boundary,
+/// by where they start, with the furthest end reached so far, so "does a run
+/// cross this interval?" is a binary search.
+struct RuledAt {
+    /// Per column: the vertical runs at its left boundary.
+    columns: Vec<RunsAt>,
+    /// Per row: the horizontal runs at its top boundary.
+    rows: Vec<RunsAt>,
+}
+
+/// Runs (start, end) sorted by start; `reach[i]` is the largest end among the first `i + 1`.
+struct RunsAt {
+    starts: Vec<f32>,
+    reach: Vec<f32>,
+}
+
+impl RunsAt {
+    fn new(mut runs: Vec<(f32, f32)>) -> Self {
+        runs.sort_by(|a, b| crate::utils::safe_float_cmp(a.0, b.0));
+        let mut top = f32::NEG_INFINITY;
+        let reach = runs
+            .iter()
+            .map(|&(_, end)| {
+                top = top.max(end);
+                top
+            })
+            .collect();
+        Self { starts: runs.iter().map(|r| r.0).collect(), reach }
+    }
+
+    /// True when a run starts before `hi` and ends after `lo`.
+    fn crosses(&self, lo: f32, hi: f32) -> bool {
+        let n = self.starts.partition_point(|&s| s < hi);
+        n > 0 && self.reach[n - 1] > lo
+    }
+}
+
+impl RuledAt {
+    fn new(grid: &GridStructure, cluster: &LineCluster, tolerance: f32) -> Self {
+        let sorted = |kind: LineKind| {
+            let mut runs: Vec<(f32, f32, f32)> = cluster
+                .lines
+                .iter()
+                .filter(|l| l.kind == kind)
+                .map(|l| (l.coord, l.start, l.end))
+                .collect();
+            runs.sort_by(|a, b| crate::utils::safe_float_cmp(a.0, b.0));
+            runs
+        };
+        // The runs whose coordinate is within `tolerance` of `at`. The search
+        // brackets generously and the test is the one the question names.
+        let near = |runs: &[(f32, f32, f32)], at: f32| {
+            let from = runs.partition_point(|r| r.0 < at - tolerance - 0.5);
+            let to = runs.partition_point(|r| r.0 <= at + tolerance + 0.5);
+            RunsAt::new(
+                runs[from..to.max(from)]
+                    .iter()
+                    .filter(|r| (r.0 - at).abs() < tolerance)
+                    .map(|r| (r.1, r.2))
+                    .collect(),
+            )
+        };
+        let (vertical, horizontal) = (sorted(LineKind::Vertical), sorted(LineKind::Horizontal));
+        Self {
+            columns: grid.columns.iter().map(|c| near(&vertical, c.x_min)).collect(),
+            rows: grid.rows.iter().map(|r| near(&horizontal, r.y_max)).collect(),
+        }
+    }
+
+    /// A vertical ruling at the left boundary of column `column` crosses the row's `y_min..y_max`.
+    fn column_boundary_crosses(&self, column: usize, y_min: f32, y_max: f32) -> bool {
+        self.columns[column].crosses(y_min, y_max)
+    }
+
+    /// A horizontal ruling at the top boundary of row `row` crosses `x_min..x_max`.
+    fn row_boundary_crosses(&self, row: usize, x_min: f32, x_max: f32) -> bool {
+        self.rows[row].crosses(x_min, x_max)
+    }
+}
+// ── end pdf_manipulator patch ──
 
 // ---------------------------------------------------------------------------
 // Intersection-based table detection (Tabula/pdfplumber/PyMuPDF pipeline)
@@ -2479,25 +2675,46 @@ fn filter_edges_by_coverage(h_edges: &mut Vec<Edge>, v_edges: &mut Vec<Edge>) {
     let x_span = (all_x_max - all_x_min).max(1.0);
     let x_tol = x_span * 0.5;
 
+    // ── pdf_manipulator patch: each edge asks a sorted index, not every edge of the other axis ──
     // Keep H-edges that have at least one V-edge whose X coord falls within
     // [start - x_tol, end + x_tol].
+    let mut v_coords: Vec<f32> = v_edges.iter().map(|v| v.coord).collect();
+    v_coords.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
     h_edges.retain(|h| {
-        v_edges
-            .iter()
-            .any(|v| v.coord >= h.start - x_tol && v.coord <= h.end + x_tol)
+        let from = v_coords.partition_point(|&c| c < h.start - x_tol);
+        v_coords.get(from).is_some_and(|&c| c <= h.end + x_tol)
     });
 
     // Keep V-edges that have at least one H-edge whose X-range overlaps
     // with this V-edge's X coordinate (within tolerance).
+    let mut reach: Vec<(f32, f32)> = h_edges
+        .iter()
+        .map(|h| (h.start - x_tol, h.end + x_tol))
+        .collect();
+    reach.sort_by(|a, b| crate::utils::safe_float_cmp(a.0, b.0));
+    let mut furthest = f32::NEG_INFINITY;
+    let furthest_to: Vec<f32> = reach
+        .iter()
+        .map(|&(_, end)| {
+            furthest = furthest.max(end);
+            furthest
+        })
+        .collect();
     v_edges.retain(|v| {
-        h_edges
-            .iter()
-            .any(|h| v.coord >= h.start - x_tol && v.coord <= h.end + x_tol)
+        let n = reach.partition_point(|&(from, _)| from <= v.coord);
+        n > 0 && furthest_to[n - 1] >= v.coord
     });
+    // ── end pdf_manipulator patch ──
 }
 
 /// Find all intersection points where an H edge and a V edge actually cross.
-fn find_intersections(h_edges: &[Edge], v_edges: &[Edge]) -> Vec<Intersection> {
+// ── pdf_manipulator patch: a cancel stops the sweep ──
+fn find_intersections(
+    h_edges: &[Edge],
+    v_edges: &[Edge],
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<Intersection>> {
+    // ── end pdf_manipulator patch ──
     let mut pts: Vec<Intersection> = Vec::new();
     // ── pdf_manipulator patch: each H edge reads the V edges in its x-range, not all of them ──
     // V edges by x; an H edge binary-searches the ones within SNAP_TOL of its
@@ -2505,7 +2722,9 @@ fn find_intersections(h_edges: &[Edge], v_edges: &[Edge]) -> Vec<Intersection> {
     // crossings and not every pair.
     let mut by_x: Vec<&Edge> = v_edges.iter().collect();
     by_x.sort_by(|a, b| crate::utils::safe_float_cmp(a.coord, b.coord));
+    let mut stride = crate::cancel::Stride::new(cancel);
     for h in h_edges {
+        stride.tick()?;
         let from = by_x.partition_point(|v| v.coord < h.start - SNAP_TOL);
         for v in by_x[from..]
             .iter()
@@ -2527,13 +2746,20 @@ fn find_intersections(h_edges: &[Edge], v_edges: &[Edge]) -> Vec<Intersection> {
         crate::utils::safe_float_cmp(a.x, b.x).then_with(|| crate::utils::safe_float_cmp(a.y, b.y))
     });
     pts.dedup_by(|a, b| (a.x - b.x).abs() <= SNAP_TOL && (a.y - b.y).abs() <= SNAP_TOL);
-    pts
+    // ── pdf_manipulator patch: the result carries the cancelled error ──
+    Ok(pts)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Build cells from intersection points.
 /// A cell exists when all four corners (x1,y1), (x2,y1), (x1,y2), (x2,y2) are present
 /// and there is no intermediate intersection between them on either axis.
-fn build_cells_from_intersections(pts: &[Intersection]) -> Vec<IntersectionCell> {
+// ── pdf_manipulator patch: a cancel stops the cell search ──
+fn build_cells_from_intersections(
+    pts: &[Intersection],
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<IntersectionCell>> {
+    // ── end pdf_manipulator patch ──
     use std::collections::BTreeSet;
 
     // Collect unique sorted X and Y coordinates.
@@ -2552,7 +2778,11 @@ fn build_cells_from_intersections(pts: &[Intersection]) -> Vec<IntersectionCell>
     let ny = ys.len();
     // present[yi * nx + xi] = true if intersection exists
     let mut present: BTreeSet<usize> = BTreeSet::new();
+    // ── pdf_manipulator patch: a cancel stops the cell search ──
+    let mut stride = crate::cancel::Stride::new(cancel);
     for p in pts {
+        stride.tick()?;
+        // ── end pdf_manipulator patch ──
         if let (Some(xi), Some(yi)) = (x_idx(p.x), y_idx(p.y)) {
             present.insert(yi * nx + xi);
         }
@@ -2563,6 +2793,9 @@ fn build_cells_from_intersections(pts: &[Intersection]) -> Vec<IntersectionCell>
     let mut cells = Vec::new();
     for yi in 0..ny {
         for xi in 0..nx {
+            // ── pdf_manipulator patch: a cancel stops the cell search ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             if !has(xi, yi) {
                 continue;
             }
@@ -2584,7 +2817,9 @@ fn build_cells_from_intersections(pts: &[Intersection]) -> Vec<IntersectionCell>
             }
         }
     }
-    cells
+    // ── pdf_manipulator patch: the result carries the cancelled error ──
+    Ok(cells)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Build grid cells from the Cartesian product of H-edge Y-positions and V-edge X-positions.
@@ -2593,7 +2828,13 @@ fn build_cells_from_intersections(pts: &[Intersection]) -> Vec<IntersectionCell>
 /// don't physically intersect (e.g., H-lines in a header area and V tick marks in a data
 /// area). Instead of requiring actual crossings, we project every unique V-line X coordinate
 /// across every unique H-line Y coordinate to create virtual grid intersections.
-fn build_extended_grid_cells(h_edges: &[Edge], v_edges: &[Edge]) -> Vec<IntersectionCell> {
+// ── pdf_manipulator patch: a cancel stops the cell search ──
+fn build_extended_grid_cells(
+    h_edges: &[Edge],
+    v_edges: &[Edge],
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<IntersectionCell>> {
+    // ── end pdf_manipulator patch ──
     // Collect unique Y positions from H edges (the row boundaries).
     let mut ys: Vec<f32> = h_edges.iter().map(|e| e.coord).collect();
     ys.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
@@ -2605,13 +2846,21 @@ fn build_extended_grid_cells(h_edges: &[Edge], v_edges: &[Edge]) -> Vec<Intersec
     xs.dedup_by(|a, b| (*a - *b).abs() <= SNAP_TOL);
 
     if xs.len() < 2 || ys.len() < 2 {
-        return Vec::new();
+        // ── pdf_manipulator patch: the result carries the cancelled error ──
+        return Ok(Vec::new());
+        // ── end pdf_manipulator patch ──
     }
 
     // Build cells from every adjacent pair of X and Y values.
     let mut cells = Vec::new();
+    // ── pdf_manipulator patch: a cancel stops the cell search ──
+    let mut stride = crate::cancel::Stride::new(cancel);
+    // ── end pdf_manipulator patch ──
     for yi in 0..ys.len() - 1 {
         for xi in 0..xs.len() - 1 {
+            // ── pdf_manipulator patch: a cancel stops the cell search ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             cells.push(IntersectionCell {
                 x1: xs[xi],
                 y1: ys[yi],
@@ -2620,14 +2869,22 @@ fn build_extended_grid_cells(h_edges: &[Edge], v_edges: &[Edge]) -> Vec<Intersec
             });
         }
     }
-    cells
+    // ── pdf_manipulator patch: the result carries the cancelled error ──
+    Ok(cells)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Group cells that share edges into tables using union-find.
-fn group_cells_into_tables(cells: &[IntersectionCell]) -> Vec<Vec<usize>> {
+// ── pdf_manipulator patch: a cancel stops the grouping ──
+fn group_cells_into_tables(
+    cells: &[IntersectionCell],
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<Vec<usize>>> {
     if cells.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    let mut stride = crate::cancel::Stride::new(cancel);
+    // ── end pdf_manipulator patch ──
     let n = cells.len();
     let mut uf = UnionFind::new(n);
 
@@ -2644,6 +2901,9 @@ fn group_cells_into_tables(cells: &[IntersectionCell]) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| crate::utils::safe_float_cmp(cells[a].y1, cells[b].y1));
     for a in 0..n {
+        // ── pdf_manipulator patch: a cancel stops the grouping ──
+        stride.tick()?;
+        // ── end pdf_manipulator patch ──
         let i = order[a];
         let ci = &cells[i];
         let y_limit = ci.y2 + SNAP_TOL;
@@ -2675,7 +2935,9 @@ fn group_cells_into_tables(cells: &[IntersectionCell]) -> Vec<Vec<usize>> {
     // list by each group's first (smallest) cell index so table order is stable.
     let mut groups: Vec<Vec<usize>> = uf.groups().into_values().collect();
     groups.sort_by_key(|g| g.first().copied().unwrap_or(usize::MAX));
-    groups
+    // ── pdf_manipulator patch: the result carries the cancelled error ──
+    Ok(groups)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Split table rows that contain text spans at multiple distinct Y positions into sub-rows.
@@ -2900,20 +3162,24 @@ fn strip_form_numbering_artifacts(table_rows: &mut Vec<TableRow>) {
 ///
 /// This implements the universal pipeline used by Tabula, pdfplumber, and PyMuPDF:
 /// `Edges -> Snap/Merge -> Intersections -> Cells -> Table Groups`
+// ── pdf_manipulator patch: a cancel stops the detection between groups ──
 fn detect_tables_from_intersections(
     spans: &[TextSpan],
     rulings: &(impl Rulings + ?Sized),
     config: &TableDetectionConfig,
-) -> Vec<Table> {
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<Table>> {
+    // ── end pdf_manipulator patch ──
     // ── pdf_manipulator patch: rulings are read from a quantised grid ──
     let ruling_grid = rulings.grid();
-    let groups = build_grid_from_lines(&ruling_grid, config);
+    let groups = build_grid_from_lines(&ruling_grid, config, cancel)?;
     // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: a table reads the spans near it, not the page's ──
     let index = SpanIndex::new(spans);
     let mut tables = Vec::new();
     for (group_cells, xs, ys, num_cols) in &groups {
+        cancel.check()?;
         let (Some(&x0), Some(&x1), Some(&y0), Some(&y1)) =
             (xs.first(), xs.last(), ys.first(), ys.last())
         else {
@@ -2952,9 +3218,12 @@ fn detect_tables_from_intersections(
     let (mut h_edges, mut v_edges) = grid_edges(&ruling_grid);
     snap_and_merge(&mut h_edges);
     snap_edges(&mut v_edges); // snap only, don't join
-    tables = split_tables_at_section_dividers(tables, &h_edges, &v_edges, config);
+    // ── pdf_manipulator patch: a cancel stops the split between tables ──
+    cancel.check()?;
+    tables = split_tables_at_section_dividers(tables, &h_edges, &v_edges, config, cancel)?;
 
-    tables
+    Ok(tables)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Steps 1-4: extract edges, find intersections, build cells, and group them
@@ -2965,19 +3234,23 @@ fn detect_tables_from_intersections(
 fn build_grid_from_lines(
     ruling_grid: &RulingGrid,
     config: &TableDetectionConfig,
-) -> Vec<(Vec<IntersectionCell>, Vec<f32>, Vec<f32>, usize)> {
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<(Vec<IntersectionCell>, Vec<f32>, Vec<f32>, usize)>> {
     // Step 1: Extract and preprocess edges.
     let (mut h_edges, mut v_edges) = grid_edges(ruling_grid);
     // ── end pdf_manipulator patch ──
     snap_and_merge(&mut h_edges);
     snap_and_merge(&mut v_edges);
 
+    // ── pdf_manipulator patch: a cancel stops the grid between its steps ──
+    cancel.check()?;
     if h_edges.len() < 2 || v_edges.len() < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Step 2: Find intersections.
-    let intersections = find_intersections(&h_edges, &v_edges);
+    let intersections = find_intersections(&h_edges, &v_edges, cancel)?;
+    // ── end pdf_manipulator patch ──
 
     // Step 2b: When intersections are sparse (< 4), filter out orphan edges
     // that have no plausible counterpart before building the extended grid.
@@ -2986,16 +3259,19 @@ fn build_grid_from_lines(
     if intersections.len() < 4 {
         filter_edges_by_coverage(&mut h_edges, &mut v_edges);
         if h_edges.len() < 2 || v_edges.len() < 2 {
-            return Vec::new();
+            // ── pdf_manipulator patch: the result carries the cancelled error ──
+            return Ok(Vec::new());
+            // ── end pdf_manipulator patch ──
         }
     }
 
     // Step 3: Build cells.
+    // ── pdf_manipulator patch: a cancel stops the cell search ──
     let cells = if intersections.len() >= 4 {
-        let c = build_cells_from_intersections(&intersections);
+        let c = build_cells_from_intersections(&intersections, cancel)?;
         if c.is_empty() {
             // Lines exist but don't form real intersection cells — try extended grid.
-            build_extended_grid_cells(&h_edges, &v_edges)
+            build_extended_grid_cells(&h_edges, &v_edges, cancel)?
         } else {
             c
         }
@@ -3003,16 +3279,21 @@ fn build_grid_from_lines(
         // H and V lines don't physically cross (e.g. Census table: H-lines in
         // header area, V tick marks in data area). Build a virtual grid by
         // projecting all V-line X positions across all H-line Y positions.
-        build_extended_grid_cells(&h_edges, &v_edges)
+        build_extended_grid_cells(&h_edges, &v_edges, cancel)?
     };
     if cells.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Step 4: Group cells into tables and compute grid boundaries per group.
-    let table_groups = group_cells_into_tables(&cells);
+    let table_groups = group_cells_into_tables(&cells, cancel)?;
+    let mut rulings: Option<RulingIndex> = None;
+    // ── end pdf_manipulator patch ──
     let mut result = Vec::new();
     for group in &table_groups {
+        // ── pdf_manipulator patch: a cancel stops the grid between its groups ──
+        cancel.check()?;
+        // ── end pdf_manipulator patch ──
         let group_cells: Vec<IntersectionCell> = group.iter().map(|&i| cells[i]).collect();
 
         // Determine unique sorted X and Y boundaries for this table.
@@ -3038,14 +3319,72 @@ fn build_grid_from_lines(
             continue;
         }
 
-        if num_cols < config.min_table_columns || num_cols > config.max_table_columns {
+        // ── pdf_manipulator patch: a group wider than the column limit must be closed everywhere ──
+        // A group of many columns is a table only when every cell of it is
+        // closed by rulings on all four sides. Tables set side by side, in
+        // rows that line up, join into one such group through cells that no
+        // ruling bounds on both ends of the gap; a ledger of 20 columns has none.
+        if num_cols < config.min_table_columns {
             continue;
         }
+        if num_cols > config.max_table_columns {
+            let ruled = rulings.get_or_insert_with(|| RulingIndex::new(&h_edges, &v_edges));
+            if !ruled.close_every(&group_cells) {
+                continue;
+            }
+        }
+        // ── end pdf_manipulator patch ──
 
         result.push((group_cells, xs, ys, num_cols));
     }
-    result
+    // ── pdf_manipulator patch: the result carries the cancelled error ──
+    Ok(result)
+    // ── end pdf_manipulator patch ──
 }
+
+// ── pdf_manipulator patch: cells closed by rulings ──
+/// The merged edges a grid's cells came from, by coordinate, so a cell asks
+/// whether a ruling holds each of its sides without reading every edge.
+struct RulingIndex {
+    horizontal: Vec<Edge>,
+    vertical: Vec<Edge>,
+}
+
+impl RulingIndex {
+    fn new(h_edges: &[Edge], v_edges: &[Edge]) -> Self {
+        let by_coord = |edges: &[Edge]| {
+            let mut sorted = edges.to_vec();
+            sorted.sort_by(|a, b| {
+                crate::utils::safe_float_cmp(a.coord, b.coord)
+                    .then_with(|| crate::utils::safe_float_cmp(a.start, b.start))
+            });
+            sorted
+        };
+        Self { horizontal: by_coord(h_edges), vertical: by_coord(v_edges) }
+    }
+
+    /// True when one edge at `coord` (within `SNAP_TOL`) spans `lo..hi` (within `SNAP_TOL`).
+    fn holds(edges: &[Edge], coord: f32, lo: f32, hi: f32) -> bool {
+        let from = edges.partition_point(|e| e.coord < coord - SNAP_TOL);
+        edges[from..]
+            .iter()
+            .take_while(|e| e.coord <= coord + SNAP_TOL)
+            .any(|e| e.start <= lo + SNAP_TOL && e.end >= hi - SNAP_TOL)
+    }
+
+    /// True when every cell has a ruling on each of its four sides: a
+    /// horizontal edge at its top and bottom that spans its width, a vertical
+    /// one at its left and right that spans its height.
+    fn close_every(&self, cells: &[IntersectionCell]) -> bool {
+        cells.iter().all(|c| {
+            Self::holds(&self.horizontal, c.y1, c.x1, c.x2)
+                && Self::holds(&self.horizontal, c.y2, c.x1, c.x2)
+                && Self::holds(&self.vertical, c.x1, c.y1, c.y2)
+                && Self::holds(&self.vertical, c.x2, c.y1, c.y2)
+        })
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Assign text spans to grid cells and build table rows with per-cell span
 /// indices. Returns `None` when the grid is degenerate.
@@ -3263,12 +3602,15 @@ const SECTION_DIVIDER_WIDTH_RATIO: f32 = 0.80;
 /// Split each table at interior horizontal edges that span nearly the full
 /// table width ("section dividers").  Returns a new list of tables where each
 /// original table may have been broken into multiple smaller ones.
+// ── pdf_manipulator patch: a cancel stops the split between tables ──
 fn split_tables_at_section_dividers(
     tables: Vec<Table>,
     h_edges: &[Edge],
     v_edges: &[Edge],
     config: &TableDetectionConfig,
-) -> Vec<Table> {
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<Table>> {
+    // ── end pdf_manipulator patch ──
     // ── pdf_manipulator patch: a table reads the edges near it, not the page's ──
     let by_coord = |edges: &[Edge]| {
         let mut sorted = edges.to_vec();
@@ -3284,6 +3626,7 @@ fn split_tables_at_section_dividers(
     };
     let mut result = Vec::new();
     for table in tables {
+        cancel.check()?;
         let Some(bbox) = table.bbox else {
             result.push(table);
             continue;
@@ -3295,8 +3638,8 @@ fn split_tables_at_section_dividers(
         let parts = split_table_at_section_dividers(table, &near_h, &near_v, config);
         result.extend(parts);
     }
+    Ok(result)
     // ── end pdf_manipulator patch ──
-    result
 }
 
 /// Split a single table at section divider lines.
@@ -3900,43 +4243,63 @@ pub fn detect_tables_with_lines(
     config: &TableDetectionConfig,
 ) -> Vec<Table> {
     // ── pdf_manipulator patch: the rulings of the paths are read from a quantised grid ──
-    detect_tables(spans, &RulingGrid::from_paths(lines), config)
+    // A check that is never cancelled cannot make the detection fail.
+    detect_tables(
+        spans,
+        &RulingGrid::from_paths(lines),
+        config,
+        &crate::cancel::CancelCheck::none(),
+    )
+    .unwrap_or_default()
 }
 
 /// [`detect_tables_with_lines`] over a page's rulings already on the grid:
 /// the page's paths need not be held to detect its tables.
+///
+/// A `cancel` that reports cancelled ends the detection with the cancelled
+/// error, polled between the stages and inside each of them.
 pub(crate) fn detect_tables(
     spans: &[TextSpan],
     lines: &RulingGrid,
     config: &TableDetectionConfig,
-) -> Vec<Table> {
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Vec<Table>> {
     // ── end pdf_manipulator patch ──
     if !config.enabled || spans.is_empty() {
-        return Vec::new();
+        // ── pdf_manipulator patch: the result carries the cancelled error ──
+        return Ok(Vec::new());
+        // ── end pdf_manipulator patch ──
     }
     match (config.horizontal_strategy, config.vertical_strategy) {
         (TableStrategy::Text, TableStrategy::Text) => {
-            return detect_tables_from_spans_column_aware(spans, config)
+            // ── pdf_manipulator patch: the result carries the cancelled error ──
+            return Ok(detect_tables_from_spans_column_aware(spans, config));
+            // ── end pdf_manipulator patch ──
         },
         (TableStrategy::Lines, TableStrategy::Lines) => {
             // Try intersection-based detection first; fall back to cluster-based.
-            let tables = detect_tables_from_intersections(spans, lines, config);
+            // ── pdf_manipulator patch: a cancel ends the detection ──
+            let tables = detect_tables_from_intersections(spans, lines, config, cancel)?;
             if !tables.is_empty() {
-                return tables.into_iter().filter(is_valid_table).collect();
+                return Ok(tables.into_iter().filter(is_valid_table).collect());
             }
-            let clusters = group_lines_into_clusters(lines, config);
-            let tables = detect_tables_in_clusters(spans, clusters, config);
-            return tables.into_iter().filter(is_valid_table).collect();
+            let clusters = group_lines_into_clusters_cancellable(lines, config, cancel)?;
+            let tables = detect_tables_in_clusters(spans, clusters, config, cancel)?;
+            return Ok(tables.into_iter().filter(is_valid_table).collect());
+            // ── end pdf_manipulator patch ──
         },
         _ => {},
     }
     // Both / hybrid strategy: try intersection-based first, then cluster, then H-rule bounded,
     // then text fallback.
-    let mut final_tables = detect_tables_from_intersections(spans, lines, config);
+    // ── pdf_manipulator patch: a cancel ends the detection ──
+    let mut final_tables = detect_tables_from_intersections(spans, lines, config, cancel)?;
     if final_tables.is_empty() {
-        let clusters = group_lines_into_clusters(lines, config);
-        final_tables.append(&mut detect_tables_in_clusters(spans, clusters, config));
+        let clusters = group_lines_into_clusters_cancellable(lines, config, cancel)?;
+        final_tables.append(&mut detect_tables_in_clusters(spans, clusters, config, cancel)?);
     }
+    cancel.check()?;
+    // ── end pdf_manipulator patch ──
     // When intersection and cluster pipelines found nothing, try H-rule bounded detection:
     // use horizontal lines as table region boundaries with text-edge column detection.
     if final_tables.is_empty() {
@@ -4062,6 +4425,9 @@ pub(crate) fn detect_tables(
         && config.horizontal_strategy != TableStrategy::Lines
         && config.vertical_strategy != TableStrategy::Lines;
 
+    // ── pdf_manipulator patch: a cancel ends the detection ──
+    cancel.check()?;
+    // ── end pdf_manipulator patch ──
     if allow_text_fallback {
         let text_candidates = detect_tables_from_spans_column_aware(spans, config);
         for text_table in text_candidates {
@@ -4092,7 +4458,9 @@ pub(crate) fn detect_tables(
             }
         }
     }
-    final_tables
+    // ── pdf_manipulator patch: the result carries the cancelled error ──
+    Ok(final_tables)
+    // ── end pdf_manipulator patch ──
 }
 
 fn grid_to_table(
@@ -5395,6 +5763,9 @@ mod tests {
             make_line_path(10.0, 130.0, 90.0, 130.0),
             make_line_path(10.0, 110.0, 90.0, 110.0),
             make_line_path(10.0, 90.0, 90.0, 90.0),
+            // ── pdf_manipulator patch: the data row is ruled below, so the table has three rows ──
+            make_line_path(10.0, 70.0, 90.0, 70.0),
+            // ── end pdf_manipulator patch ──
             make_v_line(10.0, 70.0, 60.0),
             make_v_line(50.0, 70.0, 20.0),
             make_v_line(90.0, 70.0, 60.0),
@@ -5550,7 +5921,9 @@ mod tests {
                 end: 250.0,
             },
         ];
-        let pts = find_intersections(&h, &v);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let pts = find_intersections(&h, &v, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert_eq!(pts.len(), 4, "2 H x 2 V = 4 intersections");
     }
 
@@ -5567,7 +5940,9 @@ mod tests {
             start: 0.0,
             end: 200.0,
         }];
-        let pts = find_intersections(&h, &v);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let pts = find_intersections(&h, &v, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert!(pts.is_empty(), "Non-crossing edges should produce no intersection");
     }
 
@@ -5579,7 +5954,9 @@ mod tests {
             Intersection { x: 0.0, y: 100.0 },
             Intersection { x: 100.0, y: 100.0 },
         ];
-        let cells = build_cells_from_intersections(&pts);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let cells = build_cells_from_intersections(&pts, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert_eq!(cells.len(), 1, "4 corners should produce 1 cell");
     }
 
@@ -5600,7 +5977,9 @@ mod tests {
                 y2: 100.0,
             },
         ];
-        let groups = group_cells_into_tables(&cells);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let groups = group_cells_into_tables(&cells, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert_eq!(groups.len(), 1, "Adjacent cells should be in 1 group");
     }
 
@@ -5621,7 +6000,9 @@ mod tests {
                 y2: 600.0,
             },
         ];
-        let groups = group_cells_into_tables(&cells);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let groups = group_cells_into_tables(&cells, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert_eq!(groups.len(), 2, "Distant cells should be in separate groups");
     }
 
@@ -5650,9 +6031,13 @@ mod tests {
             Intersection { x: 50.0, y: 100.0 },
             Intersection { x: 100.0, y: 100.0 },
         ];
-        let cells = build_cells_from_intersections(&pts);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let cells = build_cells_from_intersections(&pts, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert_eq!(cells.len(), 4, "3x3 grid should produce 4 cells");
-        let groups = group_cells_into_tables(&cells);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let groups = group_cells_into_tables(&cells, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert_eq!(groups.len(), 1, "All 4 cells should form 1 table");
     }
 
@@ -6205,7 +6590,7 @@ mod tests {
         let clusters = group_lines_into_clusters(&lines, &config);
         assert_eq!(clusters.len(), 1, "single ruled grid → one cluster");
         // ── pdf_manipulator patch: a cluster carries its rulings ──
-        let tables = detect_tables_in_cluster(&spans, &clusters[0], &config);
+        let tables = detect_tables_in_cluster(&spans, &clusters[0], &config, &crate::cancel::CancelCheck::none());
         // ── end pdf_manipulator patch ──
         assert_eq!(tables.len(), 1, "one table expected");
         let table = &tables[0];
@@ -6272,7 +6657,7 @@ mod tests {
         // caption text is not present in any cell.
         let clusters = group_lines_into_clusters(&lines, &config);
         // ── pdf_manipulator patch: a cluster carries its rulings ──
-        let tables = detect_tables_in_cluster(&spans, &clusters[0], &config);
+        let tables = detect_tables_in_cluster(&spans, &clusters[0], &config, &crate::cancel::CancelCheck::none());
         // ── end pdf_manipulator patch ──
         assert_eq!(tables.len(), 1);
         assert_eq!(
@@ -6715,7 +7100,9 @@ mod tests {
             ..TableDetectionConfig::default()
         };
 
-        let tables = detect_tables_from_intersections(&spans, &lines, &config);
+        // ── pdf_manipulator patch: the detection takes a cancel check ──
+        let tables = detect_tables_from_intersections(&spans, &lines, &config, &crate::cancel::CancelCheck::none()).unwrap();
+        // ── end pdf_manipulator patch ──
         assert!(
             !tables.is_empty(),
             "Extended grid should produce at least one table when H and V lines don't cross"

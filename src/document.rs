@@ -6366,6 +6366,38 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        // ── pdf_manipulator patch: the cancellable form does the work ──
+        self.extract_text_with_options_cancellable(
+            page_index,
+            options,
+            &crate::cancel::CancelCheck::none(),
+        )
+    }
+
+    /// [`extract_text`](Self::extract_text) that stops with the cancelled
+    /// error once `cancel` reports cancelled, polled through the page's table
+    /// detection.
+    pub fn extract_text_cancellable(
+        &self,
+        page_index: usize,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<String> {
+        let options = crate::converters::ConversionOptions {
+            extract_tables: true,
+            ..Default::default()
+        };
+        self.extract_text_with_options_cancellable(page_index, &options, cancel)
+    }
+
+    /// [`extract_text_with_options`](Self::extract_text_with_options) that
+    /// stops with the cancelled error once `cancel` reports cancelled.
+    fn extract_text_with_options_cancellable(
+        &self,
+        page_index: usize,
+        options: &crate::converters::ConversionOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<String> {
+        // ── end pdf_manipulator patch ──
         // Diagnostics raised by the producers that hold no document land
         // in a thread-local sink; scope them to this call so a document
         // read earlier on this thread cannot claim them.
@@ -6378,7 +6410,9 @@ impl PdfDocument {
         if let Some(vertical) = Self::try_assemble_vertical_cjk(&base_spans) {
             return Ok(vertical);
         }
-        let text = self.assemble_text_from_spans(page_index, base_spans, options)?;
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        let text = self.assemble_text_from_spans(page_index, base_spans, options, cancel)?;
+        // ── end pdf_manipulator patch ──
         Ok(Self::apply_mixed_rtl_line_pass(text))
     }
 
@@ -6509,7 +6543,14 @@ impl PdfDocument {
     ) -> Result<String> {
         let mut base_spans = self.extract_spans(page_index)?;
         base_spans.extend(extra);
-        let text = self.assemble_text_from_spans(page_index, base_spans, options)?;
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        let text = self.assemble_text_from_spans(
+            page_index,
+            base_spans,
+            options,
+            &crate::cancel::CancelCheck::none(),
+        )?;
+        // ── end pdf_manipulator patch ──
         Ok(Self::apply_mixed_rtl_line_pass(text))
     }
 
@@ -6691,6 +6732,9 @@ impl PdfDocument {
         page_index: usize,
         base_spans: Vec<crate::layout::TextSpan>,
         options: &crate::converters::ConversionOptions,
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<String> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning empty text");
@@ -6727,10 +6771,12 @@ impl PdfDocument {
             // text_fallback=false: extract_text preserves the pre-v0.3.47 behaviour
             // where line-less pages return no tables. Only the structured-output
             // converters (to_markdown, to_html) opt in to text-only spatial fallback.
+            // ── pdf_manipulator patch: a cancel stops the page's table detection ──
             Self::tables_in_frame(
-                self.extract_page_tables(page_index, &base_spans, options, false),
+                self.extract_page_tables(page_index, &base_spans, options, false, cancel)?,
                 reading_frame,
             )
+            // ── end pdf_manipulator patch ──
         } else {
             Vec::new()
         };
@@ -17927,7 +17973,14 @@ impl PdfDocument {
             extract_tables: true,
             ..Default::default()
         };
-        self.assemble_text_from_spans(page_index, spans, &options)
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        self.assemble_text_from_spans(
+            page_index,
+            spans,
+            &options,
+            &crate::cancel::CancelCheck::none(),
+        )
+        // ── end pdf_manipulator patch ──
     }
 
     /// Extract text from a region of a page with layer/ink filtering applied.
@@ -17954,7 +18007,14 @@ impl PdfDocument {
             include_region: Some((region, mode)),
             ..Default::default()
         };
-        self.assemble_text_from_spans(page_index, spans, &options)
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        self.assemble_text_from_spans(
+            page_index,
+            spans,
+            &options,
+            &crate::cancel::CancelCheck::none(),
+        )
+        // ── end pdf_manipulator patch ──
     }
 
     /// Geometric `ColumnAware` (XY-cut) span ordering. Shared by the
@@ -20128,6 +20188,18 @@ impl PdfDocument {
         page_index: usize,
         sink: &mut dyn crate::extractors::paths::PathSink,
     ) -> Result<()> {
+        self.extract_paths_into_cancellable(page_index, sink, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`extract_paths_into`](Self::extract_paths_into) that stops with the
+    /// cancelled error once `cancel` reports cancelled, polled every
+    /// [`STRIDE`](crate::cancel::STRIDE) operators.
+    pub(crate) fn extract_paths_into_cancellable(
+        &self,
+        page_index: usize,
+        sink: &mut dyn crate::extractors::paths::PathSink,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<()> {
         // ── end pdf_manipulator patch ──
         use crate::content::Operator;
         use crate::elements::{LineCap, LineJoin};
@@ -20170,8 +20242,12 @@ impl PdfDocument {
         }
 
         // Process each operator
+        // ── pdf_manipulator patch: a cancel stops the page within a stride of operators ──
+        let mut stride = crate::cancel::Stride::new(cancel);
+        // ── end pdf_manipulator patch ──
         for op in operators {
             // ── pdf_manipulator patch: the paths of the last operator go to the sink ──
+            stride.tick()?;
             extractor.drain_into(sink);
             // ── end pdf_manipulator patch ──
             match op {
@@ -20316,9 +20392,18 @@ impl PdfDocument {
 
                 // XObject processing
                 Operator::Do { name } => {
-                    if let Err(e) =
-                        self.process_form_xobject_paths(&name, &mut extractor, &mut state_stack, sink)
-                    {
+                    // ── pdf_manipulator patch: a cancel inside a form is not a form that failed ──
+                    if let Err(e) = self.process_form_xobject_paths(
+                        &name,
+                        &mut extractor,
+                        &mut state_stack,
+                        sink,
+                        cancel,
+                    ) {
+                        if cancel.is_cancelled() {
+                            return Err(e);
+                        }
+                        // ── end pdf_manipulator patch ──
                         log::warn!(
                             "Failed to process XObject '{}' in path extraction: {}",
                             name,
@@ -20599,7 +20684,24 @@ impl PdfDocument {
         page_index: usize,
         config: crate::structure::spatial_table_detector::TableDetectionConfig,
     ) -> Result<Vec<crate::structure::table_extractor::Table>> {
-        // ── pdf_manipulator patch: the page's rulings go on a quantised grid as they are painted ──
+        // ── pdf_manipulator patch: the cancellable form does the work ──
+        self.extract_tables_with_config_cancellable(
+            page_index,
+            config,
+            &crate::cancel::CancelCheck::none(),
+        )
+        // ── end pdf_manipulator patch ──
+    }
+
+    // ── pdf_manipulator patch: the page's rulings go on a quantised grid as they are painted ──
+    /// [`extract_tables_with_config`](Self::extract_tables_with_config) that
+    /// stops with the cancelled error once `cancel` reports cancelled.
+    pub fn extract_tables_with_config_cancellable(
+        &self,
+        page_index: usize,
+        config: crate::structure::spatial_table_detector::TableDetectionConfig,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Vec<crate::structure::table_extractor::Table>> {
         use crate::structure::spatial_table_detector::detect_tables;
 
         // Use words instead of spans for better granularity.
@@ -20607,35 +20709,36 @@ impl PdfDocument {
         // for the spatial detector.
         let spans = self.extract_table_word_spans(page_index)?;
         // Use all table primitives (lines, rectangles, borders) not just straight lines
-        let lines = self.page_ruling_grid(page_index)?;
+        let lines = self.page_ruling_grid(page_index, cancel)?;
 
         // Same prose-rejection filter `extract_page_tables` applies to the
         // extract_text/to_markdown/to_html path — this public API called
         // `detect_tables_with_lines` directly with no post-filter at all, so
         // it was already able to fabricate/garble tables on any prose-shaped
         // spatial candidate, independent of anything else in this function.
-        Ok(detect_tables(&spans, &lines, &config)
+        Ok(detect_tables(&spans, &lines, &config, cancel)?
             .into_iter()
             .filter(|t| t.is_real_grid() && !looks_like_prose_table(t))
             .collect())
-        // ── end pdf_manipulator patch ──
     }
 
-    // ── pdf_manipulator patch: the page's rulings go on a quantised grid as they are painted ──
     /// The rulings of page `page_index` on a grid over its media box, built as
     /// the paths are painted: the page's paths are never held.
     pub(crate) fn page_ruling_grid(
         &self,
         page_index: usize,
+        cancel: &crate::cancel::CancelCheck,
     ) -> Result<crate::host::ruling_grid::RulingGrid> {
         let bounds = match self.get_page_media_box(page_index) {
             Ok((llx, lly, urx, ury)) => crate::geometry::Rect::from_points(llx, lly, urx, ury),
             Err(_) => crate::geometry::Rect::new(0.0, 0.0, 612.0, 792.0),
         };
         let mut grid = crate::host::ruling_grid::RulingGrid::new(bounds);
-        self.extract_paths_into(page_index, &mut |path: crate::elements::PathContent| {
-            grid.add(&path)
-        })?;
+        self.extract_paths_into_cancellable(
+            page_index,
+            &mut |path: crate::elements::PathContent| grid.add(&path),
+            cancel,
+        )?;
         if grid.refused() {
             return Err(Error::Unsupported(format!(
                 "page {page_index}: the rulings did not fit in memory"
@@ -20667,6 +20770,7 @@ impl PdfDocument {
         state_stack: &mut crate::extractors::paths::PathGraphicsStateStack,
         // ── pdf_manipulator patch: the form's paths go to the page's sink ──
         sink: &mut dyn crate::extractors::paths::PathSink,
+        cancel: &crate::cancel::CancelCheck,
         // ── end pdf_manipulator patch ──
     ) -> Result<()> {
         use crate::content::{Matrix, Operator};
@@ -20812,8 +20916,12 @@ impl PdfDocument {
         let oc_base_depth = extractor.oc_layer_depth();
 
         // Process operators from the XObject
+        // ── pdf_manipulator patch: a cancel stops the form within a stride of operators ──
+        let mut stride = crate::cancel::Stride::new(cancel);
+        // ── end pdf_manipulator patch ──
         for op in operators {
             // ── pdf_manipulator patch: the paths of the last operator go to the sink ──
+            stride.tick()?;
             extractor.drain_into(sink);
             // ── end pdf_manipulator patch ──
             match op {
@@ -20931,9 +21039,18 @@ impl PdfDocument {
 
                 // Nested XObjects (recurse)
                 Operator::Do { name: nested_name } => {
-                    if let Err(e) =
-                        self.process_form_xobject_paths(&nested_name, extractor, state_stack, sink)
-                    {
+                    // ── pdf_manipulator patch: a cancel inside a form is not a form that failed ──
+                    if let Err(e) = self.process_form_xobject_paths(
+                        &nested_name,
+                        extractor,
+                        state_stack,
+                        sink,
+                        cancel,
+                    ) {
+                        if cancel.is_cancelled() {
+                            return Err(e);
+                        }
+                        // ── end pdf_manipulator patch ──
                         log::warn!("Failed to process nested XObject '{}': {}", nested_name, e);
                     }
                 },
@@ -22246,7 +22363,10 @@ impl PdfDocument {
         spans: &[TextSpan],
         options: &crate::converters::ConversionOptions,
         text_fallback: bool,
-    ) -> Vec<crate::structure::Table> {
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Vec<crate::structure::Table>> {
+        // ── end pdf_manipulator patch ──
         // Strategy 1: Structure tree (tagged PDFs)
         let struct_tree_opt = {
             let cached = self.structure_tree_cache.lock_or_recover().clone();
@@ -22337,7 +22457,9 @@ impl PdfDocument {
                         tables.len(),
                         page_index
                     );
-                    return tables;
+                    // ── pdf_manipulator patch: the result carries the cancelled error ──
+                    return Ok(tables);
+                    // ── end pdf_manipulator patch ──
                 }
             }
         }
@@ -22352,9 +22474,14 @@ impl PdfDocument {
 
         // Extract vector paths (lines/rects) for visual detection
         // ── pdf_manipulator patch: the page's rulings go on a quantised grid as they are painted ──
-        let grid = self.page_ruling_grid(page_index).unwrap_or_else(|_| {
-            crate::host::ruling_grid::RulingGrid::new(crate::geometry::Rect::new(0.0, 0.0, 0.0, 0.0))
-        });
+        let grid = match self.page_ruling_grid(page_index, cancel) {
+            Ok(grid) => grid,
+            // A cancel is the caller's, not a page that cannot be read.
+            Err(e) if cancel.is_cancelled() => return Err(e),
+            Err(_) => crate::host::ruling_grid::RulingGrid::new(crate::geometry::Rect::new(
+                0.0, 0.0, 0.0, 0.0,
+            )),
+        };
 
         // Only table-relevant paths reach the grid; the rest are dropped as
         // they are painted.
@@ -22379,7 +22506,7 @@ impl PdfDocument {
                 (TableStrategy::Text, TableStrategy::Text)
             );
             if !is_text_only && !config.text_fallback {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             if !is_text_only && config.text_fallback {
                 log::debug!(
@@ -22433,13 +22560,19 @@ impl PdfDocument {
                     grid.primitives()
                     // ── end pdf_manipulator patch ──
                 );
-                return Vec::new();
+                // ── pdf_manipulator patch: the result carries the cancelled error ──
+                return Ok(Vec::new());
+                // ── end pdf_manipulator patch ──
             }
         }
 
         // ── pdf_manipulator patch: the detector reads the grid ──
-        let raw_tables =
-            crate::structure::spatial_table_detector::detect_tables(input_spans, &grid, &config);
+        let raw_tables = crate::structure::spatial_table_detector::detect_tables(
+            input_spans,
+            &grid,
+            &config,
+            cancel,
+        )?;
         // ── end pdf_manipulator patch ──
 
         // Issue 484/486/487: when a logical multi-row table is drawn with a
@@ -22516,7 +22649,9 @@ impl PdfDocument {
                 "Text-only spatial fallback skipped for page {} — document has a structure tree (tagged PDF)",
                 page_index
             );
-            return tables;
+            // ── pdf_manipulator patch: the result carries the cancelled error ──
+            return Ok(tables);
+            // ── end pdf_manipulator patch ──
         }
 
         // Guard 2 — RTL pages: Arabic and Hebrew text naturally aligns horizontally in
@@ -22534,7 +22669,9 @@ impl PdfDocument {
                     page_index,
                     rtl_fraction * 100.0
                 );
-                return tables;
+                // ── pdf_manipulator patch: the result carries the cancelled error ──
+                return Ok(tables);
+                // ── end pdf_manipulator patch ──
             }
         }
 
@@ -22630,7 +22767,9 @@ impl PdfDocument {
             }
         }
 
-        tables
+        // ── pdf_manipulator patch: the result carries the cancelled error ──
+        Ok(tables)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Convert a page to Markdown format.
@@ -22675,11 +22814,28 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        // ── pdf_manipulator patch: the cancellable form does the work ──
+        self.to_markdown_cancellable(page_index, options, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`to_markdown`](Self::to_markdown) that stops with the cancelled error
+    /// once `cancel` reports cancelled, polled through the page's table
+    /// detection.
+    #[allow(clippy::wrong_self_convention)] // Needs mutable access for caching
+    pub fn to_markdown_cancellable(
+        &self,
+        page_index: usize,
+        options: &crate::converters::ConversionOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<String> {
+        // ── end pdf_manipulator patch ──
         // Diagnostics raised by the producers that hold no document land
         // in a thread-local sink; scope them to this call so a document
         // read earlier on this thread cannot claim them.
         let _sink = self.sink_scope();
-        self.to_markdown_inner(page_index, options, &[])
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        self.to_markdown_inner(page_index, options, &[], cancel)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Convert a page to Markdown with caller-supplied extra spans merged into
@@ -22697,7 +22853,9 @@ impl PdfDocument {
         extra_spans: &[crate::layout::TextSpan],
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
-        self.to_markdown_inner(page_index, options, extra_spans)
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        self.to_markdown_inner(page_index, options, extra_spans, &crate::cancel::CancelCheck::none())
+        // ── end pdf_manipulator patch ──
     }
 
     fn to_markdown_inner(
@@ -22705,6 +22863,9 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
         extra_spans: &[crate::layout::TextSpan],
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<String> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning empty markdown");
@@ -22764,10 +22925,12 @@ impl PdfDocument {
             // text_fallback=true: to_markdown explicitly targets structured output,
             // so we enable the text-only spatial fallback for line-less tables
             // (e.g. sailing-score grids with no ruling lines — issue #486).
+            // ── pdf_manipulator patch: a cancel stops the page's table detection ──
             Self::tables_in_frame(
-                self.extract_page_tables(page_index, &base_spans, options, true),
+                self.extract_page_tables(page_index, &base_spans, options, true, cancel)?,
                 reading_frame,
             )
+            // ── end pdf_manipulator patch ──
         } else {
             Vec::new()
         };
@@ -23334,11 +23497,27 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        // ── pdf_manipulator patch: the cancellable form does the work ──
+        self.to_html_cancellable(page_index, options, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`to_html`](Self::to_html) that stops with the cancelled error once
+    /// `cancel` reports cancelled, polled through the page's table detection.
+    #[allow(clippy::wrong_self_convention)] // Needs mutable access for caching
+    pub fn to_html_cancellable(
+        &self,
+        page_index: usize,
+        options: &crate::converters::ConversionOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<String> {
+        // ── end pdf_manipulator patch ──
         // Diagnostics raised by the producers that hold no document land
         // in a thread-local sink; scope them to this call so a document
         // read earlier on this thread cannot claim them.
         let _sink = self.sink_scope();
-        self.to_html_inner(page_index, options, &[])
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        self.to_html_inner(page_index, options, &[], cancel)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Convert a page to HTML with caller-supplied extra spans merged into the
@@ -23354,7 +23533,9 @@ impl PdfDocument {
         extra_spans: &[crate::layout::TextSpan],
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
-        self.to_html_inner(page_index, options, extra_spans)
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        self.to_html_inner(page_index, options, extra_spans, &crate::cancel::CancelCheck::none())
+        // ── end pdf_manipulator patch ──
     }
 
     #[allow(clippy::wrong_self_convention)] // Needs mutable access for caching
@@ -23363,6 +23544,9 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
         extra_spans: &[crate::layout::TextSpan],
+        // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<String> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning empty HTML");
@@ -23410,10 +23594,12 @@ impl PdfDocument {
             // text_fallback=true: to_html explicitly targets structured output,
             // so we enable the text-only spatial fallback for line-less tables
             // (e.g. sailing-score grids with no ruling lines — issue #486).
+            // ── pdf_manipulator patch: a cancel stops the page's table detection ──
             Self::tables_in_frame(
-                self.extract_page_tables(page_index, &base_spans, options, true),
+                self.extract_page_tables(page_index, &base_spans, options, true, cancel)?,
                 reading_frame,
             )
+            // ── end pdf_manipulator patch ──
         } else {
             Vec::new()
         };
@@ -23624,6 +23810,9 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        // ── pdf_manipulator patch: plain text is not a host call, so nothing cancels it ──
+        let cancel = &crate::cancel::CancelCheck::none();
+        // ── end pdf_manipulator patch ──
         // Encrypted-and-undecryptable parity: extract_text / to_markdown / to_html
         // all short-circuit to an empty string here (ISO 32000-1:2008 §7.6); the
         // geometric plain-text path below would also yield empty (no decryptable
@@ -23642,7 +23831,9 @@ impl PdfDocument {
         // path below, so their output is byte-for-byte unchanged.
         if self.prefers_structure_reading_order() {
             let base_spans = self.extract_spans(page_index)?;
-            return self.assemble_text_from_spans(page_index, base_spans, options);
+            // ── pdf_manipulator patch: a cancel stops the page's table detection ──
+            return self.assemble_text_from_spans(page_index, base_spans, options, cancel);
+            // ── end pdf_manipulator patch ──
         }
 
         // Step 1: Extract raw spans (unchanged - this is the foundation)
@@ -23658,10 +23849,12 @@ impl PdfDocument {
         let tables = if options.extract_tables {
             // text_fallback=false: to_plain_text uses the conservative pre-v0.3.47
             // behaviour to avoid false-positive table detection in key-value layouts.
+            // ── pdf_manipulator patch: a cancel stops the page's table detection ──
             Self::tables_in_frame(
-                self.extract_page_tables(page_index, &spans, options, false),
+                self.extract_page_tables(page_index, &spans, options, false, cancel)?,
                 reading_frame,
             )
+            // ── end pdf_manipulator patch ──
         } else {
             Vec::new()
         };
@@ -23780,7 +23973,7 @@ impl PdfDocument {
             if i > 0 {
                 result.push_str("\n---\n\n");
             }
-            let page_markdown = self.to_markdown(i, options)?;
+            let page_markdown = self.to_markdown_cancellable(i, options, cancel)?;
             result.push_str(&page_markdown);
             Ok(())
         })?;

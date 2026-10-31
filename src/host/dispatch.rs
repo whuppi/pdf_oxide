@@ -276,7 +276,7 @@ pub fn extract_text(
                 let opts = crate::converters::ConversionOptions::default();
                 match page {
                     None => doc.to_markdown_all_cancellable(&opts, cancel)?,
-                    Some(i) => doc.to_markdown(i, &opts)?,
+                    Some(i) => doc.to_markdown_cancellable(i, &opts, cancel)?,
                 }
             }
             "html" => {
@@ -287,12 +287,12 @@ pub fn extract_text(
                         let mut all = String::new();
                         cancel.each(0..count, |i| {
                             if i > 0 { all.push('\n'); }
-                            all.push_str(&doc.to_html(i, &opts)?);
+                            all.push_str(&doc.to_html_cancellable(i, &opts, cancel)?);
                             Ok(())
                         })?;
                         all
                     }
-                    Some(i) => doc.to_html(i, &opts)?,
+                    Some(i) => doc.to_html_cancellable(i, &opts, cancel)?,
                 }
             }
             _ => {
@@ -302,12 +302,12 @@ pub fn extract_text(
                         let mut all = String::new();
                         cancel.each(0..count, |i| {
                             if i > 0 { all.push('\n'); }
-                            all.push_str(&doc.extract_text(i)?);
+                            all.push_str(&doc.extract_text_cancellable(i, cancel)?);
                             Ok(())
                         })?;
                         all
                     }
-                    Some(i) => doc.extract_text(i)?,
+                    Some(i) => doc.extract_text_cancellable(i, cancel)?,
                 }
             }
         };
@@ -351,9 +351,9 @@ pub fn extract_text_framed<W: std::io::Write>(
         let opts = crate::converters::ConversionOptions::default();
         cancel.each(0..count, |i| {
             let page_text = match format {
-                "markdown" => doc.to_markdown(i, &opts)?,
-                "html" => doc.to_html(i, &opts)?,
-                _ => doc.extract_text(i)?,
+                "markdown" => doc.to_markdown_cancellable(i, &opts, cancel)?,
+                "html" => doc.to_html_cancellable(i, &opts, cancel)?,
+                _ => doc.extract_text_cancellable(i, cancel)?,
             };
             let mut body = String::with_capacity(separator.len() + page_text.len());
             if i > 0 {

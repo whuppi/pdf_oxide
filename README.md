@@ -3,7 +3,7 @@
 >
 > The fork's goal is memory that does not grow with the file. Streams are read from the source in small pieces, and page content is read one operator at a time. A memory test holds each operation it covers to 16 MiB of peak memory on inputs of 64 MiB and more. The fork also writes the same bytes on every run, makes smaller compressed files (object streams, deflate level 9, one copy of identical images and fonts, unused resources removed), and fixes the bugs we found while we built it, each with a test.
 >
-> Our own code is in `src/host/`. Every change to upstream code sits between `pdf_manipulator patch` markers, so that the fork can move to each new upstream release.
+> Our own code is in `src/host/`. Every change to upstream code sits between paired patch-marker comments, so that the fork can move to each new upstream release.
 >
 > You can use the fork from Rust. Depend on a fixed commit (`rev`), not on a branch, because the branch gets a new name for each upstream release. The `src/host/` API is internal to pdf_manipulator and can change in any commit.
 >

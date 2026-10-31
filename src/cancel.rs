@@ -91,3 +91,30 @@ impl CancelCheck {
         Ok(())
     }
 }
+
+/// Iterations of an inner loop between two polls of a [`CancelCheck`]: a
+/// poll is a relaxed atomic load, cheap, but not free in a loop whose body is
+/// a few instructions.
+pub(crate) const STRIDE: u32 = 4096;
+
+/// Polls a [`CancelCheck`] once per [`STRIDE`] iterations of an inner loop.
+pub(crate) struct Stride<'a> {
+    cancel: &'a CancelCheck,
+    count: u32,
+}
+
+impl<'a> Stride<'a> {
+    pub(crate) fn new(cancel: &'a CancelCheck) -> Self {
+        Self { cancel, count: 0 }
+    }
+
+    /// Counts one iteration; every [`STRIDE`]th one checks for a cancel.
+    pub(crate) fn tick(&mut self) -> Result<()> {
+        self.count = self.count.wrapping_add(1);
+        if self.count % STRIDE == 0 {
+            self.cancel.check()
+        } else {
+            Ok(())
+        }
+    }
+}

@@ -387,7 +387,11 @@ impl RulingGrid {
     }
 
     /// The clusters of rulings, top of the page first, then left to right.
-    pub(crate) fn clusters(&self) -> Vec<GridCluster> {
+    pub(crate) fn clusters(
+        &self,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> crate::error::Result<Vec<GridCluster>> {
+        let mut stride = crate::cancel::Stride::new(cancel);
         // Occupied runs in row order; `index` finds the runs of a row.
         let mut runs: Vec<(u32, u32, u32)> = Vec::new();
         let mut index: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
@@ -408,6 +412,7 @@ impl RulingGrid {
             i
         }
         for i in 0..runs.len() {
+            stride.tick()?;
             let (row, a, b) = runs[i];
             for next in row..=row.saturating_add(y_link) {
                 let Some(&(s, e)) = index.get(&next) else { continue };
@@ -430,6 +435,7 @@ impl RulingGrid {
         // Components, with the cells they cover.
         let mut extent: BTreeMap<usize, (u32, u32, u32, u32)> = BTreeMap::new();
         for i in 0..runs.len() {
+            stride.tick()?;
             let root = find(&mut parent, i);
             let (row, a, b) = runs[i];
             let e = extent.entry(root).or_insert((row, row, a, b));
@@ -467,10 +473,14 @@ impl RulingGrid {
             let j = list.partition_point(|r| r.2 < col);
             (j < list.len() && list[j].1 <= col).then(|| find(&mut parent, s + j))
         };
-        let mut place = |clusters: &mut Vec<GridCluster>, runs_of: &Runs, kind: LineKind| {
+        let mut place = |clusters: &mut Vec<GridCluster>,
+                         runs_of: &Runs,
+                         kind: LineKind|
+         -> crate::error::Result<()> {
             let horizontal = matches!(kind, LineKind::Horizontal | LineKind::RectHorizontal);
             for (&key, list) in runs_of {
                 for run in list {
+                    stride.tick()?;
                     let (row, col) = if horizontal { (key, run.a) } else { (run.a, key) };
                     let Some(root) = label(row, col) else { continue };
                     if let Some(&n) = slot.get(&root) {
@@ -478,12 +488,13 @@ impl RulingGrid {
                     }
                 }
             }
+            Ok(())
         };
-        place(&mut clusters, &self.lines_h, LineKind::Horizontal);
-        place(&mut clusters, &self.lines_v, LineKind::Vertical);
-        place(&mut clusters, &self.sides_h, LineKind::RectHorizontal);
-        place(&mut clusters, &self.sides_v, LineKind::RectVertical);
-        clusters
+        place(&mut clusters, &self.lines_h, LineKind::Horizontal)?;
+        place(&mut clusters, &self.lines_v, LineKind::Vertical)?;
+        place(&mut clusters, &self.sides_h, LineKind::RectHorizontal)?;
+        place(&mut clusters, &self.sides_v, LineKind::RectVertical)?;
+        Ok(clusters)
     }
 }
 
@@ -551,7 +562,12 @@ mod tests {
     /// The cluster relation is the old sweep's: 3 pt along x inclusive, under 6 pt along y.
     #[test]
     fn clusters_link_at_three_points_along_x_and_under_six_along_y() {
-        let clusters = |dx: f32, dy: f32| grid(&[h(0.0, 0.0, 30.0), h(30.0 + dx, dy, 30.0)]).clusters().len();
+        let clusters = |dx: f32, dy: f32| {
+            grid(&[h(0.0, 0.0, 30.0), h(30.0 + dx, dy, 30.0)])
+                .clusters(&crate::cancel::CancelCheck::none())
+                .unwrap()
+                .len()
+        };
         assert_eq!(clusters(2.9, 0.0), 1);
         assert_eq!(clusters(3.0, 0.0), 1);
         assert_eq!(clusters(3.5, 0.0), 2);
@@ -565,7 +581,7 @@ mod tests {
     #[test]
     fn clusters_come_top_of_the_page_first() {
         let g = grid(&[h(10.0, 100.0, 50.0), h(10.0, 500.0, 50.0)]);
-        let clusters = g.clusters();
+        let clusters = g.clusters(&crate::cancel::CancelCheck::none()).unwrap();
         assert_eq!(clusters.len(), 2);
         assert!(clusters[0].bbox.y > clusters[1].bbox.y);
         assert_eq!(clusters[0].lines.len(), 1);
