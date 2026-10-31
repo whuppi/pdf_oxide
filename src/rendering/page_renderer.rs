@@ -5326,25 +5326,46 @@ impl PageRenderer {
             _ => false,
         };
 
-        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-        let mut raw = xobject.decode_stream_data()?;
-        // ── end pdf_manipulator patch ──
-        if let Some(params) = Self::image_mask_ccitt_params(dict, width, height, doc)? {
-            let (decoded, rows_valid) =
-                crate::extractors::ccitt_bilevel::decompress_ccitt_reporting(&raw, &params)?;
-            raw = decoded;
-
-            // The shared CCITT image decoder normalises packed rows to
-            // 0=white, 1=black. An ImageMask needs the actual PDF sample
-            // values instead: with the CCITT default `/BlackIs1 false`,
-            // 0 means black and 1 means white; `/BlackIs1 true` reverses
-            // that mapping. `decompress_ccitt` already applies BlackIs1
-            // while normalising, so one final inversion recovers the sample
-            // values consumed by the independent `/Decode` mapping below.
-            for byte in &mut raw {
-                *byte = !*byte;
+        // ── pdf_manipulator patch: the stencil's own bytes, or the CCITT rows decoded one at a time ──
+        let raw = if let Some(params) = Self::image_mask_ccitt_params(dict, width, height, doc)? {
+            // The CCITT rows decode a row at a time off the stream's reader,
+            // the way a band consumes them; the whole decode never runs. A
+            // row the cursor could not read stops the decode early: the rows
+            // past it are the blank the padded tail becomes below.
+            let body_for_read = match xobject {
+                Object::Stream { body, .. } => body.clone(),
+                _ => return Err(Error::Image("ImageMask XObject is not a stream".to_string())),
+            };
+            let reader =
+                crate::decoders::stream::reader_in(dict, None, move || body_for_read.owned_reader())?;
+            let mut feed = crate::decoders::ccitt::BitFeed::new(reader);
+            let mut engine = crate::decoders::ccitt::FaxRowEngine::new(&params)?;
+            let mut raw = vec![0u8; expected];
+            for row in raw.chunks_exact_mut(row_bytes) {
+                match engine.pull_row(&mut feed, Some(height), row) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        log::warn!(
+                            "CCITT image-mask rows stopped early ({}x{}, K={}): {e}",
+                            width,
+                            height,
+                            params.k
+                        );
+                        break;
+                    },
+                }
             }
-
+            // Sample space: `BlackIs1` and one complement recover the samples
+            // the `/Decode` mapping below reads (the decoder normalises to
+            // `0=white, 1=black`, the sentinel of what the row values mean).
+            if params.black_is_1 {
+                for b in raw.iter_mut() {
+                    *b = !*b;
+                }
+            }
+            for b in raw.iter_mut() {
+                *b = !*b;
+            }
             // Rows the decoder could not read are padding, not content — a
             // truncated stream is padded white and a wholly undecodable one is
             // replaced by a blank buffer. Neither is neutral: an ImageMask
@@ -5358,13 +5379,19 @@ impl PageRenderer {
             // blanking the page — with the value that draws nothing under this
             // mask's own /Decode. The result is the page as it would look with
             // the stencil absent, which is the honest degradation.
-            let row_bytes = (width as usize).div_ceil(8);
-            if rows_valid < height as usize && row_bytes > 0 {
+            if engine.decoded_rows() < height as usize && row_bytes > 0 {
                 let blank = if invert { 0x00 } else { 0xFF };
-                let from = rows_valid.saturating_mul(row_bytes).min(raw.len());
+                let from = engine
+                    .decoded_rows()
+                    .saturating_mul(row_bytes)
+                    .min(raw.len());
                 raw[from..].fill(blank);
             }
-        }
+            raw
+        } else {
+            xobject.decode_stream_data()?
+        };
+        // ── end pdf_manipulator patch ──
 
         // When the fill colour is a shading pattern the stencil is not painted
         // with a colour at all — it becomes the coverage the gradient is

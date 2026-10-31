@@ -833,6 +833,68 @@ fn decode_array_inverts_1bpc(decode: Option<&crate::object::Object>) -> bool {
     matches!((as_num(&arr[0]), as_num(&arr[1])), (Some(lo), Some(hi)) if lo > hi)
 }
 
+// ── pdf_manipulator patch: the CCITT params the image prologue and the fax row cursor derive share one home ──
+/// The CCITT `/DecodeParms` a 1-bit DeviceGray image names, when the image is
+/// one: `/BitsPerComponent 1`, a `CCITTFaxDecode` filter, `/Width` and
+/// `/Height` resolved, `/Rows` defaulted to the height, and `/Decode`'s
+/// inversion folded into `black_is_1`. That is exactly what
+/// [`extract_image_from_xobject_at`] sets on the whole-decode image's
+/// `ccitt_params`, so the fax row cursor opens on the values the whole
+/// decode reads, and `None` leaves an image on the whole-decode path.
+pub(crate) fn fax_params(
+    doc: Option<&crate::document::PdfDocument>,
+    dict: &std::collections::HashMap<String, crate::object::Object>,
+    color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
+    width: u32,
+    height: u32,
+) -> Option<crate::decoders::CcittParams> {
+    use crate::object::Object;
+
+    let bits_per_component = dict.get("BitsPerComponent").and_then(|o| o.as_integer());
+    if bits_per_component != Some(1) {
+        return None;
+    }
+    let is_ccitt = dict
+        .get("Filter")
+        .map(crate::object::extract_filter_names)
+        .unwrap_or_default()
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("CCITTFaxDecode"));
+    if !is_ccitt {
+        return None;
+    }
+    let resolved_color_space =
+        match parse_color_space(&resolve_image_color_space(doc, dict, color_space_map).ok()?) {
+            Ok(space) => space,
+            // A colour space the whole decode could not parse either.
+            Err(_) => return None,
+        };
+    if resolved_color_space != ColorSpace::DeviceGray {
+        return None;
+    }    let decode_parms = dict.get("DecodeParms").and_then(|o| match o {
+        Object::Reference(_) => doc.and_then(|d| d.resolve_object(o).ok()),
+        other => Some(other.clone()),
+    });
+    let mut ccitt_params =
+        crate::object::extract_ccitt_params_with_width(decode_parms.as_ref(), Some(width))?;
+    if ccitt_params.rows.is_none() {
+        ccitt_params.rows = Some(height);
+    }
+    // ISO 32000-1 7.4.6 /BlackIs1 and 8.9.5.2 Table 90 /Decode both
+    // flip which sample bit means "black" for a 1-bit DeviceGray
+    // image, and they are independent, composable mechanisms: a
+    // producer that wants inverted polarity may set /BlackIs1 true
+    // *or* write /Decode [1 0] on the image XObject instead (both
+    // are seen in real-world scanned PDFs). Fold /Decode into the
+    // same inversion flag decompress_ccitt already honors so either
+    // one alone inverts and both together cancel out.
+    if decode_array_inverts_1bpc(dict.get("Decode")) {
+        ccitt_params.black_is_1 = !ccitt_params.black_is_1;
+    }
+    Some(ccitt_params)
+}
+// ── end pdf_manipulator patch ──
+
 /// Per-component `(Dmin, Dmax)` pairs from a `/Decode` array, or `None` when
 /// the array is absent or does not hold `2 × ncomp` numbers.
 /// The number of inks a `/DeviceN` colour space names (ISO 32000-1 §8.6.6.5,
@@ -1421,29 +1483,12 @@ pub fn extract_image_from_xobject_at(
         // bounds and defaulted to white: the page rendered nearly blank at
         // coverage 0.00988, where the ink derivable from the file is 0.07980
         // and all four reference renderers report 0.08004-0.08297.
-        let decode_parms = dict.get("DecodeParms").and_then(|o| match o {
-            Object::Reference(_) => doc.and_then(|d| d.resolve_object(o).ok()),
-            other => Some(other.clone()),
-        });
-        if let Some(mut ccitt_params) =
-            crate::object::extract_ccitt_params_with_width(decode_parms.as_ref(), Some(width))
-        {
-            if ccitt_params.rows.is_none() {
-                ccitt_params.rows = Some(height);
-            }
-            // ISO 32000-1 7.4.6 /BlackIs1 and 8.9.5.2 Table 90 /Decode both
-            // flip which sample bit means "black" for a 1-bit DeviceGray
-            // image, and they are independent, composable mechanisms: a
-            // producer that wants inverted polarity may set /BlackIs1 true
-            // *or* write /Decode [1 0] on the image XObject instead (both
-            // are seen in real-world scanned PDFs). Fold /Decode into the
-            // same inversion flag decompress_ccitt already honors so either
-            // one alone inverts and both together cancel out.
-            if decode_array_inverts_1bpc(dict.get("Decode")) {
-                ccitt_params.black_is_1 = !ccitt_params.black_is_1;
-            }
+        // ── pdf_manipulator patch: the prologue and the fax row cursor read the
+        // same params from one helper ──
+        if let Some(ccitt_params) = fax_params(doc, dict, color_space_map, width, height) {
             image.set_ccitt_params(ccitt_params);
         }
+        // ── end pdf_manipulator patch ──
     }
 
     Ok(image)

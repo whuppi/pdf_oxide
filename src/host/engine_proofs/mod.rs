@@ -23,6 +23,8 @@ mod filter_readers;
 #[cfg(feature = "rendering")]
 mod extract_proof;
 #[cfg(feature = "rendering")]
+mod fax_proof;
+#[cfg(feature = "rendering")]
 mod group_proof;
 #[cfg(feature = "rendering")]
 mod reduce_proof;

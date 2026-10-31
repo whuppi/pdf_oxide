@@ -27,9 +27,11 @@
 //! row (a flipped image meets every band from the bottom).
 
 use super::resample::RowResampler;
+use crate::decoders::{CcittParams, ccitt::FaxRowEngine};
+use crate::decoders::ccitt::BitFeed;
 use crate::error::{Error, Result};
 use crate::extractors::images::{
-    decode_jbig2_bits, row_geometry, ColorSpace, ImageData, PdfImage,
+    decode_jbig2_bits, row_geometry, ImageData, PdfImage,
 };
 use crate::object::{Object, ObjectRef};
 use image::DynamicImage;
@@ -71,6 +73,9 @@ enum Kind {
     /// A bilevel bitmap, packed MSB first, rows padded to a byte. `one` is the
     /// gray value (0 or 255) a set bit stands for; a clear bit is the other.
     Bits { packed: Vec<u8>, row_bytes: usize, one: u8 },
+    /// A fax image's rows, decoded a row at a time from the stream: two
+    /// transition lines and one row are all the decode holds.
+    Fax(Fax),
 }
 
 struct Strips {
@@ -101,6 +106,146 @@ impl Strips {
     ) -> Result<Box<dyn Read>> {
         let body = body.clone();
         crate::decoders::stream::reader_in(dict, origin, move || body.owned_reader())
+    }
+}
+
+/// A fax image's rows, decoded a row at a time from the stream's reader.
+struct Fax {
+    /// The stream's dictionary as stored, to open its reader again from.
+    dict: HashMap<String, Object>,
+    body: crate::object::StreamBody,
+    /// The decode params, `/Decode`'s inversion already folded into
+    /// `black_is_1`: a decoded row's `1` bit is the sample the whole decode
+    /// reports (1 = ink).
+    params: CcittParams,
+    /// The row count the reader will ask for: the smaller of `/Rows` and
+    /// `/Height`, which the engine serves white past the stream's end.
+    height: u32,
+    row_bytes: usize,
+    engine: FaxRowEngine,
+    feed: BitFeed,
+    /// The row last decoded, reused across reads. White once the stream has
+    /// failed and every remaining row is the blank stand-in.
+    row: Vec<u8>,
+    failed: bool,
+}
+
+impl Fax {
+    /// Opens the fax rows of the stream `dict` names: the reader its filters
+    /// leave and the CCITT params `params` holds (the caller pulled them from
+    /// the dictionary and its colour-space map exactly as the whole decode
+    /// does). `height` is the image's `/Height`.
+    fn open(
+        dict: &HashMap<String, Object>,
+        body: &crate::object::StreamBody,
+        params: CcittParams,
+        height: u32,
+    ) -> Result<Kind> {
+        // The cursor's engine reads a u16 width; wider than that stays on the
+        // whole-decode path, which truncates it the way it always has.
+        let width = params.columns;
+        if width > u16::MAX as u32 {
+            return Err(Error::Image(format!(
+                "CCITT image /Width {width} exceeds the row cursor's limit {}",
+                u16::MAX
+            )));
+        }
+        let reader = Strips::open_reader(dict, body, None)?;
+        Ok(Kind::Fax(Self {
+            dict: dict.clone(),
+            body: body.clone(),
+            height,
+            row_bytes: (width as usize).div_ceil(8),
+            engine: FaxRowEngine::new(&params)?,
+            feed: BitFeed::new(reader),
+            params,
+            row: Vec::new(),
+            failed: false,
+        }))
+    }
+
+    /// Decodes the next row and expands it into `out`: `width` pixels of
+    /// `output`, a set bit inked, exactly as the `Bits` kind reads one.
+    /// A stream the engine gives up on leaves the rows white, the blank
+    /// stand-in the whole decode makes of such a stream. The reader stops at
+    /// `min(/Rows, /Height)`; the rows past that are white as well.
+    fn read(&mut self, out: &mut [u8], width: u32, output: Output) -> Result<()> {
+        if self.row.len() != self.row_bytes {
+            self.row.clear();
+            self.row.resize(self.row_bytes, 0);
+        }
+        let mut failed_now = false;
+        if !self.failed {
+            match self.engine.pull_row(&mut self.feed, Some(self.height), &mut self.row) {
+                Ok(_) => {},
+                Err(e) => {
+                    log::warn!(
+                        "CCITT row cursor gave up ({}x{}, K={}): {e}",
+                        self.params.columns,
+                        self.height,
+                        self.params.k
+                    );
+                    self.failed = true;
+                    failed_now = true;
+                },
+            }
+        }
+        if self.failed || failed_now {
+            self.row.fill(0);
+        }
+        // The params' polarity read (and `/Decode` fold, if any) applied: a
+        // set bit is ink, as the whole decode's rows carry.
+        if self.params.black_is_1 {
+            for b in &mut self.row {
+                *b = !*b;
+            }
+        }
+        bilevel_row(&self.row, width, 0, output, out);
+        Ok(())
+    }
+
+    /// Decodes `rows` rows past the cursor without producing them.
+    fn skip(&mut self, rows: u32) -> Result<()> {
+        if self.row.len() != self.row_bytes {
+            self.row.clear();
+            self.row.resize(self.row_bytes, 0);
+        }
+        for _ in 0..rows {
+            if self.failed {
+                continue; // the rows past the failure are white already
+            }
+            match self.engine.pull_row(&mut self.feed, Some(self.height), &mut self.row) {
+                Ok(_) => {},
+                Err(e) => {
+                    log::warn!(
+                        "CCITT row cursor gave up skipping ({}x{}, K={}): {e}",
+                        self.params.columns,
+                        self.height,
+                        self.params.k
+                    );
+                    self.failed = true;
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes this source holds in memory: the row and its window, plus the
+    /// engine's two transition lines, one column each.
+    fn retained(&self) -> usize {
+        self.row.capacity()
+            + self.feed.buf.capacity()
+            + 2 * self.params.columns as usize * 2
+    }
+
+    /// Opens the stream's reader and the row decode again from the first row.
+    fn restart(&mut self) -> Result<()> {
+        let reader = Strips::open_reader(&self.dict, &self.body, None)?;
+        self.feed = BitFeed::new(reader);
+        self.engine = FaxRowEngine::new(&self.params)?;
+        self.row.clear();
+        self.failed = false;
+        Ok(())
     }
 }
 
@@ -168,6 +313,22 @@ fn dynamic_row(img: &DynamicImage, y: u32, output: Output, out: &mut [u8]) {
         },
         // `normalised` leaves no other pair.
         _ => out.fill(0),
+    }
+}
+
+/// One packed bilevel row as `output` pixels: `width` samples, MSB first, `one`
+/// the gray value a set bit stands for, `255 - one` a clear bit. What the
+/// `Bits` kind reads a row of its whole bitmap as, and what `Fax::read` reads
+/// a decoded row as.
+fn bilevel_row(row: &[u8], width: u32, one: u8, output: Output, out: &mut [u8]) {
+    for (x, px) in out.chunks_exact_mut(output.bytes()).enumerate().take(width as usize) {
+        let bit = (row[x / 8] >> (7 - (x % 8))) & 1;
+        let gray = if bit == 1 { one } else { 255 - one };
+        if output == Output::Rgba {
+            px.copy_from_slice(&[gray, gray, gray, 255]);
+        } else {
+            px[0] = gray;
+        }
     }
 }
 
@@ -326,26 +487,28 @@ impl ImageRows {
             });
         }
 
-        let pdf_image = extract_image_from_xobject_at(Some(doc), xobject, None, Some(color_spaces), target)?;
-        // A fax image is decoded to one bit a pixel and kept so.
-        if let (ImageData::Raw { pixels, .. }, Some(params), 1) =
-            (pdf_image.data(), pdf_image.ccitt_params(), pdf_image.bits_per_component())
-        {
-            if *pdf_image.color_space() == ColorSpace::DeviceGray {
-                let packed = crate::extractors::ccitt_bilevel::decompress_ccitt(pixels, params)?;
-                return Ok(Self {
-                    width: pdf_image.width(),
-                    height: pdf_image.height(),
-                    output,
-                    next: 0,
-                    kind: Kind::Bits {
-                        packed,
-                        row_bytes: (pdf_image.width() as usize).div_ceil(8),
-                        one: 0,
-                    },
-                });
+        // A fax image is decoded a row at a time; the packed whole bitmap the
+        // decode used to produce never exists.
+        if is_filter(&filters, &["CCITTFaxDecode"]) {
+            let geometry = row_geometry(Some(doc), dict, Some(color_spaces))?;
+            if let Some(params) = crate::extractors::images::fax_params(
+                Some(doc),
+                dict,
+                Some(color_spaces),
+                geometry.width,
+                geometry.height,
+            ) {
+                // `/Columns` is the row the cursor packs and paints;
+                // `/Rows` and `/Height` bound the rows it serves, at the
+                // smaller.
+                let width = params.columns;
+                let height = params.rows.map_or(geometry.height, |rows| rows.min(geometry.height));
+                let kind = Fax::open(dict, body, params, height)?;
+                return Ok(Self { width, height, output, next: 0, kind });
             }
         }
+
+        let pdf_image = extract_image_from_xobject_at(Some(doc), xobject, None, Some(color_spaces), target)?;
         let mut raster = pdf_image.to_dynamic_image_covering(target)?;
         // A colour-key /Mask is tested against the raw samples, which a JPEG
         // 2000 decode still holds beside the picture. Where a sample is in
@@ -382,7 +545,7 @@ impl ImageRows {
         doc: &crate::document::PdfDocument,
         xobject: &Object,
     ) -> Result<Self> {
-        let Object::Stream { dict, .. } = xobject else {
+        let Object::Stream { dict, body } = xobject else {
             return Err(Error::Image("mask is not a stream".to_string()));
         };
         let is_image_mask = matches!(dict.get("ImageMask"), Some(Object::Boolean(true)));
@@ -417,6 +580,62 @@ impl ImageRows {
         let packed = if is_filter(&filters, &["JBIG2Decode"]) {
             crate::extractors::images::decode_jbig2_stencil(xobject, dict, Some(doc), mw, mh)
                 .unwrap_or_default()
+        } else if is_filter(&filters, &["CCITTFaxDecode"]) {
+            // The stencil's codestream is decoded a row at a time off the
+            // stream's reader, never held whole. The decoded rows are
+            // complemented so `0` is the inked sample the `/Decode` mapping
+            // below reads, and rows the cursor could not serve stay white —
+            // the blank stand-in the whole decode made of a stream it could
+            // not read.
+            let decode_parms = dict.get("DecodeParms").and_then(|o| match o {
+                Object::Reference(_) => doc.resolve_object(o).ok(),
+                other => Some(other.clone()),
+            });
+            let mut params =
+                crate::object::extract_ccitt_params_with_width(decode_parms.as_ref(), Some(mw))
+                    .unwrap_or(crate::decoders::CcittParams {
+                        // The filter's default: Group 3, pure 1-D.
+                        k: 0,
+                        columns: mw,
+                        ..Default::default()
+                    });
+            params.columns = mw;
+            params.rows = Some(mh);
+            let rows = crate::decoders::ccitt::FaxRowEngine::new(&params);
+            let mut packed = vec![0u8; expected];
+            match rows {
+                Ok(mut engine) => {
+                    if params.columns <= u16::MAX as u32 {
+                        let reader = Strips::open_reader(dict, body, None)?;
+                        let mut feed = BitFeed::new(reader);
+                        for row in packed.chunks_exact_mut(row_bytes) {
+                            if engine.pull_row(&mut feed, Some(mh), row).is_err() {
+                                log::warn!("CCITT stencil rows stopped early: the cursor could not read a row");
+                                break; // the rest stay white padding
+                            }
+                            if params.black_is_1 {
+                                for b in row.iter_mut() {
+                                    *b = !*b;
+                                }
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "CCITT stencil /Width {mw} exceeds the row cursor's limit {}",
+                            u16::MAX
+                        );
+                    }
+                },
+                Err(e) => {
+                    log::warn!("CCITT stencil rows unreadable: {e}");
+                },
+            }
+            // The decoder emits 1 for an inked pixel, the complement of the
+            // sample value the rule below is written against.
+            for b in &mut packed {
+                *b = !*b;
+            }
+            packed
         } else {
             let raw = xobject.decode_stream_data()?;
             if raw.len() < expected / 2 {
@@ -482,6 +701,7 @@ impl ImageRows {
             },
             Kind::Raster(img) => img.as_bytes().len(),
             Kind::Bits { packed, .. } => packed.len(),
+            Kind::Fax(fax) => fax.retained(),
         }
     }
 
@@ -493,6 +713,9 @@ impl ImageRows {
             s.pixels.clear();
             s.first = 0;
             s.count = 0;
+        }
+        if let Kind::Fax(fax) = &mut self.kind {
+            fax.restart()?;
         }
         Ok(())
     }
@@ -511,6 +734,9 @@ impl ImageRows {
                 s.count = 0;
             }
         }
+        if let Kind::Fax(fax) = &mut self.kind {
+            fax.skip(target - self.next)?;
+        }
         self.next = target;
         Ok(())
     }
@@ -526,15 +752,12 @@ impl ImageRows {
             Kind::Raster(img) => dynamic_row(img, y, output, out),
             Kind::Bits { packed, row_bytes, one } => {
                 let row = &packed[y as usize * *row_bytes..(y as usize + 1) * *row_bytes];
-                for (x, px) in out.chunks_exact_mut(output.bytes()).enumerate().take(width as usize) {
-                    let bit = (row[x / 8] >> (7 - (x % 8))) & 1;
-                    let gray = if bit == 1 { *one } else { 255 - *one };
-                    if output == Output::Rgba {
-                        px.copy_from_slice(&[gray, gray, gray, 255]);
-                    } else {
-                        px[0] = gray;
-                    }
-                }
+                bilevel_row(row, width, *one, output, out);
+            },
+            Kind::Fax(fax) => {
+                // `Fax::read` decodes and expands one row, `black_is_1`
+                // folded into the params it opens with.
+                fax.read(out, width, output)?;
             },
             Kind::Strips(s) => {
                 if y >= s.first + s.count {

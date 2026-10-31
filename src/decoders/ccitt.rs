@@ -13,7 +13,8 @@
 
 use crate::decoders::{CcittParams, StreamDecoder};
 use crate::error::{Error, Result};
-use crate::extractors::ccitt_bilevel::{append_transition_row, transitions_to_bytes};
+use crate::extractors::ccitt_bilevel::transitions_to_bytes;
+use std::io::Read;
 
 /// CCITTFaxDecode stream filter (pass-through).
 ///
@@ -47,208 +48,430 @@ pub struct CcittDecoded {
 }
 
 /// Decode a CCITT codestream to packed bilevel bytes, dispatching on `/K`:
-/// Group 4 (T.6, `K < 0`) here, Group 3 (T.4, `K >= 0`) in [`decode_g3`].
+/// Group 4 (T.6, `K < 0`) here, Group 3 (T.4, `K >= 0`) in the same engine.
 ///
 /// Returns `Err` only when zero usable rows could be produced (genuinely
 /// undecodable) — the caller may then fall back.
 /// `BlackIs1` is NOT applied here; the caller owns that inversion.
+// ── pdf_manipulator patch: decode drives the row engine, so decode and the fax
+// row cursor read rows one and the same way ──
 pub fn decode(data: &[u8], params: &CcittParams) -> Result<CcittDecoded> {
     let width = params.columns as u16;
     if width == 0 {
         return Err(Error::Decode("CCITT decode requires /Columns".to_string()));
     }
-    if !params.is_group_4() {
-        // Group 3: K == 0 is pure 1-D (Modified Huffman); K > 0 is mixed 1-D/2-D.
-        return decode_g3(data, params);
+    let mut engine = FaxRowEngine::new(params)?;
+    let mut reader = BitReader::new(data);
+    let bytes_per_row = (width as usize).div_ceil(8);
+    let mut out = packed_output_buffer(bytes_per_row, params.rows)?;
+    let mut row = vec![0u8; bytes_per_row];
+    while engine.pull_row(&mut reader, params.rows, &mut row)? {
+        out.extend_from_slice(&row);
+    }
+    engine.into_decoded(out)
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: the row engine, shared with the fax row cursor in src/host/images ──
+/// A bit source the fax row decoders read: a codestream's bits, MSB first.
+/// The whole-buffer decode reads a [`BitReader`] over one slice; the fax row
+/// cursor reads its own feed over the stream as it is produced.
+pub(crate) trait BitSource {
+    /// Peek the next `n` bits (≤16) MSB-first, or `None` if fewer remain.
+    fn peek(&mut self, n: u8) -> Option<u16>;
+    /// Consume `n` peeked bits.
+    fn consume(&mut self, n: u8);
+    /// Bits from the cursor to the codestream's next byte boundary — where
+    /// `/EncodedByteAlign` starts each coded row.
+    fn bits_to_byte_boundary(&self) -> u8;
+    /// True when the codestream has no bits left.
+    fn eod(&self) -> bool;
+
+    /// The cursor's bit position, saved with [`BitSource::restore`] around a
+    /// look that may not be taken.
+    fn position(&self) -> usize;
+
+    /// Resets the cursor to a [`BitSource::position`] value. Only one look
+    /// ahead is ever taken back — a few bits behind the cursor, so a source
+    /// that drops its consumed prefix keeps the last few bytes.
+    fn restore(&mut self, position: usize);
+
+    /// A read the source failed to make. Read as an error, never as the end
+    /// of the stream: the caller pads with white rows at a stream's end, and
+    /// padding would hide a failed read. Taken once; a source that has
+    /// failed stays failed.
+    fn error(&mut self) -> Option<Error> {
+        None
+    }
+}
+
+impl BitSource for BitReader<'_> {
+    fn peek(&mut self, n: u8) -> Option<u16> {
+        BitReader::peek(self, n)
+    }
+    fn consume(&mut self, n: u8) {
+        BitReader::consume(self, n)
     }
 
-    let bytes_per_row = (width as usize).div_ceil(8);
-    let mut reader = BitReader::new(data);
-    let mut reference = transition_buffer(width)?; // imaginary all-white line above row 0
-    let mut current = transition_buffer(width)?;
-    let mut out = packed_output_buffer(bytes_per_row, params.rows)?;
-    let mut decoded_rows = 0usize;
-    let mut byte_align = params.encoded_byte_align;
-    let mut recovered = false;
+    fn bits_to_byte_boundary(&self) -> u8 {
+        BitReader::bits_to_byte_boundary(self)
+    }
 
-    loop {
-        if let Some(h) = params.rows {
-            if decoded_rows >= h as usize {
+    fn eod(&self) -> bool {
+        BitReader::eod(self)
+    }
+
+    fn position(&self) -> usize {
+        self.bit
+    }
+
+    fn restore(&mut self, position: usize) {
+        self.bit = position;
+    }
+}
+
+/// A [`BitSource`] over a reader: the codestream arrives byte by byte
+/// through the stream's filter readers, and what this holds past a decode is
+/// one read chunk and the few bytes a save/restore rewinds across. The fax
+/// row cursor of `src/host/images` opens one on the stream it reads, and a
+/// stencil render feeds one through the same engine the whole-buffer decode
+/// uses.
+pub struct BitFeed {
+    reader: Box<dyn Read>,
+    /// Unconsumed bytes, the first holding the cursor's next bit. The
+    /// consumed prefix is dropped, keeping [`BitFeed::KEEP`] bytes behind the
+    /// cursor for the one look ahead [`BitSource::restore`] takes back.
+    pub(crate) buf: Vec<u8>,
+    /// Bits consumed from `buf[0]`.
+    bit: usize,
+    /// Bits dropped off `buf`'s front, which place a position value inside
+    /// the buffer's current indexing.
+    dropped: u64,
+    ended: bool,
+    error: Option<Error>,
+}
+
+impl BitFeed {
+    const CHUNK: usize = 8 * 1024;
+    const KEEP: usize = 3;
+
+    pub fn new(reader: Box<dyn Read>) -> Self {
+        let mut buf = Vec::with_capacity(Self::CHUNK + Self::KEEP);
+        buf.resize(Self::CHUNK, 0);
+        buf.clear();
+        Self { reader, buf, bit: 0, dropped: 0, ended: false, error: None }
+    }
+
+    /// Fills the window once, keeping the bytes a restore may reach.
+    fn refill(&mut self) {
+        if self.ended || self.error.is_some() {
+            return;
+        }
+        let drop_bytes = (self.bit / 8).saturating_sub(Self::KEEP);
+        self.buf.drain(..drop_bytes);
+        self.bit -= drop_bytes * 8;
+        self.dropped += drop_bytes as u64 * 8;
+        let start = self.buf.len();
+        self.buf.resize(start + Self::CHUNK, 0);
+        let mut filled = 0usize;
+        while filled < Self::CHUNK {
+            match self.reader.read(&mut self.buf[start + filled..]) {
+                Ok(0) => {
+                    self.ended = true;
+                    break;
+                },
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    self.error = Some(crate::encryption::stream::from_io(e));
+                    self.ended = true;
+                    break;
+                },
+            }
+        }
+        self.buf.truncate(start + filled);
+    }
+}
+
+impl BitSource for BitFeed {
+    fn peek(&mut self, n: u8) -> Option<u16> {
+        debug_assert!(n > 0 && n <= 16, "a peek is one to sixteen bits");
+        while self.buf.len() * 8 - self.bit < n as usize && self.error.is_none() {
+            self.refill();
+            if self.ended {
                 break;
             }
+        }
+        if n == 0 || self.buf.len() * 8 - self.bit < n as usize {
+            return None;
+        }
+        let mut v: u16 = 0;
+        for i in 0..n as usize {
+            let bp = self.bit + i;
+            let bit = (self.buf[bp / 8] >> (7 - (bp % 8))) & 1;
+            v = (v << 1) | u16::from(bit);
+        }
+        Some(v)
+    }
+
+    fn consume(&mut self, n: u8) {
+        self.bit += n as usize;
+    }
+
+    fn bits_to_byte_boundary(&self) -> u8 {
+        // The codestream's byte boundaries, whatever the window's indexing is.
+        ((8 - ((self.dropped as usize + self.bit) % 8)) % 8) as u8
+    }
+
+    fn eod(&self) -> bool {
+        (self.ended || self.error.is_some()) && self.bit >= self.buf.len() * 8
+    }
+
+    fn position(&self) -> usize {
+        (self.dropped as usize + self.bit) as usize
+    }
+
+    fn restore(&mut self, position: usize) {
+        // A restore is the one look ahead a save/restore takes back, and the
+        // window keeps `KEEP` bytes behind the cursor, so the saved position
+        // is never dropped out from under it.
+        let relative = position - self.dropped as usize;
+        debug_assert!(relative <= self.bit);
+        self.bit = relative;
+    }
+
+    fn error(&mut self) -> Option<Error> {
+        self.error.take()
+    }
+}
+
+/// The per-row state the Group 4 and Group 3 row loops share, readable from
+/// any [`BitSource`]: `/K`, `/EncodedByteAlign`, the reference line, and the
+/// recovery contract the whole-buffer decode holds — a row that fails past
+/// the first keeps the rows decoded so far, the rest padded white to the
+/// caller's bound. `BlackIs1` is the caller's to apply.
+pub(crate) struct FaxRowEngine {
+    width: u16,
+    /// Every row is T.6 2-D.
+    group4: bool,
+    /// A tag bit after each line's EOL selects 1-D or 2-D.
+    two_dimensional: bool,
+    byte_align: bool,
+    /// Rows read from the stream.
+    decoded: usize,
+    /// Rows handed to the caller, white padding included.
+    produced: usize,
+    ended: bool,
+    recovered: bool,
+    first_row_error: &'static str,
+    reference: Vec<u16>,
+    current: Vec<u16>,
+}
+
+impl FaxRowEngine {
+    pub(crate) fn new(params: &CcittParams) -> Result<Self> {
+        let width = params.columns as u16;
+        if width == 0 {
+            return Err(Error::Decode("CCITT decode requires /Columns".to_string()));
+        }
+        Ok(Self {
+            width,
+            group4: params.is_group_4(),
+            two_dimensional: params.k > 0,
+            byte_align: params.encoded_byte_align,
+            decoded: 0,
+            produced: 0,
+            ended: false,
+            recovered: false,
+            first_row_error: if params.is_group_4() {
+                "CCITT: stream undecodable from first row"
+            } else {
+                "CCITT G3: stream undecodable from first row"
+            },
+            reference: transition_buffer(width)?, // imaginary all-white line above row 0
+            current: transition_buffer(width)?,
+        })
+    }
+
+    /// Rows read from the stream — the produced buffer's real content, as
+    /// apart from its white padding.
+    pub(crate) fn decoded_rows(&self) -> usize {
+        self.decoded
+    }
+
+    /// The next row into `out`: `ceil(width/8)` bytes packed MSB first, `1`
+    /// an inked pixel, read from `source` while it has one and white past
+    /// the stream's end. Reads at most `bound` rows; the caller stops when
+    /// it returns false. `BlackIs1` is the caller's to apply.
+    pub(crate) fn pull_row<S: BitSource>(
+        &mut self,
+        source: &mut S,
+        bound: Option<u32>,
+        out: &mut [u8],
+    ) -> Result<bool> {
+        if let Some(h) = bound {
+            if self.produced >= h as usize {
+                return Ok(false);
+            }
+        }
+        if self.ended {
+            return self.ended_row(bound, out);
+        }
+        if let Some(error) = source.error() {
+            return Err(error);
         }
         // /EncodedByteAlign: each coded row begins on a byte boundary, so skip
         // the zero fill bits left over from the previous row before reading the
         // next row's first mode code (pdfium-guarded: if a skipped bit is 1 the
         // declared alignment is wrong for this stream — disable it rather than
         // corrupt every subsequent row).
-        if byte_align && decoded_rows > 0 {
-            byte_align_skip(&mut reader, &mut byte_align);
+        if self.byte_align && self.decoded > 0 {
+            byte_align_skip(source, &mut self.byte_align);
         }
-        if reader.eod() {
-            if let Some(h) = params.rows {
-                if decoded_rows < h as usize {
-                    recovered = true; // ran out of data before all rows
-                }
-            }
-            break;
-        }
-
-        current.clear();
-        match decode_row_g4(&mut reader, &reference, width, &mut current) {
-            RowStatus::EndOfBlock => break, // clean EOFB
-            RowStatus::AllocationFailed => {
-                return Err(Error::Decode(
-                    "Unable to grow CCITT row transition buffer".to_string(),
-                ));
-            },
-            RowStatus::Error => {
-                if decoded_rows >= 1 {
-                    recovered = true; // keep the rows we have; do NOT blank the page
-                    break;
-                }
-                return Err(Error::Decode("CCITT: stream undecodable from first row".to_string()));
-            },
-            RowStatus::Ok => {
-                append_transition_row(&mut out, &current, width as usize)?;
-                std::mem::swap(&mut reference, &mut current);
-                decoded_rows += 1;
-            },
-        }
-    }
-
-    // Pad missing trailing rows with white when the height is known.
-    if let Some(h) = params.rows {
-        let white_row = transitions_to_bytes::<u16>(&[], width as usize)?;
-        while out.len() / bytes_per_row.max(1) < h as usize {
-            out.try_reserve(white_row.len()).map_err(|_| {
-                Error::Decode(format!(
-                    "Unable to grow CCITT output by {} padding bytes",
-                    white_row.len()
-                ))
-            })?;
-            out.extend_from_slice(&white_row);
-        }
-    }
-
-    if out.is_empty() {
-        return Err(Error::Decode("CCITT: no output produced".to_string()));
-    }
-
-    Ok(CcittDecoded {
-        data: out,
-        rows_decoded: decoded_rows,
-        recovered_partial: recovered,
-    })
-}
-
-/// Decode a CCITT **Group 3** (T.4) codestream. `params.k == 0` is pure 1-D
-/// (Modified Huffman); `params.k > 0` is mixed 1-D/2-D where a tag bit after the
-/// line's EOL selects that line's coding (`1` = 1-D, `0` = 2-D-relative). EOL
-/// codes (`000000000001`, absorbing any leading fill bits) delimit lines and are
-/// tolerated whether or not `/EndOfLine` is declared; six consecutive EOLs is the
-/// return-to-control terminator. Shares the run tables, reference-line walk and
-/// recovery contract with the Group 4 path. `BlackIs1` is the caller's to apply.
-fn decode_g3(data: &[u8], params: &CcittParams) -> Result<CcittDecoded> {
-    let width = params.columns as u16;
-    let two_dimensional = params.k > 0;
-    let bytes_per_row = (width as usize).div_ceil(8);
-    let mut reader = BitReader::new(data);
-    let mut reference = transition_buffer(width)?; // imaginary all-white line above row 0
-    let mut current = transition_buffer(width)?;
-    let mut out = packed_output_buffer(bytes_per_row, params.rows)?;
-    let mut decoded_rows = 0usize;
-    let mut byte_align = params.encoded_byte_align;
-    let mut recovered = false;
-
-    loop {
-        if let Some(h) = params.rows {
-            if decoded_rows >= h as usize {
-                break;
-            }
-        }
-        if byte_align && decoded_rows > 0 {
-            byte_align_skip(&mut reader, &mut byte_align);
+        if self.group4 {
+            return self.pull_g4_row(source, bound, out);
         }
         // Swallow the line's EOL (plus fill); 6+ in a row is RTC = end of page.
-        let eols = skip_eols(&mut reader);
-        if reader.eod() {
-            if let Some(h) = params.rows {
-                if decoded_rows < h as usize {
-                    recovered = true;
+        let eols = skip_eols(source);
+        if source.eod() {
+            if let Some(h) = bound {
+                if self.decoded < h as usize {
+                    self.recovered = true; // ran out of data before all rows
                 }
             }
-            break;
+            return self.ended_row(bound, out);
         }
         if eols >= 6 {
-            break;
+            return self.ended_row(bound, out);
         }
-
         // Mixed 2-D streams prefix every line with a 1-D/2-D tag bit.
-        let one_d = if two_dimensional {
-            match reader.peek(1) {
+        let one_d = if self.two_dimensional {
+            match source.peek(1) {
                 Some(b) => {
-                    reader.consume(1);
+                    source.consume(1);
                     b == 1
                 },
-                None => break,
+                None => return self.ended_row(bound, out),
             }
         } else {
             true
         };
 
-        current.clear();
+        self.current.clear();
         let status = if one_d {
-            decode_row_g3_1d(&mut reader, width, &mut current)
+            decode_row_g3_1d(source, self.width, &mut self.current)
         } else {
-            decode_row_g4(&mut reader, &reference, width, &mut current)
+            decode_row_g4(source, &self.reference, self.width, &mut self.current)
         };
         match status {
-            RowStatus::EndOfBlock => break,
-            RowStatus::AllocationFailed => {
-                return Err(Error::Decode(
-                    "Unable to grow CCITT row transition buffer".to_string(),
-                ));
-            },
-            RowStatus::Error => {
-                if decoded_rows >= 1 {
-                    recovered = true; // keep decoded rows; do NOT blank the page
-                    break;
-                }
-                return Err(Error::Decode(
-                    "CCITT G3: stream undecodable from first row".to_string(),
-                ));
-            },
             RowStatus::Ok => {
-                append_transition_row(&mut out, &current, width as usize)?;
-                std::mem::swap(&mut reference, &mut current);
-                decoded_rows += 1;
+                self.pack_row(out)?;
+                std::mem::swap(&mut self.reference, &mut self.current);
+                self.produced += 1;
+                self.decoded += 1;
+                Ok(true)
+            },
+            RowStatus::EndOfBlock => self.ended_row(bound, out),
+            RowStatus::AllocationFailed => Err(Error::Decode(
+                "Unable to grow CCITT row transition buffer".to_string(),
+            )),
+            RowStatus::Error => {
+                if self.decoded >= 1 {
+                    self.recovered = true; // keep the rows we have; do NOT blank the page
+                    return self.ended_row(bound, out);
+                }
+                Err(Error::Decode(self.first_row_error.to_string()))
             },
         }
     }
 
-    if let Some(h) = params.rows {
-        let white_row = transitions_to_bytes::<u16>(&[], width as usize)?;
-        while out.len() / bytes_per_row.max(1) < h as usize {
-            out.try_reserve(white_row.len()).map_err(|_| {
-                Error::Decode(format!(
-                    "Unable to grow CCITT output by {} padding bytes",
-                    white_row.len()
-                ))
-            })?;
-            out.extend_from_slice(&white_row);
+    /// One Group 4 (T.6) row.
+    fn pull_g4_row<S: BitSource>(
+        &mut self,
+        source: &mut S,
+        bound: Option<u32>,
+        out: &mut [u8],
+    ) -> Result<bool> {
+        if source.eod() {
+            if let Some(h) = bound {
+                if self.decoded < h as usize {
+                    self.recovered = true; // ran out of data before all rows
+                }
+            }
+            return self.ended_row(bound, out);
+        }
+        self.current.clear();
+        match decode_row_g4(source, &self.reference, self.width, &mut self.current) {
+            RowStatus::Ok => {
+                self.pack_row(out)?;
+                std::mem::swap(&mut self.reference, &mut self.current);
+                self.produced += 1;
+                self.decoded += 1;
+                Ok(true)
+            },
+            RowStatus::EndOfBlock => self.ended_row(bound, out),
+            RowStatus::AllocationFailed => Err(Error::Decode(
+                "Unable to grow CCITT row transition buffer".to_string(),
+            )),
+            RowStatus::Error => {
+                if self.decoded >= 1 {
+                    self.recovered = true; // keep the rows we have; do NOT blank the page
+                    return self.ended_row(bound, out);
+                }
+                Err(Error::Decode(self.first_row_error.to_string()))
+            },
         }
     }
-    if out.is_empty() {
-        return Err(Error::Decode("CCITT G3: no output produced".to_string()));
+
+    /// The row stream ends here: the rows the caller still expects, to its
+    /// bound when one was named, are white padding, one per call. An unnamed
+    /// bound hands nothing — the whole-buffer decode pads only a height it
+    /// was given.
+    fn ended_row(&mut self, bound: Option<u32>, out: &mut [u8]) -> Result<bool> {
+        self.ended = true;
+        if let Some(h) = bound {
+            if self.produced < h as usize {
+                out.fill(0);
+                self.produced += 1;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    Ok(CcittDecoded {
-        data: out,
-        rows_decoded: decoded_rows,
-        recovered_partial: recovered,
-    })
+    /// Packs `current` into `out` exactly as `append_transition_row` appends
+    /// it: `ceil(width/8)` bytes, MSB first, rows zero by default so the
+    /// buffer must have been zeroed before rows that carry no runs. The
+    /// buffer is the caller's, reused, never held past a row.
+    fn pack_row(&self, out: &mut [u8]) -> Result<()> {
+        out.fill(0);
+        let row = transitions_to_bytes(&self.current, self.width as usize)?;
+        out[..row.len()].copy_from_slice(&row);
+        Ok(())
+    }
+
+    /// The decode result once every bound row is served. An empty buffer is
+    /// the error the whole-buffer decode returned for an undecodable stream,
+    /// which its callers may fall back from.
+    pub(crate) fn into_decoded(self, out: Vec<u8>) -> Result<CcittDecoded> {
+        if out.is_empty() {
+            return Err(Error::Decode(
+                if self.group4 {
+                    "CCITT: no output produced"
+                } else {
+                    "CCITT G3: no output produced"
+                }
+                .to_string(),
+            ));
+        }
+        Ok(CcittDecoded {
+            data: out,
+            rows_decoded: self.decoded,
+            recovered_partial: self.recovered,
+        })
+    }
 }
+// ── end pdf_manipulator patch ──
 
 fn packed_output_buffer(bytes_per_row: usize, rows: Option<u32>) -> Result<Vec<u8>> {
     let Some(rows) = rows else {
@@ -279,7 +502,10 @@ fn transition_buffer(width: u16) -> Result<Vec<u16>> {
 /// from the left edge, each a make-up+terminating MH code. Pushes color-flip
 /// columns (first run white) into `current`, matching the G4 row contract so the
 /// shared `transitions_to_bytes` packs it identically.
-fn decode_row_g3_1d(reader: &mut BitReader, width: u16, current: &mut Vec<u16>) -> RowStatus {
+// ── pdf_manipulator patch: the row decoders read any bit source, not only a
+// whole-buffer one ──
+fn decode_row_g3_1d(reader: &mut impl BitSource, width: u16, current: &mut Vec<u16>) -> RowStatus {
+// ── end pdf_manipulator patch ──
     let mut a0: u16 = 0;
     let mut white = true;
     let mut any = false;
@@ -312,10 +538,12 @@ fn decode_row_g3_1d(reader: &mut BitReader, width: u16, current: &mut Vec<u16>) 
 /// reader untouched when the next bits are not an EOL; when a trailing fill of
 /// `>= 11` zeros runs into the end of data it is treated as a terminator and
 /// the reader is left at EOD.
-fn skip_eols(reader: &mut BitReader) -> usize {
+// ── pdf_manipulator patch: the bit-level helpers read any bit source, and the
+// cursor save/restores by position instead of a field ──
+fn skip_eols(reader: &mut impl BitSource) -> usize {
     let mut count = 0usize;
     loop {
-        let save = reader.bit;
+        let save = reader.position();
         let mut zeros = 0u32;
         loop {
             match reader.peek(1) {
@@ -327,7 +555,7 @@ fn skip_eols(reader: &mut BitReader) -> usize {
                 None => {
                     // Ran out of data inside the zero run.
                     if zeros < 11 {
-                        reader.bit = save; // not an EOL — leave the cursor put
+                        reader.restore(save); // not an EOL — leave the cursor put
                     }
                     return count;
                 },
@@ -337,7 +565,7 @@ fn skip_eols(reader: &mut BitReader) -> usize {
             reader.consume(1); // eat the EOL's terminating 1
             count += 1;
         } else {
-            reader.bit = save; // a short zero run is real code, not an EOL
+            reader.restore(save); // a short zero run is real code, not an EOL
             return count;
         }
     }
@@ -358,7 +586,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Peek the next `n` bits (≤16) MSB-first, or `None` if fewer remain.
-    fn peek(&self, n: u8) -> Option<u16> {
+    fn peek(&mut self, n: u8) -> Option<u16> {
         if n == 0 {
             return Some(0);
         }
@@ -389,7 +617,7 @@ impl<'a> BitReader<'a> {
 
 /// Skip zero fill to the next byte boundary; disable byte-align if a non-zero
 /// fill bit shows the flag is mis-declared for this stream (pdfium behavior).
-fn byte_align_skip(reader: &mut BitReader, active: &mut bool) {
+fn byte_align_skip(reader: &mut impl BitSource, active: &mut bool) {
     if !*active {
         return;
     }
@@ -407,6 +635,7 @@ fn byte_align_skip(reader: &mut BitReader, active: &mut bool) {
         }
     }
 }
+// ── end pdf_manipulator patch ──
 
 // ---------------------------------------------------------------------------
 // Mode + run-length code decoding
@@ -437,7 +666,8 @@ static MODE_CODES: &[(u8, u16, Mode)] = &[
     (12, 0b0000_0000_0001, Mode::Eof),
 ];
 
-fn read_mode(reader: &mut BitReader) -> Option<Mode> {
+// ── pdf_manipulator patch: the code readers read any bit source ──
+fn read_mode(reader: &mut impl BitSource) -> Option<Mode> {
     for &(len, code, mode) in MODE_CODES {
         if reader.peek(len) == Some(code) {
             reader.consume(len);
@@ -449,7 +679,8 @@ fn read_mode(reader: &mut BitReader) -> Option<Mode> {
 
 /// Read one Modified-Huffman run length for the given color (accumulating
 /// make-up codes until a terminating code `< 64`).
-fn read_run(reader: &mut BitReader, white: bool) -> Option<u16> {
+fn read_run(reader: &mut impl BitSource, white: bool) -> Option<u16> {
+// ── end pdf_manipulator patch ──
     let table = if white { WHITE_CODES } else { BLACK_CODES };
     let mut sum: u16 = 0;
     loop {
@@ -547,7 +778,7 @@ fn try_push_transition(transitions: &mut Vec<u16>, position: u16) -> bool {
 /// positions (first run white) into `current`. Ported from the verified `fax`
 /// crate `Group4Decoder::advance`.
 fn decode_row_g4(
-    reader: &mut BitReader,
+    reader: &mut impl BitSource,
     reference: &[u16],
     width: u16,
     current: &mut Vec<u16>,
