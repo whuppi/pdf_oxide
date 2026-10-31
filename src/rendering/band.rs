@@ -73,6 +73,12 @@ impl BandPlan {
 
 /// Receives a rendered page as straight-alpha RGBA rows, top to bottom.
 pub trait RowSink {
+    /// The raster's size, called once before the first [`Self::rows`] and
+    /// before any row of the page is delivered.
+    fn begin(&mut self, _width: u32, _height: u32) -> Result<()> {
+        Ok(())
+    }
+
     /// `rgba_straight` holds whole rows of the page's width, the first of
     /// them page row `y`. Called once per band, in order.
     fn rows(&mut self, y: u32, rgba_straight: &[u8]) -> Result<()>;
@@ -251,10 +257,25 @@ pub fn render_page_rows(
     cancel: &CancelCheck,
 ) -> Result<(u32, u32)> {
     let mut renderer = PageRenderer::new(options.clone());
-    renderer.render_bands(doc, page, &|_, height| 0..height, cancel, &mut |top, pixmap| {
-        demultiply_in_place(pixmap.data_mut());
-        sink.rows(top, pixmap.data())
-    })
+    let page_height = std::cell::Cell::new(0u32);
+    let mut begun = false;
+    renderer.render_bands(
+        doc,
+        page,
+        &|_, height| {
+            page_height.set(height);
+            0..height
+        },
+        cancel,
+        &mut |top, pixmap| {
+            if !begun {
+                begun = true;
+                sink.begin(pixmap.width(), page_height.get())?;
+            }
+            demultiply_in_place(pixmap.data_mut());
+            sink.rows(top, pixmap.data())
+        },
+    )
 }
 
 /// The deepest nesting of transparency groups, soft masks and non-separable

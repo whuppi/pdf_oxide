@@ -148,17 +148,6 @@ pub struct BookmarkSplit {
     pub end_page: usize,
 }
 
-/// A rendered page: pixel dimensions plus the encoded image bytes.
-pub struct RenderedPage {
-    /// Image width in pixels.
-    pub width: u32,
-    /// Image height in pixels.
-    pub height: u32,
-    /// PNG-encoded image bytes. `render_page` renders with the default
-    /// options (PNG); the raster is never handed out as raw RGBA here.
-    pub data: Vec<u8>,
-}
-
 /// An image extracted from a PDF page.
 pub struct ExtractedImage {
     /// Image width in pixels.
@@ -720,31 +709,6 @@ pub fn doc_export_form_data<W: std::io::Write>(
     Ok(())
 }
 
-/// Render a page to a PNG-encoded image, optionally constrained to max
-/// dimensions. Uses the default render options (PNG output).
-pub fn render_page(doc: &mut PdfDocument, page: usize, max_width: u32, max_height: u32) -> Result<RenderedPage> {
-    #[cfg(feature = "rendering")]
-    {
-        use crate::rendering::{render_page as do_render, render_page_fit, RenderOptions};
-        let opts = RenderOptions::default();
-        let rendered = if max_width > 0 && max_height > 0 {
-            render_page_fit(doc, page, max_width, max_height, &opts)?
-        } else {
-            do_render(doc, page, &opts)?
-        };
-        Ok(RenderedPage {
-            width: rendered.width as u32,
-            height: rendered.height as u32,
-            data: rendered.data,
-        })
-    }
-    #[cfg(not(feature = "rendering"))]
-    {
-        let _ = (doc, page, max_width, max_height);
-        Err(Error::InvalidPdf("Rendering not enabled".into()))
-    }
-}
-
 /// Extract all images from a page as decoded pixel data.
 pub fn extract_images(doc: &mut PdfDocument, page: usize) -> Result<Vec<ExtractedImage>> {
     let images = doc.extract_images(page)?;
@@ -799,42 +763,6 @@ pub fn extract_images_streamed<W: std::io::Write>(
         writer.write_all(&len_bytes).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
         // image data dropped here — only one image in memory at a time
-        Ok(())
-    })?;
-    // A zero-length frame terminates the stream.
-    writer.write_all(&0u32.to_le_bytes()).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-    Ok(count)
-}
-
-/// O(1)-memory streaming page render.
-///
-/// Renders pages one at a time and writes each as a length-prefixed
-/// binary frame to the writer. Each encoded page is dropped after writing.
-/// At most one rendered page in memory at any time.
-///
-/// Frame format: [len: u32 LE] [binary-encoded rendered page response]
-/// End marker:   [0x00000000]
-pub fn render_pages_streamed<W: std::io::Write>(
-    doc: &mut PdfDocument,
-    pages: &[usize],
-    max_width: u32,
-    max_height: u32,
-    writer: &mut W,
-    cancel: &crate::cancel::CancelCheck,
-) -> Result<usize> {
-    use crate::host::binary_codec::ResponseWriter;
-    let count = pages.len();
-    cancel.each(pages.iter().copied(), |page| {
-        let result = render_page(doc, page, max_width, max_height)?;
-        let mut w = ResponseWriter::ok();
-        w.put_i32("width", result.width as i32);
-        w.put_i32("height", result.height as i32);
-        w.put_bytes("data", &result.data);
-        let frame = w.finish();
-        let len_bytes = (frame.len() as u32).to_le_bytes();
-        writer.write_all(&len_bytes).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-        writer.write_all(&frame).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-        // encoded page dropped here — only one page in memory at a time
         Ok(())
     })?;
     // A zero-length frame terminates the stream.

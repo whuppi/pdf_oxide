@@ -593,6 +593,20 @@ pub fn render_page_fit(
     fit_h_px: u32,
     options: &RenderOptions,
 ) -> Result<RenderedImage> {
+    let opts = fit_options(doc, page_num, fit_w_px, fit_h_px, options)?;
+    render_page(doc, page_num, &opts)
+}
+
+// ── pdf_manipulator patch: the fit scale, for callers that stream the rows ──
+/// The options that render page `page_num` as large as fits inside
+/// `fit_w_px` by `fit_h_px`, keeping its aspect ratio.
+pub fn fit_options(
+    doc: &crate::document::PdfDocument,
+    page_num: usize,
+    fit_w_px: u32,
+    fit_h_px: u32,
+    options: &RenderOptions,
+) -> Result<RenderOptions> {
     if fit_w_px == 0 || fit_h_px == 0 {
         return Err(crate::Error::InvalidPdf("fit width/height must be positive".into()));
     }
@@ -612,8 +626,9 @@ pub fn render_page_fit(
     let scale = (fit_w_px as f32 / page_w_pt).min(fit_h_px as f32 / page_h_pt);
     let mut opts = options.clone();
     opts.scale_override = Some(scale);
-    render_page(doc, page_num, &opts)
+    Ok(opts)
 }
+// ── end pdf_manipulator patch ──
 
 /// Create a flattened PDF where each page is rendered as an image.
 ///

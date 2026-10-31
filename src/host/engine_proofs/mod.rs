@@ -28,6 +28,8 @@ mod legacy_decoders;
 mod lzw;
 mod page_operators;
 #[cfg(feature = "rendering")]
+mod render_stream;
+#[cfg(feature = "rendering")]
 mod source_trips;
 mod stream_extent;
 mod stream_head;
