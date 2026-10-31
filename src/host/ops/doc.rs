@@ -138,7 +138,10 @@ op_unit!(FORM_FIELDS, "formFields", pdf_op_form_fields_anchor, |ctx| {
             item.put_f64("width", f.width);
             item.put_f64("height", f.height);
             item.put_i32("maxLength", f.max_length);
-            item.put_i32("alignment", f.alignment);
+            item.put_str(
+                "alignment",
+                dispatch::alignment_name_from_q(f.alignment).unwrap_or(""),
+            );
             item.put_bool("readOnly", f.read_only);
             item.put_bool("required", f.required);
         });

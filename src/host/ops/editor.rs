@@ -474,7 +474,7 @@ fn do_editor_mutate(
                 req.get_f64("r").unwrap_or(0.5) as f32,
                 req.get_f64("g").unwrap_or(0.5) as f32,
                 req.get_f64("b").unwrap_or(0.5) as f32,
-                req.get_i32("layer").unwrap_or(0),
+                req.get_str("layer").unwrap_or("foreground"),
                 req.get_i32("posType").unwrap_or(0),
                 &pos_fields,
             )?;
@@ -484,7 +484,7 @@ fn do_editor_mutate(
             dispatch::edit_add_stamp(
                 editor,
                 page!(),
-                req.get_i32("stampType").unwrap_or(12),
+                req.get_str("stampType").unwrap_or("Draft"),
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
                 req.get_f64("width").unwrap_or(100.0) as f32,
@@ -673,7 +673,7 @@ fn do_editor_mutate(
             dispatch::edit_set_form_field_alignment(
                 editor,
                 req.get_str("name").unwrap_or(""),
-                req.get_i32("alignment").unwrap_or(0) as u32,
+                req.get_str("alignment").unwrap_or("left"),
             )?;
             ok_response()
         }
@@ -763,11 +763,17 @@ fn handle_editor_save(
         0 | 1 => None,
         // 2 = apply new encryption config
         2 => {
-            let algo = match req.get_i32("encryptAlgo").unwrap_or(4) {
-                1 => crate::editor::EncryptionAlgorithm::Rc4_40,
-                2 => crate::editor::EncryptionAlgorithm::Rc4_128,
-                3 => crate::editor::EncryptionAlgorithm::Aes128,
-                _ => crate::editor::EncryptionAlgorithm::Aes256,
+            let algo = match req.get_str("encryptAlgo").unwrap_or("aes256") {
+                "rc4_40" => crate::editor::EncryptionAlgorithm::Rc4_40,
+                "rc4_128" => crate::editor::EncryptionAlgorithm::Rc4_128,
+                "aes128" => crate::editor::EncryptionAlgorithm::Aes128,
+                "aes256" => crate::editor::EncryptionAlgorithm::Aes256,
+                other => {
+                    return ResponseWriter::error_kind(
+                        ErrorKind::InvalidArgument,
+                        &format!("unknown encryption algorithm: {other}"),
+                    )
+                }
             };
             let perm_bits = req.get_i32("encryptPermissions").unwrap_or(-1);
             Some(crate::editor::EncryptionConfig {

@@ -224,14 +224,23 @@ fn handle_builder_page_op(
             b: req.get_f64("b").unwrap_or(0.0) as f32,
             text: req.get_str("text").unwrap_or("").to_string(),
         },
-        "textInRect" => dispatch::PageOp::TextInRect {
-            x: req.get_f64("x").unwrap_or(0.0) as f32,
-            y: req.get_f64("y").unwrap_or(0.0) as f32,
-            w: req.get_f64("width").unwrap_or(0.0) as f32,
-            h: req.get_f64("height").unwrap_or(0.0) as f32,
-            text: req.get_str("text").unwrap_or("").to_string(),
-            align: align_from_int(req.get_i32("align").unwrap_or(0)),
-        },
+        "textInRect" => {
+            let name = req.get_str("align").unwrap_or("left");
+            let Some(align) = text_align_from_name(name) else {
+                return ResponseWriter::error_kind(
+                    ErrorKind::InvalidArgument,
+                    &format!("unknown alignment: {name}"),
+                );
+            };
+            dispatch::PageOp::TextInRect {
+                x: req.get_f64("x").unwrap_or(0.0) as f32,
+                y: req.get_f64("y").unwrap_or(0.0) as f32,
+                w: req.get_f64("width").unwrap_or(0.0) as f32,
+                h: req.get_f64("height").unwrap_or(0.0) as f32,
+                text: req.get_str("text").unwrap_or("").to_string(),
+                align,
+            }
+        }
         "rect" => dispatch::PageOp::Rect(
             req.get_f64("x").unwrap_or(0.0) as f32,
             req.get_f64("y").unwrap_or(0.0) as f32,
@@ -383,7 +392,10 @@ fn handle_builder_page_op(
             }
         }
         "table" => {
-            let columns = table_columns_from_request(req);
+            let columns = match table_columns_from_request(req) {
+                Ok(columns) => columns,
+                Err(msg) => return ResponseWriter::error_kind(ErrorKind::InvalidArgument, &msg),
+            };
             let cells = req.get_string_list("cells").unwrap_or_default();
             let column_count = req.get_i32("columnCount").unwrap_or(0);
             if column_count <= 0 || cells.len() % column_count as usize != 0 {
@@ -403,7 +415,10 @@ fn handle_builder_page_op(
             }
         }
         "streamingTable" => {
-            let columns = table_columns_from_request(req);
+            let columns = match table_columns_from_request(req) {
+                Ok(columns) => columns,
+                Err(msg) => return ResponseWriter::error_kind(ErrorKind::InvalidArgument, &msg),
+            };
             if columns.iter().any(|(_, width, _)| width.is_none()) {
                 return ResponseWriter::error_kind(
                     ErrorKind::InvalidArgument,
@@ -537,40 +552,49 @@ fn option_f32(option: &[(&str, FieldValue<'_>)], key: &str) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// Map the wire alignment index (0 left / 1 center / 2 right) — the same
-/// encoding as the WASM binding's `Align` — onto the writer's `TextAlign`.
-fn align_from_int(v: i32) -> crate::writer::TextAlign {
-    match v {
-        1 => crate::writer::TextAlign::Center,
-        2 => crate::writer::TextAlign::Right,
-        _ => crate::writer::TextAlign::Left,
+/// Map the wire alignment name (`left`, `center`, `right`) onto the
+/// writer's `TextAlign`; any other name is `None`.
+fn text_align_from_name(name: &str) -> Option<crate::writer::TextAlign> {
+    match name {
+        "left" => Some(crate::writer::TextAlign::Left),
+        "center" => Some(crate::writer::TextAlign::Center),
+        "right" => Some(crate::writer::TextAlign::Right),
+        _ => None,
     }
 }
 
-fn align_from_index(v: i32) -> crate::writer::CellAlign {
-    match v {
-        1 => crate::writer::CellAlign::Center,
-        2 => crate::writer::CellAlign::Right,
-        _ => crate::writer::CellAlign::Left,
+/// Map the wire alignment name onto the writer's `CellAlign`; any other
+/// name is `None`.
+fn cell_align_from_name(name: &str) -> Option<crate::writer::CellAlign> {
+    match name {
+        "left" => Some(crate::writer::CellAlign::Left),
+        "center" => Some(crate::writer::CellAlign::Center),
+        "right" => Some(crate::writer::CellAlign::Right),
+        _ => None,
     }
 }
 
 /// Read the table-column arrays (`headers`, `widths` with -1 for auto,
-/// `aligns`) shared by the buffered and streaming table ops.
+/// `aligns` as names) shared by the buffered and streaming table ops. A
+/// column with no entry in `aligns` aligns left; an unknown name is an
+/// error message.
 fn table_columns_from_request(
     req: &Request<'_>,
-) -> Vec<(String, Option<f32>, crate::writer::CellAlign)> {
+) -> Result<Vec<(String, Option<f32>, crate::writer::CellAlign)>, String> {
     let headers = req.get_string_list("headers").unwrap_or_default();
     let widths = req.get_f64_list("widths").unwrap_or(&[]);
-    let aligns = req.get_int_list("aligns").unwrap_or(&[]);
+    let aligns = req.get_string_list("aligns").unwrap_or_default();
     headers
         .into_iter()
         .enumerate()
         .map(|(i, h)| {
             let width = widths.get(i).copied().filter(|w| *w >= 0.0).map(|w| w as f32);
-            let align = aligns.get(i).map(|a| align_from_index(*a));
-            let align = align.unwrap_or(crate::writer::CellAlign::Left);
-            (h.to_string(), width, align)
+            let align = match aligns.get(i) {
+                None => crate::writer::CellAlign::Left,
+                Some(name) => cell_align_from_name(name)
+                    .ok_or_else(|| format!("unknown alignment: {name}"))?,
+            };
+            Ok((h.to_string(), width, align))
         })
         .collect()
 }

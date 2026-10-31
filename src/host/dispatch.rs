@@ -1355,9 +1355,32 @@ pub fn edit_set_form_field_max_length(editor: &mut DocumentEditor, name: &str, m
     editor.set_form_field_max_length(name, max_length)
 }
 
-/// Set a form field's text alignment (`/Q`: 0 left, 1 center, 2 right).
-pub fn edit_set_form_field_alignment(editor: &mut DocumentEditor, name: &str, alignment: u32) -> Result<()> {
-    editor.set_form_field_alignment(name, alignment)
+/// Set a form field's text alignment (`/Q`) from its wire name: `left`,
+/// `center` or `right`.
+pub fn edit_set_form_field_alignment(editor: &mut DocumentEditor, name: &str, alignment: &str) -> Result<()> {
+    let q = alignment_q_from_name(alignment)
+        .ok_or_else(|| Error::InvalidOperation(format!("unknown alignment: {alignment}")))?;
+    editor.set_form_field_alignment(name, q)
+}
+
+/// The `/Q` value (0 left, 1 center, 2 right) of a wire alignment name.
+fn alignment_q_from_name(name: &str) -> Option<u32> {
+    match name {
+        "left" => Some(0),
+        "center" => Some(1),
+        "right" => Some(2),
+        _ => None,
+    }
+}
+
+/// The wire name of a `/Q` value; `None` for a value outside 0 to 2.
+pub fn alignment_name_from_q(q: i32) -> Option<&'static str> {
+    match q {
+        0 => Some("left"),
+        1 => Some("center"),
+        2 => Some("right"),
+        _ => None,
+    }
 }
 
 /// Set a form field's background color (`/MK /BG`).
@@ -1679,14 +1702,23 @@ pub fn convert_from_format_to_bytes(data: &[u8], format: &str) -> Result<Vec<u8>
 // ═══════════════════════════════════════════════════════════════════
 
 /// Add a text watermark to one page (page >= 0) or all pages (page < 0).
+/// `layer` is the wire name `foreground` or `background`.
 pub fn edit_watermark(
     editor: &mut DocumentEditor, page: i32, text: &str,
     font_size: f32, rotation: f32, opacity: f32,
     r: f32, g: f32, b: f32,
-    layer: i32, pos_type: i32, pos_fields: &[f32],
+    layer: &str, pos_type: i32, pos_fields: &[f32],
 ) -> Result<()> {
     use crate::writer::WatermarkAnnotation;
     use crate::geometry::Rect;
+
+    let background = match layer {
+        "foreground" => false,
+        "background" => true,
+        other => {
+            return Err(Error::InvalidOperation(format!("unknown watermark layer: {other}")))
+        }
+    };
 
     let resolve_rect = |ed: &mut DocumentEditor, p: usize| -> Result<Vec<Rect>> {
         let mb = ed.get_page_media_box(p)?;
@@ -1733,7 +1765,7 @@ pub fn edit_watermark(
 
     let add_to_page = |ed: &mut DocumentEditor, p: usize| -> Result<()> {
         let rects = resolve_rect(ed, p)?;
-        if layer == 1 {
+        if background {
             // Under-content: prepend watermark to page content stream.
             // Renders BEHIND existing page content.
             let font_res = ensure_page_font(ed, p, "Helvetica")?;
@@ -1803,7 +1835,7 @@ pub fn edit_watermark(
                 }
                 _ => vec![Rect::new(pw * 0.1, ph * 0.3, pw * 0.8, ph * 0.4)],
             };
-            if layer == 1 {
+            if background {
                 let font_res = ensure_page_font(editor, i, "Helvetica")?;
                 for rect in &rects {
                     let stream = generate_watermark_stream(
@@ -2054,9 +2086,10 @@ fn prepend_to_page_content(
     Ok(())
 }
 
-/// Add a standard stamp annotation to a page.
+/// Add a standard stamp annotation to a page. `stamp_type` is the wire name
+/// (`Approved`, `Draft`, ...).
 pub fn edit_add_stamp(
-    editor: &mut DocumentEditor, page: usize, stamp_type: i32,
+    editor: &mut DocumentEditor, page: usize, stamp_type: &str,
     x: f32, y: f32, w: f32, h: f32, opacity: f32,
 ) -> Result<()> {
     use crate::geometry::Rect;
@@ -2064,7 +2097,8 @@ pub fn edit_add_stamp(
     // makes the stamp's /Rect and its appearance BBox grow with the
     // placement, so the label lands off-page for any y above the middle.
     let rect = Rect::new(x, y, w, h);
-    let st = stamp_type_from_int(stamp_type);
+    let st = stamp_type_from_name(stamp_type)
+        .ok_or_else(|| Error::InvalidOperation(format!("unknown stamp type: {stamp_type}")))?;
     let mut annot = crate::writer::StampAnnotation::new(rect, st);
     if opacity > 0.0 && opacity < 1.0 {
         annot.opacity = Some(opacity);
@@ -2200,18 +2234,26 @@ pub fn edit_add_image_stamp(
     Ok(())
 }
 
-fn stamp_type_from_int(i: i32) -> crate::writer::StampType {
+/// The standard stamp a wire name stands for; any other name is `None`.
+fn stamp_type_from_name(name: &str) -> Option<crate::writer::StampType> {
     use crate::writer::StampType;
-    match i {
-        0 => StampType::Approved, 1 => StampType::Experimental,
-        2 => StampType::NotApproved, 3 => StampType::AsIs,
-        4 => StampType::Expired, 5 => StampType::NotForPublicRelease,
-        6 => StampType::Confidential, 7 => StampType::Final,
-        8 => StampType::Sold, 9 => StampType::Departmental,
-        10 => StampType::ForComment, 11 => StampType::TopSecret,
-        12 => StampType::Draft, 13 => StampType::ForPublicRelease,
-        _ => StampType::Draft,
-    }
+    Some(match name {
+        "Approved" => StampType::Approved,
+        "Experimental" => StampType::Experimental,
+        "NotApproved" => StampType::NotApproved,
+        "AsIs" => StampType::AsIs,
+        "Expired" => StampType::Expired,
+        "NotForPublicRelease" => StampType::NotForPublicRelease,
+        "Confidential" => StampType::Confidential,
+        "Final" => StampType::Final,
+        "Sold" => StampType::Sold,
+        "Departmental" => StampType::Departmental,
+        "ForComment" => StampType::ForComment,
+        "TopSecret" => StampType::TopSecret,
+        "Draft" => StampType::Draft,
+        "ForPublicRelease" => StampType::ForPublicRelease,
+        _ => return None,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2905,5 +2947,31 @@ mod trim_probe_tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("not enabled in this build"));
+    }
+}
+
+#[cfg(test)]
+mod wire_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_stamp_name_maps_and_an_index_or_unknown_name_does_not() {
+        assert!(matches!(
+            stamp_type_from_name("NotForPublicRelease"),
+            Some(crate::writer::StampType::NotForPublicRelease)
+        ));
+        assert!(stamp_type_from_name("12").is_none());
+        assert!(stamp_type_from_name("draft").is_none());
+    }
+
+    #[test]
+    fn an_alignment_name_maps_to_its_q_value_and_back() {
+        for (name, q) in [("left", 0), ("center", 1), ("right", 2)] {
+            assert_eq!(alignment_q_from_name(name), Some(q));
+            assert_eq!(alignment_name_from_q(q as i32), Some(name));
+        }
+        assert_eq!(alignment_q_from_name("1"), None);
+        assert_eq!(alignment_name_from_q(-1), None);
+        assert_eq!(alignment_name_from_q(3), None);
     }
 }
