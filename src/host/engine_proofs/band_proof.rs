@@ -12,17 +12,17 @@ use crate::cancel::CancelCheck;
 use crate::document::PdfDocument;
 use crate::rendering::{PageRenderer, RenderOptions};
 
-struct Fixture {
-    name: &'static str,
-    content: String,
-    resources: String,
-    annots: String,
+pub(super) struct Fixture {
+    pub(super) name: &'static str,
+    pub(super) content: String,
+    pub(super) resources: String,
+    pub(super) annots: String,
     /// Objects numbered from 5.
-    extra: Vec<Vec<u8>>,
+    pub(super) extra: Vec<Vec<u8>>,
 }
 
 impl Fixture {
-    fn new(name: &'static str, content: &str) -> Self {
+    pub(super) fn new(name: &'static str, content: &str) -> Self {
         Self {
             name,
             content: content.to_string(),
@@ -32,7 +32,7 @@ impl Fixture {
         }
     }
 
-    fn pdf(&self) -> Vec<u8> {
+    pub(super) fn pdf(&self) -> Vec<u8> {
         let mut objects = vec![
             b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
             b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
@@ -49,7 +49,7 @@ impl Fixture {
     }
 }
 
-const HELVETICA: &str = "/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>";
+pub(super) const HELVETICA: &str = "/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>";
 
 fn fixtures() -> Vec<Fixture> {
     let mut all = Vec::new();
@@ -681,7 +681,7 @@ fn compare(width: u32, height: u32, whole: &[u8], cut: &[u8]) -> Diff {
     diff
 }
 
-fn prove(fixture: &Fixture) {
+pub(super) fn prove(fixture: &Fixture) {
     let doc = PdfDocument::from_bytes(fixture.pdf()).expect("fixture parses");
     let mut failures = Vec::new();
     for dpi in [36, 72, 150, 300] {

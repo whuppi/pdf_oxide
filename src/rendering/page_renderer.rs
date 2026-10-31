@@ -322,6 +322,10 @@ pub struct PageRenderer {
     /// its last across the bands, and dropped when the page is done or when
     /// the table needs the room.
     image_cursors: CursorTable,
+    /// Whether a soft-mask group paints nothing anywhere on the page, which a
+    /// band cannot say of itself, by the mask group and the transform it is
+    /// drawn under. Dropped with the page.
+    smask_blank: HashMap<(ObjectRef, [u32; 6]), bool>,
     // ── end pdf_manipulator patch ──
 }
 
@@ -379,9 +383,18 @@ impl PageRenderer {
             forced_rows: None,
             text_clip_outlines: std::cell::Cell::new(0),
             image_cursors: CursorTable::default(),
+            smask_blank: HashMap::new(),
             // ── end pdf_manipulator patch ──
         }
     }
+
+    // ── pdf_manipulator patch: an image's open decode lasts one page ──
+    /// Bytes the page's open images hold now: none once a render has ended.
+    #[cfg(test)]
+    pub(crate) fn open_image_bytes(&self) -> usize {
+        self.image_cursors.bytes()
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Take ownership of the per-page CMYK + spot-ink sidecar produced
     /// by the most recent [`Self::render_page_with_options`] call.
@@ -528,7 +541,25 @@ impl PageRenderer {
     /// The page's content is replayed for every band under a base transform
     /// translated by minus the band's top, so a band holds only what the
     /// budget allows and the page raster never exists whole.
+    ///
+    /// The images the page held open are dropped on every exit, an error or a
+    /// cancel included.
     pub(crate) fn render_bands(
+        &mut self,
+        doc: &PdfDocument,
+        page_num: usize,
+        select: &dyn Fn(u32, u32) -> std::ops::Range<u32>,
+        cancel: &crate::cancel::CancelCheck,
+        on_band: &mut dyn FnMut(u32, &mut Pixmap) -> Result<()>,
+    ) -> Result<(u32, u32)> {
+        let result = self.render_bands_open(doc, page_num, select, cancel, on_band);
+        self.image_cursors.clear();
+        result
+    }
+
+    /// The bands of [`Self::render_bands`], with the page's open images left
+    /// for it to drop.
+    fn render_bands_open(
         &mut self,
         doc: &PdfDocument,
         page_num: usize,
@@ -545,8 +576,10 @@ impl PageRenderer {
         // amortising transform construction across paints within a
         // single page.
         self.icc_transform_cache.clear();
-        // An image's open decode lasts one page.
+        // An image's open decode lasts one page, and so does what the
+        // renderer learned about the soft masks on it.
         self.image_cursors.clear();
+        self.smask_blank.clear();
         // Reset the H3b silent-K=0 warning latch so a new page's first
         // RGB-to-CMYK fallback under a declared-but-unparseable
         // /OutputIntents profile logs once on the new page (instead
@@ -694,6 +727,7 @@ impl PageRenderer {
             self.band = BandContext {
                 width,
                 page_height: height,
+                rows: plan.rows_per_band,
             };
             // The band is a window onto the page: everything is drawn in
             // whole-page coordinates, and the pixmap keeps the rows from
@@ -738,7 +772,6 @@ impl PageRenderer {
 
             on_band(top, &mut pixmap)?;
         }
-        self.image_cursors.clear();
 
         Ok((width, height))
     }
@@ -831,33 +864,12 @@ impl PageRenderer {
         }
     }
 
-    /// Execute PDF operators to render content.
+    /// Execute PDF operators to render content, with a clip already in force
+    /// at depth 0.
     ///
     /// OCG layer exclusion is sourced from `self.options.excluded_layers`;
     /// BDC/EMC operators referencing matching layers cause graphical operators
     /// inside that scope to be silently dropped.
-    fn execute_operators(
-        &mut self,
-        pixmap: &mut Pixmap,
-        base_transform: Transform,
-        operators: &[Operator],
-        doc: &PdfDocument,
-        page_num: usize,
-        resources: &Object,
-    ) -> Result<()> {
-        self.execute_operators_clipped(
-            pixmap,
-            base_transform,
-            operators,
-            doc,
-            page_num,
-            resources,
-            None,
-            None,
-        )
-    }
-
-    /// `execute_operators` with a clip already in force at depth 0.
     ///
     /// A nested content stream gets a fresh clip stack, and `Q` never pops
     /// below depth 0 (`clip_stack.len() > 1` guards the pop), so a clip
@@ -3861,7 +3873,7 @@ impl PageRenderer {
             if paint_glyphs {
                 if let Some(name) = font_info.diff_glyph_names.get(&code) {
                     if let Some(stream) = char_procs.get(name) {
-                        if let Some(data) = decode_type3_charproc(doc, stream) {
+                        if let Some((procedure, reference)) = type3_charproc(doc, stream) {
                             // Glyph placement: combined_base · translate(cursor)
                             // · scale(Tfs) · FontMatrix. The cursor is the
                             // un-scaled x position with Th applied at placement,
@@ -3873,7 +3885,7 @@ impl PageRenderer {
                                 .pre_concat(font_matrix);
                             let _ = self.render_type3_glyph(
                                 pixmap,
-                                &data,
+                                FormContent::Stream(&procedure, reference),
                                 glyph_transform,
                                 doc,
                                 page_num,
@@ -3904,7 +3916,9 @@ impl PageRenderer {
     fn render_type3_glyph(
         &mut self,
         pixmap: &mut Pixmap,
-        data: &[u8],
+        // ── pdf_manipulator patch: a glyph procedure is read as operators, never decoded whole ──
+        content: FormContent<'_>,
+        // ── end pdf_manipulator patch ──
         glyph_transform: Transform,
         doc: &PdfDocument,
         page_num: usize,
@@ -3914,29 +3928,54 @@ impl PageRenderer {
         if self.type3_depth >= MAX_TYPE3_DEPTH {
             return Ok(());
         }
-        let operators = match parse_content_stream(data) {
-            Ok(ops) => ops,
-            Err(_) => return Ok(()), // malformed glyph — skip, width already applied
+        // ── pdf_manipulator patch: a glyph procedure is read as operators, never decoded whole ──
+        let Ok(mut source) = form_operator_source(doc, content) else {
+            return Ok(()); // malformed glyph — skip, width already applied
         };
 
         // Detect the d0 / d1 metric operator (parsed as `Other`). `d1` locks
         // the fill colour; `d0` leaves the glyph free to set its own colours.
-        let is_d1 = operators
-            .iter()
-            .find_map(|op| match op {
+        // It is the glyph's first operator, so what is read to find it is what
+        // is held back; a glyph that has none is read whole and is a `d0` one.
+        let mut leading: Vec<Operator> = Vec::new();
+        let mut is_d1 = false;
+        for op in source.by_ref() {
+            let Ok(op) = op else {
+                return Ok(());
+            };
+            let op = op.into_owned();
+            let kind = match &op {
                 Operator::Other { name, .. } if name == "d1" => Some(true),
                 Operator::Other { name, .. } if name == "d0" => Some(false),
                 _ => None,
-            })
-            .unwrap_or(false);
+            };
+            leading.push(op);
+            if let Some(kind) = kind {
+                is_d1 = kind;
+                break;
+            }
+        }
+        let mut operators = leading
+            .into_iter()
+            .map(|op| Ok(std::borrow::Cow::Owned(op)))
+            .chain(source);
+        // ── end pdf_manipulator patch ──
 
         self.type3_depth += 1;
         let prev_lock = self.type3_fill_lock.take();
         if is_d1 {
             self.type3_fill_lock = Some(fill_rgb);
         }
-        let result =
-            self.execute_operators(pixmap, glyph_transform, &operators, doc, page_num, resources);
+        let result = self.execute_operator_stream(
+            pixmap,
+            glyph_transform,
+            &mut operators,
+            doc,
+            page_num,
+            resources,
+            None,
+            None,
+        );
         self.type3_fill_lock = prev_lock;
         self.type3_depth -= 1;
         result
@@ -4674,11 +4713,6 @@ impl PageRenderer {
                                     },
                                     "Form" => {
                                         log::debug!("XObject '{}' is a Form", name);
-                                        // Decoded stream data
-                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                                        let stream_data = xobj.decode_stream_data()?;
-                                        // ── end pdf_manipulator patch ──
-
                                         // Form XObjects can have their own Resources dictionary,
                                         // and §7.3.10 (pdf.md:2032) allows it to be written as a
                                         // reference: "Except were documented to the contrary any
@@ -4711,7 +4745,9 @@ impl PageRenderer {
                                         if let Err(e) = self.render_form_xobject(
                                             pixmap,
                                             &dict,
-                                            &stream_data,
+                                            // ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+                                            FormContent::Stream(&xobj, xobj_ref),
+                                            // ── end pdf_manipulator patch ──
                                             transform,
                                             doc,
                                             page_num,
@@ -5427,7 +5463,9 @@ impl PageRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         dict: &std::collections::HashMap<String, Object>,
-        data: &[u8],
+        // ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+        content: FormContent<'_>,
+        // ── end pdf_manipulator patch ──
         parent_transform: Transform,
         doc: &PdfDocument,
         page_num: usize,
@@ -5438,7 +5476,7 @@ impl PageRenderer {
         self.render_form_xobject_scoped(
             pixmap,
             dict,
-            data,
+            content,
             parent_transform,
             doc,
             page_num,
@@ -5465,7 +5503,9 @@ impl PageRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         dict: &std::collections::HashMap<String, Object>,
-        data: &[u8],
+        // ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+        content: FormContent<'_>,
+        // ── end pdf_manipulator patch ──
         parent_transform: Transform,
         doc: &PdfDocument,
         page_num: usize,
@@ -5487,7 +5527,7 @@ impl PageRenderer {
         let result = self.render_form_xobject_inner(
             pixmap,
             dict,
-            data,
+            content,
             parent_transform,
             doc,
             page_num,
@@ -5504,7 +5544,9 @@ impl PageRenderer {
         &mut self,
         pixmap: &mut Pixmap,
         dict: &std::collections::HashMap<String, Object>,
-        data: &[u8],
+        // ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+        content: FormContent<'_>,
+        // ── end pdf_manipulator patch ──
         parent_transform: Transform,
         doc: &PdfDocument,
         page_num: usize,
@@ -5535,13 +5577,9 @@ impl PageRenderer {
             parent_resources.clone()
         };
 
-        // Parse form content stream
-        let operators = match parse_content_stream(data) {
-            Ok(ops) => ops,
-            Err(e) => {
-                return Err(e);
-            },
-        };
+        // ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+        let mut operators = form_operator_source(doc, content)?;
+        // ── end pdf_manipulator patch ──
 
         if is_transparency_group {
             // Per PDF spec 11.6.6: Render transparency group to a separate pixmap,
@@ -5598,13 +5636,31 @@ impl PageRenderer {
                 // starts as the backdrop; each paint operator's result is
                 // merged in so later paints override earlier ones in
                 // overlap regions.
+                // ── pdf_manipulator patch: a knockout group is clipped to its /BBox like any group ──
+                // Unclipped, an element that spills past the box paints
+                // outside it, where the band culling (which takes the box
+                // for the extent of a form) skips it: the same page would
+                // differ with the band height.
+                let bbox_clip = intersect_clips(
+                    clip_to_bbox
+                        .then(|| form_bbox_clip(dict, &group_pixmap, combined_transform))
+                        .flatten(),
+                    caller_clip,
+                );
+                // A knockout group replays the operators before each element,
+                // so its content is the one a form holds whole.
+                let held = operators
+                    .map(|op| op.map(std::borrow::Cow::into_owned))
+                    .collect::<Result<Vec<Operator>>>()?;
+                // ── end pdf_manipulator patch ──
                 self.execute_knockout_group(
                     &mut group_pixmap,
                     combined_transform,
-                    &operators,
+                    &held,
                     doc,
                     page_num,
                     &form_resources,
+                    bbox_clip,
                 )?;
             } else {
                 // Execute operators into the group pixmap, clipped to the
@@ -5645,10 +5701,10 @@ impl PageRenderer {
                     g.blend_mode = "Normal".to_string();
                     g
                 });
-                self.execute_operators_clipped(
+                self.execute_operator_stream(
                     &mut group_pixmap,
                     combined_transform,
-                    &operators,
+                    &mut *operators,
                     doc,
                     page_num,
                     &form_resources,
@@ -5679,10 +5735,10 @@ impl PageRenderer {
                     .flatten(),
                 caller_clip,
             );
-            self.execute_operators_clipped(
+            self.execute_operator_stream(
                 pixmap,
                 combined_transform,
-                &operators,
+                &mut *operators,
                 doc,
                 page_num,
                 &form_resources,
@@ -5716,6 +5772,188 @@ impl PageRenderer {
     /// over-large cell), so the caller paints its normal solid fill.
     /// Never panics and never loops unboundedly.
     #[allow(clippy::too_many_arguments)]
+    // ── pdf_manipulator patch: a pattern cell over the raster budget is drawn tile by tile into the band ──
+    /// Fills `path` with a tiling pattern whose cell raster would not fit the
+    /// band budget: every tile of the lattice that the band shows is drawn into
+    /// a scratch the size of the band, its content clipped to the cell's
+    /// `/BBox`, and composited through the fill region. Nothing larger than
+    /// the band is made, and the tiles sit where the lattice puts them, not on
+    /// the pixel grid a cell texture would round them to, so this differs from
+    /// the texture by the sub-pixel placement of each tile.
+    ///
+    /// `to_device` maps pattern space to the plane. Returns `Ok(false)` when
+    /// the pattern cannot be tiled (a zero step, a lattice of more tiles than
+    /// the cap), so the caller paints its solid fill.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_with_tiles(
+        &mut self,
+        pixmap: &mut Pixmap,
+        path: &tiny_skia::Path,
+        path_transform: Transform,
+        fill_rule: tiny_skia::FillRule,
+        clip: Option<&tiny_skia::Mask>,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        page_num: usize,
+        pattern: FormContent<'_>,
+        pattern_resources: &Object,
+        to_device: Transform,
+        bbox: [f32; 4],
+        steps: (f32, f32),
+        paint_type: i64,
+    ) -> Result<bool> {
+        const MAX_TILES: i64 = 1_000_000;
+        let (x_step, y_step) = steps;
+        if x_step.abs() <= f32::EPSILON || y_step.abs() <= f32::EPSILON {
+            return Ok(false);
+        }
+        let Some(inverse) = to_device.invert() else {
+            return Ok(false);
+        };
+
+        // The part of the plane to cover: the fill's bounds, in the window.
+        let window = Window::of(pixmap);
+        let Some(window_rect) = window.rect() else {
+            return Ok(true);
+        };
+        let Some([x0, y0, x1, y1]) = super::device_bounds(path, path_transform) else {
+            return Ok(false);
+        };
+        let (rx0, ry0) = (x0.max(f64::from(window_rect.left())), y0.max(f64::from(window_rect.top())));
+        let (rx1, ry1) = (
+            x1.min(f64::from(window_rect.right())),
+            y1.min(f64::from(window_rect.bottom())),
+        );
+        if rx1 <= rx0 || ry1 <= ry0 {
+            return Ok(true);
+        }
+
+        // That region in pattern space, and the tiles whose /BBox meets it.
+        let mut corners = [
+            tiny_skia::Point::from_xy(rx0 as f32, ry0 as f32),
+            tiny_skia::Point::from_xy(rx1 as f32, ry0 as f32),
+            tiny_skia::Point::from_xy(rx0 as f32, ry1 as f32),
+            tiny_skia::Point::from_xy(rx1 as f32, ry1 as f32),
+        ];
+        inverse.map_points(&mut corners);
+        if corners.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return Ok(false);
+        }
+        let (mut px0, mut py0, mut px1, mut py1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in corners {
+            px0 = px0.min(p.x);
+            py0 = py0.min(p.y);
+            px1 = px1.max(p.x);
+            py1 = py1.max(p.y);
+        }
+        let range = |lo: f32, hi: f32, b0: f32, b1: f32, step: f32| -> (i64, i64) {
+            let a = (lo - b1) / step;
+            let b = (hi - b0) / step;
+            (a.min(b).floor() as i64, a.max(b).ceil() as i64)
+        };
+        let (i_lo, i_hi) = range(px0, px1, bbox[0], bbox[2], x_step);
+        let (j_lo, j_hi) = range(py0, py1, bbox[1], bbox[3], y_step);
+        let tiles = (i_hi - i_lo + 1).saturating_mul(j_hi - j_lo + 1);
+        if tiles <= 0 || tiles > MAX_TILES {
+            return Ok(false);
+        }
+        let Some(cell_rect) =
+            tiny_skia::Rect::from_ltrb(bbox[0], bbox[1], bbox[2], bbox[3])
+        else {
+            return Ok(false);
+        };
+        let cell_path = PathBuilder::from_rect(cell_rect);
+
+        // The fill region: the path's coverage within the active clip.
+        let Some(mut region) = tiny_skia::Mask::new_like(pixmap) else {
+            return Ok(false);
+        };
+        guarded_mask_fill_path(&mut region, path, fill_rule, true, path_transform);
+        if let Some(c) = clip {
+            for (mv, cv) in region.data_mut().iter_mut().zip(c.data().iter()) {
+                *mv = (*mv).min(*cv);
+            }
+        }
+        let Some(mut scratch) = Pixmap::new_like(pixmap) else {
+            return Ok(false);
+        };
+        let blit = PixmapPaint {
+            opacity: gs.fill_alpha.clamp(0.0, 1.0),
+            quality: tiny_skia::FilterQuality::Nearest,
+            ..PixmapPaint::default()
+        };
+        let (fr, fg, fb) = gs.fill_color_rgb;
+        let ink = (
+            (fr.clamp(0.0, 1.0) * 255.0) as u32,
+            (fg.clamp(0.0, 1.0) * 255.0) as u32,
+            (fb.clamp(0.0, 1.0) * 255.0) as u32,
+        );
+
+        // The pattern's own resource scope and no CMYK sidecar, as for a texture.
+        let saved_sidecar = self.cmyk_sidecar.take();
+        let saved_fonts = self.fonts.clone();
+        let saved_cs = self.color_spaces.clone();
+        let _ = self.load_resources(doc, pattern_resources);
+        self.pattern_depth += 1;
+        let mut painted = Ok(true);
+        'tiles: for j in j_lo..=j_hi {
+            for i in i_lo..=i_hi {
+                let tile = to_device.pre_translate(i as f32 * x_step, j as f32 * y_step);
+                if window.misses_path(&cell_path, tile, 0.0) {
+                    continue;
+                }
+                // Not anti-aliased: tiles that meet share their edge, and the
+                // pixel centres decide which tile has each pixel.
+                let Some(mut cell_clip) = tiny_skia::Mask::new_like(pixmap) else {
+                    painted = Ok(false);
+                    break 'tiles;
+                };
+                guarded_mask_fill_path(
+                    &mut cell_clip,
+                    &cell_path,
+                    tiny_skia::FillRule::Winding,
+                    false,
+                    tile,
+                );
+                scratch.fill(tiny_skia::Color::TRANSPARENT);
+                let Ok(mut ops) = form_operator_source(doc, pattern) else {
+                    painted = Ok(false);
+                    break 'tiles;
+                };
+                if let Err(e) = self.execute_operator_stream(
+                    &mut scratch,
+                    tile,
+                    &mut *ops,
+                    doc,
+                    page_num,
+                    pattern_resources,
+                    Some(cell_clip),
+                    None,
+                ) {
+                    log::debug!("tiling pattern cell failed: {e}");
+                    painted = Ok(false);
+                    break 'tiles;
+                }
+                // /PaintType 2 (uncoloured): the cell's coverage in the fill colour.
+                if paint_type == 2 {
+                    for px in scratch.data_mut().as_chunks_mut::<4>().0 {
+                        let a = u32::from(px[3]);
+                        px[0] = (ink.0 * a / 255) as u8;
+                        px[1] = (ink.1 * a / 255) as u8;
+                        px[2] = (ink.2 * a / 255) as u8;
+                    }
+                }
+                pixmap.draw_pixmap(0, 0, scratch.as_ref(), &blit, Transform::identity(), Some(&region));
+            }
+        }
+        self.pattern_depth -= 1;
+        self.fonts = saved_fonts;
+        self.color_spaces = saved_cs;
+        self.cmyk_sidecar = saved_sidecar;
+        painted
+    }
+    // ── end pdf_manipulator patch ──
+
     /// True iff the named fill colour space is a Pattern space (§8.7.3).
     ///
     /// `gs.fill_color_space` holds the *resource name* the content stream used,
@@ -6062,6 +6300,30 @@ impl PageRenderer {
         }
         let (cw, ch) = (cw as u32, ch as u32);
 
+        // ── pdf_manipulator patch: a pattern cell over the raster budget is drawn tile by tile into the band ──
+        // The cell texture is kept for a cell that fits the budget. A larger
+        // one would be a raster of its own, outside the band, so each tile of
+        // the lattice the band shows is drawn into the band instead.
+        if u64::from(cw) * u64::from(ch) * 4 > crate::rendering::band::BAND_BUDGET_BYTES as u64 {
+            return self.fill_with_tiles(
+                pixmap,
+                path,
+                path_transform,
+                fill_rule,
+                clip,
+                gs,
+                doc,
+                page_num,
+                FormContent::Stream(&pattern_obj, pattern_entry.as_reference()),
+                &pattern_resources,
+                t,
+                [bbox[0], bbox[1], bbox[2], bbox[3]],
+                (x_step, y_step),
+                paint_type,
+            );
+        }
+        // ── end pdf_manipulator patch ──
+
         // Device step vectors (linear part of `t` applied to the pattern-space
         // step vectors). For an axis-aligned matrix the cross terms are ~0.
         let step_x = (x_step * t.sx, x_step * t.ky);
@@ -6077,13 +6339,14 @@ impl PageRenderer {
         let step_y_len = step_y.0.hypot(step_y.1);
 
         // Render one cell into an offscreen pixmap sized to the device /BBox.
-        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-        let stream_data = pattern_obj.decode_stream_data()?;
-        // ── end pdf_manipulator patch ──
-        let cell_ops = match parse_content_stream(&stream_data) {
-            Ok(ops) => ops,
-            Err(_) => return Ok(false),
+        // ── pdf_manipulator patch: a pattern cell is read as operators, never decoded whole ──
+        let Ok(mut cell_ops) = form_operator_source(
+            doc,
+            FormContent::Stream(&pattern_obj, pattern_entry.as_reference()),
+        ) else {
+            return Ok(false);
         };
+        // ── end pdf_manipulator patch ──
         let mut cell = match Pixmap::new(cw, ch) {
             Some(p) => p,
             None => return Ok(false),
@@ -6098,13 +6361,15 @@ impl PageRenderer {
         let saved_cs = self.color_spaces.clone();
         let _ = self.load_resources(doc, &pattern_resources);
         self.pattern_depth += 1;
-        let render_res = self.execute_operators(
+        let render_res = self.execute_operator_stream(
             &mut cell,
             cell_transform,
-            &cell_ops,
+            &mut *cell_ops,
             doc,
             page_num,
             &pattern_resources,
+            None,
+            None,
         );
         self.pattern_depth -= 1;
         self.fonts = saved_fonts;
@@ -8418,16 +8683,10 @@ impl PageRenderer {
             },
         };
 
-        let (form_dict, form_data) = match &form_obj {
-            Object::Stream { dict, .. } => {
-                // Decode through the encryption layer if present, the
-                // same way render_form_xobject does at the main
-                // dispatch site (page_renderer:2320).
-                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                let data = form_obj.decode_stream_data()?;
-                // ── end pdf_manipulator patch ──
-                (dict.clone(), data)
-            },
+        let form_dict = match &form_obj {
+            // The group's content is read through the encryption layer
+            // when the document has one, as a form's is at the `Do` site.
+            Object::Stream { dict, .. } => dict.clone(),
             _ => {
                 pixmap.data_mut().copy_from_slice(snapshot);
                 return Ok(());
@@ -8530,7 +8789,9 @@ impl PageRenderer {
         let _ = self.render_form_xobject(
             &mut mask_pixmap,
             &form_dict,
-            &form_data,
+            // ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+            FormContent::Stream(&form_obj, Some(smask.form_ref)),
+            // ── end pdf_manipulator patch ──
             base_transform,
             doc,
             page_num,
@@ -8547,7 +8808,26 @@ impl PageRenderer {
         // against it, so a producer that wrote one meant it even if the group
         // paints nothing. This rule is for the *default* black backdrop, which
         // the producer never chose.
-        if smask.backdrop.is_none() && mask_pixmap.data() == backdrop.as_slice() {
+        // ── pdf_manipulator patch: whether a mask group paints nothing is a fact about the page, not the band ──
+        // A band that the group does not reach would find nothing painted and
+        // drop a mask that the band next to it applies, so the page decides.
+        // A band that is the whole page is the page: it asks no more.
+        let blank = smask.backdrop.is_none()
+            && if self.band.rows >= self.band.page_height {
+                mask_pixmap.data() == backdrop.as_slice()
+            } else {
+                self.smask_group_is_blank(
+                    &form_obj,
+                    &form_dict,
+                    smask.form_ref,
+                    &form_resources_obj,
+                    base_transform,
+                    doc,
+                    page_num,
+                )
+            };
+        if blank {
+            // ── end pdf_manipulator patch ──
             log::debug!(
                 "luminosity soft-mask group painted nothing; discarding the mask \
                  (matches MuPDF/pdfium/poppler/Ghostscript, departs from a literal \
@@ -8644,6 +8924,65 @@ impl PageRenderer {
         Ok(())
     }
 
+    // ── pdf_manipulator patch: whether a mask group paints nothing is a fact about the page, not the band ──
+    /// True when the soft-mask group `form_obj` paints nothing on the whole
+    /// page under `base_transform`: it is drawn onto a transparent backdrop,
+    /// one band at a time in the page's own cut, until a band holds a mark.
+    /// The answer is kept for the page, so each mask is asked about once.
+    #[allow(clippy::too_many_arguments)]
+    fn smask_group_is_blank(
+        &mut self,
+        form_obj: &Object,
+        form_dict: &HashMap<String, Object>,
+        form_ref: ObjectRef,
+        form_resources: &Object,
+        base_transform: Transform,
+        doc: &PdfDocument,
+        page_num: usize,
+    ) -> bool {
+        let key = (
+            form_ref,
+            [
+                base_transform.sx,
+                base_transform.kx,
+                base_transform.tx,
+                base_transform.ky,
+                base_transform.sy,
+                base_transform.ty,
+            ]
+            .map(f32::to_bits),
+        );
+        if let Some(blank) = self.smask_blank.get(&key) {
+            return *blank;
+        }
+        let BandContext { width, page_height, rows } = self.band;
+        let rows = rows.max(1);
+        let mut blank = true;
+        let mut top = 0;
+        while top < page_height && blank {
+            let band_rows = rows.min(page_height - top);
+            let Some(mut probe) = Pixmap::new_at(width, band_rows, (0, top as i32)) else {
+                break;
+            };
+            let _ = self.render_form_xobject(
+                &mut probe,
+                form_dict,
+                FormContent::Stream(form_obj, Some(form_ref)),
+                base_transform,
+                doc,
+                page_num,
+                form_resources,
+                None,
+                None,
+            );
+            blank = probe.data().iter().all(|&byte| byte == 0);
+            top += band_rows;
+        }
+        self.smask_blank.insert(key, blank);
+        blank
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Render a knockout transparency group per ISO 32000-1:2008 §11.4.6.2.
     ///
     /// The group's initial backdrop is `pixmap` on entry. Each painted
@@ -8673,6 +9012,9 @@ impl PageRenderer {
         doc: &PdfDocument,
         page_num: usize,
         resources: &Object,
+        // ── pdf_manipulator patch: a knockout group is clipped to its /BBox like any group ──
+        bbox_clip: Option<tiny_skia::Mask>,
+        // ── end pdf_manipulator patch ──
     ) -> Result<()> {
         // Backdrop is the pixmap state at group entry.
         // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
@@ -8705,13 +9047,15 @@ impl PageRenderer {
 
         if paint_indices.is_empty() {
             // No paint ops — still execute for state side effects (rare).
-            return self.execute_operators(
+            return self.execute_operators_clipped(
                 pixmap,
                 base_transform,
                 operators,
                 doc,
                 page_num,
                 resources,
+                bbox_clip,
+                None,
             );
         }
 
@@ -8771,13 +9115,15 @@ impl PageRenderer {
                 })
                 .collect();
 
-            self.execute_operators(
+            self.execute_operators_clipped(
                 &mut scratch,
                 base_transform,
                 &element_ops,
                 doc,
                 page_num,
                 resources,
+                bbox_clip.clone(),
+                None,
             )?;
 
             // Merge: where scratch differs from backdrop, this element
@@ -8957,7 +9303,7 @@ impl PageRenderer {
                         self.render_form_xobject(
                             pixmap,
                             &form_dict,
-                            &generated.content,
+                            FormContent::Bytes(&generated.content),
                             annot_transform,
                             doc,
                             page_num,
@@ -9019,7 +9365,6 @@ impl PageRenderer {
                             _ => n_stream_obj.clone(),
                         };
                         if let Object::Stream { ref dict, .. } = n_stream_obj {
-                            let ap_data = n_stream_obj.decode_stream_data()?;
                                 // ── end pdf_manipulator patch ──
 
                             if let Some(rect) = annot.rect {
@@ -9052,7 +9397,9 @@ impl PageRenderer {
                                 self.render_form_xobject_scoped(
                                     pixmap,
                                     &dict,
-                                    &ap_data,
+                                    // ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+                                    FormContent::Stream(&n_stream_obj, None),
+                                    // ── end pdf_manipulator patch ──
                                     annot_transform,
                                     doc,
                                     page_num,
@@ -10811,21 +11158,54 @@ fn type3_font_matrix(font_dict: &HashMap<String, Object>) -> Transform {
 /// Decode a `/CharProcs` glyph stream. Resolves an indirect reference (with
 /// encryption support) or decodes a direct stream. Returns `None` for a
 /// non-stream object or on decode failure, so the caller skips the glyph.
-fn decode_type3_charproc(doc: &PdfDocument, obj: &Object) -> Option<Vec<u8>> {
+// ── pdf_manipulator patch: a glyph procedure is read as operators, never decoded whole ──
+/// The stream of a `/CharProcs` entry and its reference, when it has one.
+fn type3_charproc(doc: &PdfDocument, obj: &Object) -> Option<(Object, Option<ObjectRef>)> {
     if let Some(obj_ref) = obj.as_reference() {
         let resolved = doc.load_object(obj_ref).ok()?;
-        if matches!(resolved, Object::Stream { .. }) {
-            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-            return resolved.decode_stream_data().ok();
-            // ── end pdf_manipulator patch ──
-        }
-        return None;
+        return matches!(resolved, Object::Stream { .. }).then_some((resolved, Some(obj_ref)));
     }
-    if matches!(obj, Object::Stream { .. }) {
-        return obj.decode_stream_data().ok();
-    }
-    None
+    matches!(obj, Object::Stream { .. }).then(|| (obj.clone(), None))
 }
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: a form's content is read as operators, never decoded whole ──
+/// Where the operators of a form, an annotation appearance, a Type 3 glyph
+/// procedure, a tiling pattern cell or a soft-mask group come from.
+#[derive(Clone, Copy)]
+enum FormContent<'a> {
+    /// A stream object. With its reference the document's content cache
+    /// serves it; without, it is decoded as it is read.
+    Stream(&'a Object, Option<ObjectRef>),
+    /// Content generated in memory.
+    Bytes(&'a [u8]),
+}
+
+type OperatorSource<'a> = Box<dyn Iterator<Item = Result<std::borrow::Cow<'a, Operator>>> + 'a>;
+
+/// The operators of `content`, read one at a time.
+fn form_operator_source<'a>(
+    doc: &'a PdfDocument,
+    content: FormContent<'a>,
+) -> Result<OperatorSource<'a>> {
+    use crate::host::content::{Mode, Operators};
+    Ok(match content {
+        FormContent::Stream(_, Some(reference)) => Box::new(
+            doc.form_operators(reference)?
+                .map(|op| op.map(std::borrow::Cow::Owned)),
+        ),
+        FormContent::Stream(object, None) => Box::new(
+            Operators::new(crate::host::content::parts::decoded_reader(object)?, Mode::Full)
+                .map(|op| op.map(std::borrow::Cow::Owned)),
+        ),
+        FormContent::Bytes(data) => Box::new(
+            parse_content_stream(data)?
+                .into_iter()
+                .map(|op| Ok(std::borrow::Cow::Owned(op))),
+        ),
+    })
+}
+// ── end pdf_manipulator patch ──
 
 /// Inclusive tile-index range `[lo, hi]` (along one axis) whose cells
 /// intersect the device interval `[region_lo, region_hi]`.

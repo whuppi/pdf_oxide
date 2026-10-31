@@ -89,6 +89,8 @@ pub trait RowSink {
 pub(crate) struct BandContext {
     pub(crate) width: u32,
     pub(crate) page_height: u32,
+    /// Rows in a band: the cut a question about the whole page is asked in.
+    pub(crate) rows: u32,
 }
 
 impl BandContext {
@@ -97,6 +99,7 @@ impl BandContext {
         Self {
             width,
             page_height: height,
+            rows: height,
         }
     }
 }

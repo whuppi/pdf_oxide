@@ -346,7 +346,25 @@ impl ImageRows {
                 });
             }
         }
-        let raster = normalised(pdf_image.to_dynamic_image_covering(target)?, output);
+        let mut raster = pdf_image.to_dynamic_image_covering(target)?;
+        // A colour-key /Mask is tested against the raw samples, which a JPEG
+        // 2000 decode still holds beside the picture. Where a sample is in
+        // range the pixel is made clear in the raster itself, so that the
+        // raw samples need not outlive the open.
+        if is_filter(&filters, &["JPXDecode"]) && pdf_image.samples_are_raw() {
+            let ranges = colour_key.and_then(|key| {
+                crate::rendering::page_renderer::parse_color_key_mask(
+                    key,
+                    pdf_image.color_space().components(),
+                )
+            });
+            if let Some(ranges) = ranges {
+                let mut rgba = raster.to_rgba8();
+                apply_colour_key(&pdf_image, &ranges, &mut rgba);
+                raster = DynamicImage::ImageRgba8(rgba);
+            }
+        }
+        let raster = normalised(raster, output);
         Ok(Self {
             width: raster.width(),
             height: raster.height(),
@@ -604,16 +622,23 @@ struct MaskRows {
     rows: ImageRows,
     /// The mask row held and its samples.
     held: Option<(u32, Vec<u8>)>,
+    /// Set when the mask could not be read: it masks nothing from then on.
+    /// A mask that cannot be read has no sample to test, so the base image
+    /// shows through, the result an absent mask gives; resolving it the other
+    /// way would erase the picture the mask only meant to refine.
+    failed: bool,
 }
 
 impl MaskRows {
     fn new(rows: ImageRows) -> Self {
-        Self { rows, held: None }
+        Self { rows, held: None, failed: false }
     }
 
-    fn restart(&mut self) -> Result<()> {
+    fn restart(&mut self) {
         self.held = None;
-        self.rows.restart()
+        if self.rows.restart().is_err() {
+            self.failed = true;
+        }
     }
 
     /// Multiplies the alpha of base row `y` (of `base_h` rows, `row` the RGBA8
@@ -748,8 +773,11 @@ impl ImageCursor {
         let y = self.base.next;
         let (w, h) = self.base.size();
         self.base.read(doc, out)?;
-        for mask in &mut self.masks {
-            mask.apply(doc, y, w, h, out)?;
+        for mask in self.masks.iter_mut().filter(|m| !m.failed) {
+            if let Err(e) = mask.apply(doc, y, w, h, out) {
+                log::debug!("image mask could not be read, so it masks nothing: {e}");
+                mask.failed = true;
+            }
         }
         premultiply_in_place(out);
         Ok(())
@@ -758,7 +786,7 @@ impl ImageCursor {
     fn restart(&mut self) -> Result<()> {
         self.base.restart()?;
         for mask in &mut self.masks {
-            mask.restart()?;
+            mask.restart();
         }
         if let Some(resampler) = &mut self.resampler {
             resampler.reset();
@@ -943,6 +971,12 @@ impl CursorTable {
     pub(crate) fn clear(&mut self) {
         self.open.clear();
         self.bytes = 0;
+    }
+
+    /// Bytes the open images hold.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// The open image for `key`, which leaves the table while it is drawn.

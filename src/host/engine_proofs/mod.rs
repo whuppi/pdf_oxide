@@ -20,6 +20,8 @@ mod editor_orphans;
 mod editor_packed;
 mod editor_trailer;
 mod filter_readers;
+#[cfg(feature = "rendering")]
+mod group_proof;
 mod editor_pages;
 mod editor_resource_prune;
 mod editor_save;
@@ -27,6 +29,8 @@ mod kept_encryption;
 mod legacy_decoders;
 mod lzw;
 mod page_operators;
+#[cfg(feature = "rendering")]
+mod render_gaps;
 #[cfg(feature = "rendering")]
 mod render_stream;
 #[cfg(feature = "rendering")]

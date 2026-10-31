@@ -33,17 +33,12 @@ objstm::parse_object_stream
 rendering::mesh_shading::eval_pdf_function
 rendering::mesh_shading::eval_type4
 rendering::mesh_shading::render_mesh_shading
-rendering::page_renderer::apply_smask_after_paint_inner
-rendering::page_renderer::decode_type3_charproc
 rendering::page_renderer::evaluate_bc_tint_function
 rendering::page_renderer::evaluate_type0_multi
-rendering::page_renderer::fill_with_tiling_pattern
 rendering::page_renderer::parse_type0_transfer_function
 rendering::page_renderer::parse_type4_transfer_function
 rendering::page_renderer::project_iccbased_to_rgb
-rendering::page_renderer::render_annotations
 rendering::page_renderer::render_image_mask # a stencil is one bit a pixel; its packed rows are kept and only the samples a band reaches become pixels
-rendering::page_renderer::render_xobject
 rendering::resolution::color::evaluate_type0_sampled
 rendering::resolution::color::evaluate_type4
 rendering::resolution::color::resolve_iccbased
