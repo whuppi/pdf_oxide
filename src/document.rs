@@ -2112,7 +2112,12 @@ impl PdfDocument {
         };
 
         // ── vector path density (case F) ──
-        let path_count = self.extract_paths(page).map(|p| p.len()).unwrap_or(0);
+        // ── pdf_manipulator patch: the page's paths are counted as they are painted ──
+        let mut path_count = 0usize;
+        if self.extract_paths_into(page, &mut |_| path_count += 1).is_err() {
+            path_count = 0;
+        }
+        // ── end pdf_manipulator patch ──
         let vector_path_density = {
             let denom = (path_count + glyphs + images.len()).max(1) as f32;
             (path_count as f32 / denom).clamp(0.0, 1.0)
@@ -20110,6 +20115,20 @@ impl PdfDocument {
     /// # }
     /// ```
     pub fn extract_paths(&self, page_index: usize) -> Result<Vec<crate::elements::PathContent>> {
+        // ── pdf_manipulator patch: the page's paths are read through a sink; this one keeps them all ──
+        let mut paths = Vec::new();
+        self.extract_paths_into(page_index, &mut |path| paths.push(path))?;
+        Ok(paths)
+    }
+
+    /// Hands each painted path of a page to `sink`, in painting order, and
+    /// keeps none: what the caller holds is what the sink keeps.
+    pub(crate) fn extract_paths_into(
+        &self,
+        page_index: usize,
+        sink: &mut dyn crate::extractors::paths::PathSink,
+    ) -> Result<()> {
+        // ── end pdf_manipulator patch ──
         use crate::content::Operator;
         use crate::elements::{LineCap, LineJoin};
         use crate::extractors::paths::{FillRule, PathExtractor, PathGraphicsStateStack};
@@ -20132,7 +20151,7 @@ impl PdfDocument {
                     page_index,
                     e
                 );
-                return Ok(Vec::new());
+                return Ok(());
             },
         };
         // ── end pdf_manipulator patch ──
@@ -20152,6 +20171,9 @@ impl PdfDocument {
 
         // Process each operator
         for op in operators {
+            // ── pdf_manipulator patch: the paths of the last operator go to the sink ──
+            extractor.drain_into(sink);
+            // ── end pdf_manipulator patch ──
             match op {
                 // Graphics state operators
                 Operator::SaveState => {
@@ -20295,7 +20317,7 @@ impl PdfDocument {
                 // XObject processing
                 Operator::Do { name } => {
                     if let Err(e) =
-                        self.process_form_xobject_paths(&name, &mut extractor, &mut state_stack)
+                        self.process_form_xobject_paths(&name, &mut extractor, &mut state_stack, sink)
                     {
                         log::warn!(
                             "Failed to process XObject '{}' in path extraction: {}",
@@ -20332,7 +20354,10 @@ impl PdfDocument {
             }
         }
 
-        Ok(extractor.finish())
+        // ── pdf_manipulator patch: the paths of the last operator go to the sink ──
+        extractor.drain_into(sink);
+        Ok(())
+        // ── end pdf_manipulator patch ──
     }
 
     /// Resolve a `BDC /OC <properties>` property operand to the human-readable
@@ -20442,16 +20467,30 @@ impl PdfDocument {
     ///
     /// Identifies paths that form axis-aligned rectangles.
     pub fn extract_rects(&self, page_index: usize) -> Result<Vec<crate::elements::PathContent>> {
-        let paths = self.extract_paths(page_index)?;
-        Ok(paths.into_iter().filter(|p| p.is_rectangle()).collect())
+        // ── pdf_manipulator patch: only the rectangles are kept ──
+        let mut rects = Vec::new();
+        self.extract_paths_into(page_index, &mut |p: crate::elements::PathContent| {
+            if p.is_rectangle() {
+                rects.push(p);
+            }
+        })?;
+        Ok(rects)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Extract straight lines from a page (v0.3.14).
     ///
     /// Identifies paths that form a single straight line segment.
     pub fn extract_lines(&self, page_index: usize) -> Result<Vec<crate::elements::PathContent>> {
-        let paths = self.extract_paths(page_index)?;
-        Ok(paths.into_iter().filter(|p| p.is_straight_line()).collect())
+        // ── pdf_manipulator patch: only the straight lines are kept ──
+        let mut lines = Vec::new();
+        self.extract_paths_into(page_index, &mut |p: crate::elements::PathContent| {
+            if p.is_straight_line() {
+                lines.push(p);
+            }
+        })?;
+        Ok(lines)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Extract tables from a page (v0.3.14).
@@ -20560,29 +20599,51 @@ impl PdfDocument {
         page_index: usize,
         config: crate::structure::spatial_table_detector::TableDetectionConfig,
     ) -> Result<Vec<crate::structure::table_extractor::Table>> {
-        use crate::structure::spatial_table_detector::detect_tables_with_lines;
+        // ── pdf_manipulator patch: the page's rulings go on a quantised grid as they are painted ──
+        use crate::structure::spatial_table_detector::detect_tables;
 
         // Use words instead of spans for better granularity.
         // This ensures that strings with spaces are split into separate columns
         // for the spatial detector.
         let spans = self.extract_table_word_spans(page_index)?;
         // Use all table primitives (lines, rectangles, borders) not just straight lines
-        let lines: Vec<_> = self
-            .extract_paths(page_index)?
-            .into_iter()
-            .filter(|p| p.is_table_primitive())
-            .collect();
+        let lines = self.page_ruling_grid(page_index)?;
 
         // Same prose-rejection filter `extract_page_tables` applies to the
         // extract_text/to_markdown/to_html path — this public API called
         // `detect_tables_with_lines` directly with no post-filter at all, so
         // it was already able to fabricate/garble tables on any prose-shaped
         // spatial candidate, independent of anything else in this function.
-        Ok(detect_tables_with_lines(&spans, &lines, &config)
+        Ok(detect_tables(&spans, &lines, &config)
             .into_iter()
             .filter(|t| t.is_real_grid() && !looks_like_prose_table(t))
             .collect())
+        // ── end pdf_manipulator patch ──
     }
+
+    // ── pdf_manipulator patch: the page's rulings go on a quantised grid as they are painted ──
+    /// The rulings of page `page_index` on a grid over its media box, built as
+    /// the paths are painted: the page's paths are never held.
+    pub(crate) fn page_ruling_grid(
+        &self,
+        page_index: usize,
+    ) -> Result<crate::host::ruling_grid::RulingGrid> {
+        let bounds = match self.get_page_media_box(page_index) {
+            Ok((llx, lly, urx, ury)) => crate::geometry::Rect::from_points(llx, lly, urx, ury),
+            Err(_) => crate::geometry::Rect::new(0.0, 0.0, 612.0, 792.0),
+        };
+        let mut grid = crate::host::ruling_grid::RulingGrid::new(bounds);
+        self.extract_paths_into(page_index, &mut |path: crate::elements::PathContent| {
+            grid.add(&path)
+        })?;
+        if grid.refused() {
+            return Err(Error::Unsupported(format!(
+                "page {page_index}: the rulings did not fit in memory"
+            )));
+        }
+        Ok(grid)
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Process paths from a Form XObject.
     ///
@@ -20604,6 +20665,9 @@ impl PdfDocument {
         name: &str,
         extractor: &mut crate::extractors::paths::PathExtractor,
         state_stack: &mut crate::extractors::paths::PathGraphicsStateStack,
+        // ── pdf_manipulator patch: the form's paths go to the page's sink ──
+        sink: &mut dyn crate::extractors::paths::PathSink,
+        // ── end pdf_manipulator patch ──
     ) -> Result<()> {
         use crate::content::{Matrix, Operator};
         use crate::elements::{LineCap, LineJoin};
@@ -20749,6 +20813,9 @@ impl PdfDocument {
 
         // Process operators from the XObject
         for op in operators {
+            // ── pdf_manipulator patch: the paths of the last operator go to the sink ──
+            extractor.drain_into(sink);
+            // ── end pdf_manipulator patch ──
             match op {
                 // Graphics state operators
                 Operator::SaveState => {
@@ -20865,7 +20932,7 @@ impl PdfDocument {
                 // Nested XObjects (recurse)
                 Operator::Do { name: nested_name } => {
                     if let Err(e) =
-                        self.process_form_xobject_paths(&nested_name, extractor, state_stack)
+                        self.process_form_xobject_paths(&nested_name, extractor, state_stack, sink)
                     {
                         log::warn!("Failed to process nested XObject '{}': {}", nested_name, e);
                     }
@@ -20897,6 +20964,9 @@ impl PdfDocument {
                 _ => {},
             }
         }
+        // ── pdf_manipulator patch: the paths of the last operator go to the sink ──
+        extractor.drain_into(sink);
+        // ── end pdf_manipulator patch ──
 
         // Finalize any pending path to prevent state leakage
         if extractor.has_current_path() {
@@ -20956,17 +21026,20 @@ impl PdfDocument {
         page_index: usize,
         region: crate::geometry::Rect,
     ) -> Result<Vec<crate::elements::PathContent>> {
-        let paths = self.extract_paths(page_index)?;
-
         // Filter paths by region intersection against RENDERED extents: a
         // region query answers "what does the reader see here", so a rule
         // whose drawn bar crosses the region must match even when its
         // geometric bbox is a distant speck. Identical to the
         // geometric test for unstroked paths.
-        Ok(paths
-            .into_iter()
-            .filter(|path| path.rendered_bbox().intersects(&region))
-            .collect())
+        // ── pdf_manipulator patch: only the paths in the region are kept ──
+        let mut inside = Vec::new();
+        self.extract_paths_into(page_index, &mut |path: crate::elements::PathContent| {
+            if path.rendered_bbox().intersects(&region) {
+                inside.push(path);
+            }
+        })?;
+        Ok(inside)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Extract text from a specific rectangular region of a page (v0.3.14).
@@ -22278,11 +22351,13 @@ impl PdfDocument {
         config.text_fallback = text_fallback;
 
         // Extract vector paths (lines/rects) for visual detection
-        let paths = self.extract_paths(page_index).unwrap_or_default();
+        // ── pdf_manipulator patch: the page's rulings go on a quantised grid as they are painted ──
+        let grid = self.page_ruling_grid(page_index).unwrap_or_else(|_| {
+            crate::host::ruling_grid::RulingGrid::new(crate::geometry::Rect::new(0.0, 0.0, 0.0, 0.0))
+        });
 
-        // Filter to table-relevant paths. Chart/plot pages often carry
-        // hundreds of curves and fills that `extract_edges` ignores anyway —
-        // passing them through the full detection pipeline wastes O(n²) time.
+        // Only table-relevant paths reach the grid; the rest are dropped as
+        // they are painted.
         //
         // Use the same predicate the public `extract_tables` uses. The looser
         // `is_horizontal_line || is_vertical_line || is_rectangle` test here
@@ -22297,27 +22372,7 @@ impl PdfDocument {
         // every real rule. The two paths agreed on nothing before this: the
         // same page yields a table through this filter and none through
         // `extract_tables`.
-        let table_paths: Vec<_> = paths
-            .into_iter()
-            .filter(|p| p.is_table_primitive())
-            .collect();
-
-        // A page with thousands of line/rect paths is a drawing or chart, not a
-        // ruled table; skip the O(E²) collinear-join + intersection sweep. Real
-        // ruled tables have at most a few hundred edges. (Tagged tables already
-        // returned above via the structure tree.)
-        const MAX_TABLE_EDGES: usize = 1500;
-        if table_paths.len() > MAX_TABLE_EDGES {
-            log::debug!(
-                "Page {} has {} line/rect paths (> {}) — skipping spatial table sweep",
-                page_index,
-                table_paths.len(),
-                MAX_TABLE_EDGES
-            );
-            return Vec::new();
-        }
-
-        if table_paths.is_empty() {
+        if grid.primitives() == 0 {
             use crate::structure::spatial_table_detector::TableStrategy;
             let is_text_only = matches!(
                 (config.horizontal_strategy, config.vertical_strategy),
@@ -22333,7 +22388,7 @@ impl PdfDocument {
                 );
             }
         }
-        let paths = table_paths;
+        // ── end pdf_manipulator patch ──
 
         let word_spans = self
             .extract_table_word_spans(page_index)
@@ -22363,7 +22418,7 @@ impl PdfDocument {
         // primitives cannot describe a grid however they are arranged. A
         // genuinely ruled RTL table clears that easily and is unaffected.
         const MIN_PRIMITIVES_FOR_A_GRID: usize = 4;
-        if config.text_fallback && paths.len() < MIN_PRIMITIVES_FOR_A_GRID {
+        if config.text_fallback && grid.primitives() < MIN_PRIMITIVES_FOR_A_GRID {
             let rtl = spans
                 .iter()
                 .filter(|s| crate::text::bidi::looks_rtl(&s.text))
@@ -22374,17 +22429,18 @@ impl PdfDocument {
                     "Declining spatial table detection on page {} — {:.0}% RTL spans and                      only {} table primitives",
                     page_index,
                     rtl * 100.0,
-                    paths.len()
+                    // ── pdf_manipulator patch: the grid counts the rulings ──
+                    grid.primitives()
+                    // ── end pdf_manipulator patch ──
                 );
                 return Vec::new();
             }
         }
 
-        let raw_tables = crate::structure::spatial_table_detector::detect_tables_with_lines(
-            input_spans,
-            &paths,
-            &config,
-        );
+        // ── pdf_manipulator patch: the detector reads the grid ──
+        let raw_tables =
+            crate::structure::spatial_table_detector::detect_tables(input_spans, &grid, &config);
+        // ── end pdf_manipulator patch ──
 
         // Issue 484/486/487: when a logical multi-row table is drawn with a
         // horizontal ruling line between every pair of rows, the line-based
@@ -22511,24 +22567,14 @@ impl PdfDocument {
             // while V-lines are confined to the interior table region.
             let candidate_spans: Vec<crate::layout::TextSpan>;
             let fallback_spans: &[crate::layout::TextSpan] = {
-                let v_lines: Vec<_> = paths.iter().filter(|p| p.is_vertical_line(2.0)).collect();
-                if !v_lines.is_empty() {
+                // ── pdf_manipulator patch: the grid keeps the vertical lines' extent as they were painted ──
+                if let Some((vline_y_min, vline_y_max)) = grid.vertical_extent() {
                     // Rendered extents: a stroke-width-encoded column rule's
                     // drawn bar spans the table height while its geometric
                     // bbox is a ~0pt speck at the midline —
                     // banding on the speck would filter out the table's own
                     // spans.
-                    let vline_y_min = v_lines
-                        .iter()
-                        .map(|p| p.rendered_bbox().y)
-                        .fold(f32::INFINITY, f32::min);
-                    let vline_y_max = v_lines
-                        .iter()
-                        .map(|p| {
-                            let r = p.rendered_bbox();
-                            r.y + r.height
-                        })
-                        .fold(f32::NEG_INFINITY, f32::max);
+                    // ── end pdf_manipulator patch ──
                     // Small margin to include spans whose centres just touch the frame.
                     const V_MARGIN: f32 = 5.0;
                     candidate_spans = input_spans

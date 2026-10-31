@@ -705,6 +705,17 @@ impl PathExtractor {
         self.paths
     }
 
+    // ── pdf_manipulator patch: paths go to a sink as they are painted ──
+    /// Hands every path painted since the last call to `sink`, in painting
+    /// order, and drops it from the extractor. Called after each operator, it
+    /// keeps the extractor to the paths of one operator.
+    pub fn drain_into(&mut self, sink: &mut dyn PathSink) {
+        for path in self.paths.drain(..) {
+            sink.path(path);
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Get the number of paths extracted so far.
     pub fn path_count(&self) -> usize {
         self.paths.len()
@@ -715,6 +726,21 @@ impl PathExtractor {
         !self.current_operations.is_empty()
     }
 }
+
+// ── pdf_manipulator patch: paths go to a sink as they are painted ──
+/// Takes the paths of a page one at a time. A sink that keeps only what it
+/// needs holds a page's rulings, not its paths.
+pub trait PathSink {
+    /// Takes one painted path.
+    fn path(&mut self, path: PathContent);
+}
+
+impl<F: FnMut(PathContent)> PathSink for F {
+    fn path(&mut self, path: PathContent) {
+        self(path)
+    }
+}
+// ── end pdf_manipulator patch ──
 
 impl Default for PathExtractor {
     fn default() -> Self {
