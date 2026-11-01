@@ -3682,7 +3682,55 @@ impl DocumentEditor {
                 }
             }
         }
-        Ok(ImageResources { images })
+        let mut line_styles = std::collections::HashMap::new();
+        if let Some(res_dict) = resources.as_dict() {
+            let states = match res_dict.get("ExtGState") {
+                Some(x) => source.resolve_object(x)?,
+                None => Object::Null,
+            };
+            if let Some(sdict) = states.as_dict() {
+                for (name, value) in sdict {
+                    line_styles.insert(name.clone(), Self::line_style_of(source, value));
+                }
+            }
+        }
+        Ok(ImageResources {
+            images,
+            line_styles,
+        })
+    }
+
+    /// The `/LW`, `/LJ`, `/ML` and `/LC` entries of an ExtGState; `None` when
+    /// the dictionary does not resolve or an entry is not a number in range.
+    fn line_style_of(
+        source: &PdfDocument,
+        value: &Object,
+    ) -> Option<crate::redaction::transform::LineStyle> {
+        let state = source.resolve_object(value).ok()?;
+        let dict = state.as_dict()?;
+        let entry = |key: &str| -> Option<Option<f64>> {
+            match dict.get(key) {
+                None => Some(None),
+                Some(v) => {
+                    let v = source.resolve_object(v).ok()?;
+                    let n = v.as_real().or_else(|| v.as_integer().map(|i| i as f64))?;
+                    Some(Some(n))
+                },
+            }
+        };
+        let cap = |key: &str| -> Option<Option<u8>> {
+            match entry(key)? {
+                None => Some(None),
+                Some(n) if (0.0..=2.0).contains(&n) && n.fract() == 0.0 => Some(Some(n as u8)),
+                Some(_) => None,
+            }
+        };
+        Some(crate::redaction::transform::LineStyle {
+            lw: entry("LW")?.map(|n| n as f32),
+            lj: cap("LJ")?,
+            ml: entry("ML")?.map(|n| n as f32),
+            lc: cap("LC")?,
+        })
     }
     // ── end pdf_manipulator patch ──
 

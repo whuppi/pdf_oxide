@@ -303,6 +303,30 @@ impl<'a> TextPass<'a> {
         self.stack.current().ctm
     }
 
+    /// The graphics state the pass is in: the stroke bound reads its line
+    /// width, join and miter limit from here.
+    pub fn gstate(&self) -> &crate::content::graphics_state::GraphicsState {
+        self.stack.current()
+    }
+
+    /// Sets the line style an ExtGState names; the entries it leaves out keep
+    /// their value. The state is saved and restored with `q`/`Q` like the rest.
+    pub fn set_line_style(&mut self, style: &crate::redaction::transform::LineStyle) {
+        let gs = self.stack.current_mut();
+        if let Some(width) = style.lw {
+            gs.line_width = width;
+        }
+        if let Some(join) = style.lj {
+            gs.line_join = join;
+        }
+        if let Some(limit) = style.ml {
+            gs.miter_limit = limit;
+        }
+        if let Some(cap) = style.lc {
+            gs.line_cap = cap;
+        }
+    }
+
     /// Appends the rewritten form of `op` to `out`.
     ///
     /// Non-text operators pass through unchanged; the graphics-state CTM and
@@ -314,7 +338,12 @@ impl<'a> TextPass<'a> {
         let (regions, min_padding, fonts) = (self.regions, self.min_padding, self.fonts);
         let (stack, ts, result) = (&mut self.stack, &mut self.ts, &mut self.result);
         match op {
-            Operator::SaveState | Operator::RestoreState | Operator::Cm { .. } => {
+            Operator::SaveState
+            | Operator::RestoreState
+            | Operator::Cm { .. }
+            | Operator::SetLineWidth { .. }
+            | Operator::SetLineJoin { .. }
+            | Operator::SetMiterLimit { .. } => {
                 super::classify::apply_ctm(stack, op);
                 out.push(op.clone());
             },

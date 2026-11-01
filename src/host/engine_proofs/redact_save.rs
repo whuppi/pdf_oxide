@@ -8,23 +8,23 @@ use crate::object::{Object, ObjectRef};
 use crate::rendering::{render_page, RenderOptions};
 use crate::PdfDocument;
 
-const PAGE: f32 = 300.0;
-const DPI: u32 = 150;
+pub(super) const PAGE: f32 = 300.0;
+pub(super) const DPI: u32 = 150;
 /// The box every proof redacts: it holds the secret line, the link, the
 /// widget and the note of the page, and nothing of the public line.
 const BOX: [f32; 4] = [15.0, 135.0, 130.0, 170.0];
 const RED: [f32; 3] = [1.0, 0.0, 0.0];
 
-fn obj(id: u32, body: &str) -> (u32, Vec<u8>) {
+pub(super) fn obj(id: u32, body: &str) -> (u32, Vec<u8>) {
     (id, format!("{id} 0 obj\n{body}\nendobj\n").into_bytes())
 }
 
-fn stream(id: u32, data: &[u8]) -> (u32, Vec<u8>) {
+pub(super) fn stream(id: u32, data: &[u8]) -> (u32, Vec<u8>) {
     (id, stream_object(id, "", data))
 }
 
 /// Writes objects by their ids in order. The ids need not be consecutive.
-fn write_pdf(objs: &[(u32, Vec<u8>)]) -> Vec<u8> {
+pub(super) fn write_pdf(objs: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut sorted: Vec<&(u32, Vec<u8>)> = objs.iter().collect();
     sorted.sort_by_key(|(id, _)| *id);
     let mut out = b"%PDF-1.4\n".to_vec();
@@ -178,7 +178,7 @@ fn object_body(bytes: &[u8], marker: &[u8]) -> Vec<u8> {
     bytes[start..end].to_vec()
 }
 
-fn render(bytes: &[u8]) -> image::RgbaImage {
+pub(super) fn render(bytes: &[u8]) -> image::RgbaImage {
     let doc = PdfDocument::from_bytes(bytes.to_vec()).unwrap();
     let rendered = render_page(
         &doc,

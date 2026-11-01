@@ -98,13 +98,15 @@ pub fn classify(
     }
 }
 
+// ── pdf_manipulator patch: the line-style operators the stroke bound reads (w, j, M) ──
 /// Update a [`GraphicsStateStack`]'s CTM for one operator.
 ///
 /// Handles only the transformation-affecting operators (`q` → save,
-/// `Q` → restore, `cm` → concat); every other operator leaves the CTM
-/// unchanged. Pruners call this while iterating so the CTM is correct at
-/// each mark. `Q` at the base stack is a safe no-op (malformed input must
-/// not panic — feature plan §4.2 no-panic property).
+/// `Q` → restore, `cm` → concat) and the line-style operators `w`, `j`
+/// and `M`; every other operator leaves the state unchanged.
+/// Pruners call this while iterating so the CTM is correct at each mark.
+/// `Q` at the base stack is a safe no-op (malformed input must not panic —
+/// feature plan §4.2 no-panic property).
 pub fn apply_ctm(stack: &mut GraphicsStateStack, op: &Operator) {
     match op {
         Operator::SaveState => stack.save(),
@@ -126,9 +128,13 @@ pub fn apply_ctm(stack: &mut GraphicsStateStack, op: &Operator) {
             let old = stack.current().ctm;
             stack.current_mut().ctm = m.multiply(&old);
         },
+        Operator::SetLineWidth { width } => stack.current_mut().line_width = *width,
+        Operator::SetLineJoin { join_style } => stack.current_mut().line_join = *join_style,
+        Operator::SetMiterLimit { limit } => stack.current_mut().miter_limit = *limit,
         _ => {},
     }
 }
+// ── end pdf_manipulator patch ──
 
 #[cfg(test)]
 mod tests {

@@ -9,6 +9,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
+mod paths;
+
+use paths::{is_path_op, paint_of, redact_path, PathRedaction};
 use super::image_prune::{classify_image_placement, invert_affine};
 use super::options::{RedactionOptions, RedactionReport};
 use super::overlay::{region_overlay_ops, resolved_fill};
@@ -30,13 +33,34 @@ pub struct ImageResources {
     /// Resource name → the XObject's reference, for XObjects the engine
     /// reads as images (`/Subtype /Image` or `/ImageMask true`).
     pub images: HashMap<String, ObjectRef>,
+    /// Resource name → the line style of an ExtGState the page names. A name
+    /// whose dictionary cannot be read maps to `None`, and a `gs` of it refuses.
+    pub line_styles: HashMap<String, Option<LineStyle>>,
 }
 
 impl ImageResources {
-    /// An empty registry: every `Do` passes through unchanged.
+    /// An empty registry: every `Do` passes through unchanged, and a `gs`
+    /// refuses, since no ExtGState can be read.
     pub fn none() -> Self {
-        Self { images: HashMap::new() }
+        Self {
+            images: HashMap::new(),
+            line_styles: HashMap::new(),
+        }
     }
+}
+
+/// The line-style entries of an ExtGState the stroke bound reads: `/LW`,
+/// `/LJ`, `/ML` and `/LC`. An entry the dictionary does not set is `None`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineStyle {
+    /// Line width (`/LW`).
+    pub lw: Option<f32>,
+    /// Line join style (`/LJ`): 0 miter, 1 round, 2 bevel.
+    pub lj: Option<u8>,
+    /// Miter limit (`/ML`).
+    pub ml: Option<f32>,
+    /// Line cap style (`/LC`): 0 butt, 1 round, 2 projecting square.
+    pub lc: Option<u8>,
 }
 
 /// Rounds the u/v keys of a covered rect: two `Do`s of one source over the
@@ -93,6 +117,10 @@ pub struct RedactPass<'a> {
     ops: Vec<Operator>,
     /// The bytes of one rewritten operator, reused.
     bytes: Vec<u8>,
+    /// The construction and clip operators of the path being read, held
+    /// until its paint operator decides them.
+    path: Vec<Operator>,
+    paths_pruned: usize,
 }
 
 /// Records a source id once in `originals`, the set the page's overwritten
@@ -126,6 +154,8 @@ impl<'a> RedactPass<'a> {
             kept_xobject_names: HashSet::new(),
             ops: Vec::new(),
             bytes: Vec::new(),
+            path: Vec::new(),
+            paths_pruned: 0,
         }
     }
 
@@ -148,6 +178,54 @@ impl<'a> RedactPass<'a> {
         out.write_all(b"q\n")?;
         for item in content.by_ref() {
             let op = item?;
+            if is_path_op(&op) {
+                self.path.push(op);
+                continue;
+            }
+            if paint_of(&op).is_some() {
+                let pending = std::mem::take(&mut self.path);
+                let decided = redact_path(
+                    &pending,
+                    &op,
+                    self.text.gstate(),
+                    &self.text.ctm(),
+                    self.regions,
+                    self.opts.edge_padding,
+                )?;
+                match decided {
+                    PathRedaction::Keep => {
+                        for held in &pending {
+                            self.emit(out, held)?;
+                        }
+                        self.emit(out, &op)?;
+                    },
+                    PathRedaction::Rewritten(written) => {
+                        self.paths_pruned += 1;
+                        for written in &written {
+                            self.emit(out, written)?;
+                        }
+                    },
+                }
+                continue;
+            }
+            if !self.path.is_empty() {
+                return Err(Error::Unsupported(
+                    "a path is not ended by a paint operator; refusing to redact a path that \
+                     cannot be read"
+                        .to_string(),
+                ));
+            }
+            if let Operator::SetExtGState { dict_name } = &op {
+                match self.images.line_styles.get(dict_name.as_str()) {
+                    Some(Some(style)) => self.text.set_line_style(style),
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "the ExtGState /{dict_name} cannot be read; refusing to redact a \
+                             page whose line style is unknown"
+                        )))
+                    },
+                }
+            }
             // An image `Do` and an inline image are decided here: the
             // placement, the overlay fill it carries, and the mechanics of
             // the copy. A `Do` of whatever else — a form (T6c), a glyph's
@@ -194,6 +272,13 @@ impl<'a> RedactPass<'a> {
                     .to_string(),
             ));
         }
+        if !self.path.is_empty() {
+            return Err(Error::Unsupported(
+                "a path is not ended by a paint operator; refusing to redact a path that \
+                 cannot be read"
+                    .to_string(),
+            ));
+        }
         out.write_all(b"Q\n")?;
         for region in &self.regions.regions {
             out.write_all(&region_overlay_ops(region, self.opts))?;
@@ -208,12 +293,21 @@ impl<'a> RedactPass<'a> {
                 bytes_removed: totals.bytes_removed,
                 images_modified: self.imgs_modified + self.inline_modified,
                 images_removed: self.imgs_removed,
+                paths_pruned: self.paths_pruned,
                 ..RedactionReport::default()
             },
             placements: self.placements,
             image_originals: self.image_originals,
             kept_xobject_names: self.kept_xobject_names,
         })
+    }
+
+    /// Writes one operator to `out` through the pass's byte buffer.
+    fn emit<W: Write>(&mut self, out: &mut W, op: &Operator) -> Result<()> {
+        self.bytes.clear();
+        serialize_operator(&mut self.bytes, op);
+        out.write_all(&self.bytes)?;
+        Ok(())
     }
 
     /// Decides one image `Do` against the regions through the composed CTM:

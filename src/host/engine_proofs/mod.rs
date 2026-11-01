@@ -36,10 +36,14 @@ mod legacy_decoders;
 mod lzw;
 mod page_operators;
 mod redact_pass;
+mod redact_path_ink;
+mod redact_paths;
 #[cfg(feature = "rendering")]
 mod redact_image_save;
 #[cfg(feature = "rendering")]
 mod redact_jpeg_dct;
+#[cfg(feature = "rendering")]
+mod redact_path_save;
 #[cfg(feature = "rendering")]
 mod redact_save;
 #[cfg(feature = "rendering")]
