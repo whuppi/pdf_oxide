@@ -522,15 +522,11 @@ struct RedactedPage {
     fonts: crate::redaction::FontInfoMetrics,
     report: crate::redaction::RedactionReport,
     dropped_annots: std::collections::HashSet<u32>,
-    /// One per overwritten placement, in pass order: the source XObject, its
-    /// covered u/v rect and the fill regions under it. The save writes each
-    /// as its own stream and its /SMask-or-/Mask copy, never the source's
-    /// pixels redacted twice.
-    placements: Vec<crate::host::images::redact_copy::ImagePlacement>,
-    /// The sources whose pixels the page dropped or rewrote.
-    image_originals: Vec<u32>,
-    /// The /XObject names the page's surviving `Do`s still name.
-    kept_xobject_names: std::collections::HashSet<String>,
+    /// What the pass queued: one image placement per overwritten copy (the
+    /// save writes each as its own stream and its /SMask-or-/Mask copy,
+    /// never the source's pixels redacted twice), the mesh, pattern and form
+    /// copies, and the resource names the page's surviving marks still name.
+    scope: crate::redaction::transform::Scope,
 }
 // ── end pdf_manipulator patch ──
 
@@ -543,6 +539,119 @@ struct RedactionCopyIds {
     image: (u32, u32),
     smask: Option<(u32, u32)>,
     mask: Option<(u32, u32)>,
+}
+
+/// The new object ids of every copy a scope queued, in the order of the
+/// scope's lists: a mesh and a form take a stream and its /Length, a pattern
+/// one dictionary, and a form carries the ids of the scope below it.
+#[derive(Default)]
+struct ScopeIds {
+    images: Vec<RedactionCopyIds>,
+    meshes: Vec<(u32, u32)>,
+    patterns: Vec<u32>,
+    forms: Vec<FormIds>,
+}
+
+/// The ids of one form copy and of the copies its own content queued.
+struct FormIds {
+    stream: (u32, u32),
+    inner: ScopeIds,
+}
+
+/// Every copy of a page's scope and of the forms below it, flattened for the
+/// writer, each with the context it is written in.
+#[derive(Default)]
+struct CopyWork<'a> {
+    /// A placement, its ids and the /ColorSpace map of the resources it is
+    /// drawn from.
+    images: Vec<(
+        &'a crate::host::images::redact_copy::ImagePlacement,
+        &'a RedactionCopyIds,
+        HashMap<String, Object>,
+    )>,
+    meshes: Vec<(&'a crate::redaction::transform::MeshCopy, (u32, u32))>,
+    /// A pattern copy, its id and the id of the mesh copy it names.
+    patterns: Vec<(&'a crate::redaction::transform::PatternCopy, u32, u32)>,
+    forms: Vec<(&'a crate::redaction::transform::FormCopy, &'a FormIds)>,
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: the forms a redaction pass opens come from the source document ──
+/// Opens the forms of a page for the redaction pass. A form without its own
+/// /Resources reads the page's, as old writers expect.
+struct DocForms<'d> {
+    source: &'d PdfDocument,
+    page_resources: Object,
+}
+
+impl DocForms<'_> {
+    /// The resources a form is drawn with, resolved.
+    fn resources_of(&self, dict: &HashMap<String, Object>) -> Result<Object> {
+        match dict.get("Resources") {
+            Some(resources) => self.source.resolve_object(resources),
+            None => Ok(self.page_resources.clone()),
+        }
+    }
+}
+
+impl crate::redaction::transform::FormLoader for DocForms<'_> {
+    fn view(&self, form: ObjectRef) -> Result<crate::redaction::transform::FormView> {
+        let object = self.source.load_object(form)?;
+        let unreadable = |what: &str| {
+            Error::Unsupported(format!(
+                "the form {} {} has {what} that cannot be read; refusing to redact a page \
+                 whose form cannot be placed",
+                form.id, form.gen
+            ))
+        };
+        let dict = object.as_dict().ok_or_else(|| unreadable("no dictionary"))?;
+        let numbers = |key: &str, count: usize| -> Result<Option<Vec<f32>>> {
+            let Some(value) = dict.get(key) else { return Ok(None) };
+            let value = self.source.resolve_object(value)?;
+            let items = value.as_array().ok_or_else(|| unreadable(key))?;
+            if items.len() != count {
+                return Err(unreadable(key));
+            }
+            items
+                .iter()
+                .map(|item| {
+                    let item = self.source.resolve_object(item)?;
+                    item.as_real()
+                        .or_else(|| item.as_integer().map(|i| i as f64))
+                        .map(|n| n as f32)
+                        .filter(|n| n.is_finite())
+                        .ok_or_else(|| unreadable(key))
+                })
+                .collect::<Result<Vec<f32>>>()
+                .map(Some)
+        };
+        let matrix = match numbers("Matrix", 6)? {
+            Some(m) => crate::content::graphics_state::Matrix {
+                a: m[0],
+                b: m[1],
+                c: m[2],
+                d: m[3],
+                e: m[4],
+                f: m[5],
+            },
+            None => crate::content::graphics_state::Matrix::identity(),
+        };
+        let b = numbers("BBox", 4)?.ok_or_else(|| unreadable("no /BBox"))?;
+        let resources = self.resources_of(dict)?;
+        Ok(crate::redaction::transform::FormView {
+            matrix,
+            bbox: Rect::from_points(b[0].min(b[2]), b[1].min(b[3]), b[0].max(b[2]), b[1].max(b[3])),
+            resources: DocumentEditor::image_resources_of(self.source, &resources)?,
+            fonts: Box::new(DocumentEditor::font_metrics_of(self.source, &resources)?),
+        })
+    }
+
+    fn content(
+        &self,
+        form: ObjectRef,
+    ) -> Result<crate::host::content::Operators<Box<dyn Read>>> {
+        self.source.form_operators(form)
+    }
 }
 // ── end pdf_manipulator patch ──
 
@@ -3028,8 +3137,16 @@ impl DocumentEditor {
                             }
                         }
                     }
-                    if let Ok(resources) = self.redacted_page_resources(src, page, &[]) {
+                    if let Ok(resources) = self.redacted_page_resources(src, page, &ScopeIds::default()) {
                         push_refs(&resources, &mut refs_buf);
+                    }
+                    // The copies the page queued name source objects too: the
+                    // fonts and colour spaces of a form copy, the function of
+                    // a mesh copy.
+                    if let Ok(named) = self.copy_sources(src, page) {
+                        for object in &named {
+                            push_refs(object, &mut refs_buf);
+                        }
                     }
                 }
                 route(&refs_buf, &seen, &mut queue, &mut by_stream);
@@ -3571,85 +3688,119 @@ impl DocumentEditor {
         deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<()> {
-        let mut dict = HashMap::new();
-        if deflate.is_some() {
-            dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
-        }
-        dict.insert("Length".to_string(), Object::Reference(ObjectRef::new(length_id, 0)));
-        let offset = writer.position();
-        serializer.write_stream_open(&mut *writer, content_id, 0, &dict)?;
-        let body_start = writer.position();
         let ops = source.page_operators(page_index)?;
-        let images = Self::page_image_resources(source, page_index)?;
-        let run = |out: &mut dyn Write| {
-            Self::run_redaction_pass(&page.regions, &page.opts, &page.fonts, &images, ops, deflate, out)
-        };
-        let outcome = match handler {
-            None => run(&mut *writer)?,
-            Some(h) => {
-                let iv = crate::encryption::EncryptionWriteHandler::generate_iv()?;
-                let mut enc = h.stream_cipher(content_id, 0).encrypting(&mut *writer, iv)?;
-                let outcome = run(&mut enc)?;
-                enc.finish()?;
-                outcome
+        let page_resources = Self::inherited_resources(source, page_index)?;
+        let images = Self::image_resources_of(source, &page_resources)?;
+        let forms = DocForms { source, page_resources };
+        let mut outcome = None;
+        Self::write_pass_stream(
+            (content_id, length_id),
+            HashMap::new(),
+            writer,
+            serializer,
+            handler,
+            deflate,
+            xref_entries,
+            |out| {
+                outcome = Some(Self::run_redaction_pass(
+                    &page.regions,
+                    &page.opts,
+                    &page.fonts,
+                    &images,
+                    &forms,
+                    ops,
+                    out,
+                )?);
+                Ok(())
             },
-        };
-        if outcome.report != page.report || outcome.placements != page.placements {
+        )?;
+        let outcome = outcome.ok_or_else(|| {
+            Error::InvalidPdf(format!("the redaction pass of page {page_index} did not run"))
+        })?;
+        if outcome.report != page.report || outcome.scope != page.scope {
             return Err(Error::InvalidPdf(format!(
                 "the redaction of page {page_index} writes a different result on save than \
                  it recorded when it was queued"
             )));
         }
+        Ok(())
+    }
+
+    /// Writes stream `ids.0` with `dict` and its /Length as the object
+    /// `ids.1` after the body. `body` writes the stream's bytes; they are
+    /// deflated at `deflate` and enciphered when the save encrypts.
+    #[allow(clippy::too_many_arguments)]
+    fn write_pass_stream(
+        ids: (u32, u32),
+        mut dict: HashMap<String, Object>,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
+        deflate: Option<u32>,
+        xref_entries: &mut XrefEntries,
+        body: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<()> {
+        let (stream_id, length_id) = ids;
+        if deflate.is_some() {
+            dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
+        }
+        dict.insert("Length".to_string(), Object::Reference(ObjectRef::new(length_id, 0)));
+        let offset = writer.position();
+        serializer.write_stream_open(&mut *writer, stream_id, 0, &dict)?;
+        let body_start = writer.position();
+        let deflated = |out: &mut dyn Write| -> Result<()> {
+            match deflate {
+                Some(level) => {
+                    let mut zlib =
+                        flate2::write::ZlibEncoder::new(out, flate2::Compression::new(level));
+                    body(&mut zlib)?;
+                    zlib.finish()?;
+                    Ok(())
+                },
+                None => body(out),
+            }
+        };
+        match handler {
+            None => deflated(&mut *writer)?,
+            Some(h) => {
+                let iv = crate::encryption::EncryptionWriteHandler::generate_iv()?;
+                let mut enc = h.stream_cipher(stream_id, 0).encrypting(&mut *writer, iv)?;
+                deflated(&mut enc)?;
+                enc.finish()?;
+            },
+        }
         let len = writer.position() - body_start;
         writer.write_all(b"\nendstream\nendobj\n")?;
-        xref_entries.push((content_id, offset, 0, true));
+        xref_entries.push((stream_id, offset, 0, true));
         let offset = writer.position();
         writer.write_all(&serializer.serialize_indirect(length_id, 0, &Object::Integer(len as i64)))?;
         xref_entries.push((length_id, offset, 0, true));
         Ok(())
     }
 
-    /// One run of the redaction pass over a page's operators into `out`,
-    /// deflated at `deflate` when given, the page's image XObjects by name.
+    /// One run of the redaction pass over a page's operators into `out`, the
+    /// page's image XObjects by name and its forms opened by `forms`.
     fn run_redaction_pass<R: std::io::Read>(
         regions: &crate::redaction::RegionSet,
         opts: &crate::redaction::RedactionOptions,
         fonts: &crate::redaction::FontInfoMetrics,
         images: &crate::redaction::transform::ImageResources,
+        forms: &dyn crate::redaction::transform::FormLoader,
         ops: crate::host::content::Operators<R>,
-        deflate: Option<u32>,
         mut out: &mut dyn Write,
     ) -> Result<crate::redaction::transform::PassOutcome> {
-        let pass = crate::redaction::transform::RedactPass::new(regions, opts, fonts, images);
-        let outcome = match deflate {
-            Some(level) => {
-                let mut zlib = flate2::write::ZlibEncoder::new(out, flate2::Compression::new(level));
-                let outcome = pass.run(ops, &mut zlib)?;
-                zlib.finish()?;
-                outcome
-            },
-            None => pass.run(ops, &mut out)?,
-        };
-        Ok(outcome)
+        let pass =
+            crate::redaction::transform::RedactPass::new(regions, opts, fonts, images).with_forms(forms);
+        pass.run(ops, &mut out)
     }
     // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: the image XObjects a page's redaction decides from ──
-    /// The image XObjects `page`'s own-and-inherited /Resources name, by their
-    /// resource name: only /Subtype /Image and /ImageMask true streams are
-    /// the entries; a form XObject (T6c's job) is no entry and its `Do`
-    /// passes through untouched.
-    fn page_image_resources(
-        source: &PdfDocument,
-        page: usize,
-    ) -> Result<crate::redaction::transform::ImageResources> {
-        use crate::redaction::transform::ImageResources;
-        let mut images = std::collections::HashMap::new();
-        // The resources a page inherits (ISO 32000-1 §7.7.3.4): its own, else
-        // the first ancestor's.
+    /// The /Resources `page` has, own or inherited (ISO 32000-1 §7.7.3.4),
+    /// resolved; `Null` when none is found.
+    fn inherited_resources(source: &PdfDocument, page: usize) -> Result<Object> {
         let page_ref = source.get_page_ref(page)?;
         let mut node = Some(page_ref);
-        let mut resources = Object::Null;
         let mut guard = 0;
         while let Some(reference) = node {
             guard += 1;
@@ -3659,45 +3810,157 @@ impl DocumentEditor {
             let Some(obj) = source.load_object(reference).ok() else { break };
             let Some(dict) = obj.as_dict() else { break };
             if let Some(res) = dict.get("Resources") {
-                resources = source.resolve_object(res)?;
-                break;
+                return source.resolve_object(res);
             }
             node = dict.get("Parent").and_then(|p| p.as_reference());
         }
-        if let Some(res_dict) = resources.as_dict() {
-            let xobjects = match res_dict.get("XObject") {
-                Some(x) => source.resolve_object(x)?,
-                None => Object::Null,
+        Ok(Object::Null)
+    }
+
+    /// The mesh shading (types 4 to 7) at `reference`, with the entries its
+    /// decoder reads resolved to direct values; `None` for any other shading.
+    fn mesh_source_of(
+        source: &PdfDocument,
+        reference: ObjectRef,
+    ) -> Option<crate::redaction::transform::MeshSource> {
+        let object = source.load_object(reference).ok()?;
+        let Object::Stream { dict, body } = &object else { return None };
+        let shading_type = source.resolve_object(dict.get("ShadingType")?).ok()?.as_integer()?;
+        if !(4..=7).contains(&shading_type) {
+            return None;
+        }
+        let mut dict = dict.clone();
+        for key in ["BitsPerCoordinate", "BitsPerComponent", "BitsPerFlag", "Decode", "VerticesPerRow"] {
+            if let Some(value) = dict.get(key) {
+                let value = source.resolve_object(value).ok()?;
+                dict.insert(key.to_string(), value);
+            }
+        }
+        Some(crate::redaction::transform::MeshSource {
+            reference,
+            object: Object::Stream { dict, body: body.clone() },
+            shading_type,
+        })
+    }
+
+    /// The image and form XObjects, the mesh shadings, the shading patterns
+    /// whose shading is a mesh and the line styles that `resources` name, by
+    /// their resource name. Only /Subtype /Image and /ImageMask true streams
+    /// are image entries.
+    fn image_resources_of(
+        source: &PdfDocument,
+        resources: &Object,
+    ) -> Result<crate::redaction::transform::ImageResources> {
+        use crate::redaction::transform::{ImageResources, MeshPattern};
+        let mut images = std::collections::HashMap::new();
+        let mut forms = std::collections::HashMap::new();
+        let mut meshes = std::collections::HashMap::new();
+        let mut patterns = std::collections::HashMap::new();
+        let entries = |key: &str| -> Result<HashMap<String, Object>> {
+            let Some(res_dict) = resources.as_dict() else { return Ok(HashMap::new()) };
+            match res_dict.get(key) {
+                Some(x) => Ok(source.resolve_object(x)?.as_dict().cloned().unwrap_or_default()),
+                None => Ok(HashMap::new()),
+            }
+        };
+        for (name, value) in &entries("XObject")? {
+            let Some(reference) = value.as_reference() else { continue };
+            let Ok(obj) = source.load_object(reference) else { continue };
+            let Some(dict) = obj.as_dict() else { continue };
+            let is_image = dict.get("ImageMask").and_then(|o| o.as_bool()) == Some(true)
+                || dict.get("Subtype").and_then(|o| o.as_name()) == Some("Image");
+            if is_image {
+                images.insert(name.clone(), reference);
+            } else if dict.get("Subtype").and_then(|o| o.as_name()) == Some("Form") {
+                forms.insert(name.clone(), reference);
+            }
+        }
+        for (name, value) in &entries("Shading")? {
+            let Some(reference) = value.as_reference() else { continue };
+            if let Some(mesh) = Self::mesh_source_of(source, reference) {
+                meshes.insert(name.clone(), mesh);
+            }
+        }
+        for (name, value) in &entries("Pattern")? {
+            let Some(reference) = value.as_reference() else { continue };
+            let Ok(obj) = source.load_object(reference) else { continue };
+            let Some(dict) = obj.as_dict() else { continue };
+            if dict.get("PatternType").and_then(|o| o.as_integer()) != Some(2) {
+                continue;
+            }
+            let Some(shading) = dict.get("Shading").and_then(|o| o.as_reference()) else { continue };
+            let Some(mesh) = Self::mesh_source_of(source, shading) else { continue };
+            let matrix = match dict.get("Matrix") {
+                None => crate::content::graphics_state::Matrix::identity(),
+                Some(m) => {
+                    let m = source.resolve_object(m)?;
+                    let numbers: Option<Vec<f32>> = m.as_array().and_then(|items| {
+                        items
+                            .iter()
+                            .map(|n| {
+                                let n = source.resolve_object(n).ok()?;
+                                n.as_real().or_else(|| n.as_integer().map(|i| i as f64))
+                            })
+                            .map(|n| n.filter(|n| n.is_finite()).map(|n| n as f32))
+                            .collect()
+                    });
+                    match numbers.as_deref() {
+                        Some(&[a, b, c, d, e, f]) => crate::content::graphics_state::Matrix { a, b, c, d, e, f },
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "the pattern {} {} has a /Matrix that cannot be read; refusing to \
+                                 redact a page whose mesh cannot be placed",
+                                reference.id, reference.gen
+                            )))
+                        },
+                    }
+                },
             };
-            if let Some(xdict) = xobjects.as_dict() {
-                for (name, value) in xdict {
-                    let Some(reference) = value.as_reference() else { continue };
-                    let Ok(obj) = source.load_object(reference) else { continue };
-                    let Some(dict) = obj.as_dict() else { continue };
-                    let is_image = dict.get("ImageMask").and_then(|o| o.as_bool()) == Some(true)
-                        || dict.get("Subtype").and_then(|o| o.as_name()) == Some("Image");
-                    if is_image {
-                        images.insert(name.clone(), reference);
+            patterns.insert(name.clone(), MeshPattern { reference, matrix, mesh });
+        }
+        let mut line_styles = std::collections::HashMap::new();
+        for (name, value) in &entries("ExtGState")? {
+            line_styles.insert(name.clone(), Self::line_style_of(source, value));
+        }
+        Ok(ImageResources {
+            images,
+            forms,
+            meshes,
+            patterns,
+            line_styles,
+        })
+    }
+
+    /// The metrics of the fonts `resources` name, by resource name. A font
+    /// that cannot be read is left out, so a show in it refuses.
+    fn font_metrics_of(
+        source: &PdfDocument,
+        resources: &Object,
+    ) -> Result<crate::redaction::FontInfoMetrics> {
+        let mut map: HashMap<String, std::sync::Arc<crate::fonts::FontInfo>> = HashMap::new();
+        if let Some(res_dict) = resources.as_dict() {
+            if let Some(font_obj) = res_dict.get("Font") {
+                let font_dict_obj = match font_obj.as_reference() {
+                    Some(r) => source.load_object(r)?,
+                    None => font_obj.clone(),
+                };
+                if let Some(font_dict) = font_dict_obj.as_dict() {
+                    for (name, val) in font_dict {
+                        let resolved = match val.as_reference() {
+                            Some(r) => match source.load_object(r) {
+                                Ok(o) => o,
+                                Err(_) => continue,
+                            },
+                            None => val.clone(),
+                        };
+                        if let Ok(fi) = crate::fonts::FontInfo::from_dict(&resolved, source) {
+                            map.insert(name.clone(), std::sync::Arc::new(fi));
+                        }
                     }
                 }
             }
         }
-        let mut line_styles = std::collections::HashMap::new();
-        if let Some(res_dict) = resources.as_dict() {
-            let states = match res_dict.get("ExtGState") {
-                Some(x) => source.resolve_object(x)?,
-                None => Object::Null,
-            };
-            if let Some(sdict) = states.as_dict() {
-                for (name, value) in sdict {
-                    line_styles.insert(name.clone(), Self::line_style_of(source, value));
-                }
-            }
-        }
-        Ok(ImageResources {
-            images,
-            line_styles,
-        })
+        Ok(crate::redaction::FontInfoMetrics::new(map))
     }
 
     /// The `/LW`, `/LJ`, `/ML` and `/LC` entries of an ExtGState; `None` when
@@ -3780,31 +4043,12 @@ impl DocumentEditor {
     }
     // ── end pdf_manipulator patch ──
 
-    /// The /ColorSpace dictionary a page's own-and-inherited /Resources
-    /// names, for the row geometry a copy's source is read through.
-    fn page_colour_space_map(
+    /// The /ColorSpace dictionary `resources` name, for the row geometry a
+    /// copy's source is read through.
+    fn colour_space_map_of(
         source: &PdfDocument,
-        page_index: usize,
+        resources: &Object,
     ) -> Result<HashMap<String, Object>> {
-        let page_ref = source.get_page_ref(page_index)?;
-        let mut node = Some(page_ref);
-        let mut resources = Object::Null;
-        let mut guard = 0;
-        while let Some(reference) = node {
-            guard += 1;
-            if guard > 64 {
-                break;
-            }
-            let Some(obj) = source.load_object(reference).ok() else {
-                break;
-            };
-            let Some(dict) = obj.as_dict() else { break };
-            if let Some(res) = dict.get("Resources") {
-                resources = source.resolve_object(res)?;
-                break;
-            }
-            node = dict.get("Parent").and_then(|p| p.as_reference());
-        }
         let Ok(Some(colour_dict)) = resources
             .as_dict()
             .and_then(|d| d.get("ColorSpace"))
@@ -3827,49 +4071,319 @@ impl DocumentEditor {
         &self,
         page_index: usize,
         page: &RedactedPage,
-        copies: &[RedactionCopyIds],
+        copies: &ScopeIds,
     ) -> Result<Object> {
-        // The resources the page inherits (§7.7.3.4), resolved.
-        let page_ref = self.source.get_page_ref(page_index)?;
-        let mut node = Some(page_ref);
-        let mut resources = Object::Null;
-        let mut guard = 0;
-        while let Some(reference) = node {
-            guard += 1;
-            if guard > 64 {
-                break;
-            }
-            let Some(obj) = self.source.load_object(reference).ok() else {
-                break;
-            };
-            let Some(dict) = obj.as_dict() else { break };
-            if let Some(res) = dict.get("Resources") {
-                resources = self.source.resolve_object(res)?;
-                break;
-            }
-            node = dict.get("Parent").and_then(|p| p.as_reference());
-        }
+        let resources = Self::inherited_resources(&self.source, page_index)?;
+        Self::rewritten_resources(&self.source, &resources, &page.scope, copies)
+    }
+
+    /// `resources` as a scope's content stream is written against: the
+    /// copies the pass queued under the names it wrote, a source XObject only
+    /// while a surviving `Do` names it, and a source shading or pattern
+    /// unless a copy replaced it and no surviving mark names it. Copies take
+    /// the ids in `ids` as far as they go.
+    fn rewritten_resources(
+        source: &PdfDocument,
+        resources: &Object,
+        scope: &crate::redaction::transform::Scope,
+        ids: &ScopeIds,
+    ) -> Result<Object> {
         let mut resources_dict = resources.as_dict().cloned().unwrap_or_default();
-        let source_xobjects = match resources_dict.get("XObject") {
-            Some(x) => self.source.resolve_object(x)?,
-            None => Object::Null,
+        let entries = |key: &str| -> Result<HashMap<String, Object>> {
+            match resources_dict.get(key) {
+                Some(x) => Ok(source.resolve_object(x)?.as_dict().cloned().unwrap_or_default()),
+                None => Ok(HashMap::new()),
+            }
         };
-        let mut xobject_dict: HashMap<String, Object> =
-            source_xobjects.as_dict().cloned().unwrap_or_default();
+        let mut xobject_dict = entries("XObject")?;
         // A source name stays only when a surviving `Do` names it.
-        xobject_dict.retain(|name, _| page.kept_xobject_names.contains(name));
+        xobject_dict.retain(|name, _| scope.kept_xobject_names.contains(name));
         // The copies, under the names the pass wrote.
-        for (placement, ids) in page.placements.iter().zip(copies) {
+        for (placement, ids) in scope.placements.iter().zip(&ids.images) {
             xobject_dict.insert(
                 placement.name.clone(),
                 Object::Reference(ObjectRef::new(ids.image.0, 0)),
             );
         }
-        resources_dict.insert(
-            "XObject".to_string(),
-            Object::Dictionary(xobject_dict),
-        );
+        for (form, ids) in scope.forms.iter().zip(&ids.forms) {
+            xobject_dict.insert(
+                form.name.clone(),
+                Object::Reference(ObjectRef::new(ids.stream.0, 0)),
+            );
+        }
+        let mut shading_dict = entries("Shading")?;
+        shading_dict.retain(|name, _| {
+            scope.kept_shadings.contains(name) || !scope.replaced_shadings.contains(name)
+        });
+        for (mesh, (id, _)) in scope.meshes.iter().zip(&ids.meshes) {
+            shading_dict.insert(mesh.name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
+        }
+        let mut pattern_dict = entries("Pattern")?;
+        pattern_dict.retain(|name, _| {
+            scope.kept_patterns.contains(name) || !scope.replaced_patterns.contains(name)
+        });
+        for (pattern, id) in scope.patterns.iter().zip(&ids.patterns) {
+            pattern_dict.insert(pattern.name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
+        }
+        resources_dict.insert("XObject".to_string(), Object::Dictionary(xobject_dict));
+        for (key, dict) in [("Shading", shading_dict), ("Pattern", pattern_dict)] {
+            if !dict.is_empty() || resources_dict.contains_key(key) {
+                resources_dict.insert(key.to_string(), Object::Dictionary(dict));
+            }
+        }
         Ok(Object::Dictionary(resources_dict))
+    }
+
+    /// Proves every image copy of `scope` and of the forms below it
+    /// writable, and collects the /SMask and /Mask objects those copies
+    /// replace.
+    fn validate_scope(
+        &self,
+        scope: &crate::redaction::transform::Scope,
+        forms: &DocForms,
+        resources: &Object,
+        mask_originals: &mut Vec<u32>,
+    ) -> Result<()> {
+        let colour_spaces = Self::colour_space_map_of(&self.source, resources)?;
+        for placement in &scope.placements {
+            redact_copy::validate_copy_source(&self.source, placement.source, &colour_spaces)?;
+            let dict = self.source.load_object(placement.source)?;
+            let dict = dict.as_dict().cloned().unwrap_or_default();
+            for key in ["SMask", "Mask"] {
+                if let Some(mask) = dict.get(key).and_then(|o| o.as_reference()) {
+                    redact_copy::validate_copy_source(&self.source, mask, &colour_spaces)?;
+                    mask_originals.push(mask.id);
+                }
+            }
+        }
+        for form in &scope.forms {
+            let dict = self.source.load_object(form.source)?.as_dict().cloned().unwrap_or_default();
+            let inner = forms.resources_of(&dict)?;
+            self.validate_scope(&form.scope, forms, &inner, mask_originals)?;
+        }
+        Ok(())
+    }
+
+    /// The objects the copies of `page` name sources from, for the
+    /// reachability walk: the fonts and colour spaces of a form copy's
+    /// resources, the function of a mesh copy, the rest of a pattern copy.
+    fn copy_sources(&self, page_index: usize, page: &RedactedPage) -> Result<Vec<Object>> {
+        let page_resources = Self::inherited_resources(&self.source, page_index)?;
+        let forms = DocForms { source: &self.source, page_resources };
+        let mut out = Vec::new();
+        Self::push_copy_sources(&self.source, &forms, &page.scope, &mut out)?;
+        Ok(out)
+    }
+
+    fn push_copy_sources(
+        source: &PdfDocument,
+        forms: &DocForms,
+        scope: &crate::redaction::transform::Scope,
+        out: &mut Vec<Object>,
+    ) -> Result<()> {
+        for mesh in &scope.meshes {
+            if let Some(mesh) = Self::mesh_source_of(source, mesh.source) {
+                out.push(Object::Dictionary(crate::redaction::transform::filtered_dict(&mesh)?));
+            }
+        }
+        for pattern in &scope.patterns {
+            let mut dict = source.load_object(pattern.source)?.as_dict().cloned().unwrap_or_default();
+            dict.remove("Shading");
+            out.push(Object::Dictionary(dict));
+        }
+        for form in &scope.forms {
+            let mut dict = source.load_object(form.source)?.as_dict().cloned().unwrap_or_default();
+            let resources = forms.resources_of(&dict)?;
+            dict.remove("Resources");
+            out.push(Object::Dictionary(dict));
+            out.push(Self::rewritten_resources(source, &resources, &form.scope, &ScopeIds::default())?);
+            Self::push_copy_sources(source, forms, &form.scope, out)?;
+        }
+        Ok(())
+    }
+
+    /// Allocates the ids of every copy `scope` queued, and of the copies of
+    /// the forms below it.
+    fn allocate_scope_ids(
+        source: &PdfDocument,
+        next_object_id: &mut u32,
+        scope: &crate::redaction::transform::Scope,
+    ) -> Result<ScopeIds> {
+        fn next(counter: &mut u32) -> u32 {
+            let id = *counter;
+            *counter += 1;
+            id
+        }
+        let mut ids = ScopeIds::default();
+        for placement in &scope.placements {
+            let source_dict =
+                source.load_object(placement.source)?.as_dict().cloned().unwrap_or_default();
+            let has_smask = source_dict.get("SMask").and_then(|o| o.as_reference()).is_some();
+            let has_mask = source_dict.get("Mask").and_then(|o| o.as_reference()).is_some();
+            let image = (next(next_object_id), next(next_object_id));
+            let smask = has_smask.then(|| (next(next_object_id), next(next_object_id)));
+            let mask = has_mask.then(|| (next(next_object_id), next(next_object_id)));
+            ids.images.push(RedactionCopyIds { image, smask, mask });
+        }
+        for _ in &scope.meshes {
+            ids.meshes.push((next(next_object_id), next(next_object_id)));
+        }
+        for _ in &scope.patterns {
+            ids.patterns.push(next(next_object_id));
+        }
+        for form in &scope.forms {
+            let stream = (next(next_object_id), next(next_object_id));
+            let inner = Self::allocate_scope_ids(source, next_object_id, &form.scope)?;
+            ids.forms.push(FormIds { stream, inner });
+        }
+        Ok(ids)
+    }
+
+    /// Flattens `scope` and the scopes of its forms into `work`, each copy
+    /// with the resources it is drawn from.
+    fn collect_copy_work<'a>(
+        source: &PdfDocument,
+        forms: &DocForms,
+        scope: &'a crate::redaction::transform::Scope,
+        ids: &'a ScopeIds,
+        resources: &Object,
+        work: &mut CopyWork<'a>,
+    ) -> Result<()> {
+        let colour_spaces = Self::colour_space_map_of(source, resources)?;
+        for (placement, copy) in scope.placements.iter().zip(&ids.images) {
+            work.images.push((placement, copy, colour_spaces.clone()));
+        }
+        for (mesh, id) in scope.meshes.iter().zip(&ids.meshes) {
+            work.meshes.push((mesh, *id));
+        }
+        for (pattern, id) in scope.patterns.iter().zip(&ids.patterns) {
+            let mesh_id = ids.meshes.get(pattern.mesh).map(|m| m.0).ok_or_else(|| {
+                Error::InvalidPdf("a pattern copy names a mesh copy that was not queued".to_string())
+            })?;
+            work.patterns.push((pattern, *id, mesh_id));
+        }
+        for (form, form_ids) in scope.forms.iter().zip(&ids.forms) {
+            let dict = source.load_object(form.source)?.as_dict().cloned().unwrap_or_default();
+            let inner = forms.resources_of(&dict)?;
+            Self::collect_copy_work(source, forms, &form.scope, &form_ids.inner, &inner, work)?;
+            work.forms.push((form, form_ids));
+        }
+        Ok(())
+    }
+
+    /// Writes the mesh copy as stream `ids.0`: the source's primitives that
+    /// meet no region, decided again as the dry run decided them.
+    #[allow(clippy::too_many_arguments)]
+    fn write_mesh_copy(
+        source: &PdfDocument,
+        mesh: &crate::redaction::transform::MeshCopy,
+        ids: (u32, u32),
+        regions: &crate::redaction::RegionSet,
+        padding: f32,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
+        deflate: Option<u32>,
+        xref_entries: &mut XrefEntries,
+    ) -> Result<()> {
+        let unreadable = || {
+            Error::InvalidPdf(format!(
+                "the mesh shading {} {} cannot be read when the redaction is saved",
+                mesh.source.id, mesh.source.gen
+            ))
+        };
+        let source_mesh = Self::mesh_source_of(source, mesh.source).ok_or_else(unreadable)?;
+        let dict = crate::redaction::transform::filtered_dict(&source_mesh)?;
+        let mut found = None;
+        Self::write_pass_stream(ids, dict, writer, serializer, handler, deflate, xref_entries, |out| {
+            let mut out = out;
+            found = Some(crate::redaction::transform::write_filtered(
+                &source_mesh,
+                &mesh.to_page,
+                regions,
+                padding,
+                &mut out,
+            )?);
+            Ok(())
+        })?;
+        match found {
+            Some(found) if found.kept == mesh.kept && found.dropped == mesh.dropped => Ok(()),
+            _ => Err(Error::InvalidPdf(format!(
+                "the mesh shading {} {} keeps different primitives on save than it recorded \
+                 when the redaction was queued",
+                mesh.source.id, mesh.source.gen
+            ))),
+        }
+    }
+
+    /// Writes the pattern copy as object `id`: the source's dictionary, its
+    /// shading the mesh copy `mesh_id`.
+    fn write_pattern_copy(
+        source: &PdfDocument,
+        pattern: &crate::redaction::transform::PatternCopy,
+        (id, mesh_id): (u32, u32),
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
+        xref_entries: &mut XrefEntries,
+    ) -> Result<()> {
+        let mut dict = source.load_object(pattern.source)?.as_dict().cloned().unwrap_or_default();
+        dict.insert("Shading".to_string(), Object::Reference(ObjectRef::new(mesh_id, 0)));
+        let object = Object::Dictionary(dict);
+        let offset = writer.position();
+        match handler {
+            Some(h) => serializer.write_indirect_encrypted(&mut *writer, id, 0, &object, h),
+            None => serializer.write_indirect(&mut *writer, id, 0, &object),
+        }
+        .map_err(crate::encryption::stream::from_io)?;
+        xref_entries.push((id, offset, 0, true));
+        Ok(())
+    }
+
+    /// Writes the form copy as stream `ids.stream`: the source's dictionary
+    /// with the rewritten resources, its content the pass run again under the
+    /// matrix the dry run recorded.
+    #[allow(clippy::too_many_arguments)]
+    fn write_form_copy(
+        source: &PdfDocument,
+        forms: &DocForms,
+        form: &crate::redaction::transform::FormCopy,
+        ids: &FormIds,
+        regions: &crate::redaction::RegionSet,
+        opts: &crate::redaction::RedactionOptions,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
+        deflate: Option<u32>,
+        xref_entries: &mut XrefEntries,
+    ) -> Result<()> {
+        use crate::redaction::transform::FormLoader;
+        let mut dict = source.load_object(form.source)?.as_dict().cloned().unwrap_or_default();
+        for key in ["Length", "Filter", "DecodeParms", "DL", "F", "FFilter", "FDecodeParms"] {
+            dict.remove(key);
+        }
+        let resources = forms.resources_of(&dict)?;
+        dict.insert(
+            "Resources".to_string(),
+            Self::rewritten_resources(source, &resources, &form.scope, &ids.inner)?,
+        );
+        let view = forms.view(form.source)?;
+        let content = forms.content(form.source)?;
+        let mut outcome = None;
+        Self::write_pass_stream(ids.stream, dict, writer, serializer, handler, deflate, xref_entries, |out| {
+            let mut out = out;
+            outcome = Some(crate::redaction::transform::redact_form(
+                regions, opts, &view, forms, form, content, &mut out,
+            )?);
+            Ok(())
+        })?;
+        match outcome {
+            Some(outcome) if outcome.scope == form.scope => Ok(()),
+            _ => Err(Error::InvalidPdf(format!(
+                "the form {} {} is redacted differently on save than when the redaction was queued",
+                form.source.id, form.source.gen
+            ))),
+        }
     }
     // ── end pdf_manipulator patch ──
 
@@ -4796,32 +5310,19 @@ impl DocumentEditor {
                                     };
                                 // ── end pdf_manipulator patch ──
 
-                                // ── pdf_manipulator patch: the ids each queued image copy is written under ──
-                                // One pair for the copy stream itself and one for its /SMask
-                                // (or /Mask stencil) stream, allocated with the rest of the
-                                // page's ids so the page's /Resources rebuild can name them.
-                                let placements: Vec<crate::host::images::redact_copy::ImagePlacement> =
-                                    self.redacted_pages
-                                        .get(&source_page_index)
-                                        .map(|page| page.placements.clone())
-                                        .unwrap_or_default();
-                                let mut redaction_copies: Vec<RedactionCopyIds> = Vec::new();
-                                for placement in &placements {
-                                    let source_dict = self
-                                        .source
-                                        .load_object(placement.source)?
-                                        .as_dict()
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    let has_smask = source_dict.get("SMask").and_then(|o| o.as_reference()).is_some();
-                                    let has_mask = source_dict.get("Mask").and_then(|o| o.as_reference()).is_some();
-                                    let image = (self.allocate_object_id(), self.allocate_object_id());
-                                    let smask = has_smask
-                                        .then(|| (self.allocate_object_id(), self.allocate_object_id()));
-                                    let mask = has_mask
-                                        .then(|| (self.allocate_object_id(), self.allocate_object_id()));
-                                    redaction_copies.push(RedactionCopyIds { image, smask, mask });
-                                }
+                                // ── pdf_manipulator patch: the ids each queued copy is written under ──
+                                // An image copy takes a pair for its stream and one for its
+                                // /SMask (or /Mask stencil) stream; a mesh or form copy takes
+                                // a stream and its /Length. All are allocated with the rest of
+                                // the page's ids so the /Resources rebuild can name them.
+                                let redaction_ids = match self.redacted_pages.get(&source_page_index) {
+                                    Some(page) => Self::allocate_scope_ids(
+                                        &self.source,
+                                        &mut self.next_object_id,
+                                        &page.scope,
+                                    )?,
+                                    None => ScopeIds::default(),
+                                };
                                 // ── end pdf_manipulator patch ──
                                 // ── pdf_manipulator patch: the /Redact annotations of marks not yet applied ──
                                 // A queued mark that was not applied is saved as a /Redact
@@ -5277,7 +5778,7 @@ impl DocumentEditor {
                                     let resources = self.redacted_page_resources(
                                         source_page_index,
                                         redacted,
-                                        &redaction_copies,
+                                        &redaction_ids,
                                     )?;
                                     new_dict.insert("Resources".to_string(), resources);
                                     // ── end pdf_manipulator patch ──
@@ -5929,7 +6430,7 @@ impl DocumentEditor {
                                                     // still use: its other source names left with the copies.
                                                     let kept_names = destructive_redaction
                                                         .and(self.redacted_pages.get(&source_page_index))
-                                                        .map(|page| &page.kept_xobject_names);
+                                                        .map(|page| &page.scope.kept_xobject_names);
                                                     for (name, xobj_ref) in DocumentEditor::sorted_entries(&xobj_dict) {
                                                         if kept_names.is_some_and(|kept| !kept.contains(name)) {
                                                             continue;
@@ -6419,11 +6920,22 @@ impl DocumentEditor {
                                     // stencil stream take) streams from the source's rows through
                                     // the same deflate → encryption → output chain the content
                                     // uses; nothing holds an encoded copy.
-                                    let colour_spaces =
-                                        Self::page_colour_space_map(&self.source, source_page_index)?;
-                                    for (placement, ids) in
-                                        page.placements.iter().zip(&redaction_copies)
-                                    {
+                                    let page_resources =
+                                        Self::inherited_resources(&self.source, source_page_index)?;
+                                    let doc_forms = DocForms {
+                                        source: &self.source,
+                                        page_resources: page_resources.clone(),
+                                    };
+                                    let mut work = CopyWork::default();
+                                    Self::collect_copy_work(
+                                        &self.source,
+                                        &doc_forms,
+                                        &page.scope,
+                                        &redaction_ids,
+                                        &page_resources,
+                                        &mut work,
+                                    )?;
+                                    for (placement, ids, colour_spaces) in &work.images {
                                         let source = &self.source;
                                         let source_dict = source
                                             .load_object(placement.source)?
@@ -6516,6 +7028,47 @@ impl DocumentEditor {
                                             &mut *writer,
                                             &serializer,
                                             &encryption_handler,
+                                            &mut xref_entries,
+                                        )?;
+                                    }
+                                    // The mesh, pattern and form copies, through the same chain.
+                                    for (mesh, ids) in &work.meshes {
+                                        Self::write_mesh_copy(
+                                            &self.source,
+                                            mesh,
+                                            *ids,
+                                            &page.regions,
+                                            page.opts.edge_padding,
+                                            &mut *writer,
+                                            &serializer,
+                                            &encryption_handler,
+                                            deflate,
+                                            &mut xref_entries,
+                                        )?;
+                                    }
+                                    for (pattern, id, mesh_id) in &work.patterns {
+                                        Self::write_pattern_copy(
+                                            &self.source,
+                                            pattern,
+                                            (*id, *mesh_id),
+                                            &mut *writer,
+                                            &serializer,
+                                            &encryption_handler,
+                                            &mut xref_entries,
+                                        )?;
+                                    }
+                                    for (form, ids) in &work.forms {
+                                        Self::write_form_copy(
+                                            &self.source,
+                                            &doc_forms,
+                                            form,
+                                            ids,
+                                            &page.regions,
+                                            &page.opts,
+                                            &mut *writer,
+                                            &serializer,
+                                            &encryption_handler,
+                                            deflate,
                                             &mut xref_entries,
                                         )?;
                                     }
@@ -10299,61 +10852,10 @@ impl DocumentEditor {
         &mut self,
         source_page: usize,
     ) -> Result<crate::redaction::FontInfoMetrics> {
-        use std::collections::HashMap as Map;
-        let mut map: Map<String, std::sync::Arc<crate::fonts::FontInfo>> = Map::new();
-
-        // Resolve /Resources: the page's own, else inherited from the
-        // /Pages chain (ISO 32000-1:2008 §7.7.3.4 inheritable attributes).
-        // `rendering`-gated `get_page_resources` is unavailable in the
-        // default build, so resolve it here. No resources ⇒ empty map ⇒
-        // the engine reports unknown fonts non-simple and *refuses*
-        // (fail closed, never under-redact).
-        let page_ref = self.source.get_page_ref(source_page)?;
-        let mut node = self.source.load_object(page_ref).ok();
-        let mut resources = Object::Null;
-        let mut guard = 0;
-        while let Some(obj) = node {
-            guard += 1;
-            if guard > 64 {
-                break; // cyclic /Parent — bail (fail closed)
-            }
-            let Some(dict) = obj.as_dict() else { break };
-            if let Some(res) = dict.get("Resources") {
-                resources = match res.as_reference() {
-                    Some(r) => self.source.load_object(r).unwrap_or(Object::Null),
-                    None => res.clone(),
-                };
-                break;
-            }
-            node = dict
-                .get("Parent")
-                .and_then(|p| p.as_reference())
-                .and_then(|r| self.source.load_object(r).ok());
-        }
-
-        if let Some(res_dict) = resources.as_dict() {
-            if let Some(font_obj) = res_dict.get("Font") {
-                let font_dict_obj = match font_obj.as_reference() {
-                    Some(r) => self.source.load_object(r)?,
-                    None => font_obj.clone(),
-                };
-                if let Some(font_dict) = font_dict_obj.as_dict() {
-                    for (name, val) in font_dict {
-                        let resolved = match val.as_reference() {
-                            Some(r) => match self.source.load_object(r) {
-                                Ok(o) => o,
-                                Err(_) => continue,
-                            },
-                            None => val.clone(),
-                        };
-                        if let Ok(fi) = crate::fonts::FontInfo::from_dict(&resolved, &self.source) {
-                            map.insert(name.clone(), std::sync::Arc::new(fi));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(crate::redaction::FontInfoMetrics::new(map))
+        // No resources ⇒ empty map ⇒ the engine reports unknown fonts
+        // non-simple and *refuses* (fail closed, never under-redact).
+        let resources = Self::inherited_resources(&self.source, source_page)?;
+        Self::font_metrics_of(&self.source, &resources)
     }
 
     /// Destructively apply every queued redaction (programmatic
@@ -10473,36 +10975,30 @@ impl DocumentEditor {
         // stream, a font whose glyphs cannot be pruned) is raised here, before
         // anything is recorded. The save runs the same pass and must agree.
         let fonts = self.build_page_font_metrics(src)?;
-        let images = Self::page_image_resources(&self.source, src)?;
+        let page_resources = Self::inherited_resources(&self.source, src)?;
+        let images = Self::image_resources_of(&self.source, &page_resources)?;
+        let forms = DocForms {
+            source: &self.source,
+            page_resources: page_resources.clone(),
+        };
         let outcome = Self::run_redaction_pass(
             rs,
             opts,
             &fonts,
             &images,
+            &forms,
             self.source.page_operators(src)?,
-            None,
             &mut std::io::sink(),
         )?;
         // Each queued copy's source is proved writable now: a source the row writers cannot read (a filter the engine does not
         // decode, a colour space the copy cannot carry) refuses the redaction
         // here, at the dry run: nothing is recorded and the save is never
         // asked to fail halfway with a rejected copy.
-        let colour_spaces = Self::page_colour_space_map(&self.source, src)?;
         // A placement's /SMask and /Mask stencil are copied too, so they are
         // proved and their originals kept out of the output like the image's.
         let mut mask_originals = Vec::new();
-        for placement in &outcome.placements {
-            redact_copy::validate_copy_source(&self.source, placement.source, &colour_spaces)?;
-            let dict = self.source.load_object(placement.source)?;
-            let dict = dict.as_dict().cloned().unwrap_or_default();
-            for key in ["SMask", "Mask"] {
-                if let Some(mask) = dict.get(key).and_then(|o| o.as_reference()) {
-                    redact_copy::validate_copy_source(&self.source, mask, &colour_spaces)?;
-                    mask_originals.push(mask.id);
-                }
-            }
-        }
-        for id in outcome.image_originals.iter().chain(&mask_originals) {
+        self.validate_scope(&outcome.scope, &forms, &page_resources, &mut mask_originals)?;
+        for id in outcome.originals.iter().chain(&mask_originals) {
             self.redacted_image_originals.insert(*id);
         }
         let dropped_annots = self.redacted_annotations(src, rs, opts)?;
@@ -10540,9 +11036,7 @@ impl DocumentEditor {
                 fonts,
                 report: outcome.report,
                 dropped_annots,
-                placements: outcome.placements,
-                image_originals: outcome.image_originals,
-                kept_xobject_names: outcome.kept_xobject_names,
+                scope: outcome.scope,
             },
         );
         self.apply_redactions_pages.insert(src);

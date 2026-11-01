@@ -12,8 +12,8 @@ use crate::object::ObjectRef;
 use crate::redaction::{RedactionOptions, RedactionRegion};
 use crate::PdfDocument;
 
-const BOX: [f32; 4] = [15.0, 135.0, 130.0, 170.0];
-const RED: [f32; 3] = [1.0, 0.0, 0.0];
+pub(super) const BOX: [f32; 4] = [15.0, 135.0, 130.0, 170.0];
+pub(super) const RED: [f32; 3] = [1.0, 0.0, 0.0];
 
 /// Coordinates of the marks under the box: a filled square, a clip inside, and
 /// the inside vertex of a fill that straddles the box.
@@ -53,7 +53,7 @@ fn content() -> Vec<u8> {
         .to_vec()
 }
 
-fn save(editor: &mut DocumentEditor, garbage_collect: bool) -> Vec<u8> {
+pub(super) fn save(editor: &mut DocumentEditor, garbage_collect: bool) -> Vec<u8> {
     editor
         .save_to_bytes_with_options(SaveOptions {
             compress: false,
@@ -67,15 +67,16 @@ fn save(editor: &mut DocumentEditor, garbage_collect: bool) -> Vec<u8> {
 /// The secret is in neither the file's bytes nor any stream it decodes to. The
 /// file's objects are read up to its largest id, since the save renumbers the
 /// page content.
-fn assert_absent_everywhere(out: &[u8], secret: &str, garbage_collect: bool) {
-    assert!(!contains(out, secret.as_bytes()), "gc={garbage_collect}: {secret} in the bytes");
+pub(super) fn assert_absent_everywhere(out: &[u8], secret: &[u8], garbage_collect: bool) {
+    let shown = String::from_utf8_lossy(secret);
+    assert!(!contains(out, secret), "gc={garbage_collect}: {shown:?} in the bytes");
     let doc = PdfDocument::from_bytes(out.to_vec()).unwrap();
     for id in 1..=largest_id(out) {
         if let Ok(object) = doc.load_object(ObjectRef::new(id, 0)) {
             if let Ok(data) = object.decode_stream_data() {
                 assert!(
-                    !contains(&data, secret.as_bytes()),
-                    "gc={garbage_collect}: {secret} in the stream of object {id}"
+                    !contains(&data, secret),
+                    "gc={garbage_collect}: {shown:?} in the stream of object {id}"
                 );
             }
         }
@@ -104,7 +105,7 @@ fn covered_path_and_clip_coordinates_leave_the_saved_file() {
             assert!(contains(&out, public.as_bytes()), "gc={garbage_collect}: {public} is gone");
         }
         for secret in COVERED {
-            assert_absent_everywhere(&out, secret, garbage_collect);
+            assert_absent_everywhere(&out, secret.as_bytes(), garbage_collect);
         }
     }
 }
@@ -143,7 +144,7 @@ fn text_clip_over_an_image_loses_the_secret_and_keeps_the_public_glyphs() {
     editor.add_redaction(0, BOX, Some(RED)).unwrap();
     editor.apply_redactions_destructive(Default::default()).unwrap();
     let out = save(&mut editor, true);
-    assert_absent_everywhere(&out, "SECRET", true);
+    assert_absent_everywhere(&out, b"SECRET", true);
     assert!(contains(&out, b"PUBLIC"), "the public glyphs are gone");
     let after = render(&out);
     let scale = DPI as f32 / 72.0;
@@ -259,7 +260,7 @@ fn text_clip_fixture() -> Vec<u8> {
     ])
 }
 
-fn padded_box() -> [f32; 4] {
+pub(super) fn padded_box() -> [f32; 4] {
     let padded = RedactionRegion::from_rect(BOX[0], BOX[1], BOX[2], BOX[3], None)
         .padded_rect(RedactionOptions::default().edge_padding);
     [padded.left(), padded.top(), padded.right(), padded.bottom()]
@@ -269,7 +270,7 @@ fn padded_box() -> [f32; 4] {
 /// padding, and is the source outside the padded box plus three points. The cut
 /// re-polygonises a fill's diagonal edge, so a partly covered edge pixel on it
 /// may move by a few levels; any other pixel must match exactly.
-fn assert_fill_inside_source_outside(before: &image::RgbaImage, after: &image::RgbaImage) {
+pub(super) fn assert_fill_inside_source_outside(before: &image::RgbaImage, after: &image::RgbaImage) {
     let scale = DPI as f32 / 72.0;
     let padded = padded_box();
     let mut diffs = Vec::new();
@@ -306,6 +307,6 @@ fn assert_fill_inside_source_outside(before: &image::RgbaImage, after: &image::R
 }
 
 /// Whether the page point (`x`, `y`) lies in `rect` grown by `grow` on every side.
-fn inside(x: f32, y: f32, rect: [f32; 4], grow: f32) -> bool {
+pub(super) fn inside(x: f32, y: f32, rect: [f32; 4], grow: f32) -> bool {
     x >= rect[0] - grow && x <= rect[2] + grow && y >= rect[1] - grow && y <= rect[3] + grow
 }

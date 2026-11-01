@@ -290,6 +290,13 @@ impl<'a> TextPass<'a> {
         }
     }
 
+    /// Starts the pass at `ctm` instead of the identity: a form's content is
+    /// read under the matrix that places the form on the page.
+    pub fn with_ctm(mut self, ctm: Matrix) -> Self {
+        self.stack.current_mut().ctm = ctm;
+        self
+    }
+
     /// The totals so far. `operators` stays empty: the rewritten operators
     /// go to the `out` of [`Self::apply`].
     pub fn result(&self) -> &TextEngineResult {

@@ -1326,6 +1326,182 @@ fn pairs(o: Option<&Object>) -> Vec<[f64; 2]> {
         .unwrap_or_default()
 }
 
+// ── pdf_manipulator patch: a mesh is filtered primitive by primitive ──
+// ===========================================================================
+// Mesh filtering for redaction.
+// ===========================================================================
+
+/// How many primitives [`filter_mesh`] kept and dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MeshFilter {
+    pub kept: usize,
+    pub dropped: usize,
+}
+
+/// A bit sink, MSB first; the last byte is padded with zero bits.
+struct BitWriter<'w, W: std::io::Write> {
+    out: &'w mut W,
+    acc: u8,
+    used: u32,
+}
+
+impl<'w, W: std::io::Write> BitWriter<'w, W> {
+    fn new(out: &'w mut W) -> Self {
+        Self { out, acc: 0, used: 0 }
+    }
+
+    fn put(&mut self, value: u64, nbits: u32) -> std::io::Result<()> {
+        for i in (0..nbits).rev() {
+            self.acc = (self.acc << 1) | ((value >> i) & 1) as u8;
+            self.used += 1;
+            if self.used == 8 {
+                self.out.write_all(&[self.acc])?;
+                self.acc = 0;
+                self.used = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if self.used > 0 {
+            let pad = 8 - self.used;
+            self.put(0, pad)?;
+        }
+        Ok(())
+    }
+}
+
+/// The raw `nbits`-wide integer a `/Decode` range maps back to `value`: the
+/// inverse of [`decode_value`], clamped to the range.
+fn encode_value(value: f32, nbits: u32, lo: f32, hi: f32) -> u64 {
+    let max = (1u64 << nbits) - 1;
+    if hi == lo {
+        return 0;
+    }
+    let t = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+    ((f64::from(t) * max as f64).round() as u64).min(max)
+}
+
+impl MeshParams {
+    fn put_point<W: std::io::Write>(&self, w: &mut BitWriter<'_, W>, p: Pt) -> std::io::Result<()> {
+        w.put(encode_value(p.0, self.bits_per_coord, self.decode[0].0, self.decode[0].1), self.bits_per_coord)?;
+        w.put(encode_value(p.1, self.bits_per_coord, self.decode[1].0, self.decode[1].1), self.bits_per_coord)
+    }
+
+    fn put_color<W: std::io::Write>(&self, w: &mut BitWriter<'_, W>, comps: &[f32]) -> std::io::Result<()> {
+        for (i, &c) in comps.iter().enumerate().take(self.ncomps()) {
+            let (lo, hi) = self.decode[2 + i];
+            w.put(encode_value(c, self.bits_per_comp, lo, hi), self.bits_per_comp)?;
+        }
+        Ok(())
+    }
+}
+
+/// The dictionary of a mesh [`filter_mesh`] wrote: the source's, without the
+/// stream's own entries, and a lattice (type 5) becomes the free-form
+/// triangles (type 4) the filter writes it as.
+pub(crate) fn filtered_mesh_dict(
+    shading: &HashMap<String, Object>,
+    shading_type: i64,
+) -> Option<HashMap<String, Object>> {
+    let params = MeshParams::parse(shading)?;
+    let mut dict = shading.clone();
+    for key in ["Length", "Filter", "DecodeParms", "DL", "F", "FFilter", "FDecodeParms"] {
+        dict.remove(key);
+    }
+    if shading_type == 5 {
+        dict.remove("VerticesPerRow");
+        dict.insert("ShadingType".to_string(), Object::Integer(4));
+        dict.insert("BitsPerFlag".to_string(), Object::Integer(i64::from(params.bits_per_flag)));
+    }
+    Some(dict)
+}
+
+/// Streams the primitives of the mesh `data` (shading `type` 4 to 7) through
+/// `drop` and writes the survivors to `out`, each with full vertices and every
+/// edge flag 0, at the source's bit depths. `drop` gets the primitive's
+/// points in shading space: the three vertices of a triangle, the control
+/// points of a patch, whose hull bounds the surface. A lattice is written as
+/// free-form triangles.
+///
+/// # Errors
+/// [`crate::error::Error::Unsupported`] when the shading's parameters cannot be
+/// read, [`crate::error::Error::Io`] when `out` fails.
+pub(crate) fn filter_mesh<R: std::io::Read, W: std::io::Write>(
+    shading: &HashMap<String, Object>,
+    shading_type: i64,
+    data: R,
+    drop: &mut dyn FnMut(&[Pt]) -> bool,
+    out: &mut W,
+) -> Result<MeshFilter> {
+    let params = MeshParams::parse(shading).ok_or_else(|| {
+        crate::error::Error::Unsupported(
+            "a mesh shading's parameters cannot be read; refusing to redact a mesh it cannot filter"
+                .to_string(),
+        )
+    })?;
+    let mut writer = BitWriter::new(out);
+    let mut stats = MeshFilter { kept: 0, dropped: 0 };
+    let mut triangles = |writer: &mut BitWriter<'_, W>,
+                         tri: [RawVertex; 3]|
+     -> std::io::Result<()> {
+        let points = [(tri[0].x, tri[0].y), (tri[1].x, tri[1].y), (tri[2].x, tri[2].y)];
+        if drop(&points) {
+            stats.dropped += 1;
+            return Ok(());
+        }
+        stats.kept += 1;
+        for v in &tri {
+            writer.put(0, params.bits_per_flag)?;
+            params.put_point(writer, (v.x, v.y))?;
+            params.put_color(writer, &v.comps)?;
+        }
+        Ok(())
+    };
+    match shading_type {
+        4 => {
+            for tri in Type4Triangles::new(BitReader::new(data), &params) {
+                triangles(&mut writer, tri)?;
+            }
+        },
+        5 => {
+            for tri in Type5Triangles::new(BitReader::new(data), &params) {
+                triangles(&mut writer, tri)?;
+            }
+        },
+        6 | 7 => {
+            let tensor = shading_type == 7;
+            for patch in Patches::new(BitReader::new(data), tensor, &params) {
+                let mut points: Vec<Pt> = patch.boundary.to_vec();
+                if tensor {
+                    points.extend_from_slice(&patch.interior);
+                }
+                if drop(&points) {
+                    stats.dropped += 1;
+                    continue;
+                }
+                stats.kept += 1;
+                writer.put(0, params.bits_per_flag)?;
+                for &p in &points {
+                    params.put_point(&mut writer, p)?;
+                }
+                for colour in &patch.colors {
+                    params.put_color(&mut writer, colour)?;
+                }
+            }
+        },
+        other => {
+            return Err(crate::error::Error::Unsupported(format!(
+                "shading type {other} is not a mesh; refusing to filter it"
+            )))
+        },
+    }
+    writer.finish()?;
+    Ok(stats)
+}
+// ── end pdf_manipulator patch ──
+
 #[cfg(test)]
 mod tests {
     use super::*;

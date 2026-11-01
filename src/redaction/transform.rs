@@ -9,9 +9,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
+mod meshes;
 mod paths;
 
+pub use meshes::{MeshPattern, MeshSource};
+pub(crate) use meshes::{filtered_dict, write_filtered};
+
 use paths::{is_path_op, paint_of, redact_path, PathRedaction};
+use super::classify::{classify, Classification};
 use super::image_prune::{classify_image_placement, invert_affine};
 use super::options::{RedactionOptions, RedactionReport};
 use super::overlay::{region_overlay_ops, resolved_fill};
@@ -21,18 +26,28 @@ use super::text_engine::{FontMetrics, TextPass};
 use crate::content::operators::Operator;
 use crate::content::graphics_state::Matrix;
 use crate::error::{Error, Result};
+use crate::geometry::Rect;
 use crate::host::content::{InlineImages, Operators};
 use crate::host::images::redact_copy::{covered_span, ImagePlacement};
 use crate::object::{Object, ObjectRef};
 
+/// How deep forms may nest inside a redacted form. A deeper tree refuses at
+/// the dry run, as a cycle does.
+pub const MAX_FORM_DEPTH: usize = 24;
+
 /// The page's image XObjects, by their resource name: the lookup a `Do`
 /// decides from. A page whose resource dictionaries the engine cannot read
-/// resolves to nothing: every `Do` passes through and no image is redacted
-/// (T6c owns forms).
+/// resolves to nothing: every `Do` passes through and nothing is redacted.
 pub struct ImageResources {
     /// Resource name → the XObject's reference, for XObjects the engine
     /// reads as images (`/Subtype /Image` or `/ImageMask true`).
     pub images: HashMap<String, ObjectRef>,
+    /// Resource name → the XObject's reference, for Form XObjects.
+    pub forms: HashMap<String, ObjectRef>,
+    /// Resource name → the mesh shading (types 4 to 7) a `sh` paints.
+    pub meshes: HashMap<String, MeshSource>,
+    /// Resource name → the shading pattern whose shading is a mesh.
+    pub patterns: HashMap<String, MeshPattern>,
     /// Resource name → the line style of an ExtGState the page names. A name
     /// whose dictionary cannot be read maps to `None`, and a `gs` of it refuses.
     pub line_styles: HashMap<String, Option<LineStyle>>,
@@ -44,8 +59,141 @@ impl ImageResources {
     pub fn none() -> Self {
         Self {
             images: HashMap::new(),
+            forms: HashMap::new(),
+            meshes: HashMap::new(),
+            patterns: HashMap::new(),
             line_styles: HashMap::new(),
         }
+    }
+}
+
+/// A form XObject as the pass reads it.
+pub struct FormView {
+    /// The form's `/Matrix`.
+    pub matrix: Matrix,
+    /// The form's `/BBox`, in form space.
+    pub bbox: Rect,
+    /// The form's own resources, as the pass decides from them.
+    pub resources: ImageResources,
+    /// The metrics of the fonts the form's resources name.
+    pub fonts: Box<dyn FontMetrics>,
+}
+
+/// Opens the forms a pass meets. The document supplies it; the pass holds no
+/// document of its own.
+pub trait FormLoader {
+    /// The form's matrix, box, resources and fonts.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] when the form cannot be read in full: a form
+    /// that cannot be read cannot be shown to be outside a region.
+    fn view(&self, form: ObjectRef) -> Result<FormView>;
+
+    /// The form's content operators.
+    ///
+    /// # Errors
+    /// When the form's stream cannot be opened.
+    fn content(&self, form: ObjectRef) -> Result<Operators<Box<dyn Read>>>;
+}
+
+/// One copy of a mesh shading with its covered primitives dropped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshCopy {
+    /// The resource name the pass writes the copy under.
+    pub name: String,
+    /// The source shading stream.
+    pub source: ObjectRef,
+    /// The matrix from shading space to page space the primitives were
+    /// decided under, and the save decides them again under.
+    pub to_page: Matrix,
+    /// How many primitives the copy keeps.
+    pub kept: usize,
+    /// How many primitives the copy drops.
+    pub dropped: usize,
+}
+
+/// One copy of a shading pattern whose shading is a [`MeshCopy`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternCopy {
+    /// The resource name the pass writes the copy under.
+    pub name: String,
+    /// The source pattern dictionary.
+    pub source: ObjectRef,
+    /// The index in [`Scope::meshes`] of the shading the copy names.
+    pub mesh: usize,
+}
+
+/// One specialized copy of a form: its content redacted under the matrix
+/// that places it on the page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormCopy {
+    /// The resource name the pass writes the copy under.
+    pub name: String,
+    /// The source form.
+    pub source: ObjectRef,
+    /// The form's matrix composed with the CTM at its `Do`: the matrix the
+    /// form's content was decided under.
+    pub ctm: Matrix,
+    /// The line style the form is drawn under, which its content inherits.
+    pub style: LineStyle,
+    /// What the form's own pass queued.
+    pub scope: Scope,
+}
+
+/// Redacts the content of the form copy `form`: the same pass the page's
+/// dry run made over it, writing its operators to `out`.
+///
+/// # Errors
+/// As [`RedactPass::run`].
+pub fn redact_form<R: Read, W: Write>(
+    regions: &RegionSet,
+    opts: &RedactionOptions,
+    view: &FormView,
+    loader: &dyn FormLoader,
+    form: &FormCopy,
+    content: Operators<R>,
+    out: &mut W,
+) -> Result<PassOutcome> {
+    RedactPass::new(regions, opts, &*view.fonts, &view.resources)
+        .with_forms(loader)
+        .starting(form.ctm, vec![form.source], &form.style)
+        .run_form(content, out)
+}
+
+/// Everything one content stream's pass queued and kept, which is the same
+/// for the page and for each form copy.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Scope {
+    /// One per overwritten image copy, in decision order.
+    pub placements: Vec<ImagePlacement>,
+    /// One per mesh copy a `sh` or a shading pattern uses.
+    pub meshes: Vec<MeshCopy>,
+    /// One per shading pattern copy.
+    pub patterns: Vec<PatternCopy>,
+    /// One per form copy.
+    pub forms: Vec<FormCopy>,
+    /// The XObject names the stream's surviving `Do`s still use.
+    pub kept_xobject_names: HashSet<String>,
+    /// The /Shading names a surviving `sh` still uses, and those a `sh`
+    /// replaced or dropped: a replaced name stays only when also kept.
+    pub kept_shadings: HashSet<String>,
+    /// See [`Scope::kept_shadings`].
+    pub replaced_shadings: HashSet<String>,
+    /// The /Pattern names a surviving colour operator still uses, and those
+    /// one replaced.
+    pub kept_patterns: HashSet<String>,
+    /// See [`Scope::kept_patterns`].
+    pub replaced_patterns: HashSet<String>,
+}
+
+impl Scope {
+    /// Every image placement of this scope and of the forms below it.
+    pub fn all_placements(&self) -> Vec<&ImagePlacement> {
+        let mut out: Vec<&ImagePlacement> = self.placements.iter().collect();
+        for form in &self.forms {
+            out.extend(form.scope.all_placements());
+        }
+        out
     }
 }
 
@@ -81,17 +229,44 @@ enum Decision {
 }
 
 /// What one run of the pass produced: its report and the queue the save
-/// writes from — one placement per overwritten copy, the sources those
-/// touched, and the XObject names the page's surviving `Do`s still name.
+/// writes from, and the objects the queue replaced.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PassOutcome {
     /// The counts the call reports.
     pub report: RedactionReport,
-    /// One per overwritten copy, in decision order.
-    pub placements: Vec<ImagePlacement>,
-    /// The object ids of the images the pass overwrote or dropped.
-    pub image_originals: Vec<u32>,
-    /// The XObject names the page's surviving `Do`s still use.
-    pub kept_xobject_names: HashSet<String>,
+    /// The copies queued and the names kept.
+    pub scope: Scope,
+    /// The object ids of every source the pass overwrote, dropped or
+    /// copied: images, mesh shadings, shading patterns and forms, in this
+    /// stream and in the forms below it.
+    pub originals: Vec<u32>,
+}
+
+impl PassOutcome {
+    /// Whether the pass changed nothing: no mark removed or cut, no copy
+    /// queued.
+    pub fn is_unchanged(&self) -> bool {
+        let report = RedactionReport {
+            regions: self.report.regions,
+            ..RedactionReport::default()
+        };
+        self.report == report
+            && self.scope.placements.is_empty()
+            && self.scope.meshes.is_empty()
+            && self.scope.patterns.is_empty()
+            && self.scope.forms.is_empty()
+    }
+}
+
+/// A source's matrix as a key: two uses of one source under the same matrix
+/// share one copy.
+type CopyKey = (u32, [u32; 6]);
+
+fn copy_key(source: ObjectRef, m: &Matrix) -> CopyKey {
+    (
+        source.id,
+        [m.a, m.b, m.c, m.d, m.e, m.f].map(f32::to_bits),
+    )
 }
 
 /// Redacts one page's operators into a writer.
@@ -99,20 +274,33 @@ pub struct RedactPass<'a> {
     regions: &'a RegionSet,
     opts: &'a RedactionOptions,
     text: TextPass<'a>,
+    fonts: &'a dyn FontMetrics,
     images: &'a ImageResources,
-    /// The overwritten placements the pass queues, in decision order.
-    placements: Vec<ImagePlacement>,
+    /// Opens the forms the stream draws; without it a form `Do` refuses.
+    loader: Option<&'a dyn FormLoader>,
+    /// The CTM the stream starts under: the page's identity, or the matrix
+    /// a form copy is specialized for. Shading patterns map through it.
+    base: Matrix,
+    /// The forms being redacted above this stream, for the cycle guard.
+    active: Vec<ObjectRef>,
+    /// The copies the pass queues and the names it keeps.
+    scope: Scope,
     /// `source → name → (rect, name)`: a copy already made of the same
     /// source over the same rect, which a second placement shares.
     copies: HashMap<u32, HashMap<u128, String>>,
-    /// The sources whose placements were overwritten or their images dropped.
-    image_originals: Vec<u32>,
+    /// Form and pattern copies already made, by source and matrix.
+    copy_names: HashMap<CopyKey, String>,
+    /// Mesh copies already made, by source and matrix, as indices in the scope.
+    mesh_copies: HashMap<CopyKey, usize>,
+    /// The sources the pass overwrote, dropped or copied.
+    originals: Vec<u32>,
+    /// The report totals of the forms below this stream.
+    nested: RedactionReport,
+    /// The names handed out so far, so each copy's name is new.
+    names_made: usize,
     imgs_removed: usize,
     imgs_modified: usize,
     inline_modified: usize,
-    /// The resource names the page's surviving `Do`s still use, kept in the
-    /// redacted page's own /Resources.
-    kept_xobject_names: HashSet<String>,
     /// The rewritten form of the operator being decided, reused.
     ops: Vec<Operator>,
     /// The bytes of one rewritten operator, reused.
@@ -121,6 +309,7 @@ pub struct RedactPass<'a> {
     /// until its paint operator decides them.
     path: Vec<Operator>,
     paths_pruned: usize,
+    specialized: usize,
 }
 
 /// Records a source id once in `originals`, the set the page's overwritten
@@ -144,19 +333,45 @@ impl<'a> RedactPass<'a> {
             regions,
             opts,
             text: TextPass::new(regions, opts.edge_padding, fonts),
+            fonts,
             images,
-            placements: Vec::new(),
+            loader: None,
+            base: Matrix::identity(),
+            active: Vec::new(),
+            scope: Scope::default(),
             copies: HashMap::new(),
-            image_originals: Vec::new(),
+            copy_names: HashMap::new(),
+            mesh_copies: HashMap::new(),
+            originals: Vec::new(),
+            nested: RedactionReport::default(),
+            names_made: 0,
             imgs_removed: 0,
             imgs_modified: 0,
             inline_modified: 0,
-            kept_xobject_names: HashSet::new(),
             ops: Vec::new(),
             bytes: Vec::new(),
             path: Vec::new(),
             paths_pruned: 0,
+            specialized: 0,
         }
+    }
+
+    /// Lets the pass redact the forms its content draws, opened by `loader`.
+    pub fn with_forms(mut self, loader: &'a dyn FormLoader) -> Self {
+        self.loader = Some(loader);
+        self
+    }
+
+    /// Starts the pass under `base` instead of the identity, as the content
+    /// of a form placed on the page by that matrix; `active` are the forms
+    /// being redacted around it. The line style the form is drawn under
+    /// carries in with `style`.
+    fn starting(mut self, base: Matrix, active: Vec<ObjectRef>, style: &LineStyle) -> Self {
+        self.text = TextPass::new(self.regions, self.opts.edge_padding, self.fonts).with_ctm(base);
+        self.text.set_line_style(style);
+        self.base = base;
+        self.active = active;
+        self
     }
 
     /// Writes the page's rewritten content to `out`: its operators inside
@@ -174,8 +389,34 @@ impl<'a> RedactPass<'a> {
         content: Operators<R>,
         out: &mut W,
     ) -> Result<PassOutcome> {
-        let mut content = content.with_inline_images(InlineImages::Collect);
         out.write_all(b"q\n")?;
+        self.process(content, out)?;
+        out.write_all(b"Q\n")?;
+        for region in &self.regions.regions {
+            out.write_all(&region_overlay_ops(region, self.opts))?;
+        }
+        Ok(self.finish())
+    }
+
+    /// Writes a form's rewritten content to `out`: the operators alone, since
+    /// the form is drawn inside the `q … Q` its `Do` implies, and no overlay,
+    /// since the page draws them.
+    fn run_form<R: Read, W: Write>(
+        mut self,
+        content: Operators<R>,
+        out: &mut W,
+    ) -> Result<PassOutcome> {
+        self.process(content, out)?;
+        Ok(self.finish())
+    }
+
+    /// Decides and writes every operator of `content`.
+    fn process<R: Read, W: Write>(
+        &mut self,
+        content: Operators<R>,
+        out: &mut W,
+    ) -> Result<()> {
+        let mut content = content.with_inline_images(InlineImages::Collect);
         for item in content.by_ref() {
             let op = item?;
             if is_path_op(&op) {
@@ -230,13 +471,30 @@ impl<'a> RedactPass<'a> {
             // placement, the overlay fill it carries, and the mechanics of
             // the copy. A `Do` of whatever else — a form (T6c), a glyph's
             // resource the pass cannot resolve — passes through and keeps
-            // its name on the page.
+            // its name on the page. A form `Do`, a `sh` of a mesh and a
+            // colour operator naming a mesh pattern are decided the same way.
             let replacement = match &op {
                 Operator::Do { name } => {
-                    match self.images.images.get(name.as_str()).copied() {
-                        Some(source) => self.decide_do(source, name.as_str())?,
-                        None => None,
+                    if let Some(source) = self.images.images.get(name.as_str()).copied() {
+                        self.decide_do(source, name.as_str())?
+                    } else if let Some(source) = self.images.forms.get(name.as_str()).copied() {
+                        self.decide_form(source, name.as_str())?
+                    } else {
+                        None
                     }
+                },
+                Operator::PaintShading { name } => self.decide_shading(name)?,
+                Operator::SetFillColorN { components, name: Some(name) } => {
+                    self.decide_pattern(name, |name| Operator::SetFillColorN {
+                        components: components.clone(),
+                        name: Some(Box::new(name)),
+                    })?
+                },
+                Operator::SetStrokeColorN { components, name: Some(name) } => {
+                    self.decide_pattern(name, |name| Operator::SetStrokeColorN {
+                        components: components.clone(),
+                        name: Some(Box::new(name)),
+                    })?
                 },
                 Operator::InlineImage { dict, data } => self.decide_inline(dict, data)?,
                 _ => None,
@@ -255,7 +513,7 @@ impl<'a> RedactPass<'a> {
             self.text.apply(&op, &mut self.ops);
             for written in &self.ops {
                 if let Operator::Do { name } = written {
-                    self.kept_xobject_names.insert(name.clone());
+                    self.scope.kept_xobject_names.insert(name.clone());
                 }
                 self.bytes.clear();
                 serialize_operator(&mut self.bytes, written);
@@ -279,27 +537,53 @@ impl<'a> RedactPass<'a> {
                     .to_string(),
             ));
         }
-        out.write_all(b"Q\n")?;
-        for region in &self.regions.regions {
-            out.write_all(&region_overlay_ops(region, self.opts))?;
-        }
+        Ok(())
+    }
+
+    /// The outcome of the stream the pass has read: its own counts plus those
+    /// of the form copies it queued.
+    fn finish(self) -> PassOutcome {
         let totals = self.text.result();
-        Ok(PassOutcome {
+        PassOutcome {
             report: RedactionReport {
                 regions: self.regions.len(),
-                glyphs_removed: totals.glyphs_removed,
+                glyphs_removed: totals.glyphs_removed + self.nested.glyphs_removed,
                 annotations_removed: 0,
                 fonts_scrubbed: 0,
-                bytes_removed: totals.bytes_removed,
-                images_modified: self.imgs_modified + self.inline_modified,
-                images_removed: self.imgs_removed,
-                paths_pruned: self.paths_pruned,
+                bytes_removed: totals.bytes_removed + self.nested.bytes_removed,
+                images_modified: self.imgs_modified
+                    + self.inline_modified
+                    + self.nested.images_modified,
+                images_removed: self.imgs_removed + self.nested.images_removed,
+                paths_pruned: self.paths_pruned + self.nested.paths_pruned,
+                xobjects_specialized: self.specialized + self.nested.xobjects_specialized,
                 ..RedactionReport::default()
             },
-            placements: self.placements,
-            image_originals: self.image_originals,
-            kept_xobject_names: self.kept_xobject_names,
-        })
+            scope: self.scope,
+            originals: self.originals,
+        }
+    }
+
+    /// A resource name for a copy of `name`, not one the stream's resources
+    /// or the copies queued so far already hold: the first `name_rN` past
+    /// the names made.
+    fn fresh_name(&mut self, name: &str) -> String {
+        let stem = name.trim_start_matches('/');
+        loop {
+            let candidate = format!("{stem}_r{}", self.names_made);
+            self.names_made += 1;
+            let taken = self.images.images.contains_key(&candidate)
+                || self.images.forms.contains_key(&candidate)
+                || self.images.meshes.contains_key(&candidate)
+                || self.images.patterns.contains_key(&candidate)
+                || self.scope.placements.iter().any(|p| p.name == candidate)
+                || self.scope.meshes.iter().any(|m| m.name == candidate)
+                || self.scope.patterns.iter().any(|p| p.name == candidate)
+                || self.scope.forms.iter().any(|f| f.name == candidate);
+            if !taken {
+                return candidate;
+            }
+        }
     }
 
     /// Writes one operator to `out` through the pass's byte buffer.
@@ -320,7 +604,7 @@ impl<'a> RedactPass<'a> {
             ImageRedaction::Keep => Ok(None),
             ImageRedaction::DeleteFull => {
                 self.imgs_removed += 1;
-                note_original(&mut self.image_originals, source.id);
+                note_original(&mut self.originals, source.id);
                 Ok(Some(Decision::Dropped))
             },
             ImageRedaction::Overwrite { u0, v0, u1, v1 } => {
@@ -335,9 +619,9 @@ impl<'a> RedactPass<'a> {
                 let copy_name = match shared {
                     Some(n) => n,
                     None => {
-                        let copy_name = self.fresh_copy_name(name);
+                        let copy_name = self.fresh_name(name);
                         let fills = self.region_fills(&ctm)?;
-                        self.placements.push(ImagePlacement {
+                        self.scope.placements.push(ImagePlacement {
                             name: copy_name.clone(),
                             source,
                             u0,
@@ -346,7 +630,7 @@ impl<'a> RedactPass<'a> {
                             v1,
                             fills,
                         });
-                        note_original(&mut self.image_originals, source.id);
+                        note_original(&mut self.originals, source.id);
                         self.imgs_modified += 1;
                         self.copies
                             .entry(source.id)
@@ -362,20 +646,187 @@ impl<'a> RedactPass<'a> {
         }
     }
 
-    /// A resource name for a copy of the image `name`, not a name the page's
-    /// resources already hold: the first `name_rN` past the placements queued.
-    fn fresh_copy_name(&self, name: &str) -> String {
-        let stem = name.trim_start_matches('/');
-        let mut index = self.placements.len();
-        loop {
-            let candidate = format!("{stem}_r{index}");
-            if !self.images.images.contains_key(&candidate)
-                && !self.placements.iter().any(|p| p.name == candidate)
-            {
-                return candidate;
-            }
-            index += 1;
+    /// Decides one form `Do` through the composed matrix of the form and the
+    /// CTM: outside its box the `Do` passes, inside it is dropped, and across
+    /// it the form is redacted as a copy specialized for that matrix. A form
+    /// the copy would leave as it is passes unchanged.
+    fn decide_form(&mut self, source: ObjectRef, name: &str) -> Result<Option<Decision>> {
+        let Some(loader) = self.loader else {
+            return Err(Error::Unsupported(
+                "a form is drawn but no form can be opened; refusing to redact a page whose \
+                 forms cannot be read"
+                    .to_string(),
+            ));
+        };
+        let view = loader.view(source)?;
+        let composed = view.matrix.multiply(&self.text.ctm());
+        match classify(&view.bbox, &composed, self.regions, self.opts.edge_padding) {
+            Classification::Outside => Ok(None),
+            Classification::Inside => {
+                self.paths_pruned += 1;
+                note_original(&mut self.originals, source.id);
+                Ok(Some(Decision::Dropped))
+            },
+            Classification::Straddle => {
+                let key = copy_key(source, &composed);
+                if let Some(shared) = self.copy_names.get(&key) {
+                    return Ok(Some(Decision::UsedAs(Operator::Do { name: shared.clone() })));
+                }
+                if self.active.contains(&source) {
+                    return Err(Error::Unsupported(
+                        "a form draws itself; refusing to redact a cycle of forms".to_string(),
+                    ));
+                }
+                if self.active.len() >= MAX_FORM_DEPTH {
+                    return Err(Error::Unsupported(format!(
+                        "forms nest more than {MAX_FORM_DEPTH} deep; refusing to redact them"
+                    )));
+                }
+                let gs = self.text.gstate();
+                let style = LineStyle {
+                    lw: Some(gs.line_width),
+                    lj: Some(gs.line_join),
+                    ml: Some(gs.miter_limit),
+                    lc: Some(gs.line_cap),
+                };
+                let mut active = self.active.clone();
+                active.push(source);
+                let inner = RedactPass::new(self.regions, self.opts, &*view.fonts, &view.resources)
+                    .with_forms(loader)
+                    .starting(composed, active, &style)
+                    .run_form(loader.content(source)?, &mut std::io::sink())?;
+                if inner.is_unchanged() {
+                    return Ok(None);
+                }
+                self.absorb(&inner.report);
+                self.specialized += 1;
+                note_original(&mut self.originals, source.id);
+                for id in &inner.originals {
+                    note_original(&mut self.originals, *id);
+                }
+                let copy_name = self.fresh_name(name);
+                self.copy_names.insert(key, copy_name.clone());
+                self.scope.forms.push(FormCopy {
+                    name: copy_name.clone(),
+                    source,
+                    ctm: composed,
+                    style,
+                    scope: inner.scope,
+                });
+                Ok(Some(Decision::UsedAs(Operator::Do { name: copy_name })))
+            },
         }
+    }
+
+    /// Adds the counts of a form copy's pass to this stream's totals.
+    fn absorb(&mut self, report: &RedactionReport) {
+        self.nested.glyphs_removed += report.glyphs_removed;
+        self.nested.bytes_removed += report.bytes_removed;
+        self.nested.images_modified += report.images_modified;
+        self.nested.images_removed += report.images_removed;
+        self.nested.paths_pruned += report.paths_pruned;
+        self.nested.xobjects_specialized += report.xobjects_specialized;
+    }
+
+    /// Decides a `sh` of the mesh `name` under the CTM: it passes when no
+    /// primitive meets a region, is dropped when every one does, and
+    /// otherwise names a copy without the primitives that do.
+    fn decide_shading(&mut self, name: &str) -> Result<Option<Decision>> {
+        let images = self.images;
+        let Some(mesh) = images.meshes.get(name) else {
+            return Ok(None);
+        };
+        let to_page = self.text.ctm();
+        let found = meshes::filter(mesh, &to_page, self.regions, self.opts.edge_padding, &mut std::io::sink())?;
+        if found.dropped == 0 {
+            self.scope.kept_shadings.insert(name.to_string());
+            return Ok(None);
+        }
+        self.scope.replaced_shadings.insert(name.to_string());
+        note_original(&mut self.originals, mesh.reference.id);
+        self.paths_pruned += 1;
+        if found.kept == 0 {
+            return Ok(Some(Decision::Dropped));
+        }
+        let index = self.mesh_copy(name, mesh.reference, to_page, found);
+        Ok(Some(Decision::UsedAs(Operator::PaintShading {
+            name: self.scope.meshes[index].name.clone(),
+        })))
+    }
+
+    /// Decides a colour operator naming the pattern `name`: a pattern whose
+    /// mesh loses no primitive passes, any other names a copy of the pattern
+    /// over a copy of the mesh, which may be empty. `rename` rebuilds the
+    /// operator under the copy's name.
+    fn decide_pattern(
+        &mut self,
+        name: &str,
+        rename: impl FnOnce(String) -> Operator,
+    ) -> Result<Option<Decision>> {
+        let images = self.images;
+        let Some(pattern) = images.patterns.get(name) else {
+            self.scope.kept_patterns.insert(name.to_string());
+            return Ok(None);
+        };
+        let to_page = pattern.matrix.multiply(&self.base);
+        let found = meshes::filter(
+            &pattern.mesh,
+            &to_page,
+            self.regions,
+            self.opts.edge_padding,
+            &mut std::io::sink(),
+        )?;
+        if found.dropped == 0 {
+            self.scope.kept_patterns.insert(name.to_string());
+            return Ok(None);
+        }
+        self.scope.replaced_patterns.insert(name.to_string());
+        let key = copy_key(pattern.reference, &to_page);
+        let copy_name = match self.copy_names.get(&key) {
+            Some(shared) => shared.clone(),
+            None => {
+                note_original(&mut self.originals, pattern.reference.id);
+                note_original(&mut self.originals, pattern.mesh.reference.id);
+                self.paths_pruned += 1;
+                let mesh = self.mesh_copy(name, pattern.mesh.reference, to_page, found);
+                let copy_name = self.fresh_name(name);
+                self.copy_names.insert(key, copy_name.clone());
+                self.scope.patterns.push(PatternCopy {
+                    name: copy_name.clone(),
+                    source: pattern.reference,
+                    mesh,
+                });
+                self.specialized += 1;
+                copy_name
+            },
+        };
+        Ok(Some(Decision::UsedAs(rename(copy_name))))
+    }
+
+    /// The index in the scope of the copy of the mesh `source` filtered under
+    /// `to_page`, made if the stream has none yet.
+    fn mesh_copy(
+        &mut self,
+        stem: &str,
+        source: ObjectRef,
+        to_page: Matrix,
+        found: crate::rendering::mesh_shading::MeshFilter,
+    ) -> usize {
+        let key = copy_key(source, &to_page);
+        if let Some(&index) = self.mesh_copies.get(&key) {
+            return index;
+        }
+        let name = self.fresh_name(stem);
+        self.scope.meshes.push(MeshCopy {
+            name,
+            source,
+            to_page,
+            kept: found.kept,
+            dropped: found.dropped,
+        });
+        self.specialized += 1;
+        self.mesh_copies.insert(key, self.scope.meshes.len() - 1);
+        self.scope.meshes.len() - 1
     }
 
     /// Every region that meets the placement through `ctm`, as its covered

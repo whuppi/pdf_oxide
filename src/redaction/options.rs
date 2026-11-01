@@ -89,7 +89,8 @@ pub struct RedactionReport {
     pub images_modified: usize,
     /// Images deleted entirely (fully covered).
     pub images_removed: usize,
-    /// Path subpaths dropped or geometry-clipped.
+    /// Paints dropped or geometry-clipped: paths, mesh `sh` paints and form
+    /// `Do`s under a region.
     pub paths_pruned: usize,
     /// Shared XObjects/patterns/Type3 fonts cloned-and-specialized.
     pub xobjects_specialized: usize,
