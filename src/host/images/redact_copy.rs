@@ -17,7 +17,7 @@
 //! as JPEG at the source's quality.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -32,9 +32,9 @@ use crate::object::{Object, ObjectRef};
 use crate::writer::ObjectSerializer;
 
 use super::classify::{filter_names, Encoding};
-use super::encode::{best_filtered_row, encode_jpeg_rows, FlateRows};
+use super::dct;
+use super::encode::{best_filtered_row, FlateRows};
 use super::execute::{Pipe, Shape, Source};
-use super::policy::Subsampling;
 use super::stream::SampleRows;
 
 /// One overwritten placement, recorded when the mark is called and written
@@ -244,8 +244,9 @@ fn put_sample(row: &mut [u8], bit_at: usize, bpc: u8, v: u32) {
     }
 }
 
-/// The fill a covered pixel takes, the first of `fills` whose rect contains
-/// the pixel's centre.
+/// The fill a covered pixel takes: the last of `fills` whose rect contains the
+/// pixel's centre. The list is in drawing order, so the last region is the one
+/// drawn on top, the same choice the DCT block path makes.
 fn pick_fill(
     x: usize,
     row: usize,
@@ -255,7 +256,7 @@ fn pick_fill(
 ) -> Option<&CoverFill> {
     let u = (x as f64 + 0.5) / w as f64;
     let v = 1.0 - (row as f64 + 0.5) / h as f64;
-    fills.iter().find(|f| {
+    fills.iter().rev().find(|f| {
         let [fu0, fv0, fu1, fv1] = f.rect;
         f64::from(fu0) <= u && u < f64::from(fu1) && f64::from(fv0) <= v && v < f64::from(fv1)
     })
@@ -399,16 +400,13 @@ fn pull_covered_row(
     Ok(())
 }
 
-/// Re-encodes a codec image's raster in the terms the raster's own decode
-/// reports, its covered pixels the fills. The caller has set the dictionary's
-/// terms they match.
-#[allow(clippy::too_many_arguments)]
+/// Re-encodes a JPEG 2000 raster in the raster's own colour model, its covered
+/// pixels the fills, as Flate. The caller has set the dictionary's terms to match.
 fn write_codec_rows(
     doc: &PdfDocument,
     object: &Object,
     kind: &super::classify::Kind,
     color_spaces: &HashMap<String, Object>,
-    jpeg_quality: Option<u8>,
     fills: &[CoverFill],
     span: (usize, usize, usize, usize),
     cancel: &CancelCheck,
@@ -431,42 +429,16 @@ fn write_codec_rows(
     };
     let source = Source::open(doc, object, kind, shape, color_spaces, None)?;
     let mut pipe = Pipe::new(doc, cancel, source, shape, None);
-    match (kind.encoding, shape) {
-        (Encoding::Jpeg, Shape::Gray | Shape::Rgb) => {
-            let mut y = 0usize;
-            let bytes = encode_jpeg_rows(
-                pipe.width,
-                pipe.height,
-                shape.channels(),
-                jpeg_quality.unwrap_or(75),
-                Subsampling::Full,
-                &mut |row| {
-                    pull_covered_row(&mut pipe, y, fills, span, row)?;
-                    y += 1;
-                    Ok(())
-                },
-            )?;
-            out.write_all(&bytes)?;
-        },
-        _ => {
-            // A CMYK JPEG and a JPX image have no colour-space keeping
-            // encoder in this build; the raster is re-encoded as Flate in
-            // the raster's own colour model (physical components).
-            let channels = shape.channels();
-            let mut encoder = FlateRows::to_writer(out, pipe.width, channels)?;
-            let mut row = vec![0u8; pipe.width as usize * usize::from(channels)];
-            for y in 0..pipe.height as usize {
-                pull_covered_row(&mut pipe, y, fills, span, &mut row)?;
-                encoder.push(&row)?;
-            }
-            encoder.finish_writer()?;
-        },
+    let channels = shape.channels();
+    let mut encoder = FlateRows::to_writer(out, pipe.width, channels)?;
+    let mut row = vec![0u8; pipe.width as usize * usize::from(channels)];
+    for y in 0..pipe.height as usize {
+        pull_covered_row(&mut pipe, y, fills, span, &mut row)?;
+        encoder.push(&row)?;
     }
+    encoder.finish_writer()?;
     Ok(())
 }
-
-/// The bytes a DCT header may span: the markers up to the first scan.
-const JPEG_HEADER_LIMIT: u64 = 1024 * 1024;
 
 /// The first bytes a JPEG 2000 codestream's main header needs: the start
 /// doubles from 64 KiB until the header is complete, up to the cap.
@@ -526,45 +498,9 @@ fn jpx_main_header(body: &crate::object::StreamBody) -> Result<Vec<u8>> {
     }
 }
 
-/// The frame's `(width, height)` from the marker segments before the first
-/// scan (ISO/IEC 10918-1 §B.2). The walk parses no scan, so a progressive
-/// frame builds no coefficient store: `jpeg_decoder::Decoder::read_info`
-/// allocates one at the first scan, which is the whole image's size in
-/// memory, so the header is read here instead.
-fn jpeg_frame_size(head: &[u8]) -> Option<(u32, u32)> {
-    let mut at = 2usize;
-    while at + 4 <= head.len() {
-        if head[at] != 0xFF {
-            return None;
-        }
-        let marker = head[at + 1];
-        match marker {
-            0xFF => at += 1,
-            0x01 | 0xD0..=0xD8 => at += 2,
-            0xDA | 0xD9 => return None,
-            _ => {
-                let len = usize::from(u16::from_be_bytes([head[at + 2], head[at + 3]]));
-                let is_frame = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
-                if is_frame {
-                    // Precision, height, width.
-                    let segment = head.get(at + 4..at + 2 + len)?;
-                    if segment.len() < 5 {
-                        return None;
-                    }
-                    let height = u16::from_be_bytes([segment[1], segment[2]]);
-                    let width = u16::from_be_bytes([segment[3], segment[4]]);
-                    return Some((u32::from(width), u32::from(height)));
-                }
-                at += 2 + len;
-            },
-        }
-    }
-    None
-}
-
 /// Reads a codec stream's header and nothing after it: the codec opens and
-/// states the size the dictionary declares. A progressive JPEG's coefficients
-/// and raster are not built here, so the dry run holds no pixels.
+/// states the size the dictionary declares. A JPEG is read by its marker walk
+/// and proved to code in the baseline tables; neither holds a pixel.
 fn check_codec_header(
     body: &crate::object::StreamBody,
     dict: &HashMap<String, Object>,
@@ -586,18 +522,14 @@ fn check_codec_header(
     };
     match encoding {
         Encoding::Jpeg => {
-            let mut head = Vec::new();
-            body.raw_reader()?
-                .take(JPEG_HEADER_LIMIT)
-                .read_to_end(&mut head)
-                .map_err(crate::encryption::stream::from_io)?;
-            let (fw, fh) = jpeg_frame_size(&head)
-                .ok_or_else(|| refuse("no frame header before the first scan".to_string()))?;
+            let jpeg = dct::Jpeg::read(body)?;
+            let (fw, fh) = jpeg.size();
             if (fw, fh) != (width, height) {
                 return Err(refuse(format!(
                     "the frame is {fw}x{fh}, the dictionary says {width}x{height}"
                 )));
             }
+            jpeg.check_codes(body, &CancelCheck::none())?;
         },
         Encoding::Jpx => {
             #[cfg(feature = "jpeg2000")]
@@ -761,17 +693,8 @@ pub(crate) fn write_copy(
             },
         }
     }
-    // The quality a plain DCT stream re-encodes at: the table its own
-    // quantization encodes, the encoder's default when it is not one.
-    let jpeg_quality = (encoding == Encoding::Jpeg)
-        .then(|| {
-            let mut head = Vec::new();
-            body.raw_reader()?
-                .take(256 * 1024)
-                .read_to_end(&mut head)
-                .map_err(crate::encryption::stream::from_io)?;
-            Ok::<_, Error>(super::classify::estimate_jpeg_quality(&head).unwrap_or(75))
-        })
+    let jpeg = (encoding == Encoding::Jpeg)
+        .then(|| dct::Jpeg::read(&body))
         .transpose()?;
     let image_mask = matches!(dict.get("ImageMask"), Some(Object::Boolean(true)));
     let width = dict
@@ -831,10 +754,7 @@ pub(crate) fn write_copy(
     // The kind (raster colour model and bits) the codec branch pipes through;
     // the shape decision belongs in the dictionary too, so it is made once,
     // before the header.
-    let mut kind = super::classify::classify_stored(doc, dict, stored, &[]);
-    if encoding == Encoding::Jpeg {
-        kind.jpeg_quality = jpeg_quality;
-    }
+    let kind = super::classify::classify_stored(doc, dict, stored, &[]);
     // The dictionary the copy carries.
     let mut out_dict = dict.clone();
     out_dict.remove("Length");
@@ -860,10 +780,17 @@ pub(crate) fn write_copy(
         out_dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
         out_dict.insert("DecodeParms".to_string(), predicted_parms(colors, bpc, width));
     }
-    // A codec source's copy is written in the raster's own terms, so the
-    // dictionary names that colour space and its components.
+    // A JPEG copy is a baseline JPEG of the same components, so its dictionary
+    // keeps the colour space and /Decode the source had.
+    if encoding == Encoding::Jpeg {
+        out_dict.insert("Filter".to_string(), Object::Name("DCTDecode".to_string()));
+        out_dict.insert("BitsPerComponent".to_string(), Object::Integer(8));
+    }
+    // A JPEG 2000 copy's raster is re-encoded as Flate in the raster's own colour
+    // model (physical components), the /Decode array gone with the colour space
+    // named: this build has no colour-space keeping encoder for it.
     let codec_shape = match (encoding, image_mask) {
-        (Encoding::Jpeg | Encoding::Jpx, false) => match kind.color {
+        (Encoding::Jpx, false) => match kind.color {
             super::classify::ColorModel::Bilevel | super::classify::ColorModel::Gray => Some(Shape::Gray),
             super::classify::ColorModel::Rgb => Some(Shape::Rgb),
             super::classify::ColorModel::Cmyk => Some(Shape::Cmyk),
@@ -878,35 +805,23 @@ pub(crate) fn write_copy(
         _ => None,
     };
     if let Some(shape) = codec_shape {
-        match (encoding, shape) {
-            (Encoding::Jpeg, Shape::Gray | Shape::Rgb) => {
-                out_dict.insert("Filter".to_string(), Object::Name("DCTDecode".to_string()));
-                out_dict.insert("BitsPerComponent".to_string(), Object::Integer(8));
+        out_dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
+        out_dict.insert("BitsPerComponent".to_string(), Object::Integer(8));
+        out_dict.remove("Decode");
+        let colors = match shape {
+            Shape::Gray | Shape::Bilevel => 1,
+            Shape::Rgb => 3,
+            Shape::Cmyk => 4,
+        };
+        out_dict.insert("DecodeParms".to_string(), predicted_parms(colors, 8, width));
+        out_dict.insert(
+            "ColorSpace".to_string(),
+            match shape {
+                Shape::Cmyk => Object::Name("DeviceCMYK".to_string()),
+                Shape::Rgb => Object::Name("DeviceRGB".to_string()),
+                Shape::Gray | Shape::Bilevel => Object::Name("DeviceGray".to_string()),
             },
-            _ => {
-                // A CMYK JPEG and a JPX image have no colour-space keeping
-                // encoder in this build; the raster is re-encoded as Flate
-                // in the raster's own colour model (physical components),
-                // the /Decode array gone with the colour space named.
-                out_dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
-                out_dict.insert("BitsPerComponent".to_string(), Object::Integer(8));
-                out_dict.remove("Decode");
-                let colors = match shape {
-                    Shape::Gray | Shape::Bilevel => 1,
-                    Shape::Rgb => 3,
-                    Shape::Cmyk => 4,
-                };
-                out_dict.insert("DecodeParms".to_string(), predicted_parms(colors, 8, width));
-                out_dict.insert(
-                    "ColorSpace".to_string(),
-                    match shape {
-                        Shape::Cmyk => Object::Name("DeviceCMYK".to_string()),
-                        Shape::Rgb => Object::Name("DeviceRGB".to_string()),
-                        Shape::Gray | Shape::Bilevel => Object::Name("DeviceGray".to_string()),
-                    },
-                );
-            },
-        }
+        );
     }
 
     let offset = writer.position();
@@ -936,12 +851,37 @@ pub(crate) fn write_copy(
                 let layout = RowLayout { width, height, ncomp: 1, bpc: 1 };
                 write_sample_rows(doc, &mut rows, &layout, &fills, (x0, x1, y0, y1), cancel, out)
             },
-            Encoding::Jpeg | Encoding::Jpx => write_codec_rows(
+            Encoding::Jpeg => {
+                let Some(jpeg) = jpeg.as_ref() else {
+                    return Err(Error::Image("a JPEG copy has no coefficient header".to_string()));
+                };
+                // A block two regions share takes the fill of the last region in
+                // the list that meets it: that region's overlay is drawn on top.
+                let (w, h) = (f64::from(width), f64::from(height));
+                let pick = |x0: usize, x1: usize, y0: usize, y1: usize| {
+                    fills.iter().rev().find_map(|f| {
+                        let [u0, v0, u1, v1] = f.rect.map(f64::from);
+                        let meets = u0 * w < x1 as f64
+                            && u1 * w > x0 as f64
+                            && (1.0 - v1) * h < y1 as f64
+                            && (1.0 - v0) * h > y0 as f64;
+                        meets.then(|| f.samples.clone())
+                    })
+                };
+                let cover = dct::Cover {
+                    x0,
+                    x1,
+                    y0,
+                    y1,
+                    fill_at: &pick,
+                };
+                jpeg.write(&body, &cover, cancel, out)
+            },
+            Encoding::Jpx => write_codec_rows(
                 doc,
                 &object,
                 &kind,
                 color_spaces,
-                jpeg_quality,
                 &fills,
                 (x0, x1, y0, y1),
                 cancel,

@@ -149,6 +149,12 @@ fn pixel(rgb: &[u8], x: usize, y: usize) -> [u8; 3] {
     [rgb[at], rgb[at + 1], rgb[at + 2]]
 }
 
+/// [`pixel`] for an image `width` samples across.
+fn pixel_of(rgb: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
+    let at = (y * width + x) * 3;
+    [rgb[at], rgb[at + 1], rgb[at + 2]]
+}
+
 /// The covered interior is the fill, the far side is the source. The band
 /// between them is the mark's padding and the image's edge, left unchecked.
 fn assert_fill_and_source(copy: &[u8], source: &[u8], gc: bool) {
@@ -353,37 +359,70 @@ fn image_shared_with_an_unredacted_page_keeps_its_original() {
     }
 }
 
-/// A DCT image: the copy is a JPEG, its covered interior the fill within the
-/// codec's error, its far side the source within the same bound, and the
-/// source's JPEG bytes are in no stream of the file.
+/// A DCT image of 32 by 32, four by four blocks: the box covers the lower-left
+/// quadrant, so the replaced blocks are the lower-left ones and the copy's far
+/// side is the source. The covered interior is the fill within the codec's
+/// error, and the source's JPEG bytes are in no stream of the file. (An 8 by 8
+/// image is one block, which the copy replaces whole, so it cannot show a far side.)
 #[test]
 fn dct_image_covered_pixels_are_the_fill_within_the_codec() {
-    let rgb = source_rgb();
-    let jpeg = encode_jpeg(&rgb, W as u32, H as u32, 3, 90, Subsampling::Full).unwrap();
-    let dict = "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+    const N: usize = 32;
+    let rgb: Vec<u8> = (0..N * N)
+        .flat_map(|i| {
+            let (x, y) = (i % N, i / N);
+            [((x * 7 + y * 3) % 256) as u8, ((x * 5 + y * 11) % 256) as u8, ((x * y) % 256) as u8]
+        })
+        .collect();
+    let jpeg = encode_jpeg(&rgb, N as u32, N as u32, 3, 90, Subsampling::Full).unwrap();
+    let dict = "/Type /XObject /Subtype /Image /Width 32 /Height 32 \
                 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode";
     let src = one_image_page(dict, &jpeg, CONTENT, vec![]);
+    // The source is lossy, so its far side is compared with the source's own decode:
+    // the copy keeps those blocks' coefficients, so the two decodes are equal.
+    let source_doc = PdfDocument::from_bytes(src.clone()).unwrap();
+    let (_, _, source_pixels) = decoded_rgb(&source_doc, the_one_image(&source_doc));
     for gc in [true, false] {
         let out = redact_and_save(&src, 0, gc);
         let doc = PdfDocument::from_bytes(out.clone()).unwrap();
-        let (_, _, copy) = decoded_rgb(&doc, the_one_image(&doc));
-        for y in 0..H {
-            for x in 0..W {
-                let got = pixel(&copy, x, y);
-                if x <= 1 && y >= 6 {
+        let (w, h, copy) = decoded_rgb(&doc, the_one_image(&doc));
+        assert_eq!((w as usize, h as usize), (N, N), "gc={gc}: the copy's size");
+        for y in 0..N {
+            for x in 0..N {
+                let got = pixel_of(&copy, N, x, y);
+                if x <= 13 && y >= 18 {
                     for c in 0..3 {
-                        assert!(got[c].abs_diff([255, 0, 0][c]) <= 32, "gc={gc}: ({x}, {y}) = {got:?}");
+                        assert!([255u8, 0, 0][c].abs_diff(got[c]) <= 32, "gc={gc}: ({x}, {y}) = {got:?}");
                     }
-                } else if x >= 6 || y <= 1 {
-                    let want = pixel(&rgb, x, y);
-                    for c in 0..3 {
-                        assert!(got[c].abs_diff(want[c]) <= 32, "gc={gc}: ({x}, {y}) = {got:?}, want {want:?}");
-                    }
+                } else if x >= 24 || y < 8 {
+                    let want = pixel_of(&source_pixels, N, x, y);
+                    assert_eq!(got, want, "gc={gc}: ({x}, {y}) is not the source's decode");
                 }
             }
         }
         assert!(!contains(&out, &jpeg), "gc={gc}: the source's JPEG is kept");
     }
+}
+
+/// Two overlapping boxes on a raw image: the overlap takes the later box's fill,
+/// and each box alone takes its own. The list is in drawing order, so the later
+/// box is the one drawn on top.
+#[test]
+fn raw_image_shared_pixel_takes_the_later_region_fill() {
+    const BLUE: [f32; 3] = [0.0, 0.0, 1.0];
+    let rgb = source_rgb();
+    let src = one_image_page(RGB_DICT, &zlib(&rgb), CONTENT, vec![]);
+    let mut editor = open_editor_from_bytes(&src, "redact_image_overlap");
+    editor.add_redaction(0, BOX, Some(RED)).unwrap();
+    editor.add_redaction(0, [100.0, 50.0, 200.0, 150.0], Some(BLUE)).unwrap();
+    editor.apply_redactions_destructive(Default::default()).unwrap();
+    let out = save(&mut editor, false);
+    let doc = PdfDocument::from_bytes(out).unwrap();
+    let (_, _, copy) = decoded_rgb(&doc, the_one_image(&doc));
+    // The image is 8 by 8 over 25 points a sample: columns 0 to 3 are under
+    // box A, columns 2 to 5 under box B, so columns 2 and 3 are the overlap.
+    assert_eq!(pixel(&copy, 1, 6), [255, 0, 0], "box A alone");
+    assert_eq!(pixel(&copy, 3, 6), [0, 0, 255], "the overlap is not the later box's fill");
+    assert_eq!(pixel(&copy, 5, 6), [0, 0, 255], "box B alone");
 }
 
 /// A CCITT image whose /Decode inverts its bits: the copy's far side is the
@@ -507,4 +546,40 @@ fn render(bytes: &[u8]) -> image::RgbaImage {
 fn pixel_at(img: &image::RgbaImage, x: f32, y: f32) -> [u8; 4] {
     let scale = DPI as f32 / 72.0;
     img.get_pixel((x * scale) as u32, ((PAGE - y) * scale) as u32).0
+}
+
+/// A DCT image on a page, redacted, rendered at 150 dpi: inside the box, padded
+/// by the codec's blocks, the page shows the fill, and far from the box it shows
+/// the source's render exactly. The image spans 50 to 250 points, so the box
+/// covers its lower-left quadrant. The redaction pads the box by two points, and
+/// the copy replaces every 8-by-8 block the padded box meets, which reaches to
+/// page x = 200 and y = 200.
+#[test]
+fn dct_image_render_is_the_fill_inside_the_box_and_the_source_outside() {
+    const N: usize = 32;
+    let rgb: Vec<u8> = (0..N * N)
+        .flat_map(|i| {
+            let (x, y) = (i % N, i / N);
+            [((x * 7 + y * 3) % 256) as u8, ((x * 5 + y * 11) % 256) as u8, ((x * y) % 256) as u8]
+        })
+        .collect();
+    let jpeg = encode_jpeg(&rgb, N as u32, N as u32, 3, 90, Subsampling::Full).unwrap();
+    let dict = "/Type /XObject /Subtype /Image /Width 32 /Height 32 \
+                /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode";
+    let src = one_image_page(dict, &jpeg, CONTENT, vec![]);
+    let before = render(&src);
+    for gc in [true, false] {
+        let after = render(&redact_and_save(&src, 0, gc));
+        for py in (52..=248).step_by(4) {
+            for px in (52..=248).step_by(4) {
+                let (x, y) = (px as f32, py as f32);
+                let got = pixel_at(&after, x, y);
+                if (56.0..=144.0).contains(&x) && (56.0..=144.0).contains(&y) {
+                    assert!(got[0] >= 223 && got[1] <= 32 && got[2] <= 32, "gc={gc}: ({x}, {y}) = {got:?}");
+                } else if x >= 210.0 || y >= 210.0 {
+                    assert_eq!(got, pixel_at(&before, x, y), "gc={gc}: ({x}, {y}) is not the source's render");
+                }
+            }
+        }
+    }
 }

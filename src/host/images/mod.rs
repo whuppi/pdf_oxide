@@ -30,4 +30,6 @@ pub mod resample;
 #[cfg(feature = "rendering")]
 pub mod stream;
 #[cfg(feature = "rendering")]
+pub mod dct;
+#[cfg(feature = "rendering")]
 pub mod redact_copy;

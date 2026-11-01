@@ -418,7 +418,8 @@ fn fill_inline(
         for x in x0..x1 {
             let u = (x as f64 + 0.5) / w as f64;
             let v = 1.0 - (y as f64 + 0.5) / h as f64;
-            let Some((_, rgb)) = fills.iter().find(|(rect, _)| {
+            // ── pdf_manipulator patch: the last region in drawing order is drawn on top ──
+            let Some((_, rgb)) = fills.iter().rev().find(|(rect, _)| {
                 let [ru0, rv0, ru1, rv1] = rect;
                 f64::from(*ru0) <= u
                     && u < f64::from(*ru1)
@@ -427,6 +428,7 @@ fn fill_inline(
             }) else {
                 continue;
             };
+            // ── end pdf_manipulator patch ──
             let at = (y * w as usize + x) * channels;
             if channels == 1 {
                 out[at] = (luma(*rgb) * 255.0).round() as u8;
