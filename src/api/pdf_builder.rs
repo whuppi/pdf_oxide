@@ -2432,57 +2432,6 @@ impl Pdf {
     // Redaction Application
     // ========================================================================
 
-    /// Apply redactions on a specific page.
-    ///
-    /// Finds all redaction annotations on the page, draws colored overlays
-    /// to hide the content, and removes the redaction annotations.
-    ///
-    /// # Arguments
-    /// * `page` - Zero-based page index
-    ///
-    /// # Note
-    /// This implementation creates visual overlays but does not remove
-    /// the underlying content from the stream. For full content removal,
-    /// a more sophisticated implementation would be needed.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut pdf = Pdf::open("document.pdf")?;
-    /// pdf.apply_page_redactions(0)?;  // Apply redactions on page 0
-    /// pdf.save("redacted.pdf")?;
-    /// ```
-    pub fn apply_page_redactions(&mut self, page: usize) -> Result<()> {
-        if let Some(ref mut editor) = self.editor {
-            editor.apply_page_redactions(page)
-        } else {
-            Err(Error::InvalidOperation(
-                "No document loaded. Use Pdf::open() to load a PDF.".to_string(),
-            ))
-        }
-    }
-
-    /// Apply redactions on all pages.
-    ///
-    /// Finds all redaction annotations throughout the document, draws
-    /// colored overlays to hide content, and removes the redaction annotations.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut pdf = Pdf::open("document.pdf")?;
-    /// pdf.apply_all_redactions()?;
-    /// pdf.save("redacted.pdf")?;
-    /// ```
-    pub fn apply_all_redactions(&mut self) -> Result<()> {
-        if let Some(ref mut editor) = self.editor {
-            editor.apply_all_redactions()
-        } else {
-            Err(Error::InvalidOperation(
-                "No document loaded. Use Pdf::open() to load a PDF.".to_string(),
-            ))
-        }
-    }
 
     /// Check if a page is marked for redaction application.
     pub fn is_page_marked_for_redaction(&self, page: usize) -> bool {

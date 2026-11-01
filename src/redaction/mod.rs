@@ -27,9 +27,14 @@ pub mod sanitize;
 pub mod serialize;
 pub mod text_engine;
 pub mod text_prune;
+// ── pdf_manipulator patch ──
+pub mod transform;
+// ── end pdf_manipulator patch ──
 
 pub use classify::Classification;
-pub use engine::{redact_content_stream, FontInfoMetrics};
+// ── pdf_manipulator patch: the whole-buffer redaction entry is gone; the metrics stay ──
+pub use engine::FontInfoMetrics;
+// ── end pdf_manipulator patch ──
 pub use options::{OcgPolicy, RedactionOptions, RedactionReport};
 pub use region::{RedactionRegion, RegionSet, DEFAULT_EDGE_PADDING};
 pub use sanitize::{sanitize_catalog, CatalogScrub, SanitizeCounts};

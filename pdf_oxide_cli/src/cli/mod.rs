@@ -175,13 +175,11 @@ fn dispatch(
         Command::Redact {
             ref file,
             ref rects,
-            from_annotations,
             ref fill,
             no_scrub_metadata,
         } => commands::redact::run(
             file,
             rects,
-            from_annotations,
             fill.as_deref(),
             no_scrub_metadata,
             output,

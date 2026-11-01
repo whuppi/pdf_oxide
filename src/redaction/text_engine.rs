@@ -264,28 +264,51 @@ fn emit_runs(out: &mut Vec<Operator>, res: &TextPruneResult) {
     }
 }
 
-/// Redact text in `ops` that intersects `regions` (page space).
-///
-/// Non-text operators pass through unchanged; the graphics-state CTM and
-/// the text state are tracked so every glyph's box is computed in page
-/// space exactly per ISO 32000-1 §9.4.4. Each text show is replaced by
-/// the absolute-re-anchored survivors (or nothing when fully redacted —
-/// no compensating offset). `q`/`Q`/`cm` are never dropped.
-pub fn redact_text_stream(
-    ops: &[Operator],
-    regions: &RegionSet,
+// ── pdf_manipulator patch: the per-operator text decisions, shared by the redaction pass ──
+/// The text decisions of one content stream, one operator at a time, so a
+/// caller can stream operators through them without holding the stream.
+pub struct TextPass<'a> {
+    regions: &'a RegionSet,
     min_padding: f32,
-    fonts: &dyn FontMetrics,
-) -> TextEngineResult {
-    let mut stack = GraphicsStateStack::new();
-    let mut ts = TextState::default();
-    let mut out: Vec<Operator> = Vec::with_capacity(ops.len());
-    let mut result = TextEngineResult::default();
+    fonts: &'a dyn FontMetrics,
+    stack: GraphicsStateStack,
+    ts: TextState,
+    result: TextEngineResult,
+}
 
-    for op in ops {
+impl<'a> TextPass<'a> {
+    /// A pass over one content stream, starting from the default text and
+    /// graphics state.
+    pub fn new(regions: &'a RegionSet, min_padding: f32, fonts: &'a dyn FontMetrics) -> Self {
+        Self {
+            regions,
+            min_padding,
+            fonts,
+            stack: GraphicsStateStack::new(),
+            ts: TextState::default(),
+            result: TextEngineResult::default(),
+        }
+    }
+
+    /// The totals so far. `operators` stays empty: the rewritten operators
+    /// go to the `out` of [`Self::apply`].
+    pub fn result(&self) -> &TextEngineResult {
+        &self.result
+    }
+
+    /// Appends the rewritten form of `op` to `out`.
+    ///
+    /// Non-text operators pass through unchanged; the graphics-state CTM and
+    /// the text state are tracked so every glyph's box is computed in page
+    /// space exactly per ISO 32000-1 §9.4.4. Each text show is replaced by
+    /// the absolute-re-anchored survivors (or nothing when fully redacted —
+    /// no compensating offset). `q`/`Q`/`cm` are never dropped.
+    pub fn apply(&mut self, op: &Operator, out: &mut Vec<Operator>) {
+        let (regions, min_padding, fonts) = (self.regions, self.min_padding, self.fonts);
+        let (stack, ts, result) = (&mut self.stack, &mut self.ts, &mut self.result);
         match op {
             Operator::SaveState | Operator::RestoreState | Operator::Cm { .. } => {
-                super::classify::apply_ctm(&mut stack, op);
+                super::classify::apply_ctm(stack, op);
                 out.push(op.clone());
             },
             Operator::BeginText => {
@@ -373,17 +396,17 @@ pub fn redact_text_stream(
                 out.push(op.clone());
             },
             Operator::Tj { text } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
+                if refuse_unsupported(fonts, &ts.font, regions, result, out, op) {
+                    return;
                 }
                 let ctm = stack.current().ctm;
-                let res = show_string(text, &mut ts, &ctm, fonts, regions, min_padding);
-                account(&mut result, text.len(), &res);
-                emit_runs(&mut out, &res);
+                let res = show_string(text, ts, &ctm, fonts, regions, min_padding);
+                account(result, text.len(), &res);
+                emit_runs(out, &res);
             },
             Operator::Quote { text } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
+                if refuse_unsupported(fonts, &ts.font, regions, result, out, op) {
+                    return;
                 }
                 // `'` = T* then show.
                 ts.tlm = Matrix {
@@ -397,17 +420,17 @@ pub fn redact_text_stream(
                 .multiply(&ts.tlm);
                 ts.tm = ts.tlm;
                 let ctm = stack.current().ctm;
-                let res = show_string(text, &mut ts, &ctm, fonts, regions, min_padding);
-                account(&mut result, text.len(), &res);
-                emit_runs(&mut out, &res);
+                let res = show_string(text, ts, &ctm, fonts, regions, min_padding);
+                account(result, text.len(), &res);
+                emit_runs(out, &res);
             },
             Operator::DoubleQuote {
                 word_space,
                 char_space,
                 text,
             } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
+                if refuse_unsupported(fonts, &ts.font, regions, result, out, op) {
+                    return;
                 }
                 ts.tw = *word_space;
                 ts.tc = *char_space;
@@ -422,13 +445,13 @@ pub fn redact_text_stream(
                 .multiply(&ts.tlm);
                 ts.tm = ts.tlm;
                 let ctm = stack.current().ctm;
-                let res = show_string(text, &mut ts, &ctm, fonts, regions, min_padding);
-                account(&mut result, text.len(), &res);
-                emit_runs(&mut out, &res);
+                let res = show_string(text, ts, &ctm, fonts, regions, min_padding);
+                account(result, text.len(), &res);
+                emit_runs(out, &res);
             },
             Operator::TJ { array } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
+                if refuse_unsupported(fonts, &ts.font, regions, result, out, op) {
+                    return;
                 }
                 // Concatenate the string elements (offsets are positional
                 // hints we deliberately discard on rewrite — G2). Per
@@ -441,7 +464,7 @@ pub fn redact_text_stream(
                     match el {
                         TextElement::String(s) => {
                             tj_orig += s.len();
-                            let r = show_string(s, &mut ts, &ctm, fonts, regions, min_padding);
+                            let r = show_string(s, ts, &ctm, fonts, regions, min_padding);
                             if r.glyphs_removed > 0 {
                                 any_removed = true;
                             }
@@ -467,9 +490,9 @@ pub fn redact_text_stream(
                         },
                     }
                 }
-                account(&mut result, tj_orig, &survived_runs);
+                account(result, tj_orig, &survived_runs);
                 if any_removed {
-                    emit_runs(&mut out, &survived_runs);
+                    emit_runs(out, &survived_runs);
                 } else {
                     // Nothing redacted in this TJ — emit it byte-identical
                     // (perf + minimal diff; no side channel since nothing
@@ -480,10 +503,28 @@ pub fn redact_text_stream(
             other => out.push(other.clone()),
         }
     }
-
-    result.operators = out;
-    result
 }
+
+/// Every operator of `ops` through [`TextPass::apply`], in order: the
+/// stream-level form the tests below read.
+#[cfg(test)]
+fn redact_text_stream(
+    ops: &[Operator],
+    regions: &RegionSet,
+    min_padding: f32,
+    fonts: &dyn FontMetrics,
+) -> TextEngineResult {
+    let mut pass = TextPass::new(regions, min_padding, fonts);
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        pass.apply(op, &mut out);
+    }
+    TextEngineResult {
+        operators: out,
+        ..pass.result
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Fail-closed guard: a show with a non-simple (composite/Type0/unknown)
 /// font while regions exist cannot be pruned reliably. Flag the result

@@ -7,7 +7,6 @@ document::extract_text_from_ap_stream
 editor::document_editor::deflate_stream
 editor::document_editor::extract_widget_appearance
 editor::document_editor::get_annotation_appearances
-editor::document_editor::get_page_content_bytes
 editor::document_editor::get_page_images
 editor::document_editor::write_stream_copy
 extractors::images::decode_jbig2_bits # the JBIG2 bitstream is the decoder's input; the bitmap is kept at one bit a pixel

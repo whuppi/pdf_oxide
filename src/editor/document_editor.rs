@@ -513,6 +513,19 @@ pub trait EditableDocument {
 
 /// PDF document editor.
 ///
+// ── pdf_manipulator patch: a page a destructive redaction rewrites on save ──
+/// A page a destructive redaction rewrites on save: the regions and options
+/// its call-time pass ran with, the glyph widths of its fonts, the report that
+/// pass produced and the annotations the redaction drops.
+struct RedactedPage {
+    regions: crate::redaction::RegionSet,
+    opts: crate::redaction::RedactionOptions,
+    fonts: crate::redaction::FontInfoMetrics,
+    report: crate::redaction::RedactionReport,
+    dropped_annots: std::collections::HashSet<u32>,
+}
+// ── end pdf_manipulator patch ──
+
 /// Provides a high-level interface for modifying PDF documents.
 /// Changes are tracked and can be saved either as incremental updates
 /// or as a complete rewrite.
@@ -562,11 +575,13 @@ pub struct DocumentEditor {
     /// (in addition to any `/Redact` annotations), used by destructive
     /// redaction (#231).
     redaction_regions: HashMap<usize, Vec<crate::redaction::RedactionRegion>>,
-    /// Destructively-redacted replacement content bytes per source page
-    /// index, produced by `apply_redactions_destructive` and written by
-    /// the save path as the page's single new `/Contents` stream so the
-    /// old content object is GC'd (no residual recoverable bytes, G6).
-    redacted_content: HashMap<usize, Vec<u8>>,
+    // ── pdf_manipulator patch: the redacted pages, recorded at apply ──
+    /// Destructively redacted pages per source page index, recorded by
+    /// `apply_redactions_destructive` and written by the save path as the
+    /// page's single new `/Contents` stream. Nothing of the content is held
+    /// here: the save streams the rewrite from the source.
+    redacted_pages: HashMap<usize, RedactedPage>,
+    // ── end pdf_manipulator patch ──
     /// Object ids of the *original* `/Contents` streams of redacted
     /// pages. These hold the pre-redaction (secret) bytes and must NEVER
     /// be emitted, independent of GC reachability — the hard G6 guarantee
@@ -847,7 +862,9 @@ impl DocumentEditor {
             flatten_annotations_pages: std::collections::HashSet::new(),
             apply_redactions_pages: std::collections::HashSet::new(),
             redaction_regions: HashMap::new(),
-            redacted_content: HashMap::new(),
+            // ── pdf_manipulator patch: the redacted pages, recorded at apply ──
+            redacted_pages: HashMap::new(),
+            // ── end pdf_manipulator patch ──
             redacted_orphan_ids: std::collections::HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
@@ -898,7 +915,9 @@ impl DocumentEditor {
             flatten_annotations_pages: std::collections::HashSet::new(),
             apply_redactions_pages: std::collections::HashSet::new(),
             redaction_regions: HashMap::new(),
-            redacted_content: HashMap::new(),
+            // ── pdf_manipulator patch: the redacted pages, recorded at apply ──
+            redacted_pages: HashMap::new(),
+            // ── end pdf_manipulator patch ──
             redacted_orphan_ids: std::collections::HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
@@ -953,7 +972,9 @@ impl DocumentEditor {
             flatten_annotations_pages: std::collections::HashSet::new(),
             apply_redactions_pages: std::collections::HashSet::new(),
             redaction_regions: HashMap::new(),
-            redacted_content: HashMap::new(),
+            // ── pdf_manipulator patch: the redacted pages, recorded at apply ──
+            redacted_pages: HashMap::new(),
+            // ── end pdf_manipulator patch ──
             redacted_orphan_ids: std::collections::HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
@@ -2258,7 +2279,7 @@ impl DocumentEditor {
             "pages were merged in"
         } else if !self.apply_redactions_pages.is_empty()
             || !self.redaction_regions.is_empty()
-            || !self.redacted_content.is_empty()
+            || !self.redacted_pages.is_empty()
             || !self.redacted_orphan_ids.is_empty()
         {
             "content was redacted or scrubbed, and the original bytes would keep it"
@@ -3025,7 +3046,7 @@ impl DocumentEditor {
         indices.extend(&self.flatten_forms_pages);
         indices.extend(&self.apply_redactions_pages);
         indices.extend(self.redaction_regions.keys());
-        indices.extend(self.redacted_content.keys());
+        indices.extend(self.redacted_pages.keys());
         indices.into_iter().filter_map(|index| leaves.get(index).map(|r| r.id)).collect()
     }
 
@@ -3463,6 +3484,84 @@ impl DocumentEditor {
 
     // ── end pdf_manipulator patch ──
 
+    // ── pdf_manipulator patch: a redacted page's content, streamed from its source ──
+    /// Writes a redacted page's content as stream `content_id`, its /Length the
+    /// object `length_id` written after the body. The body is the redaction pass
+    /// run over the source page, deflated at `deflate` and enciphered when the
+    /// save encrypts. The pass must report what it reported when it was queued,
+    /// or the save fails rather than write a different redaction.
+    fn write_redacted_content(
+        source: &PdfDocument,
+        page_index: usize,
+        page: &RedactedPage,
+        content_id: u32,
+        length_id: u32,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
+        deflate: Option<u32>,
+        xref_entries: &mut XrefEntries,
+    ) -> Result<()> {
+        let mut dict = HashMap::new();
+        if deflate.is_some() {
+            dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
+        }
+        dict.insert("Length".to_string(), Object::Reference(ObjectRef::new(length_id, 0)));
+        let offset = writer.position();
+        serializer.write_stream_open(&mut *writer, content_id, 0, &dict)?;
+        let body_start = writer.position();
+        let ops = source.page_operators(page_index)?;
+        let run = |out: &mut dyn Write| {
+            Self::run_redaction_pass(&page.regions, &page.opts, &page.fonts, ops, deflate, out)
+        };
+        let report = match handler {
+            None => run(&mut *writer)?,
+            Some(h) => {
+                let iv = crate::encryption::EncryptionWriteHandler::generate_iv()?;
+                let mut enc = h.stream_cipher(content_id, 0).encrypting(&mut *writer, iv)?;
+                let report = run(&mut enc)?;
+                enc.finish()?;
+                report
+            },
+        };
+        if report != page.report {
+            return Err(Error::InvalidPdf(format!(
+                "the redaction of page {page_index} writes a different result on save than \
+                 it recorded when it was queued"
+            )));
+        }
+        let len = writer.position() - body_start;
+        writer.write_all(b"\nendstream\nendobj\n")?;
+        xref_entries.push((content_id, offset, 0, true));
+        let offset = writer.position();
+        writer.write_all(&serializer.serialize_indirect(length_id, 0, &Object::Integer(len as i64)))?;
+        xref_entries.push((length_id, offset, 0, true));
+        Ok(())
+    }
+
+    /// One run of the redaction pass over a page's operators into `out`,
+    /// deflated at `deflate` when given.
+    fn run_redaction_pass<R: std::io::Read>(
+        regions: &crate::redaction::RegionSet,
+        opts: &crate::redaction::RedactionOptions,
+        fonts: &crate::redaction::FontInfoMetrics,
+        ops: crate::host::content::Operators<R>,
+        deflate: Option<u32>,
+        mut out: &mut dyn Write,
+    ) -> Result<crate::redaction::RedactionReport> {
+        let pass = crate::redaction::transform::RedactPass::new(regions, opts, fonts);
+        match deflate {
+            Some(level) => {
+                let mut zlib = flate2::write::ZlibEncoder::new(out, flate2::Compression::new(level));
+                let report = pass.run(ops, &mut zlib)?;
+                zlib.finish()?;
+                Ok(report)
+            },
+            None => pass.run(ops, &mut out),
+        }
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Write a full rewrite of the PDF to a generic writer.
     // ── pdf_manipulator patch: pub(crate) + PositionedWrite output ──
     // Visibility (pub(crate) for dispatch) AND the output type: the
@@ -3520,7 +3619,13 @@ impl DocumentEditor {
         }
 
         // ── pdf_manipulator patch: what the save drops with dropped pages (#261) ──
-        let mut prune = crate::host::page_prune::plan(&self.source, &self.modified_objects, &self.page_order);
+        let dropped_annots = self.redacted_annotation_ids();
+        let mut prune = crate::host::page_prune::plan(
+            &self.source,
+            &self.modified_objects,
+            &self.page_order,
+            &dropped_annots,
+        );
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: the merged pages and objects the save drops ──
         let (merged_kept, mut merged_left_out) = self.merged_prune(&HashMap::new())?;
@@ -4365,37 +4470,31 @@ impl DocumentEditor {
                                     None
                                 };
 
-                                // Check if we need to apply redactions for this page
-                                let should_apply_redactions =
-                                    self.apply_redactions_pages.contains(&source_page_index);
-                                // Destructive redaction (#231): pre-computed
-                                // replacement content for this page. Takes
-                                // precedence over the legacy cosmetic overlay
-                                // path; the bytes already include the opaque
-                                // overlay and the secret is physically gone.
-                                let destructive_redaction: Option<(Vec<u8>, u32)> = self
-                                    .redacted_content
-                                    .get(&source_page_index)
-                                    .cloned()
-                                    .map(|bytes| (bytes, self.allocate_object_id()));
-
-                                let redaction_data: Option<(Vec<RedactionData>, u32)> =
-                                    if destructive_redaction.is_some() {
-                                        // Destructive path owns Contents/Annots; skip
-                                        // the cosmetic overlay entirely.
-                                        None
-                                    } else if should_apply_redactions {
-                                        let redactions =
-                                            self.get_redaction_data(source_page_index)?;
-                                        if !redactions.is_empty() {
-                                            let overlay_id = self.allocate_object_id();
-                                            Some((redactions, overlay_id))
-                                        } else {
-                                            None
-                                        }
+                                // ── pdf_manipulator patch: the redacted content and the marks, per page ──
+                                // Destructive redaction (#231): the page's content is
+                                // rewritten from its source as the save writes it,
+                                // so the secret is never held. The pair is the content
+                                // stream's id and its /Length object's id.
+                                let destructive_redaction: Option<(u32, u32)> =
+                                    if self.redacted_pages.contains_key(&source_page_index) {
+                                        Some((self.allocate_object_id(), self.allocate_object_id()))
                                     } else {
                                         None
                                     };
+
+                                // A queued mark that was not applied is saved as a /Redact
+                                // annotation (ISO 32000-1 §12.5.6.23) and the content is left
+                                // as it is. A redacted page writes no marks.
+                                let mark_annots: Vec<(u32, HashMap<String, Object>)> =
+                                    if destructive_redaction.is_none() {
+                                        self.redaction_mark_annotations(source_page_index)
+                                            .into_iter()
+                                            .map(|mark| (self.allocate_object_id(), mark))
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                // ── end pdf_manipulator patch ──
 
                                 // Check if we need to flatten form fields for this page
                                 let should_flatten_forms =
@@ -4766,50 +4865,26 @@ impl DocumentEditor {
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
 
-                                // If we're applying redactions, update page dictionary
-                                if let (
-                                    Some((ref redactions, redact_overlay_id)),
-                                    Some(page_dict),
-                                ) = (&redaction_data, final_page_obj.as_dict())
-                                {
-                                    let mut new_dict = page_dict.clone();
-
-                                    // Add redaction overlay to Contents
-                                    if let Some(contents) = new_dict.get("Contents").cloned() {
-                                        let overlay_ref = Object::Reference(ObjectRef::new(
-                                            *redact_overlay_id,
-                                            0,
-                                        ));
-                                        let contents_array = match contents {
-                                            Object::Reference(_) => {
-                                                Object::Array(vec![contents, overlay_ref])
-                                            },
-                                            Object::Array(mut arr) => {
-                                                arr.push(overlay_ref);
-                                                Object::Array(arr)
-                                            },
-                                            _ => Object::Array(vec![contents, overlay_ref]),
+                                // ── pdf_manipulator patch: queued marks not yet applied join the page's /Annots ──
+                                if !mark_annots.is_empty() {
+                                    if let Some(page_dict) = final_page_obj.as_dict() {
+                                        let mut new_dict = page_dict.clone();
+                                        let mut annots = match self
+                                            .annots_without(&new_dict, &std::collections::HashSet::new())
+                                        {
+                                            Some(Object::Array(list)) => list,
+                                            _ => Vec::new(),
                                         };
-                                        new_dict.insert("Contents".to_string(), contents_array);
-                                    } else {
-                                        // ── pdf_manipulator patch ──
-                                        // A page with no /Contents (legal —
-                                        // blank page) still gets the overlay:
-                                        // it becomes the page's content.
-                                        new_dict.insert(
-                                            "Contents".to_string(),
-                                            Object::Reference(ObjectRef::new(*redact_overlay_id, 0)),
+                                        annots.extend(
+                                            mark_annots
+                                                .iter()
+                                                .map(|(id, _)| Object::Reference(ObjectRef::new(*id, 0))),
                                         );
-                                        // ── end pdf_manipulator patch ──
+                                        new_dict.insert("Annots".to_string(), Object::Array(annots));
+                                        final_page_obj = Object::Dictionary(new_dict);
                                     }
-
-                                    // Remove Redact annotations from /Annots array
-                                    // For now, we remove the entire /Annots array when applying redactions
-                                    // A more sophisticated implementation would only remove Redact subtypes
-                                    new_dict.remove("Annots");
-
-                                    final_page_obj = Object::Dictionary(new_dict);
                                 }
+                                // ── end pdf_manipulator patch ──
 
                                 // Destructive redaction (#231): REPLACE the
                                 // page /Contents with the single rewritten
@@ -4819,7 +4894,7 @@ impl DocumentEditor {
                                 // garbage-collected full rewrite (no residual
                                 // recoverable bytes, G6). /Redact annotations
                                 // are removed (ISO 32000-1 §12.5.6.23).
-                                if let (Some((_, redacted_id)), Some(page_dict)) =
+                                if let (Some((redacted_id, _)), Some(page_dict)) =
                                     (&destructive_redaction, final_page_obj.as_dict())
                                 {
                                     let mut new_dict = page_dict.clone();
@@ -4830,9 +4905,7 @@ impl DocumentEditor {
                                     // via `save_page`, #940), keep that addition but replace
                                     // *all* original content references with the single redacted
                                     // stream — not just entry 0. `redacted_ref` already carries
-                                    // the fully redacted, concatenated content of every original
-                                    // stream (`get_page_content_bytes` concatenates a multi-entry
-                                    // `/Contents` array before redacting it), so any other
+                                    // the fully redacted content of every original stream, so any other
                                     // original entries left in the array would be pure
                                     // duplicates, and every one of them is dropped from the
                                     // output as an orphan (`redacted_orphan_ids`) regardless —
@@ -4848,7 +4921,15 @@ impl DocumentEditor {
                                         None => redacted_ref,
                                     };
                                     new_dict.insert("Contents".to_string(), contents_value);
-                                    new_dict.remove("Annots");
+                                    // ── pdf_manipulator patch: the redacted page's dropped annotations leave /Annots ──
+                                    let dropped = self.redacted_pages[&source_page_index]
+                                        .dropped_annots
+                                        .clone();
+                                    match self.annots_without(&new_dict, &dropped) {
+                                        Some(annots) => new_dict.insert("Annots".to_string(), annots),
+                                        None => new_dict.remove("Annots"),
+                                    };
+                                    // ── end pdf_manipulator patch ──
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
 
@@ -5931,58 +6012,41 @@ impl DocumentEditor {
                                     xref_entries.push((overlay_id, offset, 0, true));
                                 }
 
-                                // Write redaction overlay content stream if present
-                                if let Some((ref redactions, redact_overlay_id)) = redaction_data {
-                                    let overlay_content =
-                                        self.generate_redaction_overlay(redactions);
-
-                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                                    let overlay_stream = Object::stream(
-                                        HashMap::new(),
-                                        overlay_content,
-                                    );
-                                    // ── end pdf_manipulator patch ──
-
+                                // ── pdf_manipulator patch: the /Redact annotations of marks not yet applied ──
+                                for (annot_id, mark) in mark_annots {
                                     let offset = writer.position();
-                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
                                     write_obj(
                                         &mut *writer,
                                         &serializer,
-                                        redact_overlay_id,
+                                        annot_id,
                                         0,
-                                        &overlay_stream,
+                                        &Object::Dictionary(mark),
                                         &encryption_handler,
                                     )?;
-                                    // ── end pdf_manipulator patch ──
-                                    xref_entries.push((redact_overlay_id, offset, 0, true));
+                                    xref_entries.push((annot_id, offset, 0, true));
                                 }
+                                // ── end pdf_manipulator patch ──
 
-                                // Write the destructively-redacted replacement
-                                // content stream (#231). These bytes already
-                                // contain the pruned content + opaque overlay;
-                                // the page /Contents was repointed to this
-                                // object above, orphaning the original.
-                                if let Some((redacted_bytes, redacted_id)) = &destructive_redaction
+                                // ── pdf_manipulator patch: the redacted content streams from its source as the save writes it ──
+                                // The page /Contents was repointed to this stream
+                                // above, orphaning the original.
+                                if let (Some((content_id, length_id)), Some(page)) =
+                                    (destructive_redaction, self.redacted_pages.get(&source_page_index))
                                 {
-                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                                    let redacted_stream = Object::stream(
-                                        HashMap::new(),
-                                        redacted_bytes.clone(),
-                                    );
-                                    // ── end pdf_manipulator patch ──
-                                    let offset = writer.position();
-                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                                    write_obj(
+                                    Self::write_redacted_content(
+                                        &self.source,
+                                        source_page_index,
+                                        page,
+                                        content_id,
+                                        length_id,
                                         &mut *writer,
                                         &serializer,
-                                        *redacted_id,
-                                        0,
-                                        &redacted_stream,
                                         &encryption_handler,
+                                        deflate,
+                                        &mut xref_entries,
                                     )?;
-                                    // ── end pdf_manipulator patch ──
-                                    xref_entries.push((*redacted_id, offset, 0, true));
                                 }
+                                // ── end pdf_manipulator patch ──
 
                                 // Write form flatten XObjects and overlay if present
                                 if let Some((
@@ -6839,20 +6903,25 @@ impl DocumentEditor {
             // real content stream instead of silently dropping the edit.
             let erasures = page.pending_erasures().to_vec();
             if !erasures.is_empty() {
-                let regions = self.redaction_regions.entry(page_index).or_default();
-                for bbox in &erasures {
-                    regions.push(crate::redaction::RedactionRegion::from_rect(
-                        bbox.x,
-                        bbox.y,
-                        bbox.x + bbox.width,
-                        bbox.y + bbox.height,
-                        None,
-                    ));
-                }
+                // ── pdf_manipulator patch: a DOM erasure is applied directly, not queued as a mark ──
+                let regions: Vec<crate::redaction::RedactionRegion> = erasures
+                    .iter()
+                    .map(|bbox| {
+                        crate::redaction::RedactionRegion::from_rect(
+                            bbox.x,
+                            bbox.y,
+                            bbox.x + bbox.width,
+                            bbox.y + bbox.height,
+                            None,
+                        )
+                    })
+                    .collect();
                 self.apply_redactions_destructive_for_page(
                     page_index,
                     &crate::redaction::RedactionOptions::default(),
+                    &regions,
                 )?;
+                // ── end pdf_manipulator patch ──
             }
         } else {
             // Freshly created page — replace the entire content stream.
@@ -9605,7 +9674,6 @@ impl DocumentEditor {
         self.redaction_regions.entry(source_page).or_default().push(
             crate::redaction::RedactionRegion::from_rect(rect[0], rect[1], rect[2], rect[3], fill),
         );
-        self.apply_redactions_pages.insert(source_page);
         self.is_modified = true;
         Ok(())
     }
@@ -9631,36 +9699,95 @@ impl DocumentEditor {
         Ok(annots + prog)
     }
 
-    /// Decode a source page's `/Contents` to raw bytes (the `/Contents`
-    /// array, if any, is the logical concatenation of its streams,
-    /// ISO 32000-1:2008 §7.8.2). Empty if the page has no contents.
-    fn get_page_content_bytes(&mut self, source_page: usize) -> Result<Vec<u8>> {
-        let page_ref = self.source.get_page_ref(source_page)?;
-        let page_obj = self.source.load_object(page_ref)?;
-        let page_dict = page_obj
-            .as_dict()
-            .ok_or_else(|| Error::InvalidPdf("Page is not a dictionary".to_string()))?;
-        let contents = match page_dict.get("Contents") {
-            Some(c) => c.clone(),
-            None => return Ok(Vec::new()),
-        };
-        match contents {
-            Object::Reference(r) => Ok(self.source.load_object(r)?.decode_stream_data()?),
-            Object::Array(arr) => {
-                let mut data = Vec::new();
-                for item in arr {
-                    if let Object::Reference(r) = item {
-                        if let Ok(s) = self.source.load_object(r)?.decode_stream_data() {
-                            data.extend_from_slice(&s);
-                            data.push(b'\n');
-                        }
-                    }
-                }
-                Ok(data)
-            },
-            _ => Ok(Vec::new()),
-        }
+    // ── pdf_manipulator patch: the annotations a redaction drops ──
+    /// Every annotation id the queued redactions drop, across the redacted pages.
+    fn redacted_annotation_ids(&self) -> std::collections::HashSet<u32> {
+        self.redacted_pages
+            .values()
+            .flat_map(|page| page.dropped_annots.iter().copied())
+            .collect()
     }
+
+    /// The annotations of source page `src` that a redaction over `rs` drops:
+    /// each whose /Rect meets a padded region, and the /Popup of each such
+    /// annotation. An annotation whose /Rect cannot be read is dropped too:
+    /// it may hold the secret, and a redaction never keeps what it cannot place.
+    fn redacted_annotations(
+        &self,
+        src: usize,
+        rs: &crate::redaction::RegionSet,
+        opts: &crate::redaction::RedactionOptions,
+    ) -> Result<std::collections::HashSet<u32>> {
+        let mut dropped = std::collections::HashSet::new();
+        let page_ref = self.source.get_page_ref(src)?;
+        let page = self.source.load_object(page_ref)?;
+        let Some(annots) = page.as_dict().and_then(|d| d.get("Annots")) else {
+            return Ok(dropped);
+        };
+        let annots = match annots {
+            Object::Reference(r) => self.source.load_object(*r)?,
+            other => other.clone(),
+        };
+        let Some(list) = annots.as_array() else {
+            return Ok(dropped);
+        };
+        for entry in list {
+            let Some(r) = entry.as_reference() else {
+                continue;
+            };
+            let annot = self.source.load_object(r).ok();
+            let dict = annot.as_ref().and_then(|a| a.as_dict());
+            let rect = dict.and_then(|d| d.get("Rect")).and_then(Self::rect_of);
+            let meets = match rect {
+                Some(rect) => rs.regions.iter().any(|reg| reg.intersects_rect(&rect, opts.edge_padding)),
+                None => true,
+            };
+            if !meets {
+                continue;
+            }
+            dropped.insert(r.id);
+            if let Some(popup) = dict.and_then(|d| d.get("Popup")).and_then(|p| p.as_reference()) {
+                dropped.insert(popup.id);
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// A PDF rectangle `[x0 y0 x1 y1]` in page space, or `None` when it is not
+    /// four numbers.
+    fn rect_of(obj: &Object) -> Option<crate::geometry::Rect> {
+        let [x0, y0, x1, y1] = obj.as_array()?.as_slice() else {
+            return None;
+        };
+        let num = |o: &Object| o.as_real().or_else(|| o.as_integer().map(|i| i as f64));
+        Some(crate::geometry::Rect::from_points(
+            num(x0)? as f32,
+            num(y0)? as f32,
+            num(x1)? as f32,
+            num(y1)? as f32,
+        ))
+    }
+
+    /// The page's `/Annots` with the annotations in `dropped` removed, or `None`
+    /// when none is left. An indirect array is read through the source.
+    fn annots_without(
+        &self,
+        page: &HashMap<String, Object>,
+        dropped: &std::collections::HashSet<u32>,
+    ) -> Option<Object> {
+        let annots = match page.get("Annots")? {
+            Object::Reference(r) => self.source.load_object(*r).ok()?,
+            other => other.clone(),
+        };
+        let kept: Vec<Object> = annots
+            .as_array()?
+            .iter()
+            .filter(|a| !a.as_reference().is_some_and(|r| dropped.contains(&r.id)))
+            .cloned()
+            .collect();
+        (!kept.is_empty()).then_some(Object::Array(kept))
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Build the [`crate::redaction::FontInfoMetrics`] for a source page
     /// from its (possibly inherited) `/Resources/Font`. A font that fails
@@ -9751,17 +9878,25 @@ impl DocumentEditor {
         &mut self,
         opts: crate::redaction::RedactionOptions,
     ) -> Result<crate::redaction::RedactionReport> {
+        // ── pdf_manipulator patch: every page with a queued mark or a /Redact annotation ──
+        // Every page with a queued mark or a /Redact annotation is applied.
         let mut pages: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        pages.extend(self.apply_redactions_pages.iter().copied());
-        pages.extend(self.redaction_regions.keys().copied());
+        for src in 0..self.source.page_count()? {
+            if self.redaction_regions.contains_key(&src) || !self.get_redaction_data(src)?.is_empty()
+            {
+                pages.insert(src);
+            }
+        }
 
         let mut total = crate::redaction::RedactionReport::default();
         for src in pages {
-            let rep = self.apply_redactions_destructive_for_page(src, &opts)?;
+            let rep = self.apply_redactions_destructive_for_page(src, &opts, &[])?;
             total.regions += rep.regions;
             total.glyphs_removed += rep.glyphs_removed;
             total.bytes_removed += rep.bytes_removed;
+            total.annotations_removed += rep.annotations_removed;
         }
+        // ── end pdf_manipulator patch ──
         self.is_modified = true;
         Ok(total)
     }
@@ -9776,6 +9911,9 @@ impl DocumentEditor {
         &mut self,
         src: usize,
         opts: &crate::redaction::RedactionOptions,
+        // ── pdf_manipulator patch: the extra regions a caller brings ──
+        extra: &[crate::redaction::RedactionRegion],
+        // ── end pdf_manipulator patch ──
     ) -> Result<crate::redaction::RedactionReport> {
         use crate::redaction::{RedactionRegion, RegionSet};
         let mut rs = RegionSet::new(src);
@@ -9793,8 +9931,16 @@ impl DocumentEditor {
                 rs.push(*r);
             }
         }
+        // ── pdf_manipulator patch: the erasures of a DOM edit join the page's regions ──
+        for r in extra {
+            rs.push(*r);
+        }
+        // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: delegate to the shared per-page core ──
-        self.destroy_regions_on_page(src, &rs, opts)
+        let rep = self.destroy_regions_on_page(src, &rs, opts)?;
+        // The queued marks are applied now: they are removed with their content.
+        self.redaction_regions.remove(&src);
+        Ok(rep)
         // ── end pdf_manipulator patch ──
     }
 
@@ -9812,17 +9958,32 @@ impl DocumentEditor {
         rs: &crate::redaction::RegionSet,
         opts: &crate::redaction::RedactionOptions,
     ) -> Result<crate::redaction::RedactionReport> {
-        use crate::redaction::redact_content_stream;
-
         if rs.is_empty() {
             return Ok(crate::redaction::RedactionReport::default());
         }
-        let content = self.get_page_content_bytes(src)?;
-        if content.is_empty() {
+        let page_ref = self.source.get_page_ref(src)?;
+        let page_obj = self.source.load_object(page_ref)?;
+        let has_contents = page_obj.as_dict().and_then(|d| d.get("Contents")).is_some();
+        if !has_contents {
             return Ok(crate::redaction::RedactionReport::default());
         }
+        // The pass runs over the whole content now, so a refusal (a damaged
+        // stream, a font whose glyphs cannot be pruned) is raised here, before
+        // anything is recorded. The save runs the same pass and must agree.
         let fonts = self.build_page_font_metrics(src)?;
-        let (bytes, rep) = redact_content_stream(&content, rs, opts, &fonts)?;
+        let pass_report = Self::run_redaction_pass(
+            rs,
+            opts,
+            &fonts,
+            self.source.page_operators(src)?,
+            None,
+            &mut std::io::sink(),
+        )?;
+        let dropped_annots = self.redacted_annotations(src, rs, opts)?;
+        let rep = crate::redaction::RedactionReport {
+            annotations_removed: dropped_annots.len(),
+            ..pass_report
+        };
         // Record the original /Contents object ids so the save path
         // hard-drops them — the removed content must not survive even
         // as an orphaned, GC-missed object.
@@ -9845,7 +10006,16 @@ impl DocumentEditor {
                 }
             }
         }
-        self.redacted_content.insert(src, bytes);
+        self.redacted_pages.insert(
+            src,
+            RedactedPage {
+                regions: rs.clone(),
+                opts: *opts,
+                fonts,
+                report: pass_report,
+                dropped_annots,
+            },
+        );
         self.apply_redactions_pages.insert(src);
         self.is_modified = true;
         Ok(rep)
@@ -9953,11 +10123,13 @@ impl DocumentEditor {
         }
 
         // ── pdf_manipulator patch: the same prune plan the save uses (#261) ──
+        let dropped_annots = self.redacted_annotation_ids();
         let reachable = self.collect_reachable_ids(
             &crate::host::page_prune::plan(
                 &self.source,
                 &self.modified_objects,
                 &self.page_order,
+                &dropped_annots,
             ),
             None,
             &HashMap::new(),
@@ -10023,50 +10195,52 @@ impl DocumentEditor {
         })
     }
 
-    /// Mark a page for (legacy) redaction application.
-    ///
-    /// Historically this drew a cosmetic overlay only. Prefer
-    /// [`add_redaction`] + [`apply_redactions_destructive`] for true
-    /// content removal (#231).
+    // ── pdf_manipulator patch: the queued marks are the page's redaction state ──
+    /// Whether `page` has queued redaction marks (from [`add_redaction`]) that
+    /// no [`apply_redactions_destructive`] has removed yet.
     ///
     /// [`add_redaction`]: DocumentEditor::add_redaction
     /// [`apply_redactions_destructive`]: DocumentEditor::apply_redactions_destructive
-    ///
-    /// # Errors
-    /// [`Error::InvalidPdf`] if `page` is out of range.
-    pub fn apply_page_redactions(&mut self, page: usize) -> Result<()> {
-        if page >= self.current_page_count() {
-            return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
-        }
-
-        let source_page = self.source_page_for(page, "applying redactions")?;
-        self.apply_redactions_pages.insert(source_page);
-        self.is_modified = true;
-        Ok(())
-    }
-
-    /// Mark all pages for redaction application.
-    pub fn apply_all_redactions(&mut self) -> Result<()> {
-        let page_count = self.current_page_count();
-        for page in 0..page_count {
-            self.apply_redactions_pages.insert(page);
-        }
-        self.is_modified = true;
-        Ok(())
-    }
-
-    /// Check if a page is marked for redaction application.
     pub fn is_page_marked_for_redaction(&self, page: usize) -> bool {
         matches!(self.page_key(page), PageKey::Source(source_page)
-            if self.apply_redactions_pages.contains(&source_page))
+            if self.redaction_regions.get(&source_page).is_some_and(|marks| !marks.is_empty()))
     }
 
-    /// Clear the apply redactions flag for a page.
+    /// Drops the queued redaction marks of `page`. Its /Redact annotations in
+    /// the source stay as they are.
     pub fn unmark_page_for_redaction(&mut self, page: usize) {
         if let PageKey::Source(source_page) = self.page_key(page) {
-            self.apply_redactions_pages.remove(&source_page);
+            self.redaction_regions.remove(&source_page);
         }
     }
+    // ── end pdf_manipulator patch ──
+
+    // ── pdf_manipulator patch: a queued mark saved as a /Redact annotation ──
+    /// The /Redact annotation dictionaries of the marks queued on source page
+    /// `src` that no apply has removed: each mark's /Rect, and its /IC when it
+    /// has a fill colour.
+    fn redaction_mark_annotations(&self, src: usize) -> Vec<HashMap<String, Object>> {
+        let Some(marks) = self.redaction_regions.get(&src) else {
+            return Vec::new();
+        };
+        let reals = |values: &[f32]| -> Object {
+            Object::Array(values.iter().map(|v| Object::Real(f64::from(*v))).collect())
+        };
+        marks
+            .iter()
+            .map(|mark| {
+                let mut dict = HashMap::new();
+                dict.insert("Type".to_string(), Object::Name("Annot".to_string()));
+                dict.insert("Subtype".to_string(), Object::Name("Redact".to_string()));
+                dict.insert("Rect".to_string(), reals(&mark.bbox));
+                if let Some(fill) = mark.fill {
+                    dict.insert("IC".to_string(), reals(&fill));
+                }
+                dict
+            })
+            .collect()
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Get redaction annotation data for a page.
     ///
@@ -10124,40 +10298,6 @@ impl DocumentEditor {
         }
 
         Ok(redactions)
-    }
-
-    /// Generate content stream to draw redaction overlays.
-    fn generate_redaction_overlay(&self, redactions: &[RedactionData]) -> Vec<u8> {
-        let mut content = Vec::new();
-
-        for redaction in redactions {
-            // Save graphics state
-            content.extend_from_slice(b"q\n");
-
-            // Set fill color (RGB)
-            content.extend_from_slice(
-                format!(
-                    "{:.3} {:.3} {:.3} rg\n",
-                    redaction.color[0], redaction.color[1], redaction.color[2]
-                )
-                .as_bytes(),
-            );
-
-            // Draw filled rectangle
-            let x = redaction.rect[0];
-            let y = redaction.rect[1];
-            let width = redaction.rect[2] - redaction.rect[0];
-            let height = redaction.rect[3] - redaction.rect[1];
-
-            content.extend_from_slice(
-                format!("{:.2} {:.2} {:.2} {:.2} re f\n", x, y, width, height).as_bytes(),
-            );
-
-            // Restore graphics state
-            content.extend_from_slice(b"Q\n");
-        }
-
-        content
     }
 
     // ========================================================================
@@ -11531,72 +11671,6 @@ mod tests {
 
         // Should still generate content even with zero bbox (uses 1.0 fallback for scale)
         assert!(content_str.contains("/Xobj0 Do\n"));
-    }
-
-    // =========================================================================
-    // generate_redaction_overlay
-    // =========================================================================
-
-    #[test]
-    fn test_generate_redaction_overlay_single() {
-        let editor = create_test_editor();
-
-        let redactions = vec![RedactionData {
-            rect: [50.0, 100.0, 200.0, 150.0],
-            color: [0.0, 0.0, 0.0],
-        }];
-
-        let content = editor.generate_redaction_overlay(&redactions);
-        let content_str = String::from_utf8(content).unwrap();
-
-        assert!(content_str.contains("q\n"));
-        assert!(content_str.contains("0.000 0.000 0.000 rg\n"));
-        assert!(content_str.contains("re f\n"));
-        assert!(content_str.contains("Q\n"));
-    }
-
-    #[test]
-    fn test_generate_redaction_overlay_custom_color() {
-        let editor = create_test_editor();
-
-        let redactions = vec![RedactionData {
-            rect: [0.0, 0.0, 100.0, 100.0],
-            color: [1.0, 0.0, 0.0], // Red
-        }];
-
-        let content = editor.generate_redaction_overlay(&redactions);
-        let content_str = String::from_utf8(content).unwrap();
-        assert!(content_str.contains("1.000 0.000 0.000 rg\n"));
-    }
-
-    #[test]
-    fn test_generate_redaction_overlay_multiple() {
-        let editor = create_test_editor();
-
-        let redactions = vec![
-            RedactionData {
-                rect: [0.0, 0.0, 100.0, 50.0],
-                color: [0.0, 0.0, 0.0],
-            },
-            RedactionData {
-                rect: [200.0, 200.0, 400.0, 300.0],
-                color: [0.5, 0.5, 0.5],
-            },
-        ];
-
-        let content = editor.generate_redaction_overlay(&redactions);
-        let content_str = String::from_utf8(content).unwrap();
-
-        // Should contain two q/Q pairs
-        assert_eq!(content_str.matches("q\n").count(), 2);
-        assert_eq!(content_str.matches("Q\n").count(), 2);
-    }
-
-    #[test]
-    fn test_generate_redaction_overlay_empty() {
-        let editor = create_test_editor();
-        let content = editor.generate_redaction_overlay(&[]);
-        assert!(content.is_empty());
     }
 
     // =========================================================================
@@ -13010,35 +13084,41 @@ mod tests {
     // Redaction methods
     // =========================================================================
 
+    // ── pdf_manipulator patch: a redaction is a queued mark until apply ──
     #[test]
-    fn test_apply_page_redactions_valid() {
+    fn test_add_redaction_marks_page() {
         let mut editor = create_test_editor();
         assert!(!editor.is_page_marked_for_redaction(0));
-        editor.apply_page_redactions(0).unwrap();
+        editor.add_redaction(0, [10.0, 10.0, 50.0, 50.0], None).unwrap();
         assert!(editor.is_page_marked_for_redaction(0));
         assert!(editor.is_modified());
     }
 
     #[test]
-    fn test_apply_page_redactions_out_of_range() {
+    fn test_add_redaction_out_of_range() {
         let mut editor = create_test_editor();
-        assert!(editor.apply_page_redactions(99).is_err());
+        assert!(editor.add_redaction(99, [10.0, 10.0, 50.0, 50.0], None).is_err());
     }
 
     #[test]
-    fn test_apply_all_redactions() {
+    fn test_apply_without_marks_changes_nothing() {
         let mut editor = create_test_editor();
-        editor.apply_all_redactions().unwrap();
-        assert!(editor.is_page_marked_for_redaction(0));
+        let report = editor
+            .apply_redactions_destructive(crate::redaction::RedactionOptions::default())
+            .unwrap();
+        assert_eq!(report.regions, 0);
+        assert!(!editor.is_page_marked_for_redaction(0));
     }
 
     #[test]
     fn test_unmark_page_for_redaction() {
         let mut editor = create_test_editor();
-        editor.apply_page_redactions(0).unwrap();
+        editor.add_redaction(0, [10.0, 10.0, 50.0, 50.0], None).unwrap();
         editor.unmark_page_for_redaction(0);
         assert!(!editor.is_page_marked_for_redaction(0));
     }
+
+    // ── end pdf_manipulator patch ──
 
     // =========================================================================
     // Image modification methods

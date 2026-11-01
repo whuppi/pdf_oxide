@@ -597,40 +597,22 @@ mod flatten_tests {
     }
 }
 
+// ── pdf_manipulator patch: a redaction mark is queued by add_redaction and removed by unmark ──
 mod redaction_tests {
     use super::*;
 
     #[test]
-    fn test_apply_page_redactions() {
+    fn test_add_redaction_marks_page() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.pdf");
         fs::write(&path, create_test_pdf()).unwrap();
 
-        let mut pdf = Pdf::open(&path).unwrap();
+        let mut editor = DocumentEditor::open(&path).unwrap();
+        editor.add_redaction(0, [10.0, 10.0, 50.0, 50.0], None).unwrap();
 
-        // Mark page for redaction application
-        pdf.apply_page_redactions(0).unwrap();
-
-        // Should be marked as modified
-        assert!(pdf.is_modified());
-        assert!(pdf.is_page_marked_for_redaction(0));
-    }
-
-    #[test]
-    fn test_apply_all_redactions() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.pdf");
-        fs::write(&path, create_test_pdf()).unwrap();
-
-        let mut pdf = Pdf::open(&path).unwrap();
-
-        // Mark all pages for redaction application
-        pdf.apply_all_redactions().unwrap();
-
-        // All pages should be marked
-        assert!(pdf.is_page_marked_for_redaction(0));
-        assert!(pdf.is_page_marked_for_redaction(1));
-        assert!(pdf.is_page_marked_for_redaction(2));
+        assert!(editor.is_modified());
+        assert!(editor.is_page_marked_for_redaction(0));
+        assert!(!editor.is_page_marked_for_redaction(1));
     }
 
     #[test]
@@ -639,11 +621,8 @@ mod redaction_tests {
         let path = dir.path().join("test.pdf");
         fs::write(&path, create_test_pdf()).unwrap();
 
-        let mut pdf = Pdf::open(&path).unwrap();
-
-        // Invalid page index should fail
-        let result = pdf.apply_page_redactions(100);
-        assert!(result.is_err());
+        let mut editor = DocumentEditor::open(&path).unwrap();
+        assert!(editor.add_redaction(100, [10.0, 10.0, 50.0, 50.0], None).is_err());
     }
 
     #[test]
@@ -652,59 +631,36 @@ mod redaction_tests {
         let path = dir.path().join("test.pdf");
         fs::write(&path, create_test_pdf()).unwrap();
 
-        let mut pdf = Pdf::open(&path).unwrap();
+        let mut editor = DocumentEditor::open(&path).unwrap();
+        editor.add_redaction(0, [10.0, 10.0, 50.0, 50.0], None).unwrap();
+        assert!(editor.is_page_marked_for_redaction(0));
 
-        // Mark then unmark
-        pdf.apply_page_redactions(0).unwrap();
-        assert!(pdf.is_page_marked_for_redaction(0));
-
-        pdf.unmark_page_for_redaction(0);
-        assert!(!pdf.is_page_marked_for_redaction(0));
+        editor.unmark_page_for_redaction(0);
+        assert!(!editor.is_page_marked_for_redaction(0));
     }
 
     #[test]
-    fn test_redaction_and_save() {
+    fn test_redaction_mark_saves_without_applying() {
         let dir = tempdir().unwrap();
         let input_path = dir.path().join("input.pdf");
         let output_path = dir.path().join("output.pdf");
         fs::write(&input_path, create_test_pdf()).unwrap();
 
-        // Apply redactions and save (even though our test PDF has no Redact annotations)
+        // A mark that is not applied is saved as a /Redact annotation, and the
+        // page keeps its content.
         {
-            let mut pdf = Pdf::open(&input_path).unwrap();
-            pdf.apply_all_redactions().unwrap();
-            pdf.save(&output_path).unwrap();
+            let mut editor = DocumentEditor::open(&input_path).unwrap();
+            editor.add_redaction(0, [10.0, 10.0, 50.0, 50.0], None).unwrap();
+            editor.save(&output_path).unwrap();
         }
 
-        // Verify output file exists and is valid PDF
         {
             let mut pdf = Pdf::open(&output_path).unwrap();
             assert_eq!(pdf.page_count().unwrap(), 3);
         }
     }
-
-    #[test]
-    fn test_editor_redaction_methods() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.pdf");
-        fs::write(&path, create_test_pdf()).unwrap();
-
-        let mut editor = DocumentEditor::open(&path).unwrap();
-
-        // Test redaction methods
-        editor.apply_page_redactions(0).unwrap();
-        assert!(editor.is_page_marked_for_redaction(0));
-        assert!(editor.is_modified());
-
-        editor.unmark_page_for_redaction(0);
-        assert!(!editor.is_page_marked_for_redaction(0));
-
-        editor.apply_all_redactions().unwrap();
-        assert!(editor.is_page_marked_for_redaction(0));
-        assert!(editor.is_page_marked_for_redaction(1));
-        assert!(editor.is_page_marked_for_redaction(2));
-    }
 }
+// ── end pdf_manipulator patch ──
 
 // ===== Image Repositioning Tests =====
 

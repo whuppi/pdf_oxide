@@ -83,17 +83,21 @@ impl PagePrune {
     }
 }
 
-/// Plans the save of `doc` with the edits in `staged` and the pages in
-/// `page_order`. A source page missing from it is dropped; a merged page
-/// is never part of the plan, since it is not a page of `doc`.
+/// Plans the save of `doc` with the edits in `staged`, the pages in
+/// `page_order` and the annotations a redaction drops. A source page missing
+/// from `page_order` is dropped; a merged page is never part of the plan,
+/// since it is not a page of `doc`. A dropped annotation that is a widget
+/// leaves the field tree with its field, as a widget of a dropped page does.
 pub(crate) fn plan(
     doc: &PdfDocument,
     staged: &HashMap<u32, Object>,
     page_order: &[PageSlot],
+    dropped_annots: &HashSet<u32>,
 ) -> PagePrune {
     let mut p = Planner {
         doc,
         staged,
+        dropped_annots,
         out: PagePrune::default(),
         dropped_pages: HashSet::new(),
         removed_names: HashSet::new(),
@@ -105,6 +109,7 @@ pub(crate) fn plan(
 struct Planner<'a> {
     doc: &'a PdfDocument,
     staged: &'a HashMap<u32, Object>,
+    dropped_annots: &'a HashSet<u32>,
     out: PagePrune,
     dropped_pages: HashSet<u32>,
     /// Named destinations removed because they targeted a dropped page.
@@ -167,6 +172,7 @@ impl Planner<'_> {
         let inner = self.inner_nodes(root);
         self.out.excluded.extend(inner.iter().copied());
         self.out.excluded.extend(self.dropped_pages.iter().copied());
+        self.out.excluded.extend(self.dropped_annots.iter().copied());
 
         let mut seen = HashSet::new();
         for r in &kept {
@@ -177,8 +183,9 @@ impl Planner<'_> {
 
         self.renumber_page_labels(&catalog, page_order);
 
-        // Nothing to prune: the tree was flat and every page is kept.
-        if self.dropped_pages.is_empty() {
+        // Nothing to prune: the tree was flat, every page is kept and no
+        // annotation is dropped.
+        if self.dropped_pages.is_empty() && self.dropped_annots.is_empty() {
             return;
         }
         self.exclude_dropped_annotations(&kept, &leaves);

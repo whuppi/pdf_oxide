@@ -1558,28 +1558,6 @@ impl PyPdfDocument {
         }
     }
 
-    /// Apply page redactions.
-    fn apply_page_redactions(&mut self, page: usize) -> PyResult<()> {
-        self.ensure_editor()?;
-        if let Some(ref mut editor) = self.editor {
-            editor
-                .apply_page_redactions(page)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        Ok(())
-    }
-
-    /// Apply all redactions.
-    fn apply_all_redactions(&mut self) -> PyResult<()> {
-        self.ensure_editor()?;
-        if let Some(ref mut editor) = self.editor {
-            editor
-                .apply_all_redactions()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        Ok(())
-    }
-
     /// Check if page marked for redaction.
     fn is_page_marked_for_redaction(&self, page: usize) -> bool {
         self.editor

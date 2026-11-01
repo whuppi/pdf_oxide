@@ -1434,52 +1434,6 @@ pub extern "C" fn document_editor_embed_file(
     }
 }
 
-/// Apply redactions on a single page (burn them in).
-#[no_mangle]
-pub extern "C" fn document_editor_apply_page_redactions(
-    handle: *mut DocumentEditor,
-    page: usize,
-    error_code: *mut i32,
-) -> i32 {
-    if handle.is_null() {
-        set_error(error_code, ERR_INVALID_ARG);
-        return -1;
-    }
-    let editor = handle_mut(handle);
-    match editor.apply_page_redactions(page) {
-        Ok(()) => {
-            set_error(error_code, ERR_SUCCESS);
-            0
-        },
-        Err(e) => {
-            set_error(error_code, classify_error(&e));
-            -1
-        },
-    }
-}
-
-/// Apply all pending redactions across the entire document.
-#[no_mangle]
-pub extern "C" fn document_editor_apply_all_redactions(
-    handle: *mut DocumentEditor,
-    error_code: *mut i32,
-) -> i32 {
-    if handle.is_null() {
-        set_error(error_code, ERR_INVALID_ARG);
-        return -1;
-    }
-    let editor = handle_mut(handle);
-    match editor.apply_all_redactions() {
-        Ok(()) => {
-            set_error(error_code, ERR_SUCCESS);
-            0
-        },
-        Err(e) => {
-            set_error(error_code, classify_error(&e));
-            -1
-        },
-    }
-}
 
 /// Queue an explicit destructive redaction rectangle on `page`
 /// (#231). Coordinates and colour are page user-space / DeviceRGB.

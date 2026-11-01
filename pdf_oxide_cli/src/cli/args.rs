@@ -314,10 +314,6 @@ pub enum Command {
         #[arg(long = "rect")]
         rects: Vec<String>,
 
-        /// Apply existing /Redact annotations in the source
-        #[arg(long = "from-annotations")]
-        from_annotations: bool,
-
         /// Overlay fill colour as R,G,B in 0..1 (default 0,0,0)
         #[arg(long)]
         fill: Option<String>,

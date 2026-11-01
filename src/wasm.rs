@@ -3159,30 +3159,6 @@ impl WasmPdfDocument {
     // Group 7: Editing — Redaction
     // ========================================================================
 
-    /// Apply redactions on a page (removes redacted content permanently).
-    #[wasm_bindgen(js_name = "applyPageRedactions")]
-    pub fn apply_page_redactions(&mut self, page_index: usize) -> Result<(), JsValue> {
-        let editor_arc = self.ensure_editor()?;
-        let mut editor = editor_arc
-            .lock()
-            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
-        editor
-            .apply_page_redactions(page_index)
-            .map_err(|e| JsValue::from_str(&format!("Failed to apply redactions: {}", e)))
-    }
-
-    /// Apply all redactions in the document.
-    #[wasm_bindgen(js_name = "applyAllRedactions")]
-    pub fn apply_all_redactions(&mut self) -> Result<(), JsValue> {
-        let editor_arc = self.ensure_editor()?;
-        let mut editor = editor_arc
-            .lock()
-            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
-        editor
-            .apply_all_redactions()
-            .map_err(|e| JsValue::from_str(&format!("Failed to apply redactions: {}", e)))
-    }
-
     /// Queue an explicit destructive redaction rectangle on a page
     /// (page user space; `fill` is an optional DeviceRGB `[r,g,b]`).
     #[wasm_bindgen(js_name = "addRedaction")]
@@ -6649,18 +6625,6 @@ mod tests {
     // ========================================================================
     // Group: Redaction
     // ========================================================================
-
-    #[test]
-    fn test_apply_page_redactions() {
-        let mut doc = doc_from_text("Hello");
-        assert!(doc.apply_page_redactions(0).is_ok());
-    }
-
-    #[test]
-    fn test_apply_all_redactions() {
-        let mut doc = doc_from_text("Hello");
-        assert!(doc.apply_all_redactions().is_ok());
-    }
 
     // ========================================================================
     // Group: Form Fields

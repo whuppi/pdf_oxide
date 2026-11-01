@@ -15,7 +15,6 @@ use std::path::Path;
 pub fn run(
     file: &Path,
     rects: &[String],
-    from_annotations: bool,
     fill: Option<&str>,
     no_scrub_metadata: bool,
     output: Option<&Path>,
@@ -30,22 +29,12 @@ pub fn run(
     let mut editor = DocumentEditor::from_document(doc)?;
     let fill_color = parse_fill(fill)?;
 
-    let mut queued = 0usize;
+    // ── pdf_manipulator patch: the apply takes the /Redact annotations as well as these marks ──
     for spec in rects {
         let (page, rect) = parse_rect(spec)?;
         editor.add_redaction(page, rect, fill_color)?;
-        queued += 1;
     }
-    if from_annotations {
-        // Mark every page so source /Redact annotations are applied too.
-        editor.apply_all_redactions()?;
-    }
-    if queued == 0 && !from_annotations {
-        return Err(Error::InvalidOperation(
-            "redact: provide at least one --rect PAGE:x0,y0,x1,y1 or --from-annotations"
-                .to_string(),
-        ));
-    }
+    // ── end pdf_manipulator patch ──
 
     // RedactionOptions is #[non_exhaustive]; build via Default then set.
     let mut opts = RedactionOptions::default();

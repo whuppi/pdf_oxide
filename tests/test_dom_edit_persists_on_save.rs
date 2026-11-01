@@ -133,7 +133,10 @@ fn set_text_erasure_is_persisted_to_saved_bytes() {
         !contains(&out, "UNIQUE_MARKER_TOKEN_12345"),
         "erased text must not survive in the saved bytes"
     );
-    assert!(contains(&out, "Second line stays"), "unrelated content must be unaffected");
+    // ── pdf_manipulator patch: the saved page is compressed, so its text is read back through the reader ──
+    let saved = PdfDocument::from_bytes(out.clone()).unwrap().extract_text(0).unwrap();
+    assert!(saved.contains("Second line stays"), "unrelated content must be unaffected");
+    // ── end pdf_manipulator patch ──
 
     let path = write_temp(&out, "issue_940_erase.pdf");
     let doc = PdfDocument::open(&path).unwrap();
@@ -162,7 +165,10 @@ fn remove_element_is_persisted_to_saved_bytes() {
         !contains(&out, "REMOVE_ME_MARKER"),
         "removed element must not survive in the saved bytes"
     );
-    assert!(contains(&out, "Keep this line"));
+    // ── pdf_manipulator patch: the saved page is compressed, so its text is read back through the reader ──
+    let saved = PdfDocument::from_bytes(out.clone()).unwrap().extract_text(0).unwrap();
+    assert!(saved.contains("Keep this line"));
+    // ── end pdf_manipulator patch ──
 }
 
 #[test]

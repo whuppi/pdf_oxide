@@ -349,10 +349,12 @@ pub use error::{Error, Result};
 pub use extractors::images::{PdfFilter, PdfImageHandle};
 pub use layout::PageText;
 pub use outline::{Destination, OutlineItem};
+// ── pdf_manipulator patch: the cosmetic-free redaction surface, without the whole-buffer entry ──
 pub use redaction::{
-    redact_content_stream, Classification, FontInfoMetrics, OcgPolicy, RedactionOptions,
+    Classification, FontInfoMetrics, OcgPolicy, RedactionOptions,
     RedactionRegion, RedactionReport, RegionSet,
 };
+// ── end pdf_manipulator patch ──
 pub use structured::{ColumnMode, RegionRole, StructuredPage, StructuredRegion};
 
 // Global font cache for batch processing

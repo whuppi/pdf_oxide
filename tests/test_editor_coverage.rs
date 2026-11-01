@@ -757,12 +757,13 @@ fn test_editable_document_trait() {
 // Tests: Redactions
 // ===========================================================================
 
+// ── pdf_manipulator patch: a redaction mark is queued by add_redaction and removed by unmark ──
 #[test]
 fn test_editor_redaction_marking() {
     let pdf = build_minimal_pdf();
     let path = write_temp_pdf(&pdf, "editor_redact.pdf");
     let mut editor = DocumentEditor::open(&path).unwrap();
-    editor.apply_page_redactions(0).unwrap();
+    editor.add_redaction(0, [10.0, 10.0, 50.0, 50.0], None).unwrap();
     assert!(editor.is_page_marked_for_redaction(0));
     editor.unmark_page_for_redaction(0);
     assert!(!editor.is_page_marked_for_redaction(0));
@@ -770,15 +771,16 @@ fn test_editor_redaction_marking() {
 }
 
 #[test]
-fn test_editor_apply_all_redactions() {
+fn test_editor_marks_are_per_page() {
     let pdf = build_multi_page_pdf(2);
-    let path = write_temp_pdf(&pdf, "editor_redact_all.pdf");
+    let path = write_temp_pdf(&pdf, "editor_redact_pages.pdf");
     let mut editor = DocumentEditor::open(&path).unwrap();
-    editor.apply_all_redactions().unwrap();
-    assert!(editor.is_page_marked_for_redaction(0));
+    editor.add_redaction(1, [10.0, 10.0, 50.0, 50.0], None).unwrap();
+    assert!(!editor.is_page_marked_for_redaction(0));
     assert!(editor.is_page_marked_for_redaction(1));
     let _ = std::fs::remove_file(&path);
 }
+// ── end pdf_manipulator patch ──
 
 // ===========================================================================
 // Tests: Image operations
