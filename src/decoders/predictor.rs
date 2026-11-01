@@ -67,6 +67,14 @@ impl DecodeParams {
         }
     }
 
+    // ── pdf_manipulator patch: the PNG byte distance is a whole pixel, not a component count ──
+    /// The byte distance of the PNG predictors: `ceil(Colors × BitsPerComponent / 8)`,
+    /// at least 1 (ISO 32000-1 §7.4.4.4).
+    pub fn bytes_per_pixel(&self) -> usize {
+        (self.colors * self.bits_per_component).div_ceil(8).max(1)
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Calculate the number of bytes of actual pixel data per row (without predictor tag).
     pub fn pixel_bytes_per_row(&self) -> usize {
         (self.columns * self.colors * self.bits_per_component).div_ceil(8)
@@ -211,7 +219,9 @@ fn decode_png_predictor(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> {
 
     let row_count = data.len() / bytes_per_row;
     let mut output = Vec::with_capacity(row_count * pixel_bytes);
-    let bpp = params.colors; // Bytes per pixel
+    // ── pdf_manipulator patch: the PNG byte distance is a whole pixel, not a component count ──
+    let bpp = params.bytes_per_pixel();
+    // ── end pdf_manipulator patch ──
 
     for row_idx in 0..row_count {
         let row_start = row_idx * bytes_per_row;
@@ -278,10 +288,13 @@ pub(super) fn png_row(
     Ok(())
 }
 
-/// Decodes one TIFF-predicted row, appending it to `output`. Below 8 bits a
-/// component, ISO 32000-1 §7.4.4.3 differences the components themselves, not
-/// the bytes: `samples` is the row's component count, the bits after it are
-/// padding and are copied.
+/// Decodes one TIFF-predicted row, appending it to `output` (ISO 32000-1
+/// §7.4.4.3: each component minus the same component of the pixel to its
+/// left). Below 8 bits the components themselves are differenced, not the
+/// bytes: `samples` is the row's component count and the bits after it are
+/// padding, copied. At 16 bits the samples are big-endian and the difference
+/// is taken modulo 65536, so the carry crosses the two bytes. At 8 bits the
+/// bytes are added.
 pub(super) fn tiff_row(
     row_data: &[u8],
     colors: usize,
@@ -302,6 +315,20 @@ pub(super) fn tiff_row(
             let sum = (((row_data[byte] >> shift) & mask) + left) & mask;
             output[start + byte] = (output[start + byte] & !(mask << shift)) | (sum << shift);
         }
+        return;
+    }
+    if bits_per_component == 16 {
+        let stride = colors * 2;
+        let whole = row_data.len() - row_data.len() % 2;
+        for i in 0..whole.min(stride) {
+            output.push(row_data[i]);
+        }
+        for i in (stride..whole).step_by(2) {
+            let left = u16::from_be_bytes([output[start + i - stride], output[start + i - stride + 1]]);
+            let sum = u16::from_be_bytes([row_data[i], row_data[i + 1]]).wrapping_add(left);
+            output.extend_from_slice(&sum.to_be_bytes());
+        }
+        output.extend_from_slice(&row_data[whole..]);
         return;
     }
     // First pixel in row is unchanged

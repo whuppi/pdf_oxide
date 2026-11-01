@@ -601,6 +601,8 @@ struct Predictor<'a> {
     bits_per_component: usize,
     /// Components in a row.
     samples: usize,
+    /// The PNG byte distance of a pixel.
+    bpp: usize,
     /// The row above, then the row being decoded (PNG only).
     window: Vec<u8>,
     row: Vec<u8>,
@@ -621,6 +623,7 @@ fn predictor_reader<'a>(up: Box<dyn Read + 'a>, params: &DecodeParams) -> Result
         colors: params.colors,
         bits_per_component: params.bits_per_component,
         samples: params.columns * params.colors,
+        bpp: params.bytes_per_pixel(),
         window: Vec::new(),
         row: Vec::new(),
     })))
@@ -670,7 +673,9 @@ impl Refill for Predictor<'_> {
                     &mut self.window,
                     row_idx,
                     self.pixel_bytes,
-                    self.colors,
+                    // ── pdf_manipulator patch: the PNG byte distance and the TIFF depth reach the row functions ──
+                    self.bpp,
+                    // ── end pdf_manipulator patch ──
                 )
                 .map_err(failure)?;
                 out.extend_from_slice(&self.window[above..]);

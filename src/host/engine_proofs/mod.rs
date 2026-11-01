@@ -41,6 +41,8 @@ mod lzw;
 mod page_operators;
 #[cfg(feature = "rendering")]
 mod pattern_paint;
+#[cfg(feature = "rendering")]
+mod predictor_depths;
 mod redact_pass;
 mod redact_path_ink;
 mod redact_paths;
