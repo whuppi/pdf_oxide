@@ -186,7 +186,7 @@ fn decode_tiff_predictor(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> 
 
     for row_data in data.chunks(bytes_per_row) {
         // ── pdf_manipulator patch: the row algorithms are shared with the reader ──
-        tiff_row(row_data, colors, &mut output);
+        tiff_row(row_data, colors, params.bits_per_component, params.columns * colors, &mut output);
         // ── end pdf_manipulator patch ──
     }
 
@@ -278,9 +278,32 @@ pub(super) fn png_row(
     Ok(())
 }
 
-/// Decodes one TIFF-predicted row, appending it to `output`.
-pub(super) fn tiff_row(row_data: &[u8], colors: usize, output: &mut Vec<u8>) {
+/// Decodes one TIFF-predicted row, appending it to `output`. Below 8 bits a
+/// component, ISO 32000-1 §7.4.4.3 differences the components themselves, not
+/// the bytes: `samples` is the row's component count, the bits after it are
+/// padding and are copied.
+pub(super) fn tiff_row(
+    row_data: &[u8],
+    colors: usize,
+    bits_per_component: usize,
+    samples: usize,
+    output: &mut Vec<u8>,
+) {
     let start = output.len();
+    if matches!(bits_per_component, 1 | 2 | 4) {
+        let bpc = bits_per_component;
+        let mask = (1u8 << bpc) - 1;
+        output.extend_from_slice(row_data);
+        let at = |bit: usize| (bit / 8, 8 - bpc - bit % 8);
+        for s in colors..samples.min(row_data.len() * 8 / bpc) {
+            let (byte, shift) = at(s * bpc);
+            let (left_byte, left_shift) = at((s - colors) * bpc);
+            let left = (output[start + left_byte] >> left_shift) & mask;
+            let sum = (((row_data[byte] >> shift) & mask) + left) & mask;
+            output[start + byte] = (output[start + byte] & !(mask << shift)) | (sum << shift);
+        }
+        return;
+    }
     // First pixel in row is unchanged
     for i in 0..colors.min(row_data.len()) {
         output.push(row_data[i]);

@@ -23,6 +23,8 @@ mod editor_trailer;
 mod ext_gstate_lines;
 mod filter_readers;
 #[cfg(feature = "rendering")]
+mod extract_1bit;
+#[cfg(feature = "rendering")]
 mod extract_proof;
 #[cfg(feature = "rendering")]
 mod fax_proof;

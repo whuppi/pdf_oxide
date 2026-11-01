@@ -598,6 +598,9 @@ struct Predictor<'a> {
     /// Decoded bytes of a row.
     pixel_bytes: usize,
     colors: usize,
+    bits_per_component: usize,
+    /// Components in a row.
+    samples: usize,
     /// The row above, then the row being decoded (PNG only).
     window: Vec<u8>,
     row: Vec<u8>,
@@ -616,6 +619,8 @@ fn predictor_reader<'a>(up: Box<dyn Read + 'a>, params: &DecodeParams) -> Result
         row_in: if png { params.bytes_per_row() } else { params.pixel_bytes_per_row() },
         pixel_bytes: params.pixel_bytes_per_row(),
         colors: params.colors,
+        bits_per_component: params.bits_per_component,
+        samples: params.columns * params.colors,
         window: Vec::new(),
         row: Vec::new(),
     })))
@@ -671,7 +676,13 @@ impl Refill for Predictor<'_> {
                 out.extend_from_slice(&self.window[above..]);
                 self.window.drain(..above);
             } else {
-                super::predictor::tiff_row(&self.row, self.colors, out);
+                super::predictor::tiff_row(
+                    &self.row,
+                    self.colors,
+                    self.bits_per_component,
+                    self.samples,
+                    out,
+                );
             }
         }
         Ok(true)
