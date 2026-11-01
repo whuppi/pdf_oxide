@@ -407,6 +407,32 @@ pub(crate) fn guarded_stroke_path(
     pixmap.stroke_path(path, paint, stroke, transform, clip_mask);
 }
 
+// ── pdf_manipulator patch: one line style for every stroke the state describes ──
+/// The stroke `gs` describes: width, caps, joins, miter limit and dash.
+pub(crate) fn stroke_of(gs: &GraphicsState) -> tiny_skia::Stroke {
+    let dash = if gs.dash_pattern.0.is_empty() {
+        None
+    } else {
+        tiny_skia::StrokeDash::new(gs.dash_pattern.0.clone(), gs.dash_pattern.1)
+    };
+    tiny_skia::Stroke {
+        width: gs.line_width,
+        line_cap: match gs.line_cap {
+            1 => tiny_skia::LineCap::Round,
+            2 => tiny_skia::LineCap::Square,
+            _ => tiny_skia::LineCap::Butt,
+        },
+        line_join: match gs.line_join {
+            1 => tiny_skia::LineJoin::Round,
+            2 => tiny_skia::LineJoin::Bevel,
+            _ => tiny_skia::LineJoin::Miter,
+        },
+        miter_limit: gs.miter_limit,
+        dash,
+    }
+}
+// ── end pdf_manipulator patch ──
+
 /// Mask sibling of [`guarded_fill_path`]. A skipped path leaves the mask
 /// untouched, which for coverage masks means zero coverage — consistent
 /// with the paint itself being skipped.

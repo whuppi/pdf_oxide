@@ -349,6 +349,19 @@ pub struct GraphicsState {
     /// selected for filling. Cleared whenever a device/CIE fill colour is
     /// set.
     pub fill_pattern_name: Option<String>,
+
+    // ── pdf_manipulator patch: the stroke side keeps the pattern it selected, as the fill side does ──
+    /// Name of the pattern selected by the most recent `SCN` while the stroke
+    /// colour space is `/Pattern`; the stroke counterpart of
+    /// [`Self::fill_pattern_name`], cleared by `CS`.
+    pub stroke_pattern_name: Option<String>,
+
+    /// Set only on the scratch state a stroke-coverage render runs under: the
+    /// text rasteriser then draws each glyph outline as a stroke of
+    /// `line_width` instead of filling it, so the pixels it paints are the
+    /// coverage a stroke pattern is painted through. Never set by content.
+    pub stroke_glyph_outlines: bool,
+    // ── end pdf_manipulator patch ──
 }
 
 /// Subtype of a soft-mask (§11.4.7 / Table 144 `S` field). Alpha uses
@@ -429,6 +442,10 @@ impl GraphicsState {
             fill_spot_inks: Vec::new(),      // no spot source yet
             stroke_spot_inks: Vec::new(),    // no spot source yet
             fill_pattern_name: None,         // no fill pattern selected yet
+            // ── pdf_manipulator patch: the stroke side keeps the pattern it selected, as the fill side does ──
+            stroke_pattern_name: None,
+            stroke_glyph_outlines: false,
+            // ── end pdf_manipulator patch ──
         }
     }
 

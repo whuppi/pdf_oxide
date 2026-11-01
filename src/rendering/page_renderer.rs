@@ -1240,6 +1240,9 @@ impl PageRenderer {
                     gs.stroke_color_components
                         .extend_from_slice(&initial.components);
                     gs.stroke_spot_inks = initial.spot_inks;
+                    // ── pdf_manipulator patch: selecting a stroke space clears the stroke pattern, as `cs` does the fill pattern ──
+                    gs.stroke_pattern_name = None;
+                    // ── end pdf_manipulator patch ──
                 },
                 Operator::SetFillColor { components } => {
                     let gs = gs_stack.current_mut();
@@ -1640,13 +1643,22 @@ impl PageRenderer {
                         gs.fill_color_rgb
                     );
                 },
-                Operator::SetStrokeColorN { components, .. } => {
+                // ── pdf_manipulator patch: `SCN` names the pattern it selects ──
+                Operator::SetStrokeColorN { components, name } => {
+                // ── end pdf_manipulator patch ──
                     let gs = gs_stack.current_mut();
                     let space_name = gs.stroke_color_space.clone();
                     let resolved_space = self.color_spaces.get(&space_name);
                     gs.stroke_color_components.clear();
                     gs.stroke_color_components.extend_from_slice(components);
                     gs.stroke_color_cmyk = None;
+                    // ── pdf_manipulator patch: `SCN` keeps the pattern it names, as `scn` does ──
+                    gs.stroke_pattern_name = if self.is_pattern_space(&space_name) {
+                        name.as_ref().map(|n| n.as_str().to_string())
+                    } else {
+                        None
+                    };
+                    // ── end pdf_manipulator patch ──
                     match space_name.as_str() {
                         "DeviceGray" | "G" if !components.is_empty() => {
                             let g = components[0];
@@ -1741,6 +1753,19 @@ impl PageRenderer {
                                                 // index/255 gray fallback at paint time.
                                                 handled = true;
                                             },
+                                            // ── pdf_manipulator patch: an uncoloured pattern's stroke colour is in its underlying space, as on the fill side ──
+                                            "Pattern" if arr.len() > 1 => {
+                                                let base = doc
+                                                    .resolve_object(&arr[1])
+                                                    .unwrap_or_else(|_| arr[1].clone());
+                                                if let Some(rgb) = components_to_rgb_in_space(
+                                                    &base, components, doc,
+                                                ) {
+                                                    gs.stroke_color_rgb = rgb;
+                                                    handled = true;
+                                                }
+                                            },
+                                            // ── end pdf_manipulator patch ──
                                             _ => {},
                                         }
                                     }
@@ -1893,8 +1918,22 @@ impl PageRenderer {
                                 self.cmyk_sidecar_snapshot_for_rgb_paint(pixmap, &gs_clone, false);
                             let cmyk_coverage =
                                 self.rasterise_stroke_coverage(&path, transform, &gs_clone, clip);
-                            self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                            // ── pdf_manipulator patch: a stroke in a tiling pattern paints the pattern ──
+                            if !self.stroke_with_tiling_pattern(
+                                pixmap,
+                                &path,
+                                transform,
+                                base_transform,
+                                clip,
+                                &gs_clone,
+                                doc,
+                                page_num,
+                                resources,
+                            )? {
+                                // ── end pdf_manipulator patch ──
+                                self.path_rasterizer
+                                    .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                            }
                             if let Some(snap) = cmyk_compose_snap {
                                 self.apply_cmyk_compose_after_paint_with_coverage(
                                     pixmap,
@@ -2014,12 +2053,16 @@ impl PageRenderer {
                                 && self.is_pattern_space(&gs_clone.fill_color_space);
                             if pattern_space_fill
                                 && self.fill_with_tiling_pattern(
+                                    // ── pdf_manipulator patch: a tiling pattern paints through a shape, here the path ──
                                     pixmap,
-                                    &path,
+                                    PatternShape::Path {
+                                        path: &path,
+                                        fill_rule: tiny_skia::FillRule::Winding,
+                                        path_transform: transform,
+                                    },
                                     base_transform,
-                                    transform,
-                                    tiny_skia::FillRule::Winding,
                                     clip,
+                                    // ── end pdf_manipulator patch ──
                                     &gs_clone,
                                     doc,
                                     page_num,
@@ -2203,12 +2246,16 @@ impl PageRenderer {
                                 && self.is_pattern_space(&gs_clone.fill_color_space);
                             let fill_by_pattern = pattern_space_fill
                                 && self.fill_with_tiling_pattern(
+                                    // ── pdf_manipulator patch: a tiling pattern paints through a shape, here the path ──
                                     pixmap,
-                                    &path,
+                                    PatternShape::Path {
+                                        path: &path,
+                                        fill_rule,
+                                        path_transform: transform,
+                                    },
                                     base_transform,
-                                    transform,
-                                    fill_rule,
                                     clip,
+                                    // ── end pdf_manipulator patch ──
                                     &gs_clone,
                                     doc,
                                     page_num,
@@ -2290,8 +2337,22 @@ impl PageRenderer {
                                 self.spot_paint_snapshot(pixmap, &gs_clone, false);
                             let stroke_cmyk_coverage =
                                 self.rasterise_stroke_coverage(&path, transform, &gs_clone, clip);
-                            self.path_rasterizer
-                                .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                            // ── pdf_manipulator patch: a stroke in a tiling pattern paints the pattern ──
+                            if !self.stroke_with_tiling_pattern(
+                                pixmap,
+                                &path,
+                                transform,
+                                base_transform,
+                                clip,
+                                &gs_clone,
+                                doc,
+                                page_num,
+                                resources,
+                            )? {
+                                // ── end pdf_manipulator patch ──
+                                self.path_rasterizer
+                                    .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                            }
                             if let Some(snap) = stroke_cmyk_compose_snap {
                                 self.apply_cmyk_compose_after_paint(
                                     pixmap, &snap, &gs_clone, doc, false,
@@ -2390,12 +2451,16 @@ impl PageRenderer {
                                 && self.is_pattern_space(&gs_clone.fill_color_space);
                             let fill_by_pattern = pattern_space_fill
                                 && self.fill_with_tiling_pattern(
+                                    // ── pdf_manipulator patch: a tiling pattern paints through a shape, here the path ──
                                     pixmap,
-                                    &path,
+                                    PatternShape::Path {
+                                        path: &path,
+                                        fill_rule: tiny_skia::FillRule::EvenOdd,
+                                        path_transform: transform,
+                                    },
                                     base_transform,
-                                    transform,
-                                    tiny_skia::FillRule::EvenOdd,
                                     clip,
+                                    // ── end pdf_manipulator patch ──
                                     &gs_clone,
                                     doc,
                                     page_num,
@@ -2480,8 +2545,22 @@ impl PageRenderer {
                                     self.spot_paint_snapshot(pixmap, &gs_clone, false);
                                 let stroke_cmyk_coverage = self
                                     .rasterise_stroke_coverage(&path, transform, &gs_clone, clip);
-                                self.path_rasterizer
-                                    .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                                // ── pdf_manipulator patch: a stroke in a tiling pattern paints the pattern ──
+                                if !self.stroke_with_tiling_pattern(
+                                    pixmap,
+                                    &path,
+                                    transform,
+                                    base_transform,
+                                    clip,
+                                    &gs_clone,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                )? {
+                                    // ── end pdf_manipulator patch ──
+                                    self.path_rasterizer
+                                        .stroke_path_clipped(pixmap, &path, transform, render_gs, clip);
+                                }
                                 if let Some(snap) = stroke_cmyk_compose_snap {
                                     self.apply_cmyk_compose_after_paint(
                                         pixmap, &snap, &gs_clone, doc, false,
@@ -2708,33 +2787,31 @@ impl PageRenderer {
                             // A shading pattern paints the glyphs through
                             // their own coverage; the advance still has to come
                             // from the font, or the text matrix stops moving.
-                            let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
-                                match self.glyph_coverage_mask(
-                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
-                                    pixmap,
-                                    // ── end pdf_manipulator patch ──
-                                    gs,
-                                    |r, scratch, cgs, fonts| {
+                            // ── pdf_manipulator patch: glyphs painted with a pattern, fill and stroke, take the pattern ──
+                            // A pattern paints the glyphs through their own coverage; the advance
+                            // still has to come from the font, or the text matrix stops moving.
+                            let draw = |r: &TextRasterizer,
+                                        scratch: &mut Pixmap,
+                                        cgs: &GraphicsState,
+                                        fonts: &HashMap<String, Arc<FontInfo>>| {
                                         let _ = r.render_text(
                                             scratch, text, transform, cgs, None, resources, doc,
                                             clip, fonts,
                                         );
-                                    },
-                                ) {
-                                    Some(mask) => self.paint_pattern_through_mask_from_resources(
-                                        pixmap,
-                                        &mask,
-                                        base_transform,
-                                        gs,
-                                        doc,
-                                        resources,
-                                    )?,
-                                    None => false,
-                                }
-                            } else {
-                                false
-                            };
-                            let adv = if pattern_painted {
+                                    };
+                            let fill_done = self.paint_text_pattern(
+                                pixmap,
+                                false,
+                                gs,
+                                base_transform,
+                                doc,
+                                page_num,
+                                resources,
+                                &draw,
+                            )?;
+                            let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
+                            // Glyphs that are only stroked take no fill from the rasteriser.
+                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer.measure_text(text, gs, &self.fonts)
                             } else {
                                 self.text_rasterizer.render_text(
@@ -2749,6 +2826,19 @@ impl PageRenderer {
                                     &self.fonts,
                                 )?
                             };
+                            if stroke_pattern {
+                                self.paint_text_pattern(
+                                    pixmap,
+                                    true,
+                                    gs,
+                                    base_transform,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                    &draw,
+                                )?;
+                            }
+                            // ── end pdf_manipulator patch ──
                             let gs_for_apply = gs_stack.current().clone();
                             if let Some(snap) = cmyk_compose_snap {
                                 self.apply_cmyk_compose_after_paint(
@@ -2880,33 +2970,31 @@ impl PageRenderer {
                             // A shading pattern paints the glyphs through
                             // their own coverage; the advance still has to come
                             // from the font, or the text matrix stops moving.
-                            let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
-                                match self.glyph_coverage_mask(
-                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
-                                    pixmap,
-                                    // ── end pdf_manipulator patch ──
-                                    gs,
-                                    |r, scratch, cgs, fonts| {
+                            // ── pdf_manipulator patch: glyphs painted with a pattern, fill and stroke, take the pattern ──
+                            // A pattern paints the glyphs through their own coverage; the advance
+                            // still has to come from the font, or the text matrix stops moving.
+                            let draw = |r: &TextRasterizer,
+                                        scratch: &mut Pixmap,
+                                        cgs: &GraphicsState,
+                                        fonts: &HashMap<String, Arc<FontInfo>>| {
                                         let _ = r.render_text(
                                             scratch, text, transform, cgs, None, resources, doc,
                                             clip, fonts,
                                         );
-                                    },
-                                ) {
-                                    Some(mask) => self.paint_pattern_through_mask_from_resources(
-                                        pixmap,
-                                        &mask,
-                                        base_transform,
-                                        gs,
-                                        doc,
-                                        resources,
-                                    )?,
-                                    None => false,
-                                }
-                            } else {
-                                false
-                            };
-                            let adv = if pattern_painted {
+                                    };
+                            let fill_done = self.paint_text_pattern(
+                                pixmap,
+                                false,
+                                gs,
+                                base_transform,
+                                doc,
+                                page_num,
+                                resources,
+                                &draw,
+                            )?;
+                            let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
+                            // Glyphs that are only stroked take no fill from the rasteriser.
+                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer.measure_text(text, gs, &self.fonts)
                             } else {
                                 self.text_rasterizer.render_text(
@@ -2921,6 +3009,19 @@ impl PageRenderer {
                                     &self.fonts,
                                 )?
                             };
+                            if stroke_pattern {
+                                self.paint_text_pattern(
+                                    pixmap,
+                                    true,
+                                    gs,
+                                    base_transform,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                    &draw,
+                                )?;
+                            }
+                            // ── end pdf_manipulator patch ──
                             let gs_for_apply = gs_stack.current().clone();
                             if let Some(snap) = cmyk_compose_snap {
                                 self.apply_cmyk_compose_after_paint(
@@ -3045,33 +3146,31 @@ impl PageRenderer {
                                     array, transform, gs, resources, doc, clip,
                                 )
                             });
-                            let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
-                                match self.glyph_coverage_mask(
-                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
-                                    pixmap,
-                                    // ── end pdf_manipulator patch ──
-                                    gs,
-                                    |r, scratch, cgs, fonts| {
+                            // ── pdf_manipulator patch: glyphs painted with a pattern, fill and stroke, take the pattern ──
+                            // A pattern paints the glyphs through their own coverage; the advance
+                            // still has to come from the font, or the text matrix stops moving.
+                            let draw = |r: &TextRasterizer,
+                                        scratch: &mut Pixmap,
+                                        cgs: &GraphicsState,
+                                        fonts: &HashMap<String, Arc<FontInfo>>| {
                                         let _ = r.render_tj_array(
                                             scratch, array, transform, cgs, None, resources, doc,
                                             clip, fonts,
                                         );
-                                    },
-                                ) {
-                                    Some(mask) => self.paint_pattern_through_mask_from_resources(
-                                        pixmap,
-                                        &mask,
-                                        base_transform,
-                                        gs,
-                                        doc,
-                                        resources,
-                                    )?,
-                                    None => false,
-                                }
-                            } else {
-                                false
-                            };
-                            let adv = if pattern_painted {
+                                    };
+                            let fill_done = self.paint_text_pattern(
+                                pixmap,
+                                false,
+                                gs,
+                                base_transform,
+                                doc,
+                                page_num,
+                                resources,
+                                &draw,
+                            )?;
+                            let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
+                            // Glyphs that are only stroked take no fill from the rasteriser.
+                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer
                                     .measure_tj_array(array, gs, &self.fonts)
                             } else {
@@ -3087,6 +3186,19 @@ impl PageRenderer {
                                     &self.fonts,
                                 )?
                             };
+                            if stroke_pattern {
+                                self.paint_text_pattern(
+                                    pixmap,
+                                    true,
+                                    gs,
+                                    base_transform,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                    &draw,
+                                )?;
+                            }
+                            // ── end pdf_manipulator patch ──
                             let gs_for_apply = gs_stack.current().clone();
                             if let Some(snap) = cmyk_compose_snap {
                                 self.apply_cmyk_compose_after_paint(
@@ -3227,33 +3339,31 @@ impl PageRenderer {
                             // A shading pattern paints the glyphs through
                             // their own coverage; the advance still has to come
                             // from the font, or the text matrix stops moving.
-                            let pattern_painted = if self.text_takes_a_fill_pattern(gs) {
-                                match self.glyph_coverage_mask(
-                                    // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
-                                    pixmap,
-                                    // ── end pdf_manipulator patch ──
-                                    gs,
-                                    |r, scratch, cgs, fonts| {
+                            // ── pdf_manipulator patch: glyphs painted with a pattern, fill and stroke, take the pattern ──
+                            // A pattern paints the glyphs through their own coverage; the advance
+                            // still has to come from the font, or the text matrix stops moving.
+                            let draw = |r: &TextRasterizer,
+                                        scratch: &mut Pixmap,
+                                        cgs: &GraphicsState,
+                                        fonts: &HashMap<String, Arc<FontInfo>>| {
                                         let _ = r.render_text(
                                             scratch, text, transform, cgs, None, resources, doc,
                                             clip, fonts,
                                         );
-                                    },
-                                ) {
-                                    Some(mask) => self.paint_pattern_through_mask_from_resources(
-                                        pixmap,
-                                        &mask,
-                                        base_transform,
-                                        gs,
-                                        doc,
-                                        resources,
-                                    )?,
-                                    None => false,
-                                }
-                            } else {
-                                false
-                            };
-                            let adv = if pattern_painted {
+                                    };
+                            let fill_done = self.paint_text_pattern(
+                                pixmap,
+                                false,
+                                gs,
+                                base_transform,
+                                doc,
+                                page_num,
+                                resources,
+                                &draw,
+                            )?;
+                            let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
+                            // Glyphs that are only stroked take no fill from the rasteriser.
+                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer.measure_text(text, gs, &self.fonts)
                             } else {
                                 self.text_rasterizer.render_text(
@@ -3268,6 +3378,19 @@ impl PageRenderer {
                                     &self.fonts,
                                 )?
                             };
+                            if stroke_pattern {
+                                self.paint_text_pattern(
+                                    pixmap,
+                                    true,
+                                    gs,
+                                    base_transform,
+                                    doc,
+                                    page_num,
+                                    resources,
+                                    &draw,
+                                )?;
+                            }
+                            // ── end pdf_manipulator patch ──
                             let gs_for_apply = gs_stack.current().clone();
                             if let Some(snap) = cmyk_compose_snap {
                                 self.apply_cmyk_compose_after_paint(
@@ -5608,9 +5731,7 @@ impl PageRenderer {
     fn fill_with_tiles(
         &mut self,
         pixmap: &mut Pixmap,
-        path: &tiny_skia::Path,
-        path_transform: Transform,
-        fill_rule: tiny_skia::FillRule,
+        shape: PatternShape<'_>,
         clip: Option<&tiny_skia::Mask>,
         gs: &GraphicsState,
         doc: &PdfDocument,
@@ -5636,7 +5757,7 @@ impl PageRenderer {
         let Some(window_rect) = window.rect() else {
             return Ok(true);
         };
-        let Some([x0, y0, x1, y1]) = super::device_bounds(path, path_transform) else {
+        let Some([x0, y0, x1, y1]) = shape.bounds() else {
             return Ok(false);
         };
         let (rx0, ry0) = (x0.max(f64::from(window_rect.left())), y0.max(f64::from(window_rect.top())));
@@ -5684,16 +5805,10 @@ impl PageRenderer {
         };
         let cell_path = PathBuilder::from_rect(cell_rect);
 
-        // The fill region: the path's coverage within the active clip.
-        let Some(mut region) = tiny_skia::Mask::new_like(pixmap) else {
+        // The fill region: the shape's coverage within the active clip.
+        let Some(region) = shape.region(pixmap, clip) else {
             return Ok(false);
         };
-        guarded_mask_fill_path(&mut region, path, fill_rule, true, path_transform);
-        if let Some(c) = clip {
-            for (mv, cv) in region.data_mut().iter_mut().zip(c.data().iter()) {
-                *mv = (*mv).min(*cv);
-            }
-        }
         let Some(mut scratch) = Pixmap::new_like(pixmap) else {
             return Ok(false);
         };
@@ -5826,10 +5941,9 @@ impl PageRenderer {
     /// matrix rides on `base_transform`, never on the CTM in force at the show,
     /// and never on the text matrix, whose geometry lives inside the mask.
     ///
-    /// Returns `false` when there is no pattern to paint or it is not a type 2
-    /// one, so the caller falls through to its ordinary paint. A tiling pattern
-    /// (PatternType 1) is a repeated content stream rather than a per-pixel
-    /// colour function, so a mask cannot serve it; it still paints flat.
+    /// Returns `false` when there is no pattern to paint or it can be painted
+    /// through neither a type 2 shading nor a type 1 tiling, so the caller
+    /// falls through to its ordinary paint.
     fn paint_pattern_through_mask_from_resources(
         &mut self,
         pixmap: &mut Pixmap,
@@ -5838,6 +5952,9 @@ impl PageRenderer {
         gs: &GraphicsState,
         doc: &PdfDocument,
         resources: &Object,
+        // ── pdf_manipulator patch: a tiling pattern paints through the mask too ──
+        page_num: usize,
+        // ── end pdf_manipulator patch ──
     ) -> Result<bool> {
         let Some(name) = gs.fill_pattern_name.as_deref() else {
             return Ok(false);
@@ -5858,8 +5975,97 @@ impl PageRenderer {
             return Ok(false);
         };
         let pattern_obj = doc.resolve_object(entry)?;
-        self.paint_shading_pattern_through_mask(pixmap, &pattern_obj, base_transform, mask, gs, doc)
+        // ── pdf_manipulator patch: a tiling pattern paints through the mask too ──
+        if self.paint_shading_pattern_through_mask(pixmap, &pattern_obj, base_transform, mask, gs, doc)? {
+            return Ok(true);
+        }
+        self.fill_with_tiling_pattern(
+            pixmap,
+            PatternShape::Mask(mask),
+            base_transform,
+            None,
+            gs,
+            doc,
+            page_num,
+            resources,
+        )
+        // ── end pdf_manipulator patch ──
     }
+
+    // ── pdf_manipulator patch: glyphs painted with a pattern, fill and stroke, take the pattern ──
+    /// The graphics state with its stroke side as the fill side, which is
+    /// what the pattern painters read.
+    fn stroke_as_fill(gs: &GraphicsState) -> GraphicsState {
+        let mut view = gs.clone();
+        view.fill_pattern_name = gs.stroke_pattern_name.clone();
+        view.fill_color_space = gs.stroke_color_space.clone();
+        view.fill_color_rgb = gs.stroke_color_rgb;
+        view.fill_alpha = gs.stroke_alpha;
+        view
+    }
+
+    /// Whether this show strokes its glyphs through a tiling pattern: the
+    /// mode strokes, the stroke colour is a pattern, and that pattern is a
+    /// tiling one (a shading stroke stays as it was).
+    fn text_takes_a_stroke_pattern(
+        &self,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        resources: &Object,
+    ) -> bool {
+        let Some(name) = gs.stroke_pattern_name.as_deref() else {
+            return false;
+        };
+        if !self.is_pattern_space(&gs.stroke_color_space)
+            || !matches!(gs.render_mode, 1 | 2 | 5 | 6)
+        {
+            return false;
+        }
+        resources
+            .as_dict()
+            .and_then(|r| r.get("Pattern"))
+            .and_then(|g| doc.resolve_object(g).ok())
+            .and_then(|g| g.as_dict().and_then(|m| m.get(name).cloned()))
+            .and_then(|e| doc.resolve_object(&e).ok())
+            .and_then(|p| p.as_dict().map(|d| d.get("PatternType").and_then(|o| o.as_integer())))
+            .is_some_and(|t| t.unwrap_or(1) == 1)
+    }
+
+    /// Paints a show's glyphs through the fill pattern, or with `stroke`
+    /// their outlines through the stroke pattern. Returns whether it painted.
+    fn paint_text_pattern(
+        &mut self,
+        pixmap: &mut Pixmap,
+        stroke: bool,
+        gs: &GraphicsState,
+        base_transform: Transform,
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+        draw: &dyn Fn(&TextRasterizer, &mut Pixmap, &GraphicsState, &HashMap<String, Arc<FontInfo>>),
+    ) -> Result<bool> {
+        if !stroke && !self.text_takes_a_fill_pattern(gs) {
+            return Ok(false);
+        }
+        let mut coverage_gs = gs.clone();
+        coverage_gs.stroke_glyph_outlines = stroke;
+        let Some(mask) = self.glyph_coverage_mask(pixmap, &coverage_gs, |r, scratch, cgs, fonts| {
+            draw(r, scratch, cgs, fonts)
+        }) else {
+            return Ok(false);
+        };
+        let view = if stroke { Self::stroke_as_fill(gs) } else { gs.clone() };
+        self.paint_pattern_through_mask_from_resources(
+            pixmap,
+            &mask,
+            base_transform,
+            &view,
+            doc,
+            resources,
+            page_num,
+        )
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Whether this show should paint through a fill pattern rather than a
     /// solid colour.
@@ -5941,13 +6147,55 @@ impl PageRenderer {
         Ok(true)
     }
 
-    fn fill_with_tiling_pattern(
+    // ── pdf_manipulator patch: a stroke in a tiling pattern paints the pattern ──
+    /// Paints a stroke of `path` through the stroke pattern, when the stroke
+    /// colour is one: the stroke's coverage is the shape, the stroke side of
+    /// `gs` is the fill side the tiling painter reads. Returns `false` when
+    /// the stroke is not in a tiling pattern, so the caller strokes as ever.
+    fn stroke_with_tiling_pattern(
         &mut self,
         pixmap: &mut Pixmap,
         path: &tiny_skia::Path,
+        transform: Transform,
         base_transform: Transform,
-        path_transform: Transform,
-        fill_rule: tiny_skia::FillRule,
+        clip: Option<&tiny_skia::Mask>,
+        gs: &GraphicsState,
+        doc: &PdfDocument,
+        page_num: usize,
+        resources: &Object,
+    ) -> Result<bool> {
+        if gs.stroke_pattern_name.is_none() || !self.is_pattern_space(&gs.stroke_color_space) {
+            return Ok(false);
+        }
+        let Some(mut scratch) = Pixmap::new_like(pixmap) else {
+            return Ok(false);
+        };
+        let mut ink = tiny_skia::Paint::default();
+        ink.set_color(Color::BLACK);
+        ink.anti_alias = true;
+        guarded_stroke_path(&mut scratch, path, &ink, &crate::rendering::stroke_of(gs), transform, clip);
+        let coverage = tiny_skia::Mask::from_pixmap(scratch.as_ref(), tiny_skia::MaskType::Alpha);
+        let as_fill = Self::stroke_as_fill(gs);
+        self.fill_with_tiling_pattern(
+            pixmap,
+            PatternShape::Mask(&coverage),
+            base_transform,
+            None,
+            &as_fill,
+            doc,
+            page_num,
+            resources,
+        )
+    }
+    // ── end pdf_manipulator patch ──
+
+    fn fill_with_tiling_pattern(
+        &mut self,
+        pixmap: &mut Pixmap,
+        // ── pdf_manipulator patch: a tiling pattern paints through a shape, a path or a coverage mask ──
+        shape: PatternShape<'_>,
+        // ── end pdf_manipulator patch ──
+        base_transform: Transform,
         clip: Option<&tiny_skia::Mask>,
         gs: &GraphicsState,
         doc: &PdfDocument,
@@ -6024,6 +6272,14 @@ impl PageRenderer {
         // expressed in pattern space" — hence `base_transform` composed with
         // the pattern's own matrix, not the CTM at the fill.
         if pattern_type == 2 {
+            // A shading pattern reaches a mask through
+            // `paint_pattern_through_mask_from_resources`, which has the
+            // pattern's name and resources already.
+            // ── pdf_manipulator patch: a tiling pattern paints through a shape, a path or a coverage mask ──
+            let PatternShape::Path { path, fill_rule, path_transform } = shape else {
+                return Ok(false);
+            };
+            // ── end pdf_manipulator patch ──
             // The shape being filled becomes the clip, since the gradient's
             // own geometry is independent of it.
             // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
@@ -6127,9 +6383,7 @@ impl PageRenderer {
         if u64::from(cw) * u64::from(ch) * 4 > crate::rendering::band::BAND_BUDGET_BYTES as u64 {
             return self.fill_with_tiles(
                 pixmap,
-                path,
-                path_transform,
-                fill_rule,
+                shape,
                 clip,
                 gs,
                 doc,
@@ -6242,28 +6496,10 @@ impl PageRenderer {
         let avg_color =
             tiny_skia::Color::from_rgba8(unpremul(sr), unpremul(sg), unpremul(sb), avg_a);
 
-        // Device-space region to cover: the fill path's bounds mapped through
-        // `path_transform`, clamped to the pixmap.
-        let b = path.bounds();
-        let pm = |x: f32, y: f32| -> (f32, f32) {
-            (
-                x * path_transform.sx + y * path_transform.kx + path_transform.tx,
-                x * path_transform.ky + y * path_transform.sy + path_transform.ty,
-            )
-        };
-        let pcorners = [
-            pm(b.left(), b.top()),
-            pm(b.right(), b.top()),
-            pm(b.right(), b.bottom()),
-            pm(b.left(), b.bottom()),
-        ];
-        let (mut rx0, mut ry0, mut rx1, mut ry1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for (x, y) in pcorners {
-            rx0 = rx0.min(x);
-            ry0 = ry0.min(y);
-            rx1 = rx1.max(x);
-            ry1 = ry1.max(y);
-        }
+        // Device-space region to cover: the shape's bounds, clamped to the pixmap.
+        // ── pdf_manipulator patch: a tiling pattern paints through a shape, a path or a coverage mask ──
+        let (mut rx0, mut ry0, mut rx1, mut ry1) = shape.device_extent();
+        // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: the pattern fills the part of the page the pixmap shows ──
         let window = Window::of(pixmap).rect();
         let (left, top, right, bottom) = window.map_or((0.0, 0.0, 0.0, 0.0), |r| {
@@ -6286,7 +6522,9 @@ impl PageRenderer {
         let flood = |pixmap: &mut Pixmap| {
             let mut p = base_paint.clone();
             p.set_color(avg_color);
-            guarded_fill_path(pixmap, path, &p, fill_rule, path_transform, clip);
+            // ── pdf_manipulator patch: a tiling pattern paints through a shape, a path or a coverage mask ──
+            shape.flood(pixmap, &p, clip);
+            // ── end pdf_manipulator patch ──
         };
         if !axis_aligned
             || x_step.abs() <= f32::EPSILON
@@ -6306,23 +6544,17 @@ impl PageRenderer {
             return Ok(true);
         }
 
-        // Build the fill-region mask (path coverage ∩ active clip) once and
+        // Build the fill-region mask (shape coverage ∩ active clip) once and
         // blit the cell into every lattice position under it.
-        // ── pdf_manipulator patch: a pixmap made like the band shows the same part of the page ──
-        let mut mask = match tiny_skia::Mask::new_like(pixmap) {
-        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: a tiling pattern paints through a shape, a path or a coverage mask ──
+        let mask = match shape.region(pixmap, clip) {
             Some(m) => m,
             None => {
                 flood(pixmap);
                 return Ok(true);
             },
         };
-        guarded_mask_fill_path(&mut mask, path, fill_rule, true, path_transform);
-        if let Some(c) = clip {
-            for (mv, cv) in mask.data_mut().iter_mut().zip(c.data().iter()) {
-                *mv = (*mv).min(*cv);
-            }
-        }
+        // ── end pdf_manipulator patch ──
 
         let blit = PixmapPaint {
             opacity: gs.fill_alpha.clamp(0.0, 1.0),
@@ -10986,6 +11218,96 @@ fn type3_charproc(doc: &PdfDocument, obj: &Object) -> Option<(Object, Option<Obj
         return matches!(resolved, Object::Stream { .. }).then_some((resolved, Some(obj_ref)));
     }
     matches!(obj, Object::Stream { .. }).then(|| (obj.clone(), None))
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: a tiling pattern paints through any shape, a path or a coverage mask ──
+/// What a tiling pattern is painted through: a path filled under its
+/// transform, or a coverage already rasterised (a stroke's, a glyph's). The
+/// one tiling painter serves both, so a stroke and text never carry a second
+/// copy of it.
+#[derive(Clone, Copy)]
+enum PatternShape<'a> {
+    Path {
+        path: &'a tiny_skia::Path,
+        fill_rule: tiny_skia::FillRule,
+        path_transform: Transform,
+    },
+    /// Coverage in the pixmap's own pixels, the clip already applied.
+    Mask(&'a tiny_skia::Mask),
+}
+
+impl PatternShape<'_> {
+    /// The shape's coverage within `clip`, as a mask of `pixmap`'s size.
+    fn region(&self, pixmap: &Pixmap, clip: Option<&tiny_skia::Mask>) -> Option<tiny_skia::Mask> {
+        let mut region = match *self {
+            Self::Path { path, fill_rule, path_transform } => {
+                let mut region = tiny_skia::Mask::new_like(pixmap)?;
+                guarded_mask_fill_path(&mut region, path, fill_rule, true, path_transform);
+                region
+            },
+            Self::Mask(mask) => mask.clone(),
+        };
+        if let Some(c) = clip {
+            for (mv, cv) in region.data_mut().iter_mut().zip(c.data().iter()) {
+                *mv = (*mv).min(*cv);
+            }
+        }
+        Some(region)
+    }
+
+    /// The device bounds of the shape; none for a mask, which has no
+    /// geometry but its pixels.
+    fn bounds(&self) -> Option<[f64; 4]> {
+        match *self {
+            Self::Path { path, path_transform, .. } => super::device_bounds(path, path_transform),
+            Self::Mask(_) => Some([f64::MIN, f64::MIN, f64::MAX, f64::MAX]),
+        }
+    }
+
+    /// The same bounds as corner coordinates, for the window to clamp.
+    fn device_extent(&self) -> (f32, f32, f32, f32) {
+        match *self {
+            Self::Path { path, path_transform, .. } => {
+                let b = path.bounds();
+                let pm = |x: f32, y: f32| -> (f32, f32) {
+                    (
+                        x * path_transform.sx + y * path_transform.kx + path_transform.tx,
+                        x * path_transform.ky + y * path_transform.sy + path_transform.ty,
+                    )
+                };
+                let corners = [
+                    pm(b.left(), b.top()),
+                    pm(b.right(), b.top()),
+                    pm(b.right(), b.bottom()),
+                    pm(b.left(), b.bottom()),
+                ];
+                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for (x, y) in corners {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+                (x0, y0, x1, y1)
+            },
+            Self::Mask(_) => (f32::MIN, f32::MIN, f32::MAX, f32::MAX),
+        }
+    }
+
+    /// Paints the shape in one flat `paint`.
+    fn flood(&self, pixmap: &mut Pixmap, paint: &tiny_skia::Paint<'_>, clip: Option<&tiny_skia::Mask>) {
+        match *self {
+            Self::Path { path, fill_rule, path_transform } => {
+                guarded_fill_path(pixmap, path, paint, fill_rule, path_transform, clip);
+            },
+            Self::Mask(_) => {
+                if let (Some(region), Some(rect)) = (self.region(pixmap, clip), Window::of(pixmap).rect()) {
+                    pixmap.fill_rect(rect, paint, Transform::identity(), Some(&region));
+                }
+            },
+        }
+    }
 }
 // ── end pdf_manipulator patch ──
 

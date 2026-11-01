@@ -39,6 +39,8 @@ mod kept_encryption;
 mod legacy_decoders;
 mod lzw;
 mod page_operators;
+#[cfg(feature = "rendering")]
+mod pattern_paint;
 mod redact_pass;
 mod redact_path_ink;
 mod redact_paths;

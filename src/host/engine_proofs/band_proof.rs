@@ -728,6 +728,16 @@ fn bands_equal_the_whole_canvas_on_text_and_clips() {
     }
 }
 
+/// A stroke and text painted with a tiling pattern are the same pixels in
+/// every cut. No Dart battery sees it: the band height is an internal knob no
+/// API sets.
+#[test]
+fn bands_equal_the_whole_canvas_on_strokes_and_text_painted_with_a_pattern() {
+    for fixture in &super::pattern_paint::fixtures() {
+        prove(fixture);
+    }
+}
+
 /// No Dart battery sees it: the band height is an internal knob no API sets.
 #[test]
 fn bands_equal_the_whole_canvas_on_shadings() {

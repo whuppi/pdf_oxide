@@ -11,6 +11,9 @@
 //! - Renders text using harfrust for shaping and tiny-skia for drawing glyph paths
 
 use super::{create_fill_paint, guarded_fill_path};
+// ── pdf_manipulator patch: a stroke-coverage render strokes the outline ──
+use super::{guarded_stroke_path, stroke_of};
+// ── end pdf_manipulator patch ──
 use crate::content::operators::TextElement;
 use crate::content::GraphicsState;
 use crate::document::PdfDocument;
@@ -427,6 +430,36 @@ pub struct TextRasterizer {
     /// (#991 asked for once per font).
     warned_fonts: std::sync::Mutex<std::collections::HashSet<String>>,
 }
+
+// ── pdf_manipulator patch: a stroke-coverage render strokes the outline ──
+/// Paints one glyph outline: filled, or under `stroke_glyph_outlines` stroked
+/// with `line_width`, which is in user space while the outline is in glyph
+/// units, so it is divided by the scale from glyph units to user space
+/// (`scale` of the font size and the text matrix's). A dash is not carried.
+fn paint_glyph(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    paint: &tiny_skia::Paint<'_>,
+    transform: Transform,
+    clip_mask: Option<&tiny_skia::Mask>,
+    gs: &GraphicsState,
+    scale: f32,
+) {
+    if !gs.stroke_glyph_outlines {
+        guarded_fill_path(pixmap, path, paint, tiny_skia::FillRule::Winding, transform, clip_mask);
+        return;
+    }
+    let tm = &gs.text_matrix;
+    let to_user = scale * (tm.a * tm.d - tm.b * tm.c).abs().sqrt();
+    if !(to_user.is_finite() && to_user > 0.0) {
+        return;
+    }
+    let mut stroke = stroke_of(gs);
+    stroke.width = gs.line_width / to_user;
+    stroke.dash = None;
+    guarded_stroke_path(pixmap, path, paint, &stroke, transform, clip_mask);
+}
+// ── end pdf_manipulator patch ──
 
 impl TextRasterizer {
     /// Create a new text rasterizer using the cached system font database.
@@ -1399,14 +1432,9 @@ impl TextRasterizer {
                     let glyph_transform =
                         combined_base.pre_translate(px, py).pre_scale(scale, scale);
 
-                    guarded_fill_path(
-                        pixmap,
-                        &path,
-                        paint,
-                        tiny_skia::FillRule::Winding,
-                        glyph_transform,
-                        clip_mask,
-                    );
+                    // ── pdf_manipulator patch: a stroke-coverage render strokes the outline ──
+                    paint_glyph(pixmap, &path, paint, glyph_transform, clip_mask, gs, scale);
+                    // ── end pdf_manipulator patch ──
                 }
             } else {
                 // FALLBACK PATH: If primary font fails, use the cluster offset to find the original character
@@ -1475,14 +1503,17 @@ impl TextRasterizer {
                                     let cjk_transform = combined_base
                                         .pre_translate(px, py)
                                         .pre_scale(cjk_scale, cjk_scale);
-                                    guarded_fill_path(
+                                    // ── pdf_manipulator patch: a stroke-coverage render strokes the outline ──
+                                    paint_glyph(
                                         pixmap,
                                         &cjk_path,
                                         paint,
-                                        tiny_skia::FillRule::Winding,
                                         cjk_transform,
                                         clip_mask,
+                                        gs,
+                                        cjk_scale,
                                     );
+                                    // ── end pdf_manipulator patch ──
                                     has_outline = true;
 
                                     if let Some(adv) =
@@ -1694,14 +1725,9 @@ impl TextRasterizer {
                             let py = y_cursor + paint_origin_dy + rise_y;
                             let glyph_transform =
                                 combined_base.pre_translate(px, py).pre_scale(scale, scale);
-                            guarded_fill_path(
-                                pixmap,
-                                &path,
-                                paint,
-                                tiny_skia::FillRule::Winding,
-                                glyph_transform,
-                                clip_mask,
-                            );
+                            // ── pdf_manipulator patch: a stroke-coverage render strokes the outline ──
+                            paint_glyph(pixmap, &path, paint, glyph_transform, clip_mask, gs, scale);
+                            // ── end pdf_manipulator patch ──
                         }
                     }
                 }
@@ -1880,14 +1906,9 @@ impl TextRasterizer {
                         let py = y_cursor + paint_origin_dy + rise_y;
                         let glyph_transform =
                             combined_base.pre_translate(px, py).pre_scale(scale, scale);
-                        guarded_fill_path(
-                            pixmap,
-                            &path,
-                            paint,
-                            tiny_skia::FillRule::Winding,
-                            glyph_transform,
-                            clip_mask,
-                        );
+                        // ── pdf_manipulator patch: a stroke-coverage render strokes the outline ──
+                        paint_glyph(pixmap, &path, paint, glyph_transform, clip_mask, gs, scale);
+                        // ── end pdf_manipulator patch ──
                         glyphs_painted += 1;
                     }
                 }
