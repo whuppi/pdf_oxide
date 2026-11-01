@@ -19,6 +19,8 @@ mod editor_objstm;
 mod editor_orphans;
 mod editor_packed;
 mod editor_trailer;
+#[cfg(feature = "rendering")]
+mod ext_gstate_lines;
 mod filter_readers;
 #[cfg(feature = "rendering")]
 mod extract_proof;

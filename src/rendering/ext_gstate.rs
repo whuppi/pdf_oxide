@@ -42,6 +42,18 @@ pub(crate) struct ParsedExtGState {
     /// spec `/None` value (clear). `Some(SoftMaskValue::Form(..))` is a
     /// Form-XObject mask.
     pub(crate) smask: Option<SoftMaskValue>,
+    // ── pdf_manipulator patch: ExtGState line parameters (Table 58) the `gs` operator must apply ──
+    /// Line width (ExtGState `/LW`).
+    pub(crate) line_width: Option<f32>,
+    /// Line cap style (ExtGState `/LC`), stored as the `J` operator stores it.
+    pub(crate) line_cap: Option<u8>,
+    /// Line join style (ExtGState `/LJ`), stored as the `j` operator stores it.
+    pub(crate) line_join: Option<u8>,
+    /// Miter limit (ExtGState `/ML`).
+    pub(crate) miter_limit: Option<f32>,
+    /// Dash array and phase (ExtGState `/D`), stored as the `d` operator stores it.
+    pub(crate) dash_pattern: Option<(Vec<f32>, f32)>,
+    // ── end pdf_manipulator patch ──
 }
 
 impl ParsedExtGState {
@@ -66,6 +78,23 @@ impl ParsedExtGState {
         if let Some(v) = self.overprint_mode {
             gs.overprint_mode = v;
         }
+        // ── pdf_manipulator patch: apply the ExtGState line parameters ──
+        if let Some(v) = self.line_width {
+            gs.line_width = v;
+        }
+        if let Some(v) = self.line_cap {
+            gs.line_cap = v;
+        }
+        if let Some(v) = self.line_join {
+            gs.line_join = v;
+        }
+        if let Some(v) = self.miter_limit {
+            gs.miter_limit = v;
+        }
+        if let Some(ref v) = self.dash_pattern {
+            gs.dash_pattern = v.clone();
+        }
+        // ── end pdf_manipulator patch ──
         if let Some(ref sm) = self.smask {
             match sm {
                 SoftMaskValue::None => {
@@ -154,6 +183,34 @@ pub(crate) fn parse_ext_g_state_inner(
         // accidentally enable nonzero-overprint mode.
         out.overprint_mode = Some(if opm == 1 { 1 } else { 0 });
     }
+
+    // ── pdf_manipulator patch: parse /LW /LC /LJ /ML /D, accepting what the w J j M d operators accept ──
+    let number = |obj: &Object| -> Option<f32> {
+        obj.as_real()
+            .map(|v| v as f32)
+            .or_else(|| obj.as_integer().map(|v| v as f32))
+    };
+    out.line_width = read("LW").and_then(|v| number(&v));
+    out.line_cap = read("LC").and_then(|v| v.as_integer()).map(|v| v as u8);
+    out.line_join = read("LJ").and_then(|v| v.as_integer()).map(|v| v as u8);
+    out.miter_limit = read("ML").and_then(|v| number(&v));
+    // `/D [[array] phase]`: the array's elements and the phase may each be indirect.
+    if let Some(Object::Array(d)) = read("D") {
+        if let Some(Object::Array(arr)) = d.first().and_then(|o| doc.resolve_object(o).ok()) {
+            let array = arr
+                .iter()
+                .filter_map(|o| doc.resolve_object(o).ok())
+                .filter_map(|o| number(&o))
+                .collect();
+            let phase = d
+                .get(1)
+                .and_then(|o| doc.resolve_object(o).ok())
+                .and_then(|o| number(&o))
+                .unwrap_or(0.0);
+            out.dash_pattern = Some((array, phase));
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     // ISO 32000-1:2008 §11.4.7 / Table 144. `/SMask` is either the
     // name `/None` (clear the current soft mask) or a soft-mask
