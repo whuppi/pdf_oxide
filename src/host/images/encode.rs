@@ -95,7 +95,7 @@ fn residual_score(row: &[u8]) -> u64 {
 
 /// Picks the PNG filter with the smallest residual sum for one row and
 /// writes filter byte + filtered row into `out`.
-fn best_filtered_row(row: &[u8], prior: &[u8], bpp: usize, out: &mut Vec<u8>) {
+pub(crate) fn best_filtered_row(row: &[u8], prior: &[u8], bpp: usize, out: &mut Vec<u8>) {
     let mut candidate = vec![0u8; row.len()];
     let mut best_filter = 0u8;
     let mut best_score = u64::MAX;
@@ -115,17 +115,18 @@ fn best_filtered_row(row: &[u8], prior: &[u8], bpp: usize, out: &mut Vec<u8>) {
 
 /// Flate with PNG predictors, 8 bits per component, rows pushed one at a
 /// time: what is held is the previous row and the compressed output.
-pub struct FlateRows {
-    zlib: ZlibEncoder<Vec<u8>>,
+pub struct FlateRows<W: Write = Vec<u8>> {
+    zlib: ZlibEncoder<W>,
     prior: Vec<u8>,
     filtered: Vec<u8>,
     channels: u8,
     width: u32,
 }
 
-impl FlateRows {
-    /// An encoder for rows of `width` pixels of `channels` 1, 3 or 4 samples.
-    pub fn new(width: u32, channels: u8) -> Result<Self> {
+impl<W: Write> FlateRows<W> {
+    /// An encoder whose compressed rows stream straight into `w`, so an
+    /// image being written is never held encoded whole.
+    pub fn to_writer(w: W, width: u32, channels: u8) -> Result<Self> {
         if !matches!(channels, 1 | 3 | 4) {
             return Err(Error::Image(format!(
                 "encode_flate_predicted: channels must be 1, 3 or 4, got {channels}"
@@ -135,7 +136,7 @@ impl FlateRows {
             return Err(Error::Image("encode_flate_predicted: width must be non-zero".to_string()));
         }
         Ok(Self {
-            zlib: ZlibEncoder::new(Vec::new(), Compression::best()),
+            zlib: ZlibEncoder::new(w, Compression::best()),
             prior: vec![0u8; width as usize * channels as usize],
             filtered: Vec::new(),
             channels,
@@ -160,17 +161,29 @@ impl FlateRows {
             .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib write failed: {e}")))
     }
 
+    /// Closes the stream and gives the writer back.
+    pub fn finish_writer(self) -> Result<W> {
+        self.zlib
+            .finish()
+            .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib finish failed: {e}")))
+    }
+}
+
+impl FlateRows<Vec<u8>> {
+    /// An encoder for rows of `width` pixels of `channels` 1, 3 or 4 samples.
+    pub fn new(width: u32, channels: u8) -> Result<Self> {
+        Self::to_writer(Vec::new(), width, channels)
+    }
+
     /// The finished stream.
     pub fn finish(self) -> Result<FlateEncoded> {
-        let bytes = self
-            .zlib
-            .finish()
-            .map_err(|e| Error::Image(format!("encode_flate_predicted: zlib finish failed: {e}")))?;
+        let (colors, columns) = (self.channels, self.width);
+        let bytes = self.finish_writer()?;
         Ok(FlateEncoded {
             bytes,
             predictor: 15,
-            colors: self.channels,
-            columns: self.width,
+            colors,
+            columns,
         })
     }
 }
@@ -357,10 +370,13 @@ impl CcittRows {
                 fax::Color::White
             }
         });
-        infallible(self.encoder.encode_line(pels, self.width));
-        Ok(())
+        self.encoder
+            .encode_line(pels, self.width)
+            .map_err(|e| Error::Image(format!("encode_ccitt_g4: line encode failed: {e:?}")))
     }
+}
 
+impl CcittRows {
     /// The finished stream.
     pub fn finish(self) -> Vec<u8> {
         infallible(self.encoder.finish()).finish()

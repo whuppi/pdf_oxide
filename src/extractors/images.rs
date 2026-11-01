@@ -1515,7 +1515,7 @@ pub fn extract_image_from_xobject_at(
 /// reads: a named space looked up in the page's colour-space map, an
 /// indirect entry loaded, and the second element of an array space (the ICC
 /// profile stream or the palette) loaded too.
-fn resolve_image_color_space(
+pub(crate) fn resolve_image_color_space(
     doc: Option<&crate::document::PdfDocument>,
     dict: &std::collections::HashMap<String, crate::object::Object>,
     color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,

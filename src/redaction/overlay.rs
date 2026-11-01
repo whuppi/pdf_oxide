@@ -41,11 +41,11 @@ fn num(v: f32) -> String {
     s
 }
 
-/// Resolve the overlay fill colour for a region per the precedence
-/// above: explicit region `fill` (the `/IC`) wins; otherwise the
-/// configured default *iff* `draw_overlay_when_no_ic`. `None` ⇒ draw no
-/// overlay (caller still removed the content; the area is just blank).
-fn resolved_fill(region: &RedactionRegion, opts: &RedactionOptions) -> Option<[f32; 3]> {
+/// Resolve the overlay fill colour for a region per the precedence above:
+/// explicit region `fill` (the `/IC`) wins; otherwise the configured default
+/// *iff* `draw_overlay_when_no_ic`. `None` ⇒ draw no overlay (caller still
+/// removed the content; the area is just blank).
+pub(crate) fn resolved_fill(region: &RedactionRegion, opts: &RedactionOptions) -> Option<[f32; 3]> {
     match region.fill {
         Some(c) => Some(c),
         None if opts.draw_overlay_when_no_ic => Some(opts.default_fill),

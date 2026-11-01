@@ -1245,6 +1245,168 @@ impl StencilCursor {
         self.rows.retained_bytes() + reduced + std::mem::size_of::<StencilCursor>()
     }
 }
+/// Rows of an image in the sample terms the stream stores, for a redaction's
+/// copy: post-filter, post-decrypt, before `/Decode` maps them to colour, so
+/// the untouched pixels are the source's own bytes and the covered ones are
+/// written once at the source's depth.
+pub(crate) struct SampleRows {
+    height: u32,
+    /// Bytes one row spans: the samples packed as the copy re-encodes.
+    row_bytes: usize,
+    next: u32,
+    kind: SampleKind,
+}
+
+enum SampleKind {
+    /// A raw-sample stream read through its filters a row at a time; the
+    /// padding of a stream too short for its declared rows is zeroes.
+    Reader { reader: Box<dyn Read>, row: Vec<u8> },
+    /// The packed rows a JBIG2 decode keeps whole (the ruled exception:
+    /// d-122 composes the page bitmap before any row could leave it). Bits
+    /// are the samples, MSB first, padded to a byte.
+    Packed { packed: Vec<u8>, at: u32 },
+    /// A stencil or an explicit mask's sample bits a row at a time, off the
+    /// stencil row cursor (its raw, CCITT and JBIG2 kinds alike); one row
+    /// `width.div_ceil(8)` bytes.
+    Stencil { rows: ImageRows },
+    /// A codec raster or a fax image read as luma rows of the colour space's
+    /// own brightness, packed one bit a pixel into the copy's samples.
+    Luma { rows: ImageRows, gray: Vec<u8> },
+}
+
+impl SampleRows {
+    /// Opens the stored-sample rows of the image `xobject`; `color_spaces`
+    /// resolves the named colour spaces the dictionary refers to, exactly as
+    /// the row cursor the renderer opens does.
+    pub(crate) fn open(
+        doc: &crate::document::PdfDocument,
+        xobject: &Object,
+        color_spaces: &HashMap<String, Object>,
+    ) -> Result<Self> {
+        let Object::Stream { dict, body } = xobject else {
+            return Err(Error::Image("XObject is not a stream".to_string()));
+        };
+        let filters = dict
+            .get("Filter")
+            .map(crate::object::extract_filter_names)
+            .unwrap_or_default();
+        let height_row = |h: u32, row_bytes: usize, kind: SampleKind| {
+            Ok(Self { height: h, row_bytes, next: 0, kind })
+        };
+        if matches!(dict.get("ImageMask"), Some(Object::Boolean(true))) {
+            let rows = ImageRows::open_stencil(doc, xobject)?;
+            let (w, h) = rows.size();
+            return height_row(h, (w as usize).div_ceil(8), SampleKind::Stencil { rows });
+        }
+        let filters_now = filters.as_slice();
+        if is_filter(filters_now, &["JBIG2Decode"]) {
+            let geometry = row_geometry(Some(doc), dict, Some(color_spaces))?;
+            let packed = crate::extractors::images::decode_jbig2_bits(
+                xobject,
+                dict,
+                Some(doc),
+                geometry.width,
+                geometry.height,
+                true,
+            )?;
+            return height_row(
+                geometry.height,
+                (geometry.width as usize).div_ceil(8),
+                SampleKind::Packed { packed, at: 0 },
+            );
+        }
+        if is_filter(filters_now, &["CCITTFaxDecode"]) {
+            let rows = ImageRows::open(doc, xobject, color_spaces, None, Output::Luma, None)?;
+            let (w, h) = rows.size();
+            return height_row(
+                h,
+                (w as usize).div_ceil(8),
+                SampleKind::Luma { rows, gray: vec![0; w as usize] },
+            );
+        }
+        if is_filter(filters_now, &["DCTDecode", "JPXDecode"]) {
+            return Err(Error::Image(
+                "a DCT or JPX image's redaction copy is piped from its raster, never held rows"
+                    .to_string(),
+            ));
+        }
+        // Raw-sample: the filters (predictor included) are the rows.
+        let geometry = row_geometry(Some(doc), dict, Some(color_spaces))?;
+        height_row(
+            geometry.height,
+            geometry.row_bytes,
+            SampleKind::Reader {
+                reader: Strips::open_reader(dict, body, None)?,
+                row: Vec::new(),
+            },
+        )
+    }
+
+    /// Bytes one row spans.
+    pub(crate) fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// The next row into `out`, `row_bytes` bytes of packed samples: the
+    /// source's own stored samples for a raw, JBIG2 or stencil source
+    /// (before its `/Decode` maps them to colour), and the colour space's
+    /// brightness at one bit for a codec or fax source.
+    pub(crate) fn read(
+        &mut self,
+        doc: &crate::document::PdfDocument,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let y = self.next;
+        if y >= self.height {
+            return Err(Error::Image("image has no more rows".to_string()));
+        }
+        match &mut self.kind {
+            SampleKind::Reader { reader, row } => {
+                if row.len() != self.row_bytes {
+                    row.clear();
+                    row.resize(self.row_bytes, 0);
+                }
+                let mut filled = 0;
+                while filled < self.row_bytes {
+                    match reader.read(&mut row[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+                        Err(e) => return Err(crate::encryption::stream::from_io(e)),
+                    }
+                }
+                row[filled..].fill(0);
+                out.copy_from_slice(row);
+            },
+            SampleKind::Packed { packed, at } => {
+                let start = *at as usize * self.row_bytes;
+                let end = start + self.row_bytes;
+                if end > packed.len() {
+                    return Err(Error::Image("packed rows end early".to_string()));
+                }
+                out.copy_from_slice(&packed[start..end]);
+                *at += 1;
+            },
+            SampleKind::Stencil { rows } => rows.read_samples(out)?,
+            SampleKind::Luma { rows, gray } => {
+                rows.read(doc, gray)?;
+                // One luma byte a pixel, packed MSB-first one bit a sample.
+                for (x, &luma) in gray.iter().enumerate() {
+                    let mask = 1u8 << (7 - (x % 8));
+                    let Some(b) = out.get_mut(x / 8) else { break };
+                    if luma >= 128 {
+                        *b |= mask;
+                    } else {
+                        *b &= !mask;
+                    }
+                }
+            },
+        }
+        self.next += 1;
+        Ok(())
+    }
+}
+
 /// nearest-neighbour onto the base image's grid (§8.9.6.3 maps both to the
 /// same unit square, so they need not share a resolution).
 struct MaskRows {
@@ -1336,8 +1498,8 @@ impl ImageCursor {
         let base = ImageRows::open(doc, xobject, color_spaces, target, Output::Rgba, colour_key)?;
         let mut masks = Vec::new();
 
-        // /Mask: a stencil or gray image, "1 = opaque" after the image's own
-        // /Decode (§8.9.6.3).
+        // /Mask: an image mask, where sample 0 shows the base image under the
+        // default /Decode (§8.9.6.3).
         if let Some(reference) = mask.and_then(|m| m.as_reference()) {
             if let Ok(stream) = doc.load_object(reference) {
                 match ImageRows::open(doc, &stream, color_spaces, target, Output::Luma, None) {

@@ -37,6 +37,8 @@ mod lzw;
 mod page_operators;
 mod redact_pass;
 #[cfg(feature = "rendering")]
+mod redact_image_save;
+#[cfg(feature = "rendering")]
 mod redact_save;
 #[cfg(feature = "rendering")]
 mod render_gaps;

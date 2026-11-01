@@ -296,6 +296,13 @@ impl<'a> TextPass<'a> {
         &self.result
     }
 
+    /// The composed CTM at the position the pass has read to, the frame the
+    /// text engine tracks for its glyph boxes; an image `Do` at the same
+    /// position is classified against the same matrix.
+    pub fn ctm(&self) -> crate::content::graphics_state::Matrix {
+        self.stack.current().ctm
+    }
+
     /// Appends the rewritten form of `op` to `out`.
     ///
     /// Non-text operators pass through unchanged; the graphics-state CTM and

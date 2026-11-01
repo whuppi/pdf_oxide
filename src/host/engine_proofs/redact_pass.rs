@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 use crate::host::content::{Mode, Operators};
 use crate::redaction::text_engine::FontMetrics;
-use crate::redaction::transform::RedactPass;
+use crate::redaction::transform::{ImageResources, RedactPass};
 use crate::redaction::{RedactionOptions, RedactionRegion, RedactionReport, RegionSet};
 
 /// Fixed-pitch stub: every code is 500/1000 em wide, simple one-byte.
@@ -52,9 +52,10 @@ fn redact(
     fonts: &dyn FontMetrics,
 ) -> Result<(Vec<u8>, RedactionReport)> {
     let mut out = Vec::new();
-    let report =
-        RedactPass::new(regions, opts, fonts).run(Operators::new(content, Mode::Full), &mut out)?;
-    Ok((out, report))
+    let images = ImageResources::none();
+    let outcome = RedactPass::new(regions, opts, fonts, &images)
+        .run(Operators::new(content, Mode::Full), &mut out)?;
+    Ok((out, outcome.report))
 }
 
 const SECRET_DOC: &[u8] = b"BT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";

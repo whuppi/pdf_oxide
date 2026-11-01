@@ -9,6 +9,9 @@ use crate::elements::{ContentElement, StructureElement};
 use crate::error::{Error, Result};
 use crate::extractors::HierarchicalExtractor;
 use crate::geometry::Rect;
+// ── pdf_manipulator patch: an image's redaction copy comes from the row writers ──
+use crate::host::images::redact_copy;
+// ── end pdf_manipulator patch ──
 use crate::object::{Object, ObjectRef};
 // ── pdf_manipulator patch: stream bodies are StreamBody ──
 use crate::object::StreamBody;
@@ -511,21 +514,40 @@ pub trait EditableDocument {
     fn save_with_options(&mut self, path: impl AsRef<Path>, options: SaveOptions) -> Result<()>;
 }
 
-/// PDF document editor.
-///
 // ── pdf_manipulator patch: a page a destructive redaction rewrites on save ──
-/// A page a destructive redaction rewrites on save: the regions and options
-/// its call-time pass ran with, the glyph widths of its fonts, the report that
-/// pass produced and the annotations the redaction drops.
+/// A page a destructive redaction rewrites on save.
 struct RedactedPage {
     regions: crate::redaction::RegionSet,
     opts: crate::redaction::RedactionOptions,
     fonts: crate::redaction::FontInfoMetrics,
     report: crate::redaction::RedactionReport,
     dropped_annots: std::collections::HashSet<u32>,
+    /// One per overwritten placement, in pass order: the source XObject, its
+    /// covered u/v rect and the fill regions under it. The save writes each
+    /// as its own stream and its /SMask-or-/Mask copy, never the source's
+    /// pixels redacted twice.
+    placements: Vec<crate::host::images::redact_copy::ImagePlacement>,
+    /// The sources whose pixels the page dropped or rewrote.
+    image_originals: Vec<u32>,
+    /// The /XObject names the page's surviving `Do`s still name.
+    kept_xobject_names: std::collections::HashSet<String>,
 }
 // ── end pdf_manipulator patch ──
 
+// ── pdf_manipulator patch: the ids one queued image copy is written under ──
+/// The new object ids one image copy is written from: its stream and its
+/// /Length, and the copies its `/SMask` or `/Mask` stencil stream takes
+/// (written in step, after the page's content, the same u/v rect mapping).
+#[derive(Default)]
+struct RedactionCopyIds {
+    image: (u32, u32),
+    smask: Option<(u32, u32)>,
+    mask: Option<(u32, u32)>,
+}
+// ── end pdf_manipulator patch ──
+
+/// PDF document editor.
+///
 /// Provides a high-level interface for modifying PDF documents.
 /// Changes are tracked and can be saved either as incremental updates
 /// or as a complete rewrite.
@@ -588,6 +610,13 @@ pub struct DocumentEditor {
     /// (#231; reachability alone is insufficient because the page is only
     /// repointed transiently during the write).
     redacted_orphan_ids: std::collections::HashSet<u32>,
+    // ── pdf_manipulator patch: the sources redaction overwrote or dropped ──
+    /// The source image XObjects redaction overwrote or dropped: an original
+    /// is written only when something else still references it (a page the
+    /// redaction did not touch, resources another kept page shares), with
+    /// garbage collection on and off.
+    redacted_image_originals: std::collections::HashSet<u32>,
+    // ── end pdf_manipulator patch ──
     /// Image modifications per page: page_index -> (image_name -> modification)
     image_modifications: HashMap<usize, HashMap<String, ImageModification>>,
     /// Pages where form fields should be flattened
@@ -634,7 +663,7 @@ pub struct DocumentEditor {
 /// with the set of ids they hold. `push` is the only way to add an entry
 /// (an inherent method shadows `Vec::push` reached through `DerefMut`), so
 /// `contains_id` is exact at every point without rebuilding the set.
-struct XrefEntries {
+pub(crate) struct XrefEntries {
     entries: Vec<(u32, u64, u16, bool)>,
     ids: HashSet<u32>,
 }
@@ -644,7 +673,7 @@ impl XrefEntries {
         Self { entries: Vec::new(), ids: HashSet::new() }
     }
 
-    fn push(&mut self, entry: (u32, u64, u16, bool)) {
+    pub(crate) fn push(&mut self, entry: (u32, u64, u16, bool)) {
         self.ids.insert(entry.0);
         self.entries.push(entry);
     }
@@ -866,6 +895,9 @@ impl DocumentEditor {
             redacted_pages: HashMap::new(),
             // ── end pdf_manipulator patch ──
             redacted_orphan_ids: std::collections::HashSet::new(),
+            // ── pdf_manipulator patch: the sources redaction overwrote or dropped ──
+            redacted_image_originals: std::collections::HashSet::new(),
+            // ── end pdf_manipulator patch ──
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -919,6 +951,9 @@ impl DocumentEditor {
             redacted_pages: HashMap::new(),
             // ── end pdf_manipulator patch ──
             redacted_orphan_ids: std::collections::HashSet::new(),
+            // ── pdf_manipulator patch: the sources redaction overwrote or dropped ──
+            redacted_image_originals: std::collections::HashSet::new(),
+            // ── end pdf_manipulator patch ──
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -976,6 +1011,9 @@ impl DocumentEditor {
             redacted_pages: HashMap::new(),
             // ── end pdf_manipulator patch ──
             redacted_orphan_ids: std::collections::HashSet::new(),
+            // ── pdf_manipulator patch: the sources redaction overwrote or dropped ──
+            redacted_image_originals: std::collections::HashSet::new(),
+            // ── end pdf_manipulator patch ──
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -2886,6 +2924,13 @@ impl DocumentEditor {
         let mut seen = vec![false; max_id];
         let mut queue: Vec<u32> = Vec::with_capacity(256);
         let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
+        // The page object of each redacted page, by id: the walk reads it as
+        // the save writes it, not as the source has it.
+        let redacted_page_at: HashMap<u32, usize> = self
+            .redacted_pages
+            .keys()
+            .filter_map(|&src| self.source.get_page_ref(src).ok().map(|r| (r.id, src)))
+            .collect();
         // an object stream is drained before the walk leaves it
         // Ids whose objects sit in an object stream wait here by container;
         // the walk reads the members of one stream together, so the stream
@@ -2966,6 +3011,30 @@ impl DocumentEditor {
                 continue;
             }
             refs_buf.clear();
+            // A redacted page writes its own /Resources: a source image is
+            // reached only through a name a surviving `Do` still uses.
+            if let Some(&src) = redacted_page_at.get(&id) {
+                if let Some(page) = self.redacted_pages.get(&src) {
+                    if let Some(dict) = self
+                        .source
+                        .load_object(ObjectRef::new(id, 0))
+                        .ok()
+                        .as_ref()
+                        .and_then(|o| o.as_dict())
+                    {
+                        for (key, value) in dict {
+                            if key.as_str() != "Resources" && key.as_str() != "Contents" {
+                                push_refs(value, &mut refs_buf);
+                            }
+                        }
+                    }
+                    if let Ok(resources) = self.redacted_page_resources(src, page, &[]) {
+                        push_refs(&resources, &mut refs_buf);
+                    }
+                }
+                route(&refs_buf, &seen, &mut queue, &mut by_stream);
+                continue;
+            }
             // The references of an object the resource prune cuts are those
             // that are left.
             if let Some(cuts) = prune.cuts.get(&id) {
@@ -3511,20 +3580,21 @@ impl DocumentEditor {
         serializer.write_stream_open(&mut *writer, content_id, 0, &dict)?;
         let body_start = writer.position();
         let ops = source.page_operators(page_index)?;
+        let images = Self::page_image_resources(source, page_index)?;
         let run = |out: &mut dyn Write| {
-            Self::run_redaction_pass(&page.regions, &page.opts, &page.fonts, ops, deflate, out)
+            Self::run_redaction_pass(&page.regions, &page.opts, &page.fonts, &images, ops, deflate, out)
         };
-        let report = match handler {
+        let outcome = match handler {
             None => run(&mut *writer)?,
             Some(h) => {
                 let iv = crate::encryption::EncryptionWriteHandler::generate_iv()?;
                 let mut enc = h.stream_cipher(content_id, 0).encrypting(&mut *writer, iv)?;
-                let report = run(&mut enc)?;
+                let outcome = run(&mut enc)?;
                 enc.finish()?;
-                report
+                outcome
             },
         };
-        if report != page.report {
+        if outcome.report != page.report || outcome.placements != page.placements {
             return Err(Error::InvalidPdf(format!(
                 "the redaction of page {page_index} writes a different result on save than \
                  it recorded when it was queued"
@@ -3540,25 +3610,218 @@ impl DocumentEditor {
     }
 
     /// One run of the redaction pass over a page's operators into `out`,
-    /// deflated at `deflate` when given.
+    /// deflated at `deflate` when given, the page's image XObjects by name.
     fn run_redaction_pass<R: std::io::Read>(
         regions: &crate::redaction::RegionSet,
         opts: &crate::redaction::RedactionOptions,
         fonts: &crate::redaction::FontInfoMetrics,
+        images: &crate::redaction::transform::ImageResources,
         ops: crate::host::content::Operators<R>,
         deflate: Option<u32>,
         mut out: &mut dyn Write,
-    ) -> Result<crate::redaction::RedactionReport> {
-        let pass = crate::redaction::transform::RedactPass::new(regions, opts, fonts);
-        match deflate {
+    ) -> Result<crate::redaction::transform::PassOutcome> {
+        let pass = crate::redaction::transform::RedactPass::new(regions, opts, fonts, images);
+        let outcome = match deflate {
             Some(level) => {
                 let mut zlib = flate2::write::ZlibEncoder::new(out, flate2::Compression::new(level));
-                let report = pass.run(ops, &mut zlib)?;
+                let outcome = pass.run(ops, &mut zlib)?;
                 zlib.finish()?;
-                Ok(report)
+                outcome
             },
-            None => pass.run(ops, &mut out),
+            None => pass.run(ops, &mut out)?,
+        };
+        Ok(outcome)
+    }
+    // ── end pdf_manipulator patch ──
+
+    // ── pdf_manipulator patch: the image XObjects a page's redaction decides from ──
+    /// The image XObjects `page`'s own-and-inherited /Resources name, by their
+    /// resource name: only /Subtype /Image and /ImageMask true streams are
+    /// the entries; a form XObject (T6c's job) is no entry and its `Do`
+    /// passes through untouched.
+    fn page_image_resources(
+        source: &PdfDocument,
+        page: usize,
+    ) -> Result<crate::redaction::transform::ImageResources> {
+        use crate::redaction::transform::ImageResources;
+        let mut images = std::collections::HashMap::new();
+        // The resources a page inherits (ISO 32000-1 §7.7.3.4): its own, else
+        // the first ancestor's.
+        let page_ref = source.get_page_ref(page)?;
+        let mut node = Some(page_ref);
+        let mut resources = Object::Null;
+        let mut guard = 0;
+        while let Some(reference) = node {
+            guard += 1;
+            if guard > 64 {
+                break; // a cyclic /Parent chain: bail (fail closed)
+            }
+            let Some(obj) = source.load_object(reference).ok() else { break };
+            let Some(dict) = obj.as_dict() else { break };
+            if let Some(res) = dict.get("Resources") {
+                resources = source.resolve_object(res)?;
+                break;
+            }
+            node = dict.get("Parent").and_then(|p| p.as_reference());
         }
+        if let Some(res_dict) = resources.as_dict() {
+            let xobjects = match res_dict.get("XObject") {
+                Some(x) => source.resolve_object(x)?,
+                None => Object::Null,
+            };
+            if let Some(xdict) = xobjects.as_dict() {
+                for (name, value) in xdict {
+                    let Some(reference) = value.as_reference() else { continue };
+                    let Ok(obj) = source.load_object(reference) else { continue };
+                    let Some(dict) = obj.as_dict() else { continue };
+                    let is_image = dict.get("ImageMask").and_then(|o| o.as_bool()) == Some(true)
+                        || dict.get("Subtype").and_then(|o| o.as_name()) == Some("Image");
+                    if is_image {
+                        images.insert(name.clone(), reference);
+                    }
+                }
+            }
+        }
+        Ok(ImageResources { images })
+    }
+    // ── end pdf_manipulator patch ──
+
+    // ── pdf_manipulator patch: one queued copy, streamed through the save's chain ──
+    /// Writes one redacted copy of `source_ref` as stream `out_id`, its
+    /// /Length the object `length_id`. Thin wrapper over
+    /// [`crate::host::images::redact_copy::write_copy`]: the placement comes
+    /// from the pass, the save's deflate level and encryption apply.
+    #[allow(clippy::too_many_arguments)]
+    fn write_redacted_image_copy(
+        source: &PdfDocument,
+        source_ref: ObjectRef,
+        (out_id, length_id): (u32, u32),
+        u0: f32,
+        v0: f32,
+        u1: f32,
+        v1: f32,
+        fills: &[([f32; 4], [f32; 3])],
+        semantics: &redact_copy::CopySemantics,
+        color_spaces: &HashMap<String, Object>,
+        dict_edits: &HashMap<String, Object>,
+        cancel: &crate::cancel::CancelCheck,
+        writer: &mut impl crate::host::positioned_write::PositionedWrite,
+        serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
+        xref_entries: &mut XrefEntries,
+    ) -> Result<()> {
+        redact_copy::write_copy(
+            source,
+            source_ref,
+            out_id,
+            length_id,
+            u0,
+            v0,
+            u1,
+            v1,
+            fills,
+            semantics,
+            color_spaces,
+            dict_edits,
+            cancel,
+            writer,
+            serializer,
+            handler,
+            xref_entries,
+        )
+    }
+    // ── end pdf_manipulator patch ──
+
+    /// The /ColorSpace dictionary a page's own-and-inherited /Resources
+    /// names, for the row geometry a copy's source is read through.
+    fn page_colour_space_map(
+        source: &PdfDocument,
+        page_index: usize,
+    ) -> Result<HashMap<String, Object>> {
+        let page_ref = source.get_page_ref(page_index)?;
+        let mut node = Some(page_ref);
+        let mut resources = Object::Null;
+        let mut guard = 0;
+        while let Some(reference) = node {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(obj) = source.load_object(reference).ok() else {
+                break;
+            };
+            let Some(dict) = obj.as_dict() else { break };
+            if let Some(res) = dict.get("Resources") {
+                resources = source.resolve_object(res)?;
+                break;
+            }
+            node = dict.get("Parent").and_then(|p| p.as_reference());
+        }
+        let Ok(Some(colour_dict)) = resources
+            .as_dict()
+            .and_then(|d| d.get("ColorSpace"))
+            .map(|cs| source.resolve_object(cs))
+            .transpose()
+            .map(|o| o.map(|o| o.as_dict().cloned()))
+        else {
+            return Ok(HashMap::new());
+        };
+        Ok(colour_dict.unwrap_or_default())
+    }
+
+    // ── pdf_manipulator patch: the redacted page's own /Resources ──
+    /// The /Resources a redacted page carries: a copy of the resolved,
+    /// inherited dictionary where each copy name a placement queued points
+    /// at its copy and a source name stays only when an unredacted `Do` on
+    /// this page still names it. The source resources another page shares
+    /// are never edited — the redacted page's own dictionary is the edit.
+    fn redacted_page_resources(
+        &self,
+        page_index: usize,
+        page: &RedactedPage,
+        copies: &[RedactionCopyIds],
+    ) -> Result<Object> {
+        // The resources the page inherits (§7.7.3.4), resolved.
+        let page_ref = self.source.get_page_ref(page_index)?;
+        let mut node = Some(page_ref);
+        let mut resources = Object::Null;
+        let mut guard = 0;
+        while let Some(reference) = node {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(obj) = self.source.load_object(reference).ok() else {
+                break;
+            };
+            let Some(dict) = obj.as_dict() else { break };
+            if let Some(res) = dict.get("Resources") {
+                resources = self.source.resolve_object(res)?;
+                break;
+            }
+            node = dict.get("Parent").and_then(|p| p.as_reference());
+        }
+        let mut resources_dict = resources.as_dict().cloned().unwrap_or_default();
+        let source_xobjects = match resources_dict.get("XObject") {
+            Some(x) => self.source.resolve_object(x)?,
+            None => Object::Null,
+        };
+        let mut xobject_dict: HashMap<String, Object> =
+            source_xobjects.as_dict().cloned().unwrap_or_default();
+        // A source name stays only when a surviving `Do` names it.
+        xobject_dict.retain(|name, _| page.kept_xobject_names.contains(name));
+        // The copies, under the names the pass wrote.
+        for (placement, ids) in page.placements.iter().zip(copies) {
+            xobject_dict.insert(
+                placement.name.clone(),
+                Object::Reference(ObjectRef::new(ids.image.0, 0)),
+            );
+        }
+        resources_dict.insert(
+            "XObject".to_string(),
+            Object::Dictionary(xobject_dict),
+        );
+        Ok(Object::Dictionary(resources_dict))
     }
     // ── end pdf_manipulator patch ──
 
@@ -3625,6 +3888,8 @@ impl DocumentEditor {
             &self.modified_objects,
             &self.page_order,
             &dropped_annots,
+            // the image sources destructive redaction replaced
+            &self.redacted_image_originals,
         );
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: the merged pages and objects the save drops ──
@@ -4481,7 +4746,36 @@ impl DocumentEditor {
                                     } else {
                                         None
                                     };
+                                // ── end pdf_manipulator patch ──
 
+                                // ── pdf_manipulator patch: the ids each queued image copy is written under ──
+                                // One pair for the copy stream itself and one for its /SMask
+                                // (or /Mask stencil) stream, allocated with the rest of the
+                                // page's ids so the page's /Resources rebuild can name them.
+                                let placements: Vec<crate::host::images::redact_copy::ImagePlacement> =
+                                    self.redacted_pages
+                                        .get(&source_page_index)
+                                        .map(|page| page.placements.clone())
+                                        .unwrap_or_default();
+                                let mut redaction_copies: Vec<RedactionCopyIds> = Vec::new();
+                                for placement in &placements {
+                                    let source_dict = self
+                                        .source
+                                        .load_object(placement.source)?
+                                        .as_dict()
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let has_smask = source_dict.get("SMask").and_then(|o| o.as_reference()).is_some();
+                                    let has_mask = source_dict.get("Mask").and_then(|o| o.as_reference()).is_some();
+                                    let image = (self.allocate_object_id(), self.allocate_object_id());
+                                    let smask = has_smask
+                                        .then(|| (self.allocate_object_id(), self.allocate_object_id()));
+                                    let mask = has_mask
+                                        .then(|| (self.allocate_object_id(), self.allocate_object_id()));
+                                    redaction_copies.push(RedactionCopyIds { image, smask, mask });
+                                }
+                                // ── end pdf_manipulator patch ──
+                                // ── pdf_manipulator patch: the /Redact annotations of marks not yet applied ──
                                 // A queued mark that was not applied is saved as a /Redact
                                 // annotation (ISO 32000-1 §12.5.6.23) and the content is left
                                 // as it is. A redacted page writes no marks.
@@ -4921,6 +5215,24 @@ impl DocumentEditor {
                                         None => redacted_ref,
                                     };
                                     new_dict.insert("Contents".to_string(), contents_value);
+                                    // ── pdf_manipulator patch: the redacted page's own /Resources ──
+                                    // The copy names the pass queued point at their copies; a
+                                    // source name stays only when a surviving `Do` names it.
+                                    let redacted = self
+                                        .redacted_pages
+                                        .get(&source_page_index)
+                                        .ok_or_else(|| {
+                                            Error::InvalidPdf(
+                                                "a redacted page's recorded pass is missing".to_string(),
+                                            )
+                                        })?;
+                                    let resources = self.redacted_page_resources(
+                                        source_page_index,
+                                        redacted,
+                                        &redaction_copies,
+                                    )?;
+                                    new_dict.insert("Resources".to_string(), resources);
+                                    // ── end pdf_manipulator patch ──
                                     // ── pdf_manipulator patch: the redacted page's dropped annotations leave /Annots ──
                                     let dropped = self.redacted_pages[&source_page_index]
                                         .dropped_annots
@@ -5565,7 +5877,15 @@ impl DocumentEditor {
                                                 };
                                                 if let Some(xobj_dict) = xobject_dict {
                                                     // ── pdf_manipulator patch: key order, so the objects are written in a fixed order ──
-                                                    for (_, xobj_ref) in DocumentEditor::sorted_entries(&xobj_dict) {
+                                                    // A redacted page names only the source images its surviving `Do`s
+                                                    // still use: its other source names left with the copies.
+                                                    let kept_names = destructive_redaction
+                                                        .and(self.redacted_pages.get(&source_page_index))
+                                                        .map(|page| &page.kept_xobject_names);
+                                                    for (name, xobj_ref) in DocumentEditor::sorted_entries(&xobj_dict) {
+                                                        if kept_names.is_some_and(|kept| !kept.contains(name)) {
+                                                            continue;
+                                                        }
                                                     // ── end pdf_manipulator patch ──
                                                         if let Some(ref_obj) =
                                                             xobj_ref.as_reference()
@@ -6045,8 +6365,114 @@ impl DocumentEditor {
                                         deflate,
                                         &mut xref_entries,
                                     )?;
+                                    // ── end pdf_manipulator patch ──
+                                    // ── pdf_manipulator patch: the queued image copies, written after the page's content ──
+                                    // Each copy (and, in step, the copies its /SMask or /Mask
+                                    // stencil stream take) streams from the source's rows through
+                                    // the same deflate → encryption → output chain the content
+                                    // uses; nothing holds an encoded copy.
+                                    let colour_spaces =
+                                        Self::page_colour_space_map(&self.source, source_page_index)?;
+                                    for (placement, ids) in
+                                        page.placements.iter().zip(&redaction_copies)
+                                    {
+                                        let source = &self.source;
+                                        let source_dict = source
+                                            .load_object(placement.source)?
+                                            .as_dict()
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        // The mask copies' fill is the covered rect; the
+                                        // colour is unused, the semantics pick the sample.
+                                        let base_fills = [(placement.covered_rect(), [1.0, 1.0, 1.0])];
+                                        if let (Some((sid, slid)), Some(mask_ref)) =
+                                            (ids.smask, source_dict.get("SMask").and_then(|o| o.as_reference()))
+                                        {
+                                            // The /SMask's own copy: opaque in the covered rect,
+                                            // so the fill shows.
+                                            Self::write_redacted_image_copy(
+                                                source,
+                                                mask_ref,
+                                                (sid, slid),
+                                                placement.u0,
+                                                placement.v0,
+                                                placement.u1,
+                                                placement.v1,
+                                                &base_fills,
+                                                &redact_copy::CopySemantics::Opaque,
+                                                &colour_spaces,
+                                                &HashMap::new(),
+                                                cancel,
+                                                &mut *writer,
+                                                &serializer,
+                                                &encryption_handler,
+                                                &mut xref_entries,
+                                            )?;
+                                        }
+                                        if let (Some((mid, mlid)), Some(stream_ref)) =
+                                            (ids.mask, source_dict.get("Mask").and_then(|o| o.as_reference()))
+                                        {
+                                            // The /Mask stencil's copy: the covered rect maps
+                                            // to the samples the base image shows through.
+                                            Self::write_redacted_image_copy(
+                                                source,
+                                                stream_ref,
+                                                (mid, mlid),
+                                                placement.u0,
+                                                placement.v0,
+                                                placement.u1,
+                                                placement.v1,
+                                                &base_fills,
+                                                &redact_copy::CopySemantics::Base,
+                                                &colour_spaces,
+                                                &HashMap::new(),
+                                                cancel,
+                                                &mut *writer,
+                                                &serializer,
+                                                &encryption_handler,
+                                                &mut xref_entries,
+                                            )?;
+                                        }
+                                        // The image copy itself: the covered pixels take the
+                                        // regions' fill; the mask references, if the source
+                                        // carried any, name the new copies.
+                                        let dict_edits = {
+                                            let mut edits = HashMap::new();
+                                            if let Some((sid, _)) = ids.smask {
+                                                edits.insert(
+                                                    "SMask".to_string(),
+                                                    Object::Reference(ObjectRef::new(sid, 0)),
+                                                );
+                                            }
+                                            if let Some((mid, _)) = ids.mask {
+                                                edits.insert(
+                                                    "Mask".to_string(),
+                                                    Object::Reference(ObjectRef::new(mid, 0)),
+                                                );
+                                            }
+                                            edits
+                                        };
+                                        Self::write_redacted_image_copy(
+                                            source,
+                                            placement.source,
+                                            ids.image,
+                                            placement.u0,
+                                            placement.v0,
+                                            placement.u1,
+                                            placement.v1,
+                                            &placement.fills,
+                                            &redact_copy::CopySemantics::Overlay,
+                                            &colour_spaces,
+                                            &dict_edits,
+                                            cancel,
+                                            &mut *writer,
+                                            &serializer,
+                                            &encryption_handler,
+                                            &mut xref_entries,
+                                        )?;
+                                    }
+                                    // ── end pdf_manipulator patch ──
                                 }
-                                // ── end pdf_manipulator patch ──
 
                                 // Write form flatten XObjects and overlay if present
                                 if let Some((
@@ -6385,6 +6811,21 @@ impl DocumentEditor {
             self.dropped_only_ids(&prune)
         };
         // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: the reachability an original image a redaction replaced is judged by ──
+        // With garbage collection on the sweep's own reachable set answers;
+        // with it off the same walk runs once, over what the output already
+        // names, so a copy's original appears exactly when a kept page still
+        // quotes it.
+        let redact_reach = if !prune.redacted_image_originals.is_empty() && !options.garbage_collect {
+            Some(self.collect_reachable_ids(
+                &prune,
+                Some((&xref_entries, &serializer.written_references())),
+                &aliases,
+            ))
+        } else {
+            None
+        };
+        // ── end pdf_manipulator patch ──
 
         let all_source_ids = self.source.all_object_ids();
         for obj_id in all_source_ids {
@@ -6422,6 +6863,19 @@ impl DocumentEditor {
             // ── pdf_manipulator patch: dropped pages never written (#261) ──
             if prune.excluded.contains(&obj_id) || dropped_only.contains(&obj_id) {
                 continue;
+            }
+            // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: an original image a redaction replaced is written only when something else still references it ──
+            // Without garbage collection the walk's answer is taken by name.
+            // With it there is no walk to take, so the reachable-set check
+            // below decides alone.
+            if prune.redacted_image_originals.contains(&obj_id) {
+                let referenced_elsewhere = redact_reach
+                    .as_ref()
+                    .is_none_or(|interesting| interesting.contains(&obj_id));
+                if !referenced_elsewhere {
+                    continue;
+                }
             }
             // ── end pdf_manipulator patch ──
             if let Some(ref reachable) = reachable_ids {
@@ -9971,18 +10425,42 @@ impl DocumentEditor {
         // stream, a font whose glyphs cannot be pruned) is raised here, before
         // anything is recorded. The save runs the same pass and must agree.
         let fonts = self.build_page_font_metrics(src)?;
-        let pass_report = Self::run_redaction_pass(
+        let images = Self::page_image_resources(&self.source, src)?;
+        let outcome = Self::run_redaction_pass(
             rs,
             opts,
             &fonts,
+            &images,
             self.source.page_operators(src)?,
             None,
             &mut std::io::sink(),
         )?;
+        // Each queued copy's source is proved writable now: a source the row writers cannot read (a filter the engine does not
+        // decode, a colour space the copy cannot carry) refuses the redaction
+        // here, at the dry run: nothing is recorded and the save is never
+        // asked to fail halfway with a rejected copy.
+        let colour_spaces = Self::page_colour_space_map(&self.source, src)?;
+        // A placement's /SMask and /Mask stencil are copied too, so they are
+        // proved and their originals kept out of the output like the image's.
+        let mut mask_originals = Vec::new();
+        for placement in &outcome.placements {
+            redact_copy::validate_copy_source(&self.source, placement.source, &colour_spaces)?;
+            let dict = self.source.load_object(placement.source)?;
+            let dict = dict.as_dict().cloned().unwrap_or_default();
+            for key in ["SMask", "Mask"] {
+                if let Some(mask) = dict.get(key).and_then(|o| o.as_reference()) {
+                    redact_copy::validate_copy_source(&self.source, mask, &colour_spaces)?;
+                    mask_originals.push(mask.id);
+                }
+            }
+        }
+        for id in outcome.image_originals.iter().chain(&mask_originals) {
+            self.redacted_image_originals.insert(*id);
+        }
         let dropped_annots = self.redacted_annotations(src, rs, opts)?;
         let rep = crate::redaction::RedactionReport {
             annotations_removed: dropped_annots.len(),
-            ..pass_report
+            ..outcome.report.clone()
         };
         // Record the original /Contents object ids so the save path
         // hard-drops them — the removed content must not survive even
@@ -10012,8 +10490,11 @@ impl DocumentEditor {
                 regions: rs.clone(),
                 opts: *opts,
                 fonts,
-                report: pass_report,
+                report: outcome.report,
                 dropped_annots,
+                placements: outcome.placements,
+                image_originals: outcome.image_originals,
+                kept_xobject_names: outcome.kept_xobject_names,
             },
         );
         self.apply_redactions_pages.insert(src);
@@ -10130,6 +10611,8 @@ impl DocumentEditor {
                 &self.modified_objects,
                 &self.page_order,
                 &dropped_annots,
+                // the image sources destructive redaction replaced
+                &self.redacted_image_originals,
             ),
             None,
             &HashMap::new(),

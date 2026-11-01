@@ -172,7 +172,7 @@ struct Applied {
 
 /// What a row holds per pixel on its way to the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
+pub(crate) enum Shape {
     /// One byte, 0 or 255; resampling thresholds instead of blending.
     Bilevel,
     /// One byte.
@@ -184,7 +184,7 @@ enum Shape {
 }
 
 impl Shape {
-    fn channels(self) -> u8 {
+    pub(crate) fn channels(self) -> u8 {
         match self {
             Self::Bilevel | Self::Gray => 1,
             Self::Rgb => 3,
@@ -194,7 +194,7 @@ impl Shape {
 
     /// `raw`, one row of this shape, as the four lanes a pixel the resampler
     /// takes.
-    fn lanes(self, raw: &[u8], out: &mut [u8]) {
+    pub(crate) fn lanes(self, raw: &[u8], out: &mut [u8]) {
         match self {
             Self::Bilevel | Self::Gray => {
                 for (&g, px) in raw.iter().zip(out.chunks_exact_mut(4)) {
@@ -212,7 +212,7 @@ impl Shape {
     }
 
     /// The inverse of [`Self::lanes`] over resampled lanes.
-    fn pack(self, lanes: &[u8], out: &mut [u8]) {
+    pub(crate) fn pack(self, lanes: &[u8], out: &mut [u8]) {
         match self {
             Self::Bilevel => {
                 for (px, g) in lanes.chunks_exact(4).zip(out.iter_mut()) {
@@ -235,7 +235,7 @@ impl Shape {
 }
 
 /// Where an image's rows come from, in the shape the encoder is given.
-enum Source {
+pub(crate) enum Source {
     /// An image read as RGBA, its samples cut to the shape.
     Image { rows: ImageRows, shape: Shape, row: Vec<u8> },
     /// A gray mask read as luma; `invert` writes 0 where the stencil paints.
@@ -245,11 +245,12 @@ enum Source {
 }
 
 impl Source {
-    fn open(
+    pub(crate) fn open(
         doc: &PdfDocument,
         object: &Object,
         kind: &Kind,
         shape: Shape,
+        color_spaces: &HashMap<String, Object>,
         target: Option<(u32, u32)>,
     ) -> Result<Self> {
         if shape == Shape::Cmyk {
@@ -261,7 +262,7 @@ impl Source {
                 invert: true,
             });
         }
-        let rows = ImageRows::open(doc, object, &HashMap::new(), target, RowOutput::Rgba, None)?;
+        let rows = ImageRows::open(doc, object, color_spaces, target, RowOutput::Rgba, None)?;
         let (width, _) = rows.size();
         Ok(Self::Image {
             rows,
@@ -270,7 +271,7 @@ impl Source {
         })
     }
 
-    fn size(&self) -> (u32, u32) {
+    pub(crate) fn size(&self) -> (u32, u32) {
         match self {
             Self::Image { rows, .. } | Self::Luma { rows, .. } => rows.size(),
             Self::Cmyk(rows) => rows.size(),
@@ -278,7 +279,7 @@ impl Source {
     }
 
     /// The next row into `out`: `width * channels` bytes.
-    fn read(&mut self, doc: &PdfDocument, out: &mut [u8]) -> Result<()> {
+    pub(crate) fn read(&mut self, doc: &PdfDocument, out: &mut [u8]) -> Result<()> {
         match self {
             Self::Image { rows, shape, row } => {
                 rows.read(doc, row)?;
@@ -308,14 +309,14 @@ impl Source {
 }
 
 /// The samples of a CMYK image as stored, not converted to RGB.
-enum CmykRows {
+pub(crate) enum CmykRows {
     /// A JPEG's raster, which the codec returns whole.
     Raster { pixels: Vec<u8>, width: u32, height: u32, next: u32 },
     /// A raw-sample stream read through its filters a strip of rows at a time.
     Strips(CmykStrips),
 }
 
-struct CmykStrips {
+pub(crate) struct CmykStrips {
     /// The stream's dictionary without its filters, which `reader` applies.
     dict: HashMap<String, Object>,
     reader: Box<dyn Read>,
@@ -331,7 +332,7 @@ struct CmykStrips {
 }
 
 impl CmykRows {
-    fn open(doc: &PdfDocument, object: &Object, kind: &Kind) -> Result<Self> {
+    pub(crate) fn open(doc: &PdfDocument, object: &Object, kind: &Kind) -> Result<Self> {
         let Object::Stream { dict, body } = object else {
             return Err(Error::Image("image XObject is not a stream".to_string()));
         };
@@ -452,13 +453,13 @@ impl CmykStrips {
 
 /// An image's rows at the size they are written: read, resampled when the
 /// size differs from the source's, one row at a time.
-struct Pipe<'a> {
+pub(crate) struct Pipe<'a> {
     doc: &'a PdfDocument,
     cancel: &'a CancelCheck,
     source: Source,
-    shape: Shape,
-    width: u32,
-    height: u32,
+    pub(crate) shape: Shape,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     resampler: Option<RowResampler>,
     /// The next row to give.
     next: u32,
@@ -472,7 +473,7 @@ struct Pipe<'a> {
 impl<'a> Pipe<'a> {
     /// `target` is the size to write; `None` keeps the source's. A codec that
     /// decodes in reduced form has produced at least that size.
-    fn new(
+    pub(crate) fn new(
         doc: &'a PdfDocument,
         cancel: &'a CancelCheck,
         source: Source,
@@ -500,7 +501,8 @@ impl<'a> Pipe<'a> {
     }
 
     /// The next row into `out`: `width * channels` bytes.
-    fn pull(&mut self, out: &mut [u8]) -> Result<()> {
+    /// The next row into `out`: `width * channels` bytes.
+    pub(crate) fn pull(&mut self, out: &mut [u8]) -> Result<()> {
         self.cancel.check()?;
         let Some(resampler) = self.resampler.as_mut() else {
             return self.source.read(self.doc, out);
@@ -527,7 +529,7 @@ impl<'a> Pipe<'a> {
     }
 
     /// Every row, into a Flate stream with predictors.
-    fn flate(&mut self) -> Result<super::encode::FlateEncoded> {
+    pub(crate) fn flate(&mut self) -> Result<super::encode::FlateEncoded> {
         let channels = self.shape.channels();
         let mut encoder = FlateRows::new(self.width, channels)?;
         let mut row = vec![0u8; self.width as usize * channels as usize];
@@ -575,7 +577,7 @@ fn apply(
         ColorModel::Cmyk if !convert_cmyk => Shape::Cmyk,
         _ => Shape::Rgb,
     };
-    let source = Source::open(doc, object, kind, shape, target)?;
+    let source = Source::open(doc, object, kind, shape, &HashMap::new(), target)?;
     let mut pipe = Pipe::new(doc, cancel, source, shape, target);
     let (w, h) = (pipe.width, pipe.height);
 

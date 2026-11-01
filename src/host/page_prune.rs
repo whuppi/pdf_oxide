@@ -42,6 +42,14 @@ const INHERITABLE: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 #[derive(Default)]
 pub(crate) struct PagePrune {
     pub excluded: HashSet<u32>,
+    // ── pdf_manipulator patch: the image sources a redaction replaced ──
+    /// The source image XObjects destructive redaction overwrote or dropped:
+    /// an original is written only when something else still references it,
+    /// with garbage collection on and off (the reachability walk's answer,
+    /// which garbage collection on already applies and garbage collection
+    /// off applies by name here).
+    pub redacted_image_originals: HashSet<u32>,
+    // ── end pdf_manipulator patch ──
     /// The kept source pages: the kids of the root `/Pages` node in the
     /// output. The reachability walk enters them directly, since the
     /// source root lists the intermediate nodes the save excludes.
@@ -93,6 +101,9 @@ pub(crate) fn plan(
     staged: &HashMap<u32, Object>,
     page_order: &[PageSlot],
     dropped_annots: &HashSet<u32>,
+    // ── pdf_manipulator patch: the image sources destructive redaction replaced ──
+    redacted_image_originals: &HashSet<u32>,
+    // ── end pdf_manipulator patch ──
 ) -> PagePrune {
     let mut p = Planner {
         doc,
@@ -102,6 +113,9 @@ pub(crate) fn plan(
         dropped_pages: HashSet::new(),
         removed_names: HashSet::new(),
     };
+    // ── pdf_manipulator patch: the image sources destructive redaction replaced ──
+    p.out.redacted_image_originals = redacted_image_originals.clone();
+    // ── end pdf_manipulator patch ──
     p.run(page_order);
     p.out
 }
