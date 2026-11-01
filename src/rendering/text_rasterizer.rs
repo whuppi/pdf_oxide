@@ -499,18 +499,61 @@ impl TextRasterizer {
         }
     }
 
+    // ── pdf_manipulator patch: modes 1, 2, 5 and 6 stroke the glyph outline with the stroke paint ──
     /// Render a text string (Tj operator).
     /// Returns the total horizontal advance in PDF points.
     ///
-    /// `color_override` carries the resolution-pipeline output: the
-    /// fill RGBA replaces the value `gs` would supply when present, so
-    /// the operator arm doesn't have to clone `gs` purely to splice a
-    /// colour. Stroke override is accepted for forward compatibility —
-    /// the text rasteriser does not currently paint stroked glyphs, so
-    /// the stroke channel is recorded but not yet observable on the
-    /// pixmap.
-    #[allow(unused_variables)]
+    /// `color_override` carries the resolution-pipeline output: its fill
+    /// RGBA replaces the fill colour `gs` would supply, its stroke RGBA the
+    /// stroke colour. A mode that strokes (1, 2, 5, 6; ISO 32000-1 §9.3.6)
+    /// fills first where it fills at all, then strokes the outlines over the
+    /// fill: a second pass of the one glyph painter, with the stroke colour
+    /// as its paint and `stroke_glyph_outlines` set.
     pub fn render_text(
+        &self,
+        pixmap: &mut Pixmap,
+        text: &[u8],
+        base_transform: Transform,
+        gs: &GraphicsState,
+        color_override: Option<&crate::rendering::page_renderer::ResolvedColors>,
+        resources: &Object,
+        doc: &PdfDocument,
+        clip_mask: Option<&tiny_skia::Mask>,
+        font_cache: &HashMap<String, Arc<crate::fonts::FontInfo>>,
+    ) -> Result<f32> {
+        if gs.stroke_glyph_outlines || !matches!(gs.render_mode, 1 | 2 | 5 | 6) {
+            return self.render_text_pass(
+                pixmap, text, base_transform, gs, color_override, resources, doc, clip_mask,
+                font_cache,
+            );
+        }
+        let mut fill_gs = gs.clone();
+        fill_gs.render_mode = if matches!(gs.render_mode, 2 | 6) { 0 } else { 3 };
+        let advance = self.render_text_pass(
+            pixmap, text, base_transform, &fill_gs, color_override, resources, doc, clip_mask,
+            font_cache,
+        )?;
+        let mut stroke_gs = gs.clone();
+        stroke_gs.render_mode = 0;
+        stroke_gs.stroke_glyph_outlines = true;
+        stroke_gs.fill_color_rgb = gs.stroke_color_rgb;
+        stroke_gs.fill_alpha = gs.stroke_alpha;
+        let stroke_colors = crate::rendering::page_renderer::ResolvedColors {
+            fill: color_override.and_then(|c| c.stroke),
+            stroke: None,
+        };
+        self.render_text_pass(
+            pixmap, text, base_transform, &stroke_gs, Some(&stroke_colors), resources, doc,
+            clip_mask, font_cache,
+        )?;
+        Ok(advance)
+    }
+    // ── end pdf_manipulator patch ──
+
+    /// One painting pass of [`Self::render_text`]: the glyphs filled, or with
+    /// `stroke_glyph_outlines` stroked, in the fill paint.
+    #[allow(unused_variables)]
+    fn render_text_pass(
         &self,
         pixmap: &mut Pixmap,
         text: &[u8],

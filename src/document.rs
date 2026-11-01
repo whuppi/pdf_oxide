@@ -741,95 +741,8 @@ pub enum PageArea {
     Footer,
 }
 
-/// Scan raw file bytes for candidate ObjStm positions.
-///
-/// Each hit is `(object_number, byte_offset_of_N_G_obj_header)`. We look
-/// for the shape `N G obj ... /Type /ObjStm` within a small window after
-/// each object header so that the caller can then `load_uncompressed_object`
-/// at exactly that offset without parsing the whole file body.
-///
-/// The scan is intentionally tolerant: it doesn't require `/Type`
-/// `/ObjStm` to be separated by whitespace (many producers write
-/// `/Type/ObjStm`), doesn't anchor on any particular position within the
-/// header, and doesn't rely on xref entries being correct — which is the
-/// whole point of the recovery path it serves.
-fn find_objstm_candidates(content: &[u8]) -> Vec<(u32, u64)> {
-    const DICT_PEEK_BYTES: usize = 2048;
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    while pos < content.len() {
-        let valid_start = pos == 0
-            || content[pos - 1] == b'\n'
-            || content[pos - 1] == b'\r'
-            || content[pos - 1] == b' ';
-        if !valid_start || !content[pos].is_ascii_digit() {
-            pos += 1;
-            continue;
-        }
-        let header_start = pos;
-
-        // Parse N (object number)
-        let num_start = pos;
-        while pos < content.len() && content[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if pos >= content.len() || content[pos] != b' ' {
-            pos = header_start + 1;
-            continue;
-        }
-        let obj_num: u32 = match std::str::from_utf8(&content[num_start..pos])
-            .ok()
-            .and_then(|s| s.parse().ok())
-        {
-            Some(n) => n,
-            None => {
-                pos = header_start + 1;
-                continue;
-            },
-        };
-        pos += 1;
-
-        // Parse G (generation)
-        let gen_start = pos;
-        while pos < content.len() && content[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if pos >= content.len() || content[pos] != b' ' {
-            pos = header_start + 1;
-            continue;
-        }
-        if std::str::from_utf8(&content[gen_start..pos])
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .is_none()
-        {
-            pos = header_start + 1;
-            continue;
-        }
-        pos += 1;
-
-        // Require literal "obj"
-        if pos + 3 > content.len() || &content[pos..pos + 3] != b"obj" {
-            pos = header_start + 1;
-            continue;
-        }
-
-        // Peek up to DICT_PEEK_BYTES ahead for `/Type` followed (after
-        // optional whitespace) by `/ObjStm`. We don't decompress — the
-        // ObjStm dict header is always uncompressed plaintext even when
-        // the stream body is Flate-encoded.
-        let window_end = (pos + DICT_PEEK_BYTES).min(content.len());
-        let window = &content[pos..window_end];
-        if contains_objstm_marker(window) {
-            out.push((obj_num, header_start as u64));
-        }
-
-        pos = header_start + 1;
-    }
-    out
-}
-
-fn contains_objstm_marker(window: &[u8]) -> bool {
+// ── pdf_manipulator patch: the sweep for object streams is `scan::objstm_candidates` ──
+pub(crate) fn contains_objstm_marker(window: &[u8]) -> bool {
     // Tolerant match: find `/Type` then allow optional whitespace before `/ObjStm`.
     let mut i = 0;
     while i + 5 <= window.len() {
@@ -851,6 +764,7 @@ fn contains_objstm_marker(window: &[u8]) -> bool {
     }
     false
 }
+// ── end pdf_manipulator patch ──
 
 /// Append ink names declared by `Separation` and `DeviceN` colour spaces
 /// in `cs_dict` to `out`. Reserved colorants `/All` and `/None` (§8.6.6.4)
@@ -2600,74 +2514,10 @@ impl PdfDocument {
             obj_ref.gen
         );
 
-        let mut content = Vec::new();
-        {
-            // Hold one guard for seek+read to prevent split-lock race (#398 Race A).
-            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-            let mut reader = self.source.lock_reader();
-            // ── end pdf_manipulator patch ──
-            reader.seek(SeekFrom::Start(0))?;
-            reader.read_to_end(&mut content)?;
-        }
-
-        let mut offsets = HashMap::new();
-
-        // Scan for all "N G obj" patterns in the file
-        let mut pos = 0;
-        while pos < content.len() {
-            // Look for digit at a line start (after newline or at file start)
-            let valid_start = pos == 0 || content[pos - 1] == b'\n' || content[pos - 1] == b'\r';
-            if !valid_start || !content[pos].is_ascii_digit() {
-                pos += 1;
-                continue;
-            }
-
-            // Try to parse "N G obj" starting at pos
-            let start = pos;
-            // Parse object number (digits)
-            while pos < content.len() && content[pos].is_ascii_digit() {
-                pos += 1;
-            }
-            if pos >= content.len() || content[pos] != b' ' {
-                continue;
-            }
-            let obj_num_str = std::str::from_utf8(&content[start..pos]).unwrap_or("");
-            let obj_num: u32 = match obj_num_str.parse() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-
-            pos += 1; // skip space
-
-            // Parse generation number (digits)
-            let gen_start = pos;
-            while pos < content.len() && content[pos].is_ascii_digit() {
-                pos += 1;
-            }
-            if pos >= content.len() || content[pos] != b' ' {
-                continue;
-            }
-            let _gen_str = std::str::from_utf8(&content[gen_start..pos]).unwrap_or("");
-
-            pos += 1; // skip space
-
-            // Check for "obj" keyword
-            if pos + 3 <= content.len() && &content[pos..pos + 3] == b"obj" {
-                let after_obj = pos + 3;
-                // Verify "obj" is followed by whitespace, newline, or '<'
-                let valid_end = after_obj >= content.len() || {
-                    let c = content[after_obj];
-                    c == b'\n' || c == b'\r' || c == b' ' || c == b'\t' || c == b'<'
-                };
-                if valid_end {
-                    offsets.entry(obj_num).or_insert(start as u64);
-                    pos = after_obj;
-                    continue;
-                }
-            }
-            // Reset pos to just after the start to avoid infinite loop
-            pos = start + 1;
-        }
+        // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+        // Scan for all "N G obj" patterns in the file, a window at a time.
+        let offsets = crate::host::scan::object_offsets(&self.source)?;
+        // ── end pdf_manipulator patch ──
 
         log::info!("File scan found {} objects", offsets.len());
 
@@ -2722,21 +2572,13 @@ impl PdfDocument {
         // Only flip `objstm_recovery_done` after we finish the scan+parse
         // pass; a transient seek/read failure should leave the flag unset
         // so a later retry can still attempt recovery.
-        let file_bytes = {
-            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-            let mut r = self.source.lock_reader();
-            // ── end pdf_manipulator patch ──
-            if r.seek(SeekFrom::Start(0)).is_err() {
-                return;
-            }
-            let mut buf = Vec::new();
-            if r.read_to_end(&mut buf).is_err() {
-                return;
-            }
-            buf
-        };
-
-        let candidates = find_objstm_candidates(&file_bytes);
+        // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+        let candidates =
+            match crate::host::scan::objstm_candidates(&self.source, contains_objstm_marker) {
+                Ok(candidates) => candidates,
+                Err(_) => return,
+            };
+        // ── end pdf_manipulator patch ──
 
         let mut objstms_found = 0usize;
         let mut recovered = 0usize;
@@ -26611,26 +26453,67 @@ pub fn parse_trailer<R: Read>(reader: &mut R) -> Result<Object> {
     // The reader should already be positioned after the xref table
     // We need to read until we find "trailer", then parse the dictionary
 
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer)?;
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    // The reader is read in windows to the first "trailer"; from there only
+    // the bytes up to the word that ends its dictionary (the next "trailer",
+    // "startxref" or "%%EOF") are kept.
+    use crate::host::scan::{Flow, Matcher, TRAILER_WORDS, WINDOW};
+    let mut matcher = Matcher::new(&TRAILER_WORDS, 0);
+    let mut chunk = vec![0u8; WINDOW];
+    let mut consumed = 0u64;
+    let mut from_trailer: Vec<u8> = Vec::new();
+    let mut trailer_end: Option<u64> = None;
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let mut cut: Option<usize> = None;
+        let start = consumed;
+        matcher.feed(&chunk[..n], &mut |hit| {
+            match trailer_end {
+                None if hit.pattern == 0 => trailer_end = Some(hit.offset + 7),
+                Some(_) => {
+                    cut = Some((hit.offset.saturating_sub(start)) as usize);
+                    return Ok(Flow::Stop);
+                },
+                None => {},
+            }
+            Ok(Flow::Continue)
+        })?;
+        consumed += n as u64;
+        if let Some(end) = trailer_end {
+            // Keep what follows the keyword from this chunk on.
+            let keep_from = end.saturating_sub(start).min(n as u64) as usize;
+            let keep_to = cut.map_or(n, |c| c.min(n));
+            if keep_to > keep_from {
+                from_trailer.extend_from_slice(&chunk[keep_from..keep_to]);
+            }
+            if cut.is_some() {
+                break;
+            }
+        }
+    }
 
-    // Find "trailer" keyword
-    let content = String::from_utf8_lossy(&buffer);
-    let trailer_pos = content.find("trailer").ok_or_else(|| {
-        Error::InvalidPdf("Trailer keyword not found after xref table".to_string())
-    })?;
-
+    let trailer_pos = match trailer_end {
+        Some(end) => end as usize - 7,
+        None => {
+            return Err(Error::InvalidPdf("Trailer keyword not found after xref table".to_string()))
+        },
+    };
+    let buffer = from_trailer;
     // Skip past "trailer" keyword (7 bytes)
     let dict_start = trailer_pos + 7;
-    if dict_start >= buffer.len() {
+    if buffer.is_empty() {
         return Err(Error::UnexpectedEof);
     }
 
     // Parse the dictionary that follows
-    let (_, trailer_dict) = parse_object(&buffer[dict_start..]).map_err(|e| Error::ParseError {
+    let (_, trailer_dict) = parse_object(&buffer).map_err(|e| Error::ParseError {
         offset: dict_start,
         reason: format!("Failed to parse trailer dictionary: {:?}", e),
     })?;
+    // ── end pdf_manipulator patch ──
 
     // Verify it's a dictionary
     if trailer_dict.as_dict().is_none() {

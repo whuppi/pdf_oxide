@@ -2811,14 +2811,18 @@ impl PageRenderer {
                             )?;
                             let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
                             // Glyphs that are only stroked take no fill from the rasteriser.
-                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
+                            // A flat stroke is painted by the rasteriser, a pattern one by the pattern.
+                            let flat_gs = Self::flat_text_gs(gs, fill_done, stroke_pattern);
+                            let text_gs = flat_gs.as_ref().unwrap_or(gs);
+                            let flat_stroke = !stroke_pattern && matches!(gs.render_mode, 1 | 2 | 5 | 6);
+                            let adv = if (fill_done && !flat_stroke) || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer.measure_text(text, gs, &self.fonts)
                             } else {
                                 self.text_rasterizer.render_text(
                                     pixmap,
                                     text,
                                     transform,
-                                    gs,
+                                    text_gs,
                                     colors.as_ref(),
                                     resources,
                                     doc,
@@ -2994,14 +2998,18 @@ impl PageRenderer {
                             )?;
                             let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
                             // Glyphs that are only stroked take no fill from the rasteriser.
-                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
+                            // A flat stroke is painted by the rasteriser, a pattern one by the pattern.
+                            let flat_gs = Self::flat_text_gs(gs, fill_done, stroke_pattern);
+                            let text_gs = flat_gs.as_ref().unwrap_or(gs);
+                            let flat_stroke = !stroke_pattern && matches!(gs.render_mode, 1 | 2 | 5 | 6);
+                            let adv = if (fill_done && !flat_stroke) || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer.measure_text(text, gs, &self.fonts)
                             } else {
                                 self.text_rasterizer.render_text(
                                     pixmap,
                                     text,
                                     transform,
-                                    gs,
+                                    text_gs,
                                     colors.as_ref(),
                                     resources,
                                     doc,
@@ -3170,7 +3178,11 @@ impl PageRenderer {
                             )?;
                             let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
                             // Glyphs that are only stroked take no fill from the rasteriser.
-                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
+                            // A flat stroke is painted by the rasteriser, a pattern one by the pattern.
+                            let flat_gs = Self::flat_text_gs(gs, fill_done, stroke_pattern);
+                            let text_gs = flat_gs.as_ref().unwrap_or(gs);
+                            let flat_stroke = !stroke_pattern && matches!(gs.render_mode, 1 | 2 | 5 | 6);
+                            let adv = if (fill_done && !flat_stroke) || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer
                                     .measure_tj_array(array, gs, &self.fonts)
                             } else {
@@ -3178,7 +3190,7 @@ impl PageRenderer {
                                     pixmap,
                                     array,
                                     transform,
-                                    gs,
+                                    text_gs,
                                     colors.as_ref(),
                                     resources,
                                     doc,
@@ -3363,14 +3375,18 @@ impl PageRenderer {
                             )?;
                             let stroke_pattern = self.text_takes_a_stroke_pattern(gs, doc, resources);
                             // Glyphs that are only stroked take no fill from the rasteriser.
-                            let adv = if fill_done || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
+                            // A flat stroke is painted by the rasteriser, a pattern one by the pattern.
+                            let flat_gs = Self::flat_text_gs(gs, fill_done, stroke_pattern);
+                            let text_gs = flat_gs.as_ref().unwrap_or(gs);
+                            let flat_stroke = !stroke_pattern && matches!(gs.render_mode, 1 | 2 | 5 | 6);
+                            let adv = if (fill_done && !flat_stroke) || (stroke_pattern && !matches!(gs.render_mode, 0 | 2 | 4 | 6)) {
                                 self.text_rasterizer.measure_text(text, gs, &self.fonts)
                             } else {
                                 self.text_rasterizer.render_text(
                                     pixmap,
                                     text,
                                     transform,
-                                    gs,
+                                    text_gs,
                                     colors.as_ref(),
                                     resources,
                                     doc,
@@ -5991,6 +6007,25 @@ impl PageRenderer {
         )
         // ── end pdf_manipulator patch ──
     }
+
+    // ── pdf_manipulator patch: a flat stroke is painted by the rasteriser, a pattern one by the pattern ──
+    /// The state the rasteriser shows a text with when a pattern has painted
+    /// part of it: the fill side only when the stroke is a pattern, the stroke
+    /// side only when the fill was a pattern and the stroke is flat. `None`
+    /// when the rasteriser paints it as it stands.
+    fn flat_text_gs(gs: &GraphicsState, fill_done: bool, stroke_pattern: bool) -> Option<GraphicsState> {
+        let mode = if stroke_pattern {
+            0
+        } else if fill_done && matches!(gs.render_mode, 2 | 6) {
+            1
+        } else {
+            return None;
+        };
+        let mut view = gs.clone();
+        view.render_mode = mode;
+        Some(view)
+    }
+    // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: glyphs painted with a pattern, fill and stroke, take the pattern ──
     /// The graphics state with its stroke side as the fill side, which is

@@ -31,6 +31,8 @@ pub(crate) mod render_stream;
 pub(crate) mod resource_prune;
 pub(crate) mod row_space;
 pub(crate) mod ruling_grid;
+pub(crate) mod scan;
+pub(crate) mod forward;
 pub(crate) mod span_index;
 #[cfg(feature = "test-support")]
 pub mod probe;

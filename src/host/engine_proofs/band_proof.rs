@@ -738,6 +738,16 @@ fn bands_equal_the_whole_canvas_on_strokes_and_text_painted_with_a_pattern() {
     }
 }
 
+/// Text in each rendering mode 0 to 7, stroked and clipping, is the same
+/// pixels in every cut. No Dart battery sees it: the band height is an
+/// internal knob no API sets.
+#[test]
+fn bands_equal_the_whole_canvas_on_text_in_every_rendering_mode() {
+    for fixture in &super::text_render_modes::fixtures() {
+        prove(fixture);
+    }
+}
+
 /// No Dart battery sees it: the band height is an internal knob no API sets.
 #[test]
 fn bands_equal_the_whole_canvas_on_shadings() {

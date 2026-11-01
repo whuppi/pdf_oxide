@@ -22,8 +22,6 @@ fonts::font_dict::resolve_encoding_writing_mode
 host::attachments::attachment_bytes
 object::decode_stream_data
 object::read_whole_raw
-objstm::decode_object_stream
-objstm::parse_object_stream
 rendering::mesh_shading::eval_pdf_function
 rendering::mesh_shading::eval_type4
 rendering::mesh_shading::render_mesh_shading

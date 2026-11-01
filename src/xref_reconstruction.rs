@@ -8,16 +8,12 @@
 
 use crate::error::{Error, Result};
 use crate::object::{Object, ObjectRef};
-use crate::parser::parse_object;
 use crate::xref::{CrossRefTable, XRefEntry};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::sync::LazyLock;
-
-static RE_OBJ_PATTERN: LazyLock<regex::bytes::Regex> =
-    LazyLock::new(|| regex::bytes::Regex::new(r"(\d+)\s+(\d+)\s+obj").unwrap());
-static RE_TRAILER: LazyLock<regex::bytes::Regex> =
-    LazyLock::new(|| regex::bytes::Regex::new(r"trailer\s*<<").unwrap());
+// ── pdf_manipulator patch: file-level scans run in bounded windows ──
+use crate::host::scan::{self, Flow, OfSeek};
+use std::io::{Read, Seek, SeekFrom};
+// ── end pdf_manipulator patch ──
 
 /// Reconstruct the cross-reference table by scanning the entire PDF file.
 ///
@@ -25,12 +21,13 @@ static RE_TRAILER: LazyLock<regex::bytes::Regex> =
 /// an xref table from the discovered objects. It also attempts to find the
 /// trailer dictionary and identify the catalog.
 ///
+// ── pdf_manipulator patch: file-level scans run in bounded windows ──
 /// # Performance
 ///
-/// For small to medium files (<10 MB), the entire file is read into memory.
-/// For larger files, this could be optimized to scan in chunks, but that's
-/// deferred until needed.
+/// The file is read once, in 64 KiB windows; what is held is one window and
+/// an entry per object found, never the file.
 ///
+// ── end pdf_manipulator patch ──
 /// # Returns
 ///
 /// The reconstructed cross-reference table, the trailer, and any SYNTHETIC
@@ -65,56 +62,50 @@ pub fn reconstruct_xref<R: Read + Seek>(
 ) -> Result<(CrossRefTable, Object, Vec<(ObjectRef, Object)>)> {
     log::info!("Reconstructing xref table by scanning file...");
 
-    // Read entire file into memory for scanning
-    reader.seek(SeekFrom::Start(0))?;
-    let mut contents = Vec::new();
-    reader.read_to_end(&mut contents)?;
-
-    log::debug!("File size: {} bytes", contents.len());
-
     let mut xref = CrossRefTable::new();
     let mut objects_found = 0;
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    let mut fold = TrailerFold::default();
+    let mut trailers = scan::Trailers::default();
+    let mut input = OfSeek(&mut *reader);
 
-    // Scan for "N G obj" patterns
+    // Scan for "N G obj" patterns, and for the trailers on the way.
     // Pattern: one or more digits, whitespace, one or more digits, whitespace, "obj"
-    for capture in RE_OBJ_PATTERN.captures_iter(&contents) {
-        let full_match = match capture.get(0) {
-            Some(m) => m,
-            None => continue,
+    let words: [&[u8]; 4] =
+        [scan::pat::OBJ, scan::pat::TRAILER, scan::pat::STARTXREF, scan::pat::EOF_MARK];
+    scan::scan(&mut input, 0, &words, |hit, r| {
+        if hit.pattern != 0 {
+            trailers.hit(hit, r, hit.pattern == 1, &mut |start, parsed| fold.accept(start, parsed))?;
+            return Ok(Flow::Continue);
+        }
+        let Some(header) = scan::header_before(hit, r, scan::Spacing::Any, scan::Before::Anything)?
+        else {
+            return Ok(Flow::Continue);
         };
-        let obj_num_bytes = match capture.get(1) {
-            Some(m) => m.as_bytes(),
-            None => continue,
-        };
-        let gen_num_bytes = match capture.get(2) {
-            Some(m) => m.as_bytes(),
-            None => continue,
-        };
+        let offset = header.start;
 
         // Parse object and generation numbers
-        let obj_num: u32 = match std::str::from_utf8(obj_num_bytes)
+        let obj_num: u32 = match std::str::from_utf8(&header.number)
             .ok()
             .and_then(|s| s.parse().ok())
         {
             Some(n) => n,
             None => {
-                log::warn!("Failed to parse object number at offset {}", full_match.start());
-                continue;
+                log::warn!("Failed to parse object number at offset {}", offset);
+                return Ok(Flow::Continue);
             },
         };
 
-        let gen_num: u16 = match std::str::from_utf8(gen_num_bytes)
+        let gen_num: u16 = match std::str::from_utf8(&header.generation)
             .ok()
             .and_then(|s| s.parse().ok())
         {
             Some(n) => n,
             None => {
-                log::warn!("Failed to parse generation number at offset {}", full_match.start());
-                continue;
+                log::warn!("Failed to parse generation number at offset {}", offset);
+                return Ok(Flow::Continue);
             },
         };
-
-        let offset = full_match.start() as u64;
 
         // SPEC COMPLIANCE FIX: Validate that this is actually an object header
         // PDF Spec: ISO 32000-1:2008, Section 7.5.4 - Cross-Reference Table
@@ -131,54 +122,44 @@ pub fn reconstruct_xref<R: Read + Seek>(
 
         // Check if the next bytes after "obj" form a valid PDF object
         // We do basic validation: look for dictionary start, array start, or primitive values
-        let validation_start = offset + full_match.as_bytes().len() as u64;
-        if validation_start < contents.len() as u64 {
-            let remaining = &contents[validation_start as usize..];
+        if let Some(next_byte) = scan::first_non_space(hit, r, hit.offset + 3)? {
+            // Valid object should start with:
+            // - << (dictionary)
+            // - [ (array)
+            // - < (hex string or dict - ambiguous at this point)
+            // - ( (literal string)
+            // - / (name)
+            // - t, f, n (true, false, null)
+            // - digit or - (number)
+            let is_valid_object_start =
+                matches!(next_byte, b'<' | b'[' | b'(' | b'/' | b't' | b'f' | b'n' | b'-')
+                    || next_byte.is_ascii_digit();
 
-            // Skip whitespace
-            let mut i = 0;
-            while i < remaining.len() && remaining[i].is_ascii_whitespace() {
-                i += 1;
+            if !is_valid_object_start {
+                log::debug!(
+                    "Skipping false positive object header at offset {} (next byte: 0x{:02x} '{}')",
+                    offset,
+                    next_byte,
+                    if next_byte.is_ascii_graphic() {
+                        next_byte as char
+                    } else {
+                        '?'
+                    }
+                );
+                return Ok(Flow::Continue);
             }
 
-            if i < remaining.len() {
-                let next_byte = remaining[i];
-
-                // Valid object should start with:
-                // - << (dictionary)
-                // - [ (array)
-                // - < (hex string or dict - ambiguous at this point)
-                // - ( (literal string)
-                // - / (name)
-                // - t, f, n (true, false, null)
-                // - digit or - (number)
-                let is_valid_object_start =
-                    matches!(next_byte, b'<' | b'[' | b'(' | b'/' | b't' | b'f' | b'n' | b'-')
-                        || next_byte.is_ascii_digit();
-
-                if !is_valid_object_start {
-                    log::debug!(
-                        "Skipping false positive object header at offset {} (next byte: 0x{:02x} '{}')",
-                        offset,
-                        next_byte,
-                        if next_byte.is_ascii_graphic() {
-                            next_byte as char
-                        } else {
-                            '?'
-                        }
-                    );
-                    continue;
-                }
-
-                log::debug!("Validated object {} gen {} at offset {}", obj_num, gen_num, offset);
-            }
+            log::debug!("Validated object {} gen {} at offset {}", obj_num, gen_num, offset);
         }
 
         // Add to xref table
         let entry = XRefEntry::uncompressed(offset, gen_num);
         xref.add_entry(obj_num, entry);
         objects_found += 1;
-    }
+        Ok(Flow::Continue)
+    })?;
+    trailers.finish(&mut input, &mut |start, parsed| fold.accept(start, parsed))?;
+    // ── end pdf_manipulator patch ──
 
     log::info!("Reconstructed xref with {} objects", objects_found);
 
@@ -187,47 +168,35 @@ pub fn reconstruct_xref<R: Read + Seek>(
     }
 
     // Try to find the trailer dictionary
-    let (trailer, synthetic) = find_trailer(&contents, reader, &xref)?;
+    let (trailer, synthetic) = pick_trailer(fold, reader, &xref)?;
 
     Ok((xref, trailer, synthetic))
 }
 
-/// Find and parse the trailer dictionary.
-///
-/// Searches for "trailer" keyword in the file and attempts to parse the
-/// dictionary that follows. If not found, attempts to reconstruct a minimal
-/// trailer by finding the catalog object.
-fn find_trailer<R: Read + Seek>(
-    contents: &[u8],
-    reader: &mut R,
-    xref: &CrossRefTable,
-) -> Result<(Object, Vec<(ObjectRef, Object)>)> {
-    log::debug!("Searching for trailer dictionary...");
+// ── pdf_manipulator patch: file-level scans run in bounded windows ──
+/// The trailers a scan has parsed, folded as they come: the last one with a
+/// `/Root`, and the latest `/Encrypt`, `/ID` and `/Info` of the others.
+#[derive(Default)]
+struct TrailerFold {
+    /// The chosen /Root-bearing trailer plus the byte offset it was parsed
+    /// from (the scan yields trailers in ascending file order, so a later
+    /// offset = a more recent incremental update).
+    best: Option<(Object, u64)>,
+    /// /Encrypt /ID /Info salvaged from /Root-less parsed trailers, each
+    /// tracked with the offset it came from. If no /Root-bearing trailer
+    /// exists and we synthesize a minimal one, an encrypted file's /Encrypt
+    /// (and /ID, used for the encryption key) would otherwise be lost, making
+    /// the document undecryptable. Per ISO 32000-1 §7.5.5 the most recent
+    /// occurrence wins — including over a /Root-bearing trailer that appears
+    /// earlier in the file.
+    salvaged: HashMap<String, (Object, u64)>,
+}
 
-    // Search for all "trailer" keywords and prefer the last valid one.
-    // Per ISO 32000-1:2008 Section 7.5.5, the most recent trailer (from the
-    // latest incremental update) takes precedence. Using the first trailer can
-    // miss /Encrypt entries added in later revisions.
-    // The chosen /Root-bearing trailer plus the byte offset it was parsed
-    // from (RE_TRAILER yields matches in ascending file order, so a later
-    // offset = a more recent incremental update).
-    let mut best_trailer: Option<(Object, usize)> = None;
-    // /Encrypt /ID /Info salvaged from /Root-less parsed trailers, each
-    // tracked with the offset it came from. If no /Root-bearing trailer
-    // exists and we synthesize a minimal one, an encrypted file's /Encrypt
-    // (and /ID, used for the encryption key) would otherwise be lost, making
-    // the document undecryptable. Per ISO 32000-1 §7.5.5 the most recent
-    // occurrence wins — including over a /Root-bearing trailer that appears
-    // earlier in the file.
-    let mut salvaged: HashMap<String, (Object, usize)> = HashMap::new();
-    for mat in RE_TRAILER.find_iter(contents) {
-        let trailer_start = mat.start();
+impl TrailerFold {
+    fn accept(&mut self, trailer_start: u64, parsed: Result<Object>) {
         log::debug!("Found trailer keyword at offset {}", trailer_start);
-
-        let trailer_keyword_end = trailer_start + 7; // len("trailer")
-        let input = &contents[trailer_keyword_end..];
-        match parse_object(input) {
-            Ok((_, obj)) => {
+        match parsed {
+            Ok(obj) => {
                 // Only accept a parsed trailer that actually carries /Root.
                 // A Linearized file's sparse end-of-file trailer legitimately
                 // omits /Root — the Catalog is reachable via the linearization
@@ -237,12 +206,13 @@ fn find_trailer<R: Read + Seek>(
                 // "Trailer missing /Root entry". The *last* /Root-bearing
                 // trailer still wins for /Root itself.
                 if obj.as_dict().is_some_and(|d| d.get("Root").is_some()) {
-                    best_trailer = Some((obj, trailer_start));
+                    self.best = Some((obj, trailer_start));
                 } else {
                     if let Some(d) = obj.as_dict() {
                         for key in ["Encrypt", "ID", "Info"] {
                             if let Some(v) = d.get(key) {
-                                salvaged.insert(key.to_string(), (v.clone(), trailer_start));
+                                self.salvaged
+                                    .insert(key.to_string(), (v.clone(), trailer_start));
                             }
                         }
                     }
@@ -257,6 +227,24 @@ fn find_trailer<R: Read + Seek>(
             },
         }
     }
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: file-level scans run in bounded windows ──
+/// Pick the trailer dictionary from the ones the scan found.
+///
+/// Prefers the last /Root-bearing trailer. If there is none, attempts to
+/// reconstruct a minimal trailer by finding the catalog object.
+fn pick_trailer<R: Read + Seek>(
+    fold: TrailerFold,
+    reader: &mut R,
+    xref: &CrossRefTable,
+) -> Result<(Object, Vec<(ObjectRef, Object)>)> {
+    // Per ISO 32000-1:2008 Section 7.5.5, the most recent trailer (from the
+    // latest incremental update) takes precedence. Using the first trailer can
+    // miss /Encrypt entries added in later revisions.
+    let TrailerFold { best: best_trailer, salvaged } = fold;
+// ── end pdf_manipulator patch ──
     if let Some((mut trailer, best_off)) = best_trailer {
         // Merge salvaged /Encrypt /ID /Info from /Root-less trailers using
         // most-recent-occurrence-wins (ISO 32000-1 §7.5.5): a salvaged value
@@ -649,68 +637,9 @@ fn recover_from_objstms<R: Read + Seek>(
 /// This is a standalone function that doesn't require the full PdfDocument
 /// context, used during trailer reconstruction.
 fn load_object_at_offset<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Object> {
-    reader.seek(SeekFrom::Start(offset))?;
-
-    // Read enough data to parse the object
-    let mut buf_reader = BufReader::new(reader);
-    let mut content = Vec::new();
-
-    // Read up to 1MB or until we find endobj
-    // This is a conservative limit to avoid memory issues
-    let mut bytes_read = 0;
-    const MAX_OBJECT_SIZE: usize = 1024 * 1024; // 1MB
-
-    loop {
-        let mut line = Vec::new();
-        match buf_reader.read_until(b'\n', &mut line) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                content.extend_from_slice(&line);
-                bytes_read += n;
-
-                if bytes_read > MAX_OBJECT_SIZE {
-                    return Err(Error::InvalidPdf("Object too large".to_string()));
-                }
-
-                // Check if we've found endobj
-                if content.windows(6).any(|w| w == b"endobj") {
-                    break;
-                }
-            },
-            Err(e) => return Err(Error::Io(e)),
-        }
-    }
-
-    // Parse: "obj_num gen obj <object> endobj"
-    use crate::lexer::token;
-
-    let input = &content[..];
-
-    // Skip object number
-    let (rest, _) = token(input).map_err(|e| Error::ParseError {
-        offset: 0,
-        reason: format!("failed to parse object number: {}", e),
-    })?;
-
-    // Skip generation number
-    let (rest, _) = token(rest).map_err(|e| Error::ParseError {
-        offset: 0,
-        reason: format!("failed to parse generation: {}", e),
-    })?;
-
-    // Skip 'obj' keyword
-    let (rest, _) = token(rest).map_err(|e| Error::ParseError {
-        offset: 0,
-        reason: format!("failed to parse 'obj' keyword: {}", e),
-    })?;
-
-    // Parse the actual object
-    let (_, obj) = parse_object(rest).map_err(|e| Error::ParseError {
-        offset: 0,
-        reason: format!("failed to parse object: {}", e),
-    })?;
-
-    Ok(obj)
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    scan::load_object(&mut OfSeek(reader), offset)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Check if an object is the document catalog.

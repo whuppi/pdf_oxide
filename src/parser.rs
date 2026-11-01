@@ -481,7 +481,9 @@ fn parse_array(input: &[u8]) -> IResult<&[u8], Object> {
 /// - Dictionary is not properly closed with `>>`
 /// - A key is not a name
 /// - Values are malformed
-fn parse_dictionary(input: &[u8]) -> IResult<&[u8], Object> {
+// ── pdf_manipulator patch: the file-level scans read a dictionary without its stream ──
+pub(crate) fn parse_dictionary(input: &[u8]) -> IResult<&[u8], Object> {
+// ── end pdf_manipulator patch ──
     let mut dict = HashMap::new();
     let mut remaining = input;
 

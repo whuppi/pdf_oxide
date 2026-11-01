@@ -223,53 +223,50 @@ impl Default for CrossRefTable {
 /// - The offset following "startxref" cannot be parsed
 /// - The file is too small to contain a valid xref reference
 pub fn find_xref_offset<R: Read + Seek>(reader: &mut R) -> Result<u64> {
-    let file_size = reader.seek(SeekFrom::End(0))?;
-
-    // GROW the tail window until `startxref` is found. A fixed 2 KB window assumes
-    // the keyword sits close to the end of the file - and real producers break that
-    // assumption constantly by PADDING the file after `%%EOF`:
-    //
-    //   gov.uscourts.ca2.*  192 KiB exactly, with **5,245 trailing NUL bytes**.
-    //
-    // Those are valid, readable PDFs (poppler and Acrobat open them), but the last
-    // 2 KB is nothing but padding, so `startxref` is not in the window and the whole
-    // document is rejected as InvalidXref - a TOTAL loss, not a degradation. Growing
-    // the window costs nothing on a well-formed file (the first 2 KB read hits) and
-    // recovers the padded ones.
-    const WINDOWS: [u64; 5] = [2048, 16 * 1024, 128 * 1024, 1024 * 1024, u64::MAX];
-    for &want in WINDOWS.iter() {
-        let read_size = std::cmp::min(want, file_size);
-        reader.seek(SeekFrom::End(-(read_size as i64)))?;
-
-        let mut buf = Vec::new();
-        reader.take(read_size).read_to_end(&mut buf)?;
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    // The LAST `startxref` of the file is found by reading backwards in
+    // windows: a producer that PADS the file after `%%EOF` (a real case: 192 KiB
+    // exactly, with 5,245 trailing NUL bytes) leaves it far from the end, and
+    // the offset line after it is read forward from there.
+    let mut input = crate::host::scan::OfSeek(reader);
+    let file_size = crate::host::scan::ReadAt::len(&mut input)?;
+    let Some(pos) = crate::host::scan::rfind(&mut input, file_size, b"startxref")? else {
+        return Err(Error::InvalidXref);
+    };
+    let after = pos + 9; // 9 = len("startxref")
+    let mut want = 4096u64;
+    loop {
+        let remaining = file_size - after;
+        let len = want.min(remaining) as usize;
+        let mut buf = vec![0u8; len];
+        let n = crate::host::scan::ReadAt::read_at(&mut input, after, &mut buf)?;
+        buf.truncate(n);
         let content = String::from_utf8_lossy(&buf);
+        let complete = len as u64 == remaining;
 
-        if let Some(pos) = content.rfind("startxref") {
-            let after_keyword = &content[pos + 9..]; // 9 = len("startxref")
-
-            // Split lines manually to handle CR, LF, and CRLF line endings.
-            // Standard .lines() only handles LF and CRLF, not standalone CR.
-            for line in split_lines(after_keyword) {
-                // Trim NUL padding as well as whitespace: a padded file leaves the
-                // offset line looking like "189089\0\0\0..." and `str::trim` alone
-                // does not strip NULs, so the all-digits check below would fail.
-                let trimmed = line.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-                if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
-                    return trimmed.parse::<u64>().map_err(|_| Error::InvalidXref);
-                }
+        // Split lines manually to handle CR, LF, and CRLF line endings.
+        // Standard .lines() only handles LF and CRLF, not standalone CR.
+        let mut lines = split_lines(&content);
+        if !complete {
+            // The last line may continue in the next window.
+            lines.pop();
+        }
+        for line in lines {
+            // Trim NUL padding as well as whitespace: a padded file leaves the
+            // offset line looking like "189089\0\0\0..." and `str::trim` alone
+            // does not strip NULs, so the all-digits check below would fail.
+            let trimmed = line.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+            if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                return trimmed.parse::<u64>().map_err(|_| Error::InvalidXref);
             }
-            // Keyword found but no offset after it - a wider window will not help.
+        }
+        // Keyword found but no offset after it.
+        if complete {
             return Err(Error::InvalidXref);
         }
-
-        // Whole file already scanned: the keyword genuinely is not there.
-        if read_size == file_size {
-            break;
-        }
+        want *= 2;
     }
-
-    Err(Error::InvalidXref)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Parse the cross-reference table at the given byte offset.
@@ -551,31 +548,27 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
     log::debug!("parse_traditional_xref: Starting at offset {}", offset);
     reader.seek(SeekFrom::Start(offset))?;
 
-    // Read only until "trailer" or "startxref" instead of the entire remaining file.
-    // For linearized PDFs, the first xref may be near byte 0, and read_to_end would
-    // load the entire file (e.g., 375MB) just to parse an 8-entry xref table.
-    let lines = read_until_trailer(reader).map_err(|e| {
-        log::error!("Failed to read xref lines: {}", e);
-        Error::InvalidXref
-    })?;
-
-    log::debug!("parse_traditional_xref: Read {} lines", lines.len());
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    // The lines are read on demand, in windows: the table is read to its
+    // "trailer" and no further, so a file that has none, or an offset that
+    // points into the middle of the body, reads only what the parse uses.
+    let mut lines = crate::host::scan::Lines::new(&mut *reader);
 
     let mut xref = CrossRefTable::new();
-    let mut line_idx = 0;
+    // ── end pdf_manipulator patch ──
 
     // Find "xref" keyword, skipping leading whitespace and stray data lines
     // Some PDFs have garbage bytes or comments before the xref keyword
     let mut skipped_lines = 0;
     const MAX_SKIP_LINES: usize = 10;
-    while line_idx < lines.len() {
-        let trimmed = lines[line_idx].trim();
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        // ── end pdf_manipulator patch ──
         if trimmed.is_empty() {
-            line_idx += 1;
             continue; // Skip empty lines (don't count toward limit)
         }
         if trimmed.starts_with("xref") {
-            line_idx += 1;
             break; // Found xref keyword
         }
         // Tolerate a few unexpected lines before xref
@@ -584,13 +577,13 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
             return Err(Error::InvalidXref);
         }
         log::debug!("Skipping unexpected line before xref: {:?}", trimmed);
-        line_idx += 1;
     }
 
     // Parse subsections
-    while line_idx < lines.len() {
-        let trimmed = lines[line_idx].trim();
-        line_idx += 1;
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        // ── end pdf_manipulator patch ──
 
         // End of xref table
         if trimmed.starts_with("trailer") {
@@ -618,9 +611,13 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
 
         // Parse entries in this subsection
         let mut i = 0;
-        while i < count && line_idx < lines.len() {
-            let trimmed = lines[line_idx].trim();
-            line_idx += 1;
+        // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+        while i < count {
+            let Some(line) = lines.next() else {
+                break;
+            };
+            let trimmed = line.trim();
+            // ── end pdf_manipulator patch ──
 
             // Skip empty lines (don't increment counter)
             if trimmed.is_empty() {
@@ -631,7 +628,9 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
             if trimmed.starts_with("trailer") {
                 // We expected more entries but hit trailer early
                 log::warn!("Expected {} entries but only found {} before trailer", count, i);
-                line_idx -= 1; // Back up so outer loop can process trailer
+                // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+                lines.unread(line); // Back up so outer loop can process trailer
+                // ── end pdf_manipulator patch ──
                 break;
             }
 
@@ -711,15 +710,47 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
     // After the "trailer" keyword, the lines contain the trailer dict (e.g., "<< /Size 100 /Root 1 0 R /Prev 12345 >>").
     // We concatenate remaining lines and parse the dictionary so that /Prev and other
     // trailer entries are available via xref.trailer().
-    let remaining_text: String = lines[line_idx..].join("\n");
-    if !remaining_text.trim().is_empty() {
-        // The trailer dict should start with "<<" after optional whitespace
+    // ── pdf_manipulator patch: file-level scans run in bounded windows ──
+    // The lines are taken while they can still be the dictionary: up to the
+    // line that completes it, or to the word that ends the section.
+    let mut remaining_text = String::new();
+    let mut trailer_set = false;
+    for line in lines.by_ref() {
+        let word = line.trim_start();
+        if word.starts_with("startxref") || word.starts_with("%%EOF") {
+            break;
+        }
+        if !remaining_text.is_empty() {
+            remaining_text.push('\n');
+        }
+        remaining_text.push_str(&line);
         let trimmed = remaining_text.trim();
-        if trimmed.starts_with("<<")
-            || trimmed.starts_with("<< ")
-            || trimmed.starts_with("<<\n")
-            || trimmed.starts_with("<<\r")
-        {
+        if trimmed.is_empty() {
+            continue;
+        }
+        // The trailer dict should start with "<<" after optional whitespace
+        if !trimmed.starts_with("<<") {
+            break;
+        }
+        // A dictionary the text ends in the middle of parses as the entries
+        // so far, with nothing left over; one that is closed leaves the line
+        // ending after it. The line ending tells them apart.
+        let mut closed = trimmed.as_bytes().to_vec();
+        closed.push(b'\n');
+        if let Ok((rest, trailer_obj)) = parse_object(&closed) {
+            if !rest.is_empty() {
+                if let Some(dict) = trailer_obj.as_dict() {
+                    xref.set_trailer(dict.clone());
+                }
+                trailer_set = true;
+                break;
+            }
+        }
+    }
+    if !trailer_set {
+        // The section ended inside the dictionary: the entries read are all it has.
+        let trimmed = remaining_text.trim();
+        if trimmed.starts_with("<<") {
             if let Ok((_, trailer_obj)) = parse_object(trimmed.as_bytes()) {
                 if let Some(dict) = trailer_obj.as_dict() {
                     xref.set_trailer(dict.clone());
@@ -727,6 +758,11 @@ fn parse_traditional_xref<R: Read + Seek>(reader: &mut R, offset: u64) -> Result
             }
         }
     }
+    if let Some(e) = lines.error() {
+        log::error!("Failed to read xref lines: {}", e);
+        return Err(Error::InvalidXref);
+    }
+    // ── end pdf_manipulator patch ──
 
     Ok(xref)
 }
@@ -1099,79 +1135,10 @@ fn split_lines(text: &str) -> Vec<String> {
     lines
 }
 
-/// Read a line from a BufReader, handling all PDF line ending styles (LF, CRLF, CR).
-///
-/// Standard BufReader::read_line() only handles LF and CRLF, but some PDFs use
-/// standalone CR (Mac-style line endings). This function handles all three by
-/// reading the entire buffer and splitting manually.
-/// Read the xref table and trailer from reader, bounded by finding "trailer" + dict.
-///
-/// This avoids `read_to_end` which would read the entire remaining file for
-/// linearized PDFs where the first xref is near byte 0. Instead, we read in
-/// chunks and search for the "trailer" keyword in raw bytes, which correctly
-/// handles all line ending styles (CR, LF, CRLF).
-fn read_until_trailer<R: Read + Seek>(reader: &mut R) -> std::io::Result<Vec<String>> {
-    // Read in chunks until we find "trailer" keyword followed by a dict,
-    // followed by "startxref" or ">>" closing the dict.
-    // Most xref tables are <1MB. We cap at 32MB to prevent runaway reads.
-    const CHUNK_SIZE: usize = 256 * 1024;
-    const MAX_TOTAL: usize = 32 * 1024 * 1024;
-
-    let mut data = Vec::with_capacity(CHUNK_SIZE);
-    let mut total_read = 0usize;
-    let mut found_end = false;
-
-    loop {
-        let prev_len = data.len();
-        data.resize(prev_len + CHUNK_SIZE, 0);
-        let n = reader.read(&mut data[prev_len..])?;
-        data.truncate(prev_len + n);
-        total_read += n;
-
-        if n == 0 {
-            break; // EOF
-        }
-
-        // Search for the end of the trailer section: look for ">>" after "trailer"
-        // then "startxref" or "%%EOF"
-        if let Some(trailer_pos) = find_bytes(&data, b"trailer") {
-            // Find the closing ">>" of the trailer dict after "trailer"
-            let after_trailer = &data[trailer_pos + 7..];
-            if let Some(dict_end) = find_bytes(after_trailer, b">>") {
-                // Check if we also have "startxref" after ">>"
-                let after_dict = &after_trailer[dict_end + 2..];
-                if find_bytes(after_dict, b"startxref").is_some() || after_dict.len() > 20 {
-                    found_end = true;
-                    // Truncate to just past the trailer dict + a bit more
-                    let end_pos = trailer_pos + 7 + dict_end + 2 + 50.min(after_dict.len());
-                    data.truncate(end_pos);
-                    break;
-                }
-            }
-        }
-
-        if total_read >= MAX_TOTAL {
-            break;
-        }
-    }
-
-    if !found_end {
-        // Fallback: if we didn't find trailer end in 32MB, use what we have
-        log::warn!(
-            "Could not find trailer end marker within {}MB of xref",
-            total_read / (1024 * 1024)
-        );
-    }
-
-    // Split into lines handling CR, LF, and CRLF
-    let text = String::from_utf8_lossy(&data);
-    Ok(split_lines(&text))
-}
-
-/// Find the position of a byte pattern in a byte slice.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
+// ── pdf_manipulator patch: file-level scans run in bounded windows ──
+// `read_until_trailer` and `find_bytes` are gone: the xref lines are read on
+// demand by `host::scan::Lines`.
+// ── end pdf_manipulator patch ──
 
 #[cfg(test)]
 mod tests {

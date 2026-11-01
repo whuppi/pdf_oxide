@@ -491,25 +491,32 @@ fn qa_text_tr1_stroke_only_no_panic() {
     assert_eq!(on.len(), 100 * 100 * 4, "Tr=1 must produce a full pixmap");
 }
 
-/// Probe 5c — Tr=2 (fill+stroke). Pipeline resolves BOTH sides; the
-/// rasteriser today only paints the fill side. Painted ink must be the
-/// FILL colour.
+// ── pdf_manipulator patch: Tr 2 and 6 fill, then stroke in the stroke colour (ISO 32000-1 Table 106); the rasteriser now strokes ──
+/// Pixels in the 100×100 render whose colour `pick` accepts.
+fn count_rgb(rgba: &[u8], pick: impl Fn(u8, u8, u8) -> bool) -> u32 {
+    rgba.chunks_exact(4).filter(|p| pick(p[0], p[1], p[2])).count() as u32
+}
+
+/// Asserts the glyph shows the fill colour (red) inside and the stroke
+/// colour (blue) on its outline.
+fn assert_fill_and_stroke(mode: u8, rgba: &[u8]) {
+    let red = count_rgb(rgba, |r, g, b| r > 180 && g < 80 && b < 80);
+    let blue = count_rgb(rgba, |r, g, b| b > 180 && r < 80 && g < 80);
+    assert!(red > 0, "Tr={mode} must fill the glyph in the fill colour, red pixels {red}");
+    assert!(blue > 0, "Tr={mode} must stroke the outline in the stroke colour, blue pixels {blue}");
+}
+
+/// Probe 5c — Tr=2 (fill+stroke): the glyph is filled red and its
+/// outline stroked blue.
 #[test]
 fn qa_text_tr2_fill_and_stroke_paints_fill_color() {
-    // Tr=2 fill+stroke: pipeline resolves BOTH sides but the
-    // rasteriser paints fill only. The painted ink must be the FILL
-    // colour (red), not the stroke colour (blue).
     let content = "BT 1 0 0 rg 0 0 1 RG /F1 40 Tf 2 Tr 10 30 Td (M) Tj ET\n";
     let bytes = build_pdf_text(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
-    let avg = average_ink_rgb(&on, 0, 0, 100, 100);
-    let (r, g, b) = avg.expect("Tr=2 must paint glyph ink");
-    assert!(
-        r > 180.0 && r > g + 60.0 && r > b + 60.0,
-        "Tr=2 ink must be FILL red, not stroke blue, got ({r:.1}, {g:.1}, {b:.1})"
-    );
+    assert_fill_and_stroke(2, &on);
 }
+// ── end pdf_manipulator patch ──
 
 /// Probe 5d — Tr=3 (invisible). Pipeline short-circuits to None — no
 /// clone of `gs` happens. The page must stay at the white background
@@ -568,24 +575,18 @@ fn qa_text_tr5_stroke_plus_clip_renders_without_panic() {
     assert_eq!(on.len(), 100 * 100 * 4, "Tr=5 must produce a full pixmap");
 }
 
-/// Probe 5g — Tr=6 (fill + stroke + add to clip path). Pipeline resolves
-/// BOTH sides; rasteriser paints fill only. Painted ink must be the
-/// fill colour, not the stroke colour.
+// ── pdf_manipulator patch: Tr 2 and 6 fill, then stroke in the stroke colour (ISO 32000-1 Table 106); the rasteriser now strokes ──
+/// Probe 5g — Tr=6 (fill + stroke + add to clip path): filled red,
+/// outline stroked blue.
 #[test]
 fn qa_text_tr6_fill_stroke_plus_clip_paints_fill_color() {
     let content = "BT 1 0 0 rg 0 0 1 RG /F1 40 Tf 6 Tr 10 30 Td (M) Tj ET\n";
     let bytes = build_pdf_text(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
-    // Tr=6 (fill+stroke+clip): both sides resolved; rasteriser
-    // paints fill only. Ink must be FILL red, not stroke blue.
-    let avg = average_ink_rgb(&on, 0, 0, 100, 100);
-    let (r, g, b) = avg.expect("Tr=6 must paint the fill side");
-    assert!(
-        r > 180.0 && r > g + 60.0 && r > b + 60.0,
-        "Tr=6 painted ink must be FILL red, not stroke blue, got ({r:.1}, {g:.1}, {b:.1})"
-    );
+    assert_fill_and_stroke(6, &on);
 }
+// ── end pdf_manipulator patch ──
 
 /// Probe 5h — Tr=7 (add to clip path only). Per the spec Tr=7 is a
 /// clip-only mode that paints nothing. The pipeline helper's `matches!`

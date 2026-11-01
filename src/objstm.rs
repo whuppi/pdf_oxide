@@ -69,101 +69,19 @@ use std::collections::HashMap;
 /// # Ok::<(), pdf_oxide::error::Error>(())
 /// ```
 pub fn parse_object_stream(stream_obj: &Object) -> Result<HashMap<u32, Object>> {
-    // Extract stream dictionary and data
-    let dict = match stream_obj {
-        Object::Stream { dict, .. } => dict,
-        _ => return Err(Error::InvalidPdf("object stream is not a Stream object".to_string())),
-    };
-
-    // Verify this is an object stream
-    if let Some(type_obj) = dict.get("Type") {
-        if let Some(type_name) = type_obj.as_name() {
-            if type_name != "ObjStm" {
-                return Err(Error::InvalidPdf(format!(
-                    "expected /Type /ObjStm, got /Type /{}",
-                    type_name
-                )));
-            }
-        }
-    }
-
-    // Get required parameters
-    let n = dict
-        .get("N")
-        .and_then(|o| o.as_integer())
-        .ok_or_else(|| Error::InvalidPdf("object stream missing /N entry".to_string()))?;
-
-    let first = dict
-        .get("First")
-        .and_then(|o| o.as_integer())
-        .ok_or_else(|| Error::InvalidPdf("object stream missing /First entry".to_string()))?;
-
-    // Validate parameters
-    if !(0..=1_000_000).contains(&n) {
-        return Err(Error::InvalidPdf(format!("invalid object stream /N value: {}", n)));
-    }
-
-    if !(0..=10_000_000).contains(&first) {
-        return Err(Error::InvalidPdf(format!("invalid object stream /First value: {}", first)));
-    }
-
-    let n = n as usize;
-    let first = first as usize;
-
-    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-    // Decode the stream data
-    let decoded_data = stream_obj.decode_stream_data()?;
-    // ── end pdf_manipulator patch ──
-
-    // Validate decoded data size
-    if decoded_data.len() < first {
-        return Err(Error::InvalidPdf(format!(
-            "object stream data too short: {} bytes, expected at least {}",
-            decoded_data.len(),
-            first
-        )));
-    }
-
-    // Parse the pairs section (before /First)
-    let pairs_data = &decoded_data[..first];
-    let pairs = parse_object_number_pairs(pairs_data, n)?;
-
-    // Parse the objects section (after /First)
-    let objects_data = &decoded_data[first..];
+    // ── pdf_manipulator patch: object stream members parse one at a time ──
+    // The members are read through the stream's decoded reader, one after
+    // the other in the order of the table; the objects they parse to are the
+    // result, and the decoded stream is never held.
+    let decoded = decode_object_stream(stream_obj)?;
     let mut result = HashMap::new();
-
-    for (obj_num, offset_in_data) in pairs {
-        // The offset is relative to the start of objects_data
-        if offset_in_data >= objects_data.len() {
-            log::warn!(
-                "Object {} offset {} is beyond stream data length {}",
-                obj_num,
-                offset_in_data,
-                objects_data.len()
-            );
-            continue;
-        }
-
-        // Parse the object starting at this offset
-        let obj_data = &objects_data[offset_in_data..];
-        match parse_object(obj_data) {
-            Ok((_remaining, obj)) => {
-                result.insert(obj_num, obj);
-            },
-            Err(e) => {
-                log::warn!(
-                    "Failed to parse object {} from stream at offset {}: {:?}",
-                    obj_num,
-                    offset_in_data,
-                    e
-                );
-                // Continue parsing other objects even if one fails
-                continue;
-            },
+    for &(obj_num, offset) in &decoded.pairs {
+        if let Some(obj) = decoded.member_at(obj_num, offset) {
+            result.insert(obj_num, obj);
         }
     }
-
     Ok(result)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Parse the pairs section of an object stream.
@@ -265,33 +183,64 @@ fn read_integer_string(data: &[u8]) -> Option<(&[u8], String)> {
 }
 
 // ── pdf_manipulator patch: object stream members parse one at a time ──
-/// An object stream decoded once: its bytes and the offset of each member.
-/// `member` parses a single object from the bytes, so answering one request
-/// never builds the whole stream's objects (a stream of large arrays holds
-/// hundreds of megabytes parsed, a few megabytes decoded).
-#[derive(Debug)]
+/// An object stream opened: the offset of each member and the means to read
+/// one. `member` decodes forward to a single member and parses just that
+/// object, so answering one request never builds the whole stream's objects
+/// (a stream of large arrays holds hundreds of megabytes parsed, a few
+/// megabytes decoded) and never holds its decoded bytes. A member before the
+/// reader's place reopens the stream: a stream decodes forward only.
 pub struct DecodedObjStm {
-    data: Vec<u8>,
+    /// Where the members begin in the decoded data.
     first: usize,
+    /// The table's pairs, in the table's order.
+    pairs: Vec<(u32, usize)>,
+    /// Each member's offset (relative to `first`); the last pair of a number
+    /// wins.
     offsets: HashMap<u32, usize>,
+    /// The distinct offsets, ascending: a member ends where the next begins.
+    starts: Vec<usize>,
+    bytes: crate::host::forward::Forward,
+}
+
+impl std::fmt::Debug for DecodedObjStm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DecodedObjStm {{ members: {} }}", self.pairs.len())
+    }
 }
 
 impl DecodedObjStm {
+    /// Times a member read went back and opened the stream again.
+    #[cfg(test)]
+    pub(crate) fn reopens(&self) -> usize {
+        self.bytes.reopens()
+    }
+
     /// Parses member `obj_num`; `None` when the stream does not hold it or
     /// its bytes do not parse.
     pub fn member(&self, obj_num: u32) -> Option<Object> {
         let offset = *self.offsets.get(&obj_num)?;
-        let objects_data = &self.data[self.first..];
-        if offset >= objects_data.len() {
+        self.member_at(obj_num, offset)
+    }
+
+    fn member_at(&self, obj_num: u32, offset: usize) -> Option<Object> {
+        let next = self.starts.partition_point(|&s| s <= offset);
+        let len = self.starts.get(next).map_or(u64::MAX, |&end| (end - offset) as u64);
+        let bytes = match self.bytes.read_at((self.first + offset) as u64, len) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("Failed to read object {} from stream at offset {}: {}", obj_num, offset, e);
+                return None;
+            },
+        };
+        if bytes.is_empty() {
             log::warn!(
-                "Object {} offset {} is beyond stream data length {}",
+                "Object {} offset {} is beyond stream data length",
                 obj_num,
-                offset,
-                objects_data.len()
+                offset
             );
             return None;
         }
-        match parse_object(&objects_data[offset..]) {
+        match parse_object(&bytes) {
             Ok((_remaining, obj)) => Some(obj),
             Err(e) => {
                 log::warn!(
@@ -306,11 +255,13 @@ impl DecodedObjStm {
     }
 }
 
-/// Decodes an object stream and reads its offset table, parsing no member.
+/// Opens an object stream and reads its offset table, parsing no member.
 /// The argument and errors are those of `parse_object_stream`.
 pub fn decode_object_stream(stream_obj: &Object) -> Result<DecodedObjStm> {
-    let dict = match stream_obj {
-        Object::Stream { dict, .. } => dict,
+    use std::io::Read;
+
+    let (dict, body) = match stream_obj {
+        Object::Stream { dict, body } => (dict, body),
         _ => return Err(Error::InvalidPdf("object stream is not a Stream object".to_string())),
     };
     if let Some(type_name) = dict.get("Type").and_then(|t| t.as_name()) {
@@ -337,16 +288,40 @@ pub fn decode_object_stream(stream_obj: &Object) -> Result<DecodedObjStm> {
     }
     let first = first as usize;
 
-    let data = stream_obj.decode_stream_data()?;
-    if data.len() < first {
+    let open: Box<dyn Fn() -> Result<Box<dyn Read>> + Send + Sync> = {
+        let dict = dict.clone();
+        let body = body.clone();
+        Box::new(move || {
+            let owned = body.clone();
+            crate::decoders::stream::reader_in(&dict, body.origin(), move || owned.owned_reader())
+        })
+    };
+    let mut reader = open()?;
+    let mut table = Vec::new();
+    reader
+        .by_ref()
+        .take(first as u64)
+        .read_to_end(&mut table)
+        .map_err(crate::encryption::stream::from_io)?;
+    if table.len() < first {
         return Err(Error::InvalidPdf(format!(
             "object stream data too short: {} bytes, expected at least {}",
-            data.len(),
+            table.len(),
             first
         )));
     }
-    let pairs = parse_object_number_pairs(&data[..first], n as usize)?;
-    Ok(DecodedObjStm { data, first, offsets: pairs.into_iter().collect() })
+    let pairs = parse_object_number_pairs(&table, n as usize)?;
+    let offsets: HashMap<u32, usize> = pairs.iter().copied().collect();
+    let mut starts: Vec<usize> = pairs.iter().map(|&(_, offset)| offset).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    Ok(DecodedObjStm {
+        first,
+        pairs,
+        offsets,
+        starts,
+        bytes: crate::host::forward::Forward::new(open, Some((reader, first as u64))),
+    })
 }
 // ── end pdf_manipulator patch ──
 

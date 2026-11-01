@@ -72,6 +72,7 @@ mod render_gaps;
 mod render_region_crop;
 #[cfg(feature = "rendering")]
 mod render_stream;
+mod scan_proof;
 #[cfg(feature = "rendering")]
 mod stencil_proof;
 #[cfg(feature = "rendering")]
@@ -81,5 +82,7 @@ mod stream_head;
 mod support;
 mod table_rulings;
 mod text_dense_baseline;
+#[cfg(feature = "rendering")]
+mod text_render_modes;
 mod text_tj_chunks;
 mod whole_reads;
