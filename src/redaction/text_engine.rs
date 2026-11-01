@@ -22,8 +22,14 @@
 //! trait abstracts width/encoding so the security-critical logic is
 //! exhaustively unit-testable without a real document.
 
+// ── pdf_manipulator patch: the codes each font showed or lost ──
+use super::font_scrub::FontCodes;
+// ── end pdf_manipulator patch ──
 use super::region::RegionSet;
 use super::text_prune::{prune_run, Glyph, TextPruneResult};
+// ── pdf_manipulator patch: the codes each font showed or lost ──
+use std::collections::BTreeMap;
+// ── end pdf_manipulator patch ──
 use crate::content::graphics_state::{GraphicsStateStack, Matrix};
 use crate::content::operators::{Operator, TextElement};
 use crate::geometry::Rect;
@@ -116,6 +122,11 @@ pub struct TextEngineResult {
     pub bytes_removed: u64,
     /// Distinct `(font_hash, code)` removed, for font scrubbing.
     pub removed_codes: Vec<(u32, u32)>,
+    // ── pdf_manipulator patch: the codes each font showed or lost ──
+    /// By font resource name, the codes the stream removed and the codes it
+    /// still shows.
+    pub fonts: BTreeMap<String, FontCodes>,
+    // ── end pdf_manipulator patch ──
     /// Set when a text show used a font whose per-glyph boxes cannot be
     /// reconstructed reliably (composite/Type0/unknown) *and* regions
     /// exist. The caller must treat this as a hard refusal — emitting the
@@ -444,7 +455,7 @@ impl<'a> TextPass<'a> {
                 }
                 let ctm = stack.current().ctm;
                 let res = show_string(text, ts, &ctm, fonts, regions, min_padding);
-                account(result, text.len(), &res);
+                account(result, &ts.font, text.len(), &res);
                 emit_runs(out, &res);
             },
             Operator::Quote { text } => {
@@ -464,7 +475,7 @@ impl<'a> TextPass<'a> {
                 ts.tm = ts.tlm;
                 let ctm = stack.current().ctm;
                 let res = show_string(text, ts, &ctm, fonts, regions, min_padding);
-                account(result, text.len(), &res);
+                account(result, &ts.font, text.len(), &res);
                 emit_runs(out, &res);
             },
             Operator::DoubleQuote {
@@ -489,7 +500,7 @@ impl<'a> TextPass<'a> {
                 ts.tm = ts.tlm;
                 let ctm = stack.current().ctm;
                 let res = show_string(text, ts, &ctm, fonts, regions, min_padding);
-                account(result, text.len(), &res);
+                account(result, &ts.font, text.len(), &res);
                 emit_runs(out, &res);
             },
             Operator::TJ { array } => {
@@ -516,6 +527,11 @@ impl<'a> TextPass<'a> {
                                     survived_runs.removed_codes.push(*c);
                                 }
                             }
+                            for c in &r.surviving_codes {
+                                if !survived_runs.surviving_codes.contains(c) {
+                                    survived_runs.surviving_codes.push(*c);
+                                }
+                            }
                             survived_runs.glyphs_removed += r.glyphs_removed;
                             survived_runs.runs.extend(r.runs);
                         },
@@ -533,7 +549,7 @@ impl<'a> TextPass<'a> {
                         },
                     }
                 }
-                account(result, tj_orig, &survived_runs);
+                account(result, &ts.font, tj_orig, &survived_runs);
                 if any_removed {
                     emit_runs(out, &survived_runs);
                 } else {
@@ -622,7 +638,18 @@ fn show_strings(op: &Operator) -> Vec<&[u8]> {
 /// show-string payload byte count; removed bytes = `orig_len` minus the
 /// surviving runs' bytes (re-serialization float bloat makes a raw
 /// stream-length diff meaningless, so the byte metric is computed here).
-fn account(result: &mut TextEngineResult, orig_len: usize, res: &TextPruneResult) {
+// ── pdf_manipulator patch: the codes each font showed or lost ──
+fn account(result: &mut TextEngineResult, font: &str, orig_len: usize, res: &TextPruneResult) {
+    if !res.removed_codes.is_empty() || !res.surviving_codes.is_empty() {
+        let codes = result.fonts.entry(font.to_string()).or_default();
+        for (_, code) in &res.removed_codes {
+            codes.removed.insert(*code);
+        }
+        for (_, code) in &res.surviving_codes {
+            codes.surviving.insert(*code);
+        }
+    }
+    // ── end pdf_manipulator patch ──
     result.glyphs_removed += res.glyphs_removed;
     let kept: usize = res.runs.iter().map(|r| r.bytes.len()).sum();
     result.bytes_removed += orig_len.saturating_sub(kept) as u64;

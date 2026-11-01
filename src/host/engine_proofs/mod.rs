@@ -43,7 +43,13 @@ mod page_operators;
 mod pattern_paint;
 #[cfg(feature = "rendering")]
 mod predictor_depths;
+#[cfg(feature = "rendering")]
+mod image_mods_belt;
 mod redact_pass;
+#[cfg(feature = "rendering")]
+mod redact_flatten;
+#[cfg(feature = "rendering")]
+mod redact_font_scrub;
 mod redact_path_ink;
 mod redact_paths;
 #[cfg(feature = "rendering")]

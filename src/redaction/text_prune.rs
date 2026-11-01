@@ -62,6 +62,11 @@ pub struct TextPruneResult {
     /// Distinct `(resource_id, glyph_code)` pairs removed (deduped, in
     /// first-seen order) for `font_scrub`.
     pub removed_codes: Vec<(u32, u32)>,
+    // ── pdf_manipulator patch: the codes a show keeps ──
+    /// Distinct `(resource_id, glyph_code)` pairs that survive, in first-seen
+    /// order: the codes `font_scrub` must leave their width and mapping.
+    pub surviving_codes: Vec<(u32, u32)>,
+    // ── end pdf_manipulator patch ──
     /// Total glyphs physically removed.
     pub glyphs_removed: usize,
 }
@@ -80,6 +85,9 @@ pub fn prune_run(glyphs: &[Glyph], regions: &RegionSet, min_padding: f32) -> Tex
     // O(1) membership for the dedup; the Vec still carries the public
     // first-seen order (Copilot review, PR #512 — avoids O(n²)).
     let mut seen_codes: HashSet<(u32, u32)> = HashSet::new();
+    // ── pdf_manipulator patch: the codes a show keeps ──
+    let mut seen_surviving: HashSet<(u32, u32)> = HashSet::new();
+    // ── end pdf_manipulator patch ──
 
     for g in glyphs {
         let removed = regions.any_intersects(&g.bbox, min_padding);
@@ -94,6 +102,11 @@ pub fn prune_run(glyphs: &[Glyph], regions: &RegionSet, min_padding: f32) -> Tex
                 out.removed_codes.push(g.code);
             }
         } else {
+            // ── pdf_manipulator patch: the codes a show keeps ──
+            if seen_surviving.insert(g.code) {
+                out.surviving_codes.push(g.code);
+            }
+            // ── end pdf_manipulator patch ──
             match &mut cur {
                 Some(run) => run.bytes.extend_from_slice(&g.bytes),
                 None => {

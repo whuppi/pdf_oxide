@@ -24,6 +24,16 @@ use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::path::Path;
 
+// ── pdf_manipulator patch: the font and structure scrub of a redaction ──
+// A child module, so it reads the redacted pages and the forms their passes open.
+#[path = "../host/redact_scrub.rs"]
+mod redact_scrub;
+// ── end pdf_manipulator patch ──
+// ── pdf_manipulator patch: image bounds are edited on the belt ──
+#[path = "../host/image_mods.rs"]
+mod image_mods;
+// ── end pdf_manipulator patch ──
+
 /// Document metadata (Info dictionary).
 #[derive(Debug, Clone, Default)]
 pub struct DocumentInfo {
@@ -527,6 +537,37 @@ struct RedactedPage {
     /// never the source's pixels redacted twice), the mesh, pattern and form
     /// copies, and the resource names the page's surviving marks still name.
     scope: crate::redaction::transform::Scope,
+    /// The annotations and widgets the save flattens on this page, which the
+    /// pass decided with the page's content (set when the save prepares it).
+    flat: Option<FlatPage>,
+}
+
+/// The flattened appearances of a redacted page: each is a Form XObject the
+/// page's overlay draws, so the pass sees it as any other form and the
+/// redaction removes what lies under a box.
+struct FlatPage {
+    sets: Vec<FlatSet>,
+    /// The overlay operators of every set, in order.
+    overlay: Vec<u8>,
+}
+
+/// The appearances of one kind of flattening, with the id and resource name
+/// each Form XObject is written under.
+struct FlatSet {
+    appearances: Vec<AnnotationAppearance>,
+    xobjects: Vec<(u32, String)>,
+    /// Whether the set flattens widgets: the page keeps no widget after it.
+    widgets: bool,
+}
+
+impl FlatPage {
+    /// The Form XObject written under `id`, when it is one of the page's.
+    fn object(&self, id: u32) -> Option<Object> {
+        self.sets.iter().find_map(|set| {
+            let at = set.xobjects.iter().position(|(xid, _)| *xid == id)?;
+            Some(set.appearances[at].form_object())
+        })
+    }
 }
 // ── end pdf_manipulator patch ──
 
@@ -550,6 +591,10 @@ struct ScopeIds {
     meshes: Vec<(u32, u32)>,
     patterns: Vec<u32>,
     forms: Vec<FormIds>,
+    /// The /Font entries of the scope's resources that the scrub replaces:
+    /// the copy of a font shared with content the redaction does not touch,
+    /// or a direct font dictionary rewritten.
+    fonts: HashMap<String, Object>,
 }
 
 /// The ids of one form copy and of the copies its own content queued.
@@ -582,9 +627,19 @@ struct CopyWork<'a> {
 struct DocForms<'d> {
     source: &'d PdfDocument,
     page_resources: Object,
+    /// The page's flattened appearances, which no document holds.
+    flat: Option<&'d FlatPage>,
 }
 
 impl DocForms<'_> {
+    /// The object `form` names.
+    fn load(&self, form: ObjectRef) -> Result<Object> {
+        match self.flat.and_then(|flat| flat.object(form.id)) {
+            Some(object) => Ok(object),
+            None => self.source.load_object(form),
+        }
+    }
+
     /// The resources a form is drawn with, resolved.
     fn resources_of(&self, dict: &HashMap<String, Object>) -> Result<Object> {
         match dict.get("Resources") {
@@ -596,7 +651,7 @@ impl DocForms<'_> {
 
 impl crate::redaction::transform::FormLoader for DocForms<'_> {
     fn view(&self, form: ObjectRef) -> Result<crate::redaction::transform::FormView> {
-        let object = self.source.load_object(form)?;
+        let object = self.load(form)?;
         let unreadable = |what: &str| {
             Error::Unsupported(format!(
                 "the form {} {} has {what} that cannot be read; refusing to redact a page \
@@ -641,7 +696,7 @@ impl crate::redaction::transform::FormLoader for DocForms<'_> {
         Ok(crate::redaction::transform::FormView {
             matrix,
             bbox: Rect::from_points(b[0].min(b[2]), b[1].min(b[3]), b[0].max(b[2]), b[1].max(b[3])),
-            resources: DocumentEditor::image_resources_of(self.source, &resources)?,
+            resources: DocumentEditor::image_resources_of(self.source, &resources, None)?,
             fonts: Box::new(DocumentEditor::font_metrics_of(self.source, &resources)?),
         })
     }
@@ -650,7 +705,13 @@ impl crate::redaction::transform::FormLoader for DocForms<'_> {
         &self,
         form: ObjectRef,
     ) -> Result<crate::host::content::Operators<Box<dyn Read>>> {
-        self.source.form_operators(form)
+        match self.flat.and_then(|flat| flat.object(form.id)) {
+            Some(object) => Ok(crate::host::content::Operators::new(
+                crate::host::content::parts::decoded_reader(&object)?,
+                crate::host::content::Mode::Full,
+            )),
+            None => self.source.form_operators(form),
+        }
     }
 }
 // ── end pdf_manipulator patch ──
@@ -914,8 +975,13 @@ pub struct ModifiedPageProps {
 /// Stores annotation appearance data for flattening.
 #[derive(Debug, Clone)]
 struct AnnotationAppearance {
-    /// Content stream bytes from the appearance
-    content: Vec<u8>,
+    // ── pdf_manipulator patch: the appearance stream as stored, never a byte copy ──
+    /// The appearance stream's dictionary (empty for a generated appearance)
+    dict: HashMap<String, Object>,
+    /// Its data: an extent of the document that holds the stream, or the
+    /// bytes of an appearance generated here
+    body: StreamBody,
+    // ── end pdf_manipulator patch ──
     /// BBox of the appearance XObject
     bbox: [f32; 4],
     /// Rect of the annotation on the page
@@ -929,6 +995,55 @@ struct AnnotationAppearance {
     /// XObject. Empty for self-contained appearances.
     extra_objects: Vec<(u32, Object)>,
 }
+
+// ── pdf_manipulator patch: the appearance is flattened as the stream it is stored as ──
+impl AnnotationAppearance {
+    /// The data of the appearance object `object` and the entries of its
+    /// dictionary that [`Self::form_object`] does not set (the filters and the
+    /// like). A dictionary where a stream is expected is an empty stream.
+    fn stream_of(object: &Object) -> (HashMap<String, Object>, StreamBody) {
+        let none = HashMap::new();
+        let (dict, body) = match object {
+            Object::Stream { dict, body } => (dict, body.clone()),
+            other => (other.as_dict().unwrap_or(&none), StreamBody::Inline(bytes::Bytes::new())),
+        };
+        // Rebuilt, not trimmed: a table emptied by `remove` keeps its slots.
+        let rest = dict
+            .iter()
+            .filter(|(key, _)| {
+                !["Length", "Type", "Subtype", "FormType", "BBox", "Matrix", "Resources"]
+                    .contains(&key.as_str())
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        (rest, body)
+    }
+
+    /// The Form XObject this appearance is flattened as: its own stream with
+    /// /BBox, /Matrix and /Resources set.
+    fn form_object(&self) -> Object {
+        let mut dict = self.dict.clone();
+        dict.remove("Length");
+        dict.insert("Type".to_string(), Object::Name("XObject".to_string()));
+        dict.insert("Subtype".to_string(), Object::Name("Form".to_string()));
+        dict.insert("FormType".to_string(), Object::Integer(1));
+        dict.insert(
+            "BBox".to_string(),
+            Object::Array(self.bbox.iter().map(|v| Object::Real(*v as f64)).collect()),
+        );
+        if let Some(m) = self.matrix {
+            dict.insert(
+                "Matrix".to_string(),
+                Object::Array(m.iter().map(|v| Object::Real(*v as f64)).collect()),
+            );
+        }
+        if let Some(resources) = &self.resources {
+            dict.insert("Resources".to_string(), resources.clone());
+        }
+        Object::Stream { dict, body: self.body.clone() }
+    }
+}
+// ── end pdf_manipulator patch ──
 
 /// Information about an image on a page.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3680,6 +3795,7 @@ impl DocumentEditor {
         source: &PdfDocument,
         page_index: usize,
         page: &RedactedPage,
+        mods: Option<&HashMap<String, ImageModification>>,
         content_id: u32,
         length_id: u32,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
@@ -3689,9 +3805,15 @@ impl DocumentEditor {
         xref_entries: &mut XrefEntries,
     ) -> Result<()> {
         let ops = source.page_operators(page_index)?;
-        let page_resources = Self::inherited_resources(source, page_index)?;
-        let images = Self::image_resources_of(source, &page_resources)?;
-        let forms = DocForms { source, page_resources };
+        let flat = page.flat.as_ref();
+        let page_resources = Self::with_flat_xobjects(
+            source,
+            Self::inherited_resources(source, page_index)?,
+            flat,
+        )?;
+        let images = Self::image_resources_of(source, &page_resources, flat)?;
+        let forms = DocForms { source, page_resources, flat };
+        let overlay: &[u8] = flat.map_or(&[], |flat| flat.overlay.as_slice());
         let mut outcome = None;
         Self::write_pass_stream(
             (content_id, length_id),
@@ -3702,15 +3824,35 @@ impl DocumentEditor {
             deflate,
             xref_entries,
             |out| {
-                outcome = Some(Self::run_redaction_pass(
-                    &page.regions,
-                    &page.opts,
-                    &page.fonts,
-                    &images,
-                    &forms,
-                    ops,
-                    out,
-                )?);
+                // The image bounds are edited after the redaction decided the
+                // page, on the operators it wrote.
+                outcome = Some(match mods {
+                    Some(mods) => {
+                        let mut stage = image_mods::ImageModStage::new(mods, &mut *out);
+                        let outcome = Self::run_redaction_pass(
+                            &page.regions,
+                            &page.opts,
+                            &page.fonts,
+                            &images,
+                            &forms,
+                            ops,
+                            overlay,
+                            &mut stage,
+                        )?;
+                        stage.finish()?;
+                        outcome
+                    },
+                    None => Self::run_redaction_pass(
+                        &page.regions,
+                        &page.opts,
+                        &page.fonts,
+                        &images,
+                        &forms,
+                        ops,
+                        overlay,
+                        out,
+                    )?,
+                });
                 Ok(())
             },
         )?;
@@ -3787,11 +3929,38 @@ impl DocumentEditor {
         images: &crate::redaction::transform::ImageResources,
         forms: &dyn crate::redaction::transform::FormLoader,
         ops: crate::host::content::Operators<R>,
+        appended: &[u8],
         mut out: &mut dyn Write,
     ) -> Result<crate::redaction::transform::PassOutcome> {
         let pass =
             crate::redaction::transform::RedactPass::new(regions, opts, fonts, images).with_forms(forms);
-        pass.run(ops, &mut out)
+        pass.run_then(
+            ops,
+            crate::host::content::Operators::new(appended, crate::host::content::Mode::Full),
+            &mut out,
+        )
+    }
+
+    /// `resources` with the XObjects the page's flattened appearances are
+    /// written as, under the names the page's overlay draws them by.
+    fn with_flat_xobjects(
+        source: &PdfDocument,
+        resources: Object,
+        flat: Option<&FlatPage>,
+    ) -> Result<Object> {
+        let Some(flat) = flat else { return Ok(resources) };
+        let mut dict = resources.as_dict().cloned().unwrap_or_default();
+        let mut xobjects = match dict.get("XObject") {
+            Some(x) => source.resolve_object(x)?.as_dict().cloned().unwrap_or_default(),
+            None => HashMap::new(),
+        };
+        for set in &flat.sets {
+            for (id, name) in &set.xobjects {
+                xobjects.insert(name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
+            }
+        }
+        dict.insert("XObject".to_string(), Object::Dictionary(xobjects));
+        Ok(Object::Dictionary(dict))
     }
     // ── end pdf_manipulator patch ──
 
@@ -3850,6 +4019,7 @@ impl DocumentEditor {
     fn image_resources_of(
         source: &PdfDocument,
         resources: &Object,
+        flat: Option<&FlatPage>,
     ) -> Result<crate::redaction::transform::ImageResources> {
         use crate::redaction::transform::{ImageResources, MeshPattern};
         let mut images = std::collections::HashMap::new();
@@ -3865,7 +4035,12 @@ impl DocumentEditor {
         };
         for (name, value) in &entries("XObject")? {
             let Some(reference) = value.as_reference() else { continue };
-            let Ok(obj) = source.load_object(reference) else { continue };
+            let Some(obj) = flat
+                .and_then(|flat| flat.object(reference.id))
+                .or_else(|| source.load_object(reference).ok())
+            else {
+                continue;
+            };
             let Some(dict) = obj.as_dict() else { continue };
             let is_image = dict.get("ImageMask").and_then(|o| o.as_bool()) == Some(true)
                 || dict.get("Subtype").and_then(|o| o.as_name()) == Some("Image");
@@ -3922,12 +4097,25 @@ impl DocumentEditor {
         for (name, value) in &entries("ExtGState")? {
             line_styles.insert(name.clone(), Self::line_style_of(source, value));
         }
+        let mut mcids = std::collections::HashMap::new();
+        for (name, value) in &entries("Properties")? {
+            let Ok(properties) = source.resolve_object(value) else { continue };
+            let mcid = properties
+                .as_dict()
+                .and_then(|d| d.get("MCID"))
+                .and_then(|m| m.as_integer())
+                .and_then(|m| u32::try_from(m).ok());
+            if let Some(mcid) = mcid {
+                mcids.insert(name.clone(), mcid);
+            }
+        }
         Ok(ImageResources {
             images,
             forms,
             meshes,
             patterns,
             line_styles,
+            mcids,
         })
     }
 
@@ -4074,7 +4262,20 @@ impl DocumentEditor {
         copies: &ScopeIds,
     ) -> Result<Object> {
         let resources = Self::inherited_resources(&self.source, page_index)?;
-        Self::rewritten_resources(&self.source, &resources, &page.scope, copies)
+        let rewritten = Self::rewritten_resources(&self.source, &resources, &page.scope, copies)?;
+        // The flattened appearances a surviving `Do` still draws.
+        let Some(flat) = &page.flat else { return Ok(rewritten) };
+        let mut dict = rewritten.as_dict().cloned().unwrap_or_default();
+        let mut xobjects = dict.get("XObject").and_then(Object::as_dict).cloned().unwrap_or_default();
+        for set in &flat.sets {
+            for (id, name) in &set.xobjects {
+                if page.scope.kept_xobject_names.contains(name) {
+                    xobjects.insert(name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
+                }
+            }
+        }
+        dict.insert("XObject".to_string(), Object::Dictionary(xobjects));
+        Ok(Object::Dictionary(dict))
     }
 
     /// `resources` as a scope's content stream is written against: the
@@ -4125,6 +4326,13 @@ impl DocumentEditor {
         for (pattern, id) in scope.patterns.iter().zip(&ids.patterns) {
             pattern_dict.insert(pattern.name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
         }
+        if !ids.fonts.is_empty() {
+            let mut font_dict = entries("Font")?;
+            for (name, entry) in &ids.fonts {
+                font_dict.insert(name.clone(), entry.clone());
+            }
+            resources_dict.insert("Font".to_string(), Object::Dictionary(font_dict));
+        }
         resources_dict.insert("XObject".to_string(), Object::Dictionary(xobject_dict));
         for (key, dict) in [("Shading", shading_dict), ("Pattern", pattern_dict)] {
             if !dict.is_empty() || resources_dict.contains_key(key) {
@@ -4169,7 +4377,7 @@ impl DocumentEditor {
     /// resources, the function of a mesh copy, the rest of a pattern copy.
     fn copy_sources(&self, page_index: usize, page: &RedactedPage) -> Result<Vec<Object>> {
         let page_resources = Self::inherited_resources(&self.source, page_index)?;
-        let forms = DocForms { source: &self.source, page_resources };
+        let forms = DocForms { source: &self.source, page_resources, flat: page.flat.as_ref() };
         let mut out = Vec::new();
         Self::push_copy_sources(&self.source, &forms, &page.scope, &mut out)?;
         Ok(out)
@@ -4192,7 +4400,7 @@ impl DocumentEditor {
             out.push(Object::Dictionary(dict));
         }
         for form in &scope.forms {
-            let mut dict = source.load_object(form.source)?.as_dict().cloned().unwrap_or_default();
+            let mut dict = forms.load(form.source)?.as_dict().cloned().unwrap_or_default();
             let resources = forms.resources_of(&dict)?;
             dict.remove("Resources");
             out.push(Object::Dictionary(dict));
@@ -4263,7 +4471,7 @@ impl DocumentEditor {
             work.patterns.push((pattern, *id, mesh_id));
         }
         for (form, form_ids) in scope.forms.iter().zip(&ids.forms) {
-            let dict = source.load_object(form.source)?.as_dict().cloned().unwrap_or_default();
+            let dict = forms.load(form.source)?.as_dict().cloned().unwrap_or_default();
             let inner = forms.resources_of(&dict)?;
             Self::collect_copy_work(source, forms, &form.scope, &form_ids.inner, &inner, work)?;
             work.forms.push((form, form_ids));
@@ -4358,7 +4566,7 @@ impl DocumentEditor {
         xref_entries: &mut XrefEntries,
     ) -> Result<()> {
         use crate::redaction::transform::FormLoader;
-        let mut dict = source.load_object(form.source)?.as_dict().cloned().unwrap_or_default();
+        let mut dict = forms.load(form.source)?.as_dict().cloned().unwrap_or_default();
         for key in ["Length", "Filter", "DecodeParms", "DL", "F", "FFilter", "FDecodeParms"] {
             dict.remove(key);
         }
@@ -4443,6 +4651,9 @@ impl DocumentEditor {
             return Err(Error::EncryptedPdf);
         }
 
+        // ── pdf_manipulator patch: a redacted page that is also flattened is decided with its appearances ──
+        self.prepare_flat_redactions()?;
+        // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: what the save drops with dropped pages (#261) ──
         let dropped_annots = self.redacted_annotation_ids();
         let mut prune = crate::host::page_prune::plan(
@@ -4453,6 +4664,9 @@ impl DocumentEditor {
             // the image sources destructive redaction replaced
             &self.redacted_image_originals,
         );
+        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: the font and structure scrub of the redacted pages ──
+        let scrub = self.plan_scrub(&mut prune)?;
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: the merged pages and objects the save drops ──
         let (merged_kept, mut merged_left_out) = self.merged_prune(&HashMap::new())?;
@@ -4690,6 +4904,29 @@ impl DocumentEditor {
         } else {
             None
         };
+
+        // ── pdf_manipulator patch: the objects the font scrub writes under new ids ──
+        for (id, object) in &scrub.objects {
+            let offset = writer.position();
+            write_obj(&mut *writer, &serializer, *id, 0, object, &encryption_handler)?;
+            xref_entries.push((*id, offset, 0, true));
+        }
+        for stream in &scrub.streams {
+            Self::write_pass_stream(
+                (stream.id, stream.length_id),
+                stream.dict.clone(),
+                &mut *writer,
+                &serializer,
+                &encryption_handler,
+                deflate,
+                &mut xref_entries,
+                |out| {
+                    out.write_all(&stream.bytes)?;
+                    Ok(())
+                },
+            )?;
+        }
+        // ── end pdf_manipulator patch ──
 
         // Write catalog (possibly modified)
         let mut catalog_obj = self
@@ -5266,9 +5503,17 @@ impl DocumentEditor {
                                 let new_form_field_wrappers: Vec<FormFieldWrapper> =
                                     page_form_fields.iter().map(|(_, w)| w.clone()).collect();
 
+                                // ── pdf_manipulator patch: a redacted page's appearances are drawn by its redacted content ──
+                                let flat_redacted = self
+                                    .redacted_pages
+                                    .get(&source_page_index)
+                                    .is_some_and(|page| page.flat.is_some());
+                                // ── end pdf_manipulator patch ──
                                 // Check if we need to flatten annotations for this page
-                                let should_flatten =
-                                    self.flatten_annotations_pages.contains(&source_page_index);
+                                // ── pdf_manipulator patch: a redacted page's appearances are drawn by its redacted content ──
+                                let should_flatten = !flat_redacted
+                                    && self.flatten_annotations_pages.contains(&source_page_index);
+                                // ── end pdf_manipulator patch ──
                                 let flatten_data: Option<(
                                     Vec<AnnotationAppearance>,
                                     u32,
@@ -5310,12 +5555,25 @@ impl DocumentEditor {
                                     };
                                 // ── end pdf_manipulator patch ──
 
+                                // ── pdf_manipulator patch: the content stream of a page whose image bounds changed ──
+                                let image_mods_content: Option<(u32, u32)> = if destructive_redaction.is_none()
+                                    && self.image_modifications.contains_key(&source_page_index)
+                                    && !(self.structure_modified
+                                        && self.modified_content.contains_key(&source_page_index))
+                                    && page_obj.as_dict().is_some_and(|d| d.contains_key("Contents"))
+                                {
+                                    Some((self.allocate_object_id(), self.allocate_object_id()))
+                                } else {
+                                    None
+                                };
+                                // ── end pdf_manipulator patch ──
+
                                 // ── pdf_manipulator patch: the ids each queued copy is written under ──
                                 // An image copy takes a pair for its stream and one for its
                                 // /SMask (or /Mask stencil) stream; a mesh or form copy takes
                                 // a stream and its /Length. All are allocated with the rest of
                                 // the page's ids so the /Resources rebuild can name them.
-                                let redaction_ids = match self.redacted_pages.get(&source_page_index) {
+                                let mut redaction_ids = match self.redacted_pages.get(&source_page_index) {
                                     Some(page) => Self::allocate_scope_ids(
                                         &self.source,
                                         &mut self.next_object_id,
@@ -5323,6 +5581,9 @@ impl DocumentEditor {
                                     )?,
                                     None => ScopeIds::default(),
                                 };
+                                if let Some(page) = self.redacted_pages.get(&source_page_index) {
+                                    scrub.attach(source_page_index, &page.scope, &mut redaction_ids);
+                                }
                                 // ── end pdf_manipulator patch ──
                                 // ── pdf_manipulator patch: the /Redact annotations of marks not yet applied ──
                                 // A queued mark that was not applied is saved as a /Redact
@@ -5340,8 +5601,10 @@ impl DocumentEditor {
                                 // ── end pdf_manipulator patch ──
 
                                 // Check if we need to flatten form fields for this page
-                                let should_flatten_forms =
-                                    self.flatten_forms_pages.contains(&source_page_index);
+                                // ── pdf_manipulator patch: a redacted page's appearances are drawn by its redacted content ──
+                                let should_flatten_forms = !flat_redacted
+                                    && self.flatten_forms_pages.contains(&source_page_index);
+                                // ── end pdf_manipulator patch ──
                                 let form_flatten_data: Option<(
                                     Vec<AnnotationAppearance>,
                                     u32,
@@ -5435,6 +5698,32 @@ impl DocumentEditor {
                                 } else {
                                     page_obj.clone()
                                 };
+
+                                // ── pdf_manipulator patch: the page draws the content written on the belt ──
+                                // The streams it replaces are written only where something else
+                                // still names them.
+                                if let (Some((content_id, _)), Some(page_dict)) =
+                                    (image_mods_content, final_page_obj.as_dict())
+                                {
+                                    let mut new_dict = page_dict.clone();
+                                    if let Some(contents) = new_dict.get("Contents").cloned() {
+                                        if let Some(r) = contents.as_reference() {
+                                            prune.redacted_image_originals.insert(r.id);
+                                        }
+                                        let resolved = self.source.resolve_object(&contents)?;
+                                        for part in resolved.as_array().into_iter().flatten() {
+                                            if let Some(r) = part.as_reference() {
+                                                prune.redacted_image_originals.insert(r.id);
+                                            }
+                                        }
+                                    }
+                                    new_dict.insert(
+                                        "Contents".to_string(),
+                                        Object::Reference(ObjectRef::new(content_id, 0)),
+                                    );
+                                    final_page_obj = Object::Dictionary(new_dict);
+                                }
+                                // ── end pdf_manipulator patch ──
 
                                 // If we have an erase overlay, update Contents to include it
                                 if let (Some(overlay_obj_id), Some(page_dict)) =
@@ -5790,6 +6079,32 @@ impl DocumentEditor {
                                         Some(annots) => new_dict.insert("Annots".to_string(), annots),
                                         None => new_dict.remove("Annots"),
                                     };
+                                    // The flattened annotations and widgets left the page.
+                                    for set in redacted.flat.iter().flat_map(|flat| &flat.sets) {
+                                        let kept: Vec<Object> = match new_dict.get("Annots") {
+                                            Some(Object::Array(list)) if set.widgets => list
+                                                .iter()
+                                                .filter(|annot| {
+                                                    !annot
+                                                        .as_reference()
+                                                        .and_then(|r| self.load_source_object(r).ok())
+                                                        .and_then(|a| {
+                                                            a.as_dict()
+                                                                .and_then(|d| d.get("Subtype"))
+                                                                .and_then(|s| s.as_name().map(str::to_string))
+                                                        })
+                                                        .is_some_and(|subtype| subtype == "Widget")
+                                                })
+                                                .cloned()
+                                                .collect(),
+                                            _ => Vec::new(),
+                                        };
+                                        if kept.is_empty() {
+                                            new_dict.remove("Annots");
+                                        } else {
+                                            new_dict.insert("Annots".to_string(), Object::Array(kept));
+                                        }
+                                    }
                                     // ── end pdf_manipulator patch ──
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
@@ -5890,7 +6205,12 @@ impl DocumentEditor {
 
                                         // Filter out Widget annotations
                                         let mut filtered_annots = Vec::new();
-                                        for annot_ref in annots_array {
+                                        for (at, annot_ref) in annots_array.into_iter().enumerate() {
+                                            // ── pdf_manipulator patch: each annotation is read once ──
+                                            if at % 256 == 255 {
+                                                self.source.clear_object_cache();
+                                            }
+                                            // ── end pdf_manipulator patch ──
                                             if let Some(ref_obj) = annot_ref.as_reference() {
                                                 if let Ok(annot_obj) =
                                                     self.load_source_object(ref_obj)
@@ -6067,151 +6387,31 @@ impl DocumentEditor {
                                             new_xobject_refs.extend(xobject_refs);
                                         }
                                     } else {
-                                        // Check if we have image modifications for this page
-                                        let has_image_mods = self
-                                            .image_modifications
-                                            .contains_key(&source_page_index);
-
-                                        if has_image_mods {
-                                            // Rewrite content stream with image modifications
-                                            if let Some(contents) = page_dict.get("Contents") {
-                                                match contents {
-                                                    Object::Reference(contents_ref) => {
-                                                        let contents_obj = self
-                                                            .source
-                                                            .load_object(*contents_ref)?;
-                                                        if let Ok(content_data) =
-                                                            contents_obj.decode_stream_data()
-                                                        {
-                                                            let mods = self
-                                                                .image_modifications
-                                                                .get(&source_page_index)
-                                                                .unwrap();
-                                                            match self.rewrite_content_stream_with_image_mods(&content_data, mods) {
-                                                                Ok(modified_content) => {
-                                                                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                                                                    let modified_stream = Object::stream(
-                                                                        HashMap::new(),
-                                                                        modified_content,
-                                                                    );
-                                                                    // ── end pdf_manipulator patch ──
-                                                                    let offset = writer.position();
-                                                                    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                                                                    write_obj(
-                                                                        &mut *writer,
-                                                                        &serializer,
-                                                                        contents_ref.id,
-                                                                        0,
-                                                                        &modified_stream,
-                                                                        &encryption_handler,
-                                                                    )?;
-                                                                    xref_entries.push((contents_ref.id, offset, 0, true));
-                                                                }
-                                                                Err(_) => {
-                                                                    // Fallback to original content on error
-                                                                    let offset = writer.position();
-                                                                    write_obj(
-                                                                        &mut *writer,
-                                                                        &serializer,
-                                                                        contents_ref.id,
-                                                                        0,
-                                                                        &contents_obj,
-                                                                        &encryption_handler,
-                                                                    )?;
-                                                                    xref_entries.push((contents_ref.id, offset, 0, true));
-                                                                }
-                                                            }
-                                                        } else {
-                                                            // Can't decode, write original
-                                                            let offset =
-                                                                writer.position();
-                                                            write_obj(
-                                                                &mut *writer,
-                                                                &serializer,
-                                                                contents_ref.id,
-                                                                0,
-                                                                &contents_obj,
-                                                                &encryption_handler,
-                                                            )?;
-                                                                    // ── end pdf_manipulator patch ──
-                                                            xref_entries.push((
-                                                                contents_ref.id,
-                                                                offset,
-                                                                0,
-                                                                true,
-                                                            ));
-                                                        }
-                                                    },
-                                                    Object::Array(arr) => {
-                                                        // Multiple content streams - apply modifications to all
-                                                        let mods = self
-                                                            .image_modifications
-                                                            .get(&source_page_index)
-                                                            .unwrap();
-                                                        for item in arr {
-                                                            if let Object::Reference(ref_obj) = item
-                                                            {
-                                                                let stream_obj = self
-                                                                    .source
-                                                                    .load_object(*ref_obj)?;
-                                                                if let Ok(content_data) =
-                                                                    stream_obj.decode_stream_data()
-                                                                {
-                                                                    match self.rewrite_content_stream_with_image_mods(&content_data, mods) {
-                                                                        Ok(modified_content) => {
-                                                                            // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                                                                            let modified_stream = Object::stream(
-                                                                                HashMap::new(),
-                                                                                modified_content,
-                                                                            );
-                                                                            // ── end pdf_manipulator patch ──
-                                                                            let offset = writer.position();
-                                                                            // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                                                                            write_obj(
-                                                                                &mut *writer,
-                                                                                &serializer,
-                                                                                ref_obj.id,
-                                                                                0,
-                                                                                &modified_stream,
-                                                                                &encryption_handler,
-                                                                            )?;
-                                                                            xref_entries.push((ref_obj.id, offset, 0, true));
-                                                                        }
-                                                                        Err(_) => {
-                                                                            let offset = writer.position();
-                                                                            write_obj(
-                                                                                &mut *writer,
-                                                                                &serializer,
-                                                                                ref_obj.id,
-                                                                                0,
-                                                                                &stream_obj,
-                                                                                &encryption_handler,
-                                                                            )?;
-                                                                            xref_entries.push((ref_obj.id, offset, 0, true));
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    let offset =
-                                                                        writer.position();
-                                                                    write_obj(
-                                                                        &mut *writer,
-                                                                        &serializer,
-                                                                        ref_obj.id,
-                                                                        0,
-                                                                        &stream_obj,
-                                                                        &encryption_handler,
-                                                                    )?;
-                                                                            // ── end pdf_manipulator patch ──
-                                                                    xref_entries.push((
-                                                                        ref_obj.id, offset, 0, true,
-                                                                    ));
-                                                                }
-                                                            }
-                                                        }
-                                                    },
-                                                    _ => {},
-                                                }
-                                            }
+                                        // ── pdf_manipulator patch: a page's image bounds are written on the belt ──
+                                        // One new content stream, read through the page's
+                                        // operators; a stream that cannot be read fails the
+                                        // save, and the original content is never written
+                                        // in its place.
+                                        if let Some(ids) = image_mods_content {
+                                            let mods = &self.image_modifications[&source_page_index];
+                                            Self::write_pass_stream(
+                                                ids,
+                                                HashMap::new(),
+                                                &mut *writer,
+                                                &serializer,
+                                                &encryption_handler,
+                                                deflate,
+                                                &mut xref_entries,
+                                                |out| {
+                                                    Self::write_image_mods_content(
+                                                        &self.source,
+                                                        source_page_index,
+                                                        mods,
+                                                        out,
+                                                    )
+                                                },
+                                            )?;
+                                        // ── end pdf_manipulator patch ──
                                         } else if destructive_redaction.is_none() {
                                             // Use original contents — but NEVER when this
                                             // page was destructively redacted (#231 G6):
@@ -6774,59 +6974,10 @@ impl DocumentEditor {
                                     for ((obj_id, _name), appearance) in
                                         xobj_ids.iter().zip(appearances.iter())
                                     {
-                                        // Build Form XObject dictionary
-                                        let mut form_dict = HashMap::new();
-                                        form_dict.insert(
-                                            "Type".to_string(),
-                                            Object::Name("XObject".to_string()),
-                                        );
-                                        form_dict.insert(
-                                            "Subtype".to_string(),
-                                            Object::Name("Form".to_string()),
-                                        );
-                                        form_dict
-                                            .insert("FormType".to_string(), Object::Integer(1));
-                                        form_dict.insert(
-                                            "BBox".to_string(),
-                                            Object::Array(vec![
-                                                Object::Real(appearance.bbox[0] as f64),
-                                                Object::Real(appearance.bbox[1] as f64),
-                                                Object::Real(appearance.bbox[2] as f64),
-                                                Object::Real(appearance.bbox[3] as f64),
-                                            ]),
-                                        );
-
-                                        // Add matrix if present
-                                        if let Some(m) = appearance.matrix {
-                                            form_dict.insert(
-                                                "Matrix".to_string(),
-                                                Object::Array(vec![
-                                                    Object::Real(m[0] as f64),
-                                                    Object::Real(m[1] as f64),
-                                                    Object::Real(m[2] as f64),
-                                                    Object::Real(m[3] as f64),
-                                                    Object::Real(m[4] as f64),
-                                                    Object::Real(m[5] as f64),
-                                                ]),
-                                            );
-                                        }
-
-                                        // Add resources if present
-                                        if let Some(ref resources) = appearance.resources {
-                                            form_dict
-                                                .insert("Resources".to_string(), resources.clone());
-                                        }
-
-                                        // Create stream object
-                                        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                                        let form_stream = Object::stream(
-                                            form_dict,
-                                            appearance.content.clone(),
-                                        );
-                                        // ── end pdf_manipulator patch ──
+                                        // ── pdf_manipulator patch: the appearance is written as the stream it is stored as ──
+                                        let form_stream = appearance.form_object();
 
                                         let offset = writer.position();
-                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
                                         write_obj(
                                             &mut *writer,
                                             &serializer,
@@ -6849,9 +7000,9 @@ impl DocumentEditor {
                                                 extra_obj,
                                                 &encryption_handler,
                                             )?;
-                                        // ── end pdf_manipulator patch ──
                                             xref_entries.push((*extra_id, off, 0, true));
                                         }
+                                        // ── end pdf_manipulator patch ──
                                     }
 
                                     // Write the overlay content stream that invokes the XObjects
@@ -6906,6 +7057,7 @@ impl DocumentEditor {
                                         &self.source,
                                         source_page_index,
                                         page,
+                                        self.image_modifications.get(&source_page_index),
                                         content_id,
                                         length_id,
                                         &mut *writer,
@@ -6914,6 +7066,40 @@ impl DocumentEditor {
                                         deflate,
                                         &mut xref_entries,
                                     )?;
+                                    // ── end pdf_manipulator patch ──
+                                    // ── pdf_manipulator patch: the flattened appearances a surviving `Do` still draws ──
+                                    // One the redaction dropped or replaced by a copy is not written.
+                                    for set in page.flat.iter().flat_map(|flat| &flat.sets) {
+                                        for ((id, name), appearance) in
+                                            set.xobjects.iter().zip(&set.appearances)
+                                        {
+                                            if !page.scope.kept_xobject_names.contains(name) {
+                                                continue;
+                                            }
+                                            let offset = writer.position();
+                                            write_obj(
+                                                &mut *writer,
+                                                &serializer,
+                                                *id,
+                                                0,
+                                                &appearance.form_object(),
+                                                &encryption_handler,
+                                            )?;
+                                            xref_entries.push((*id, offset, 0, true));
+                                            for (extra_id, extra_obj) in &appearance.extra_objects {
+                                                let off = writer.position();
+                                                write_obj(
+                                                    &mut *writer,
+                                                    &serializer,
+                                                    *extra_id,
+                                                    0,
+                                                    extra_obj,
+                                                    &encryption_handler,
+                                                )?;
+                                                xref_entries.push((*extra_id, off, 0, true));
+                                            }
+                                        }
+                                    }
                                     // ── end pdf_manipulator patch ──
                                     // ── pdf_manipulator patch: the queued image copies, written after the page's content ──
                                     // Each copy (and, in step, the copies its /SMask or /Mask
@@ -6925,6 +7111,7 @@ impl DocumentEditor {
                                     let doc_forms = DocForms {
                                         source: &self.source,
                                         page_resources: page_resources.clone(),
+                                        flat: page.flat.as_ref(),
                                     };
                                     let mut work = CopyWork::default();
                                     Self::collect_copy_work(
@@ -7086,58 +7273,10 @@ impl DocumentEditor {
                                     for ((obj_id, _), appearance) in
                                         form_xobj_ids.iter().zip(form_appearances.iter())
                                     {
-                                        let mut form_dict: HashMap<String, Object> = HashMap::new();
-                                        form_dict.insert(
-                                            "Type".to_string(),
-                                            Object::Name("XObject".to_string()),
-                                        );
-                                        form_dict.insert(
-                                            "Subtype".to_string(),
-                                            Object::Name("Form".to_string()),
-                                        );
-                                        form_dict
-                                            .insert("FormType".to_string(), Object::Integer(1));
-                                        form_dict.insert(
-                                            "BBox".to_string(),
-                                            Object::Array(vec![
-                                                Object::Real(appearance.bbox[0] as f64),
-                                                Object::Real(appearance.bbox[1] as f64),
-                                                Object::Real(appearance.bbox[2] as f64),
-                                                Object::Real(appearance.bbox[3] as f64),
-                                            ]),
-                                        );
-
-                                        // Add matrix if present
-                                        if let Some(m) = appearance.matrix {
-                                            form_dict.insert(
-                                                "Matrix".to_string(),
-                                                Object::Array(vec![
-                                                    Object::Real(m[0] as f64),
-                                                    Object::Real(m[1] as f64),
-                                                    Object::Real(m[2] as f64),
-                                                    Object::Real(m[3] as f64),
-                                                    Object::Real(m[4] as f64),
-                                                    Object::Real(m[5] as f64),
-                                                ]),
-                                            );
-                                        }
-
-                                        // Add resources if present
-                                        if let Some(ref resources) = appearance.resources {
-                                            form_dict
-                                                .insert("Resources".to_string(), resources.clone());
-                                        }
-
-                                        // Create stream object
-                                        // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                                        let form_stream = Object::stream(
-                                            form_dict,
-                                            appearance.content.clone(),
-                                        );
-                                        // ── end pdf_manipulator patch ──
+                                        // ── pdf_manipulator patch: the appearance is written as the stream it is stored as ──
+                                        let form_stream = appearance.form_object();
 
                                         let offset = writer.position();
-                                        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
                                         write_obj(
                                             &mut *writer,
                                             &serializer,
@@ -7160,9 +7299,9 @@ impl DocumentEditor {
                                                 extra_obj,
                                                 &encryption_handler,
                                             )?;
-                                        // ── end pdf_manipulator patch ──
                                             xref_entries.push((*extra_id, off, 0, true));
                                         }
+                                        // ── end pdf_manipulator patch ──
                                     }
 
                                     // Write the overlay content stream that invokes the XObjects
@@ -9796,10 +9935,20 @@ impl DocumentEditor {
     fn get_widget_appearances(&mut self, page: usize) -> Result<Vec<AnnotationAppearance>> {
         use crate::annotation_types::AnnotationSubtype;
 
-        let annotations = self.source.get_annotations(page)?;
+        // ── pdf_manipulator patch: one annotation is held at a time ──
+        let annotation_refs = self.source.annotation_refs(page)?;
         let mut appearances = Vec::new();
 
-        for annotation in annotations {
+        for (at, annotation_ref) in annotation_refs.into_iter().enumerate() {
+            // Each annotation and appearance is read once: the cache would
+            // only fill beside the appearances.
+            if at % 256 == 255 {
+                self.source.clear_object_cache();
+            }
+            let Ok(annotation) = self.source.parse_annotation(annotation_ref) else {
+                continue;
+            };
+            // ── end pdf_manipulator patch ──
             // Only process Widget annotations (form fields)
             if annotation.subtype_enum != AnnotationSubtype::Widget {
                 continue;
@@ -10209,22 +10358,17 @@ impl DocumentEditor {
             annot_rect[3] as f32,
         ];
 
-        // Get content stream bytes
-        let content_bytes = if let Some(ref_obj) = appearance_ref {
-            let stream_obj = self.source.load_object(ref_obj)?;
-            match stream_obj.decode_stream_data() {
-                Ok(data) => data,
-                Err(_) => return Ok(None),
-            }
-        } else {
-            match appearance_obj.decode_stream_data() {
-                Ok(data) => data,
-                Err(_) => return Ok(None),
-            }
+        // ── pdf_manipulator patch: the appearance stream is carried as it is stored ──
+        let stream_obj = match appearance_ref {
+            Some(ref_obj) => self.source.load_object(ref_obj)?,
+            None => appearance_obj,
         };
+        let (dict, body) = AnnotationAppearance::stream_of(&stream_obj);
+        // ── end pdf_manipulator patch ──
 
         Ok(Some(AnnotationAppearance {
-            content: content_bytes.to_vec(),
+            dict,
+            body,
             bbox,
             annot_rect,
             matrix,
@@ -10408,7 +10552,8 @@ impl DocumentEditor {
         res.insert("Font".to_string(), Object::Dictionary(font_res));
 
         Ok(Some(AnnotationAppearance {
-            content: content.into_bytes(),
+            dict: HashMap::new(),
+            body: StreamBody::Inline(bytes::Bytes::from(content.into_bytes())),
             bbox: [0.0, 0.0, width, height],
             annot_rect: [
                 rect[0] as f32,
@@ -10441,7 +10586,8 @@ impl DocumentEditor {
             .map(|r| [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32])
             .unwrap_or([0.0, 0.0, 0.0, 0.0]);
         Ok(Some(AnnotationAppearance {
-            content: generated.content,
+            dict: HashMap::new(),
+            body: StreamBody::Inline(bytes::Bytes::from(generated.content)),
             bbox: generated.bbox,
             annot_rect,
             matrix: None,
@@ -10456,10 +10602,15 @@ impl DocumentEditor {
     /// Returns a list of (content_bytes, bbox, resources) for each annotation
     /// that has an appearance stream.
     fn get_annotation_appearances(&mut self, page: usize) -> Result<Vec<AnnotationAppearance>> {
-        let annotations = self.source.get_annotations(page)?;
+        // ── pdf_manipulator patch: one annotation is held at a time ──
+        let annotation_refs = self.source.annotation_refs(page)?;
         let mut appearances = Vec::new();
 
-        for annotation in annotations {
+        for annotation_ref in annotation_refs {
+            let Ok(annotation) = self.source.parse_annotation(annotation_ref) else {
+                continue;
+            };
+            // ── end pdf_manipulator patch ──
             // Skip annotations without a raw dictionary
             let raw_dict = match &annotation.raw_dict {
                 Some(dict) => dict,
@@ -10572,27 +10723,20 @@ impl DocumentEditor {
                 annot_rect[3] as f32,
             ];
 
-            // Get the content stream bytes
-            let content_bytes = if let Some(ref_obj) = appearance_ref {
-                // Load the object and decode its stream data
-                let stream_obj = match self.source.load_object(ref_obj) {
+            // ── pdf_manipulator patch: the appearance stream is carried as it is stored ──
+            let stream_obj = match appearance_ref {
+                Some(ref_obj) => match self.source.load_object(ref_obj) {
                     Ok(obj) => obj,
                     Err(_) => continue,
-                };
-                match stream_obj.decode_stream_data() {
-                    Ok(data) => data,
-                    Err(_) => continue,
-                }
-            } else {
-                // Inline stream - try to decode directly
-                match appearance_obj.decode_stream_data() {
-                    Ok(data) => data,
-                    Err(_) => continue,
-                }
+                },
+                None => appearance_obj,
             };
+            let (dict, body) = AnnotationAppearance::stream_of(&stream_obj);
+            // ── end pdf_manipulator patch ──
 
             appearances.push(AnnotationAppearance {
-                content: content_bytes,
+                dict,
+                body,
                 bbox,
                 annot_rect,
                 matrix,
@@ -10899,6 +11043,7 @@ impl DocumentEditor {
             total.glyphs_removed += rep.glyphs_removed;
             total.bytes_removed += rep.bytes_removed;
             total.annotations_removed += rep.annotations_removed;
+            total.fonts_scrubbed += rep.fonts_scrubbed;
         }
         // ── end pdf_manipulator patch ──
         self.is_modified = true;
@@ -10976,10 +11121,11 @@ impl DocumentEditor {
         // anything is recorded. The save runs the same pass and must agree.
         let fonts = self.build_page_font_metrics(src)?;
         let page_resources = Self::inherited_resources(&self.source, src)?;
-        let images = Self::image_resources_of(&self.source, &page_resources)?;
+        let images = Self::image_resources_of(&self.source, &page_resources, None)?;
         let forms = DocForms {
             source: &self.source,
             page_resources: page_resources.clone(),
+            flat: None,
         };
         let outcome = Self::run_redaction_pass(
             rs,
@@ -10988,6 +11134,7 @@ impl DocumentEditor {
             &images,
             &forms,
             self.source.page_operators(src)?,
+            &[],
             &mut std::io::sink(),
         )?;
         // Each queued copy's source is proved writable now: a source the row writers cannot read (a filter the engine does not
@@ -11037,6 +11184,7 @@ impl DocumentEditor {
                 report: outcome.report,
                 dropped_annots,
                 scope: outcome.scope,
+                flat: None,
             },
         );
         self.apply_redactions_pages.insert(src);
@@ -11584,171 +11732,54 @@ impl DocumentEditor {
             .unwrap_or(false)
     }
 
-    /// Rewrite content stream with image modifications applied.
+    // ── pdf_manipulator patch: image bounds are edited on the belt ──
+    /// The page `page_index`'s content with `mods` applied, written to `out`
+    /// one operator at a time. The modifications are in page space: they are
+    /// made on the composed matrix and mapped back through the enclosing
+    /// transform, so an image drawn under `q 1 0 0 1 56 700 cm` moves to the
+    /// position asked for and not 56 past it. Any error reaches the caller.
+    fn write_image_mods_content(
+        source: &PdfDocument,
+        page_index: usize,
+        mods: &HashMap<String, ImageModification>,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        let mut ops = source
+            .page_operators(page_index)?
+            .with_inline_images(crate::host::content::InlineImages::Collect);
+        let mut stage = image_mods::ImageModStage::new(mods, out);
+        for item in ops.by_ref() {
+            stage.push(&item?)?;
+        }
+        if !ops.damage().is_clean() {
+            return Err(Error::Unsupported(
+                "the content stream is damaged; refusing to move an image in a stream whose \
+                 operators cannot be read in full"
+                    .to_string(),
+            ));
+        }
+        stage.finish()?;
+        Ok(())
+    }
+
+    /// `content_data` with `modifications` applied: the belt over one buffer,
+    /// for the tests that read what it writes.
+    #[cfg(test)]
     fn rewrite_content_stream_with_image_mods(
         &self,
         content_data: &[u8],
         modifications: &HashMap<String, ImageModification>,
     ) -> Result<Vec<u8>> {
-        use crate::content::parser::parse_content_stream;
-
-        let operators = parse_content_stream(content_data)?;
         let mut output = Vec::new();
-
-        // ── pdf_manipulator patch: modifications are in PAGE space ──
-        // get_page_images reports each image's COMPOSED matrix (its own
-        // cm concatenated with every enclosing cm), so x/y/width/height
-        // handed back here mean page-space values. Overwriting the inner
-        // cm with them ignored the enclosing transform: an image drawn as
-        // `q 1 0 0 1 56 700 cm  100 0 0 80 0 0 cm /Im1 Do Q` repositioned
-        // to x=76 landed at 56+76. Track the CTM exactly as the listing
-        // does and set the inner matrix so the composition is the request.
-        type M = [f32; 6];
-        fn mul(m: M, n: M) -> M {
-            // row-vector convention, same as the CTM tracking in
-            // get_page_images: result = m · n (m applied first)
-            [
-                m[0] * n[0] + m[1] * n[2],
-                m[0] * n[1] + m[1] * n[3],
-                m[2] * n[0] + m[3] * n[2],
-                m[2] * n[1] + m[3] * n[3],
-                m[4] * n[0] + m[5] * n[2] + n[4],
-                m[4] * n[1] + m[5] * n[3] + n[5],
-            ]
+        let mut stage = image_mods::ImageModStage::new(modifications, &mut output);
+        for item in crate::host::content::Operators::new(content_data, crate::host::content::Mode::Full) {
+            stage.push(&item?)?;
         }
-        fn inverse(m: M) -> Option<M> {
-            let det = m[0] * m[3] - m[1] * m[2];
-            if det.abs() < f32::EPSILON {
-                return None;
-            }
-            let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
-            Some([a, b, c, d, -(m[4] * a + m[5] * c), -(m[4] * b + m[5] * d)])
-        }
-        let identity: M = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-        let mut ctm_stack: Vec<M> = Vec::new();
-        let mut current_ctm = identity;
-        // ── end pdf_manipulator patch ──
-
-        let mut i = 0;
-        while i < operators.len() {
-            let op = &operators[i];
-
-            // Look for pattern: q ... cm ... Do ... Q
-            // We need to find cm operators that precede Do operators
-            match op {
-                // ── pdf_manipulator patch: keep the CTM stack in step ──
-                crate::content::operators::Operator::SaveState => {
-                    ctm_stack.push(current_ctm);
-                    self.serialize_operator(&mut output, op);
-                },
-                crate::content::operators::Operator::RestoreState => {
-                    if let Some(saved) = ctm_stack.pop() {
-                        current_ctm = saved;
-                    }
-                    self.serialize_operator(&mut output, op);
-                },
-                // ── end pdf_manipulator patch ──
-                crate::content::operators::Operator::Cm { a, b, c, d, e, f } => {
-                    // Look ahead to see if next relevant op is Do
-                    let mut j = i + 1;
-                    let mut found_do = None;
-                    while j < operators.len() {
-                        match &operators[j] {
-                            crate::content::operators::Operator::Do { name } => {
-                                found_do = Some(name.clone());
-                                break;
-                            },
-                            crate::content::operators::Operator::RestoreState => break,
-                            crate::content::operators::Operator::SaveState => break,
-                            crate::content::operators::Operator::Cm { .. } => break,
-                            _ => {},
-                        }
-                        j += 1;
-                    }
-
-                    let inner: M = [*a, *b, *c, *d, *e, *f];
-                    if let Some(name) = found_do {
-                        if let Some(modification) = modifications.get(&name) {
-                            // ── pdf_manipulator patch: compose, edit, decompose ──
-                            // Edit the composed matrix in page space: move the
-                            // translation, rescale each axis along its current
-                            // direction, then map back through the enclosing
-                            // transform. A singular enclosing transform (nothing
-                            // visible anyway) falls back to editing the inner
-                            // matrix directly, as before.
-                            let composed = mul(inner, current_ctm);
-                            let mut wanted = composed;
-                            if let Some(width) = modification.width {
-                                let len =
-                                    (composed[0] * composed[0] + composed[1] * composed[1]).sqrt();
-                                if len > f32::EPSILON {
-                                    wanted[0] = composed[0] / len * width;
-                                    wanted[1] = composed[1] / len * width;
-                                }
-                            }
-                            if let Some(height) = modification.height {
-                                let len =
-                                    (composed[2] * composed[2] + composed[3] * composed[3]).sqrt();
-                                if len > f32::EPSILON {
-                                    wanted[2] = composed[2] / len * height;
-                                    wanted[3] = composed[3] / len * height;
-                                }
-                            }
-                            if let Some(x) = modification.x {
-                                wanted[4] = x;
-                            }
-                            if let Some(y) = modification.y {
-                                wanted[5] = y;
-                            }
-                            let new_inner = match inverse(current_ctm) {
-                                Some(inv) => mul(wanted, inv),
-                                None => [
-                                    modification.width.unwrap_or(*a),
-                                    *b,
-                                    *c,
-                                    modification.height.unwrap_or(*d),
-                                    modification.x.unwrap_or(*e),
-                                    modification.y.unwrap_or(*f),
-                                ],
-                            };
-                            output.extend_from_slice(
-                                format!(
-                                    "{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm\n",
-                                    new_inner[0],
-                                    new_inner[1],
-                                    new_inner[2],
-                                    new_inner[3],
-                                    new_inner[4],
-                                    new_inner[5]
-                                )
-                                .as_bytes(),
-                            );
-                            current_ctm = mul(new_inner, current_ctm);
-                            // ── end pdf_manipulator patch ──
-                            i += 1;
-                            continue;
-                        }
-                    }
-
-                    // No modification, output as-is
-                    output.extend_from_slice(
-                        format!("{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm\n", a, b, c, d, e, f)
-                            .as_bytes(),
-                    );
-                    // ── pdf_manipulator patch ──
-                    current_ctm = mul(inner, current_ctm);
-                    // ── end pdf_manipulator patch ──
-                },
-                _ => {
-                    // Serialize the operator
-                    self.serialize_operator(&mut output, op);
-                },
-            }
-            i += 1;
-        }
-
+        stage.finish()?;
+        drop(stage);
         Ok(output)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Serialize an operator to content-stream bytes.
     ///
@@ -12628,7 +12659,8 @@ mod tests {
         let editor = create_test_editor();
 
         let appearance = AnnotationAppearance {
-            content: b"test content".to_vec(),
+            dict: HashMap::new(),
+            body: StreamBody::Inline(bytes::Bytes::from_static(b"test content")),
             bbox: [0.0, 0.0, 100.0, 50.0],
             annot_rect: [10.0, 20.0, 210.0, 70.0],
             matrix: None,
@@ -12651,7 +12683,8 @@ mod tests {
         let editor = create_test_editor();
 
         let appearance = AnnotationAppearance {
-            content: b"test".to_vec(),
+            dict: HashMap::new(),
+            body: StreamBody::Inline(bytes::Bytes::from_static(b"test")),
             bbox: [0.0, 0.0, 100.0, 100.0],
             annot_rect: [0.0, 0.0, 100.0, 100.0],
             matrix: Some([1.0, 0.0, 0.0, 1.0, 5.0, 5.0]),
@@ -12682,7 +12715,8 @@ mod tests {
         let editor = create_test_editor();
 
         let appearance = AnnotationAppearance {
-            content: b"empty".to_vec(),
+            dict: HashMap::new(),
+            body: StreamBody::Inline(bytes::Bytes::from_static(b"empty")),
             bbox: [0.0, 0.0, 0.0, 0.0], // zero-size
             annot_rect: [10.0, 20.0, 110.0, 120.0],
             matrix: None,
@@ -13867,7 +13901,8 @@ mod tests {
     #[test]
     fn test_annotation_appearance_construction() {
         let ap = AnnotationAppearance {
-            content: b"q 1 0 0 1 0 0 cm Q".to_vec(),
+            dict: HashMap::new(),
+            body: StreamBody::Inline(bytes::Bytes::from_static(b"q 1 0 0 1 0 0 cm Q")),
             bbox: [0.0, 0.0, 100.0, 50.0],
             annot_rect: [10.0, 20.0, 110.0, 70.0],
             matrix: Some([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
@@ -13883,7 +13918,8 @@ mod tests {
     #[test]
     fn test_annotation_appearance_no_matrix_no_resources() {
         let ap = AnnotationAppearance {
-            content: vec![],
+            dict: HashMap::new(),
+            body: StreamBody::Inline(bytes::Bytes::new()),
             bbox: [0.0, 0.0, 0.0, 0.0],
             annot_rect: [0.0, 0.0, 0.0, 0.0],
             matrix: None,
@@ -13891,7 +13927,7 @@ mod tests {
             extra_objects: Vec::new(),
         };
         assert!(ap.matrix.is_none());
-        assert!(ap.content.is_empty());
+        assert!(ap.body.is_empty());
     }
 
     // =========================================================================

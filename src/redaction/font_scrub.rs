@@ -23,6 +23,77 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+// ── pdf_manipulator patch: the codes a content stream shows or loses, per font ──
+/// The codes of one font a content stream shows, one bit a code. A code has
+/// at most 16 bits (a simple font's byte or an Identity-H CID), so a set is at
+/// most 8 KiB however many codes the stream shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeSet {
+    words: Vec<u64>,
+}
+
+impl CodeSet {
+    /// Adds `code`.
+    pub fn insert(&mut self, code: u32) {
+        let code = code.min(u32::from(u16::MAX)) as usize;
+        let word = code / 64;
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1 << (code % 64);
+    }
+
+    /// Whether `code` is in the set.
+    pub fn contains(&self, code: u32) -> bool {
+        let code = code.min(u32::from(u16::MAX)) as usize;
+        self.words.get(code / 64).is_some_and(|w| w & (1 << (code % 64)) != 0)
+    }
+
+    /// Whether the set holds no code.
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|w| *w == 0)
+    }
+
+    /// Adds every code of `other`.
+    pub fn union_with(&mut self, other: &CodeSet) {
+        if self.words.len() < other.words.len() {
+            self.words.resize(other.words.len(), 0);
+        }
+        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
+            *mine |= *theirs;
+        }
+    }
+
+    /// The codes, in increasing order.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(at, word)| {
+            (0..64u32).filter(move |bit| word & (1 << bit) != 0).map(move |bit| at as u32 * 64 + bit)
+        })
+    }
+
+    /// The codes as an ordered set, the shape [`scrub_font`] reads.
+    pub fn to_set(&self) -> BTreeSet<u32> {
+        self.iter().collect()
+    }
+}
+
+/// What one content stream did to the codes of one font.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FontCodes {
+    /// Codes of glyphs the redaction removed.
+    pub removed: CodeSet,
+    /// Codes of glyphs the stream still shows.
+    pub surviving: CodeSet,
+}
+
+impl FontCodes {
+    /// Whether a code was removed here and is not shown here any more.
+    pub fn has_redaction_only_code(&self) -> bool {
+        self.removed.iter().any(|code| !self.surviving.contains(code))
+    }
+}
+// ── end pdf_manipulator patch ──
+
 /// One font's redaction-relevant state. `widths[i]` is the advance for
 /// glyph code `first_char + i` (PDF `/Widths` semantics); codes outside
 /// `first_char .. first_char + widths.len()` use `missing_width`.

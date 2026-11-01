@@ -181,6 +181,24 @@ impl PdfDocument {
     /// # Ok::<(), pdf_oxide::error::Error>(())
     /// ```
     pub fn get_annotations(&self, page_index: usize) -> Result<Vec<Annotation>> {
+        // ── pdf_manipulator patch: the annotations are read from their references ──
+        let mut result = Vec::new();
+        for annot_ref in self.annotation_refs(page_index)? {
+            if let Ok(annotation) = self.parse_annotation(annot_ref) {
+                result.push(annotation);
+            }
+        }
+        Ok(result)
+    }
+
+    /// The references of the annotations in the page's `/Annots`, in order.
+    /// A caller that handles one annotation at a time parses each from its
+    /// reference and holds none of the others.
+    pub(crate) fn annotation_refs(
+        &self,
+        page_index: usize,
+    ) -> Result<Vec<crate::object::ObjectRef>> {
+        // ── end pdf_manipulator patch ──
         // Get the page reference
         let page_ref = self.get_page_ref(page_index)?;
         let page_obj = self.load_object(page_ref)?;
@@ -201,25 +219,21 @@ impl PdfDocument {
             None => return Ok(Vec::new()),
         };
 
-        let mut result = Vec::new();
-
-        // Parse each annotation
-        for annot_obj in annots {
-            let annot_ref = match annot_obj {
-                Object::Reference(r) => r,
-                _ => continue, // Skip non-references
-            };
-
-            if let Ok(annotation) = self.parse_annotation(annot_ref) {
-                result.push(annotation);
-            }
-        }
-
-        Ok(result)
+        // ── pdf_manipulator patch: the annotations are read from their references ──
+        Ok(annots
+            .into_iter()
+            .filter_map(|annot_obj| match annot_obj {
+                Object::Reference(r) => Some(r),
+                _ => None, // Skip non-references
+            })
+            .collect())
+        // ── end pdf_manipulator patch ──
     }
 
     /// Parse a single annotation object.
-    fn parse_annotation(&self, annot_ref: crate::object::ObjectRef) -> Result<Annotation> {
+    // ── pdf_manipulator patch: the annotations are read from their references ──
+    pub(crate) fn parse_annotation(&self, annot_ref: crate::object::ObjectRef) -> Result<Annotation> {
+        // ── end pdf_manipulator patch ──
         let annot_obj = self.load_object(annot_ref)?;
 
         let dict = annot_obj.as_dict().ok_or_else(|| {

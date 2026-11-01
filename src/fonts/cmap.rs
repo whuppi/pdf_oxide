@@ -187,6 +187,32 @@ impl CMap {
         self.ranges.sort_unstable_by_key(|r| r.start);
     }
 
+    // ── pdf_manipulator patch: the mappings of a CMap, for the redaction font scrub ──
+    /// Every mapping in code order, the compressed ranges expanded to one
+    /// entry a code. The `/ToUnicode` table of a font the redaction scrubs is
+    /// written again from these.
+    pub fn mappings(&self) -> Vec<(u32, String)> {
+        let mut out: Vec<(u32, String)> = self.chars.iter().map(|(c, s)| (*c, s.clone())).collect();
+        for range in &self.ranges {
+            for code in range.start..=range.end {
+                if let Some(ch) = char::from_u32(range.target.wrapping_add(code - range.start)) {
+                    out.push((code, ch.to_string()));
+                }
+            }
+        }
+        out.sort_by_key(|(code, _)| *code);
+        out
+    }
+
+    /// The fallback ranges, as `(first code, last code, text)`.
+    pub fn notdef_mappings(&self) -> Vec<(u32, u32, String)> {
+        self.notdef_ranges
+            .iter()
+            .filter_map(|r| self.chars.get(&r.target).map(|s| (r.start, r.end, s.clone())))
+            .collect()
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Check if the CMap is empty.
     pub fn is_empty(&self) -> bool {
         self.chars.is_empty() && self.ranges.is_empty() && self.notdef_ranges.is_empty()

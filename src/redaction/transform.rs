@@ -6,7 +6,7 @@
 //! byte counter when a redaction is queued and into the file when it is
 //! saved; both produce the same [`RedactionReport`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 
 mod meshes;
@@ -17,6 +17,7 @@ pub(crate) use meshes::{filtered_dict, write_filtered};
 
 use paths::{is_path_op, paint_of, redact_path, PathRedaction};
 use super::classify::{classify, Classification};
+use super::font_scrub::FontCodes;
 use super::image_prune::{classify_image_placement, invert_affine};
 use super::options::{RedactionOptions, RedactionReport};
 use super::overlay::{region_overlay_ops, resolved_fill};
@@ -27,7 +28,7 @@ use crate::content::operators::Operator;
 use crate::content::graphics_state::Matrix;
 use crate::error::{Error, Result};
 use crate::geometry::Rect;
-use crate::host::content::{InlineImages, Operators};
+use crate::host::content::{InlineImages, Mode, Operators};
 use crate::host::images::redact_copy::{covered_span, ImagePlacement};
 use crate::object::{Object, ObjectRef};
 
@@ -51,6 +52,9 @@ pub struct ImageResources {
     /// Resource name → the line style of an ExtGState the page names. A name
     /// whose dictionary cannot be read maps to `None`, and a `gs` of it refuses.
     pub line_styles: HashMap<String, Option<LineStyle>>,
+    /// Resource name → the `/MCID` of a marked-content property list the
+    /// stream names with `BDC`.
+    pub mcids: HashMap<String, u32>,
 }
 
 impl ImageResources {
@@ -63,6 +67,7 @@ impl ImageResources {
             meshes: HashMap::new(),
             patterns: HashMap::new(),
             line_styles: HashMap::new(),
+            mcids: HashMap::new(),
         }
     }
 }
@@ -184,6 +189,11 @@ pub struct Scope {
     pub kept_patterns: HashSet<String>,
     /// See [`Scope::kept_patterns`].
     pub replaced_patterns: HashSet<String>,
+    /// By font resource name, in name order, the codes the stream removed and
+    /// the codes it still shows.
+    pub fonts: Vec<(String, FontCodes)>,
+    /// The `/MCID`s of the marked content that lost or changed a mark.
+    pub mcids: BTreeSet<u32>,
 }
 
 impl Scope {
@@ -310,6 +320,9 @@ pub struct RedactPass<'a> {
     path: Vec<Operator>,
     paths_pruned: usize,
     specialized: usize,
+    /// The marked-content sequences open at the operator being read, each
+    /// with its `/MCID` when it has one.
+    marked: Vec<Option<u32>>,
 }
 
 /// Records a source id once in `originals`, the set the page's overwritten
@@ -353,6 +366,7 @@ impl<'a> RedactPass<'a> {
             path: Vec::new(),
             paths_pruned: 0,
             specialized: 0,
+            marked: Vec::new(),
         }
     }
 
@@ -385,12 +399,28 @@ impl<'a> RedactPass<'a> {
     ///   the error is not a valid redaction; the caller discards it.
     /// - [`Error::Io`] when `out` fails.
     pub fn run<R: Read, W: Write>(
+        self,
+        content: Operators<R>,
+        out: &mut W,
+    ) -> Result<PassOutcome> {
+        self.run_then(content, Operators::new(std::io::empty(), Mode::Full), out)
+    }
+
+    /// As [`Self::run`] over `content` followed by `then`: the page's own
+    /// operators and the operators an edit appends to it (a flattened
+    /// widget), which the pass decides as one stream.
+    ///
+    /// # Errors
+    /// As [`Self::run`].
+    pub fn run_then<R: Read, T: Read, W: Write>(
         mut self,
         content: Operators<R>,
+        then: Operators<T>,
         out: &mut W,
     ) -> Result<PassOutcome> {
         out.write_all(b"q\n")?;
         self.process(content, out)?;
+        self.process(then, out)?;
         out.write_all(b"Q\n")?;
         for region in &self.regions.regions {
             out.write_all(&region_overlay_ops(region, self.opts))?;
@@ -442,6 +472,7 @@ impl<'a> RedactPass<'a> {
                     },
                     PathRedaction::Rewritten(written) => {
                         self.paths_pruned += 1;
+                        self.touch_marked();
                         for written in &written {
                             self.emit(out, written)?;
                         }
@@ -455,6 +486,24 @@ impl<'a> RedactPass<'a> {
                      cannot be read"
                         .to_string(),
                 ));
+            }
+            match &op {
+                Operator::BeginMarkedContent { .. } => self.marked.push(None),
+                Operator::BeginMarkedContentDict { properties, .. } => {
+                    let mcid = match &**properties {
+                        Object::Dictionary(dict) => dict
+                            .get("MCID")
+                            .and_then(Object::as_integer)
+                            .and_then(|mcid| u32::try_from(mcid).ok()),
+                        Object::Name(name) => self.images.mcids.get(name.as_str()).copied(),
+                        _ => None,
+                    };
+                    self.marked.push(mcid);
+                },
+                Operator::EndMarkedContent => {
+                    self.marked.pop();
+                },
+                _ => {},
             }
             if let Operator::SetExtGState { dict_name } = &op {
                 match self.images.line_styles.get(dict_name.as_str()) {
@@ -500,8 +549,12 @@ impl<'a> RedactPass<'a> {
                 _ => None,
             };
             match replacement {
-                Some(Decision::Dropped) => continue,
+                Some(Decision::Dropped) => {
+                    self.touch_marked();
+                    continue;
+                },
                 Some(Decision::UsedAs(written)) => {
+                    self.touch_marked();
                     self.bytes.clear();
                     serialize_operator(&mut self.bytes, &written);
                     out.write_all(&self.bytes)?;
@@ -510,7 +563,11 @@ impl<'a> RedactPass<'a> {
                 None => {},
             }
             self.ops.clear();
+            let glyphs_before = self.text.result().glyphs_removed;
             self.text.apply(&op, &mut self.ops);
+            if self.text.result().glyphs_removed > glyphs_before {
+                self.touch_marked();
+            }
             for written in &self.ops {
                 if let Operator::Do { name } = written {
                     self.scope.kept_xobject_names.insert(name.clone());
@@ -542,14 +599,25 @@ impl<'a> RedactPass<'a> {
 
     /// The outcome of the stream the pass has read: its own counts plus those
     /// of the form copies it queued.
-    fn finish(self) -> PassOutcome {
+    fn finish(mut self) -> PassOutcome {
         let totals = self.text.result();
+        self.scope.fonts = totals
+            .fonts
+            .iter()
+            .map(|(name, codes)| (name.clone(), codes.clone()))
+            .collect();
+        let scrubbed = self
+            .scope
+            .fonts
+            .iter()
+            .filter(|(_, codes)| codes.has_redaction_only_code())
+            .count();
         PassOutcome {
             report: RedactionReport {
                 regions: self.regions.len(),
                 glyphs_removed: totals.glyphs_removed + self.nested.glyphs_removed,
                 annotations_removed: 0,
-                fonts_scrubbed: 0,
+                fonts_scrubbed: scrubbed + self.nested.fonts_scrubbed,
                 bytes_removed: totals.bytes_removed + self.nested.bytes_removed,
                 images_modified: self.imgs_modified
                     + self.inline_modified
@@ -562,6 +630,12 @@ impl<'a> RedactPass<'a> {
             scope: self.scope,
             originals: self.originals,
         }
+    }
+
+    /// Notes that every marked-content sequence open now lost or changed a
+    /// mark, so the structure elements that own them lose their strings.
+    fn touch_marked(&mut self) {
+        self.scope.mcids.extend(self.marked.iter().flatten());
     }
 
     /// A resource name for a copy of `name`, not one the stream's resources
@@ -726,6 +800,7 @@ impl<'a> RedactPass<'a> {
         self.nested.images_removed += report.images_removed;
         self.nested.paths_pruned += report.paths_pruned;
         self.nested.xobjects_specialized += report.xobjects_specialized;
+        self.nested.fonts_scrubbed += report.fonts_scrubbed;
     }
 
     /// Decides a `sh` of the mesh `name` under the CTM: it passes when no
