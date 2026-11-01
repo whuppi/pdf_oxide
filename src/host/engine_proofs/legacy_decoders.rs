@@ -498,7 +498,10 @@ fn decode_png_predictor(data: &[u8], params: &DecodeParams) -> Result<Vec<u8>> {
 
     let row_count = data.len() / bytes_per_row;
     let mut output = Vec::with_capacity(row_count * pixel_bytes);
-    let bpp = params.colors; // Bytes per pixel
+    // The one departure from the old code: its byte distance was the colour
+    // count, wrong at 16 bits and below 8 (ISO 32000-1 §7.4.4.4), and a
+    // reference must not keep a bug the decoder no longer has.
+    let bpp = params.bytes_per_pixel();
 
     for row_idx in 0..row_count {
         let row_start = row_idx * bytes_per_row;
