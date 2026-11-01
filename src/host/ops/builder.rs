@@ -475,8 +475,8 @@ fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Op
         None => return ResponseWriter::error("builder not found"),
     };
 
-    let compress = req.get_bool("compress").unwrap_or(true);
-    let mut builder = builder.compress_streams(compress);
+    let deflate = req.get_bool("deflate").unwrap_or(true);
+    let mut builder = builder.compress_streams(deflate);
     builder.end_page();
 
     if let Some(mut writer) = sink_writer {

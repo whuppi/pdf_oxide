@@ -297,7 +297,10 @@ fn handle_open(
                 item.put_i32("index", i as i32);
                 item.put_f64("width", p.width);
                 item.put_f64("height", p.height);
-                item.put_i32("rotation", p.rotation);
+                item.put_str(
+                    "rotation",
+                    dispatch::rotation_name_from_degrees(p.rotation).unwrap_or("r0"),
+                );
                 if let Some(label) = &p.label {
                     item.put_str("label", label);
                 }

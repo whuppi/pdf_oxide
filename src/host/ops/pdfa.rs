@@ -8,7 +8,10 @@ use crate::host::ops::support::handle_with_doc;
 
 op_unit!(VALIDATE_PDF_A, "validatePdfA", pdf_op_validate_pdf_a_anchor, |ctx| {
     handle_with_doc(ctx.state, ctx.req, |doc, req| {
-        let level = req.get_i32("level").unwrap_or(2);
+        let name = req.get_str("level").unwrap_or("a2");
+        let level = dispatch::pdfa_level_from_name(name).ok_or_else(|| {
+            crate::error::Error::InvalidOperation(format!("unknown PDF/A level: {name}"))
+        })?;
         let result = dispatch::validate_pdf_a(doc, level, ctx.cancel)?;
         let mut w = ResponseWriter::ok();
         w.put_bool("compliant", result.compliant);
@@ -24,7 +27,10 @@ op_unit!(
     pdf_op_validate_pdf_ua_anchor,
     |ctx| {
         handle_with_doc(ctx.state, ctx.req, |doc, req| {
-            let level = req.get_i32("level").unwrap_or(1);
+            let name = req.get_str("level").unwrap_or("ua1");
+            let level = dispatch::pdfua_level_from_name(name).ok_or_else(|| {
+                crate::error::Error::InvalidOperation(format!("unknown PDF/UA level: {name}"))
+            })?;
             let result = dispatch::validate_pdf_ua(doc, level, ctx.cancel)?;
             let mut w = ResponseWriter::ok();
             w.put_bool("valid", result);

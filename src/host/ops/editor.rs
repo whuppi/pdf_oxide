@@ -262,6 +262,13 @@ fn handle_editor_mutate(
     }
 }
 
+/// The rotation the request's `rotation` field names, in degrees.
+fn rotation_of(req: &Request<'_>) -> crate::error::Result<i32> {
+    let name = req.get_str("rotation").unwrap_or("");
+    dispatch::rotation_degrees_from_name(name)
+        .ok_or_else(|| crate::error::Error::InvalidOperation(format!("unknown rotation: {name}")))
+}
+
 fn do_editor_mutate(
     editor: &mut DocumentEditor,
     edit_op: &str,
@@ -299,12 +306,11 @@ fn do_editor_mutate(
         }
         "rotatePage" => {
             let page = page!();
-            let degrees = req.get_i32("degrees").unwrap_or(0);
-            dispatch::edit_rotate_pages(editor, &[(page, degrees)])?;
+            dispatch::edit_rotate_pages(editor, &[(page, rotation_of(req)?)])?;
             ok_response()
         }
         "rotateAll" => {
-            dispatch::edit_rotate_all(editor, req.get_i32("degrees").unwrap_or(0))?;
+            dispatch::edit_rotate_all(editor, rotation_of(req)?)?;
             ok_response()
         }
         "movePage" => {
@@ -380,8 +386,7 @@ fn do_editor_mutate(
         }
         "setPageRotation" => {
             let page = page!();
-            let degrees = req.get_i32("degrees").unwrap_or(0);
-            dispatch::edit_set_page_rotation(editor, page, degrees)?;
+            dispatch::edit_set_page_rotation(editor, page, rotation_of(req)?)?;
             ok_response()
         }
         "reduceImages" => {
@@ -569,7 +574,10 @@ fn do_editor_mutate(
             ok_response()
         }
         "convertToPdfA" => {
-            dispatch::edit_convert_to_pdf_a(editor, req.get_i32("level").unwrap_or(2), cancel)?;
+            let name = req.get_str("level").unwrap_or("a2");
+            let level = dispatch::pdfa_level_from_name(name)
+                .ok_or_else(|| Error::InvalidOperation(format!("unknown PDF/A level: {name}")))?;
+            dispatch::edit_convert_to_pdf_a(editor, level, cancel)?;
             ok_response()
         }
         "resizeImage" => {
@@ -746,7 +754,7 @@ fn handle_editor_save(
         None => return ResponseWriter::error("editor not found"),
     };
 
-    let compress = req.get_bool("compress").unwrap_or(true);
+    let deflate = req.get_bool("deflate").unwrap_or(true);
     let gc = req.get_bool("garbageCollect").unwrap_or(true);
     let object_streams = req.get_bool("objectStreams").unwrap_or(true);
     // A negative level is no level: the save refuses it as out of range.
@@ -787,7 +795,7 @@ fn handle_editor_save(
     };
     let options = crate::editor::SaveOptions {
         incremental: mode == 1,
-        compress,
+        compress: deflate,
         garbage_collect: gc,
         encryption,
         keep_source_encryption: encrypt_mode == 0,

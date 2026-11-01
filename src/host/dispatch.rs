@@ -861,6 +861,50 @@ pub fn edit_rotate_all(editor: &mut DocumentEditor, degrees: i32) -> Result<()> 
     editor.rotate_all_pages(degrees)
 }
 
+/// The degrees a wire rotation name stands for; any other name is `None`.
+pub fn rotation_degrees_from_name(name: &str) -> Option<i32> {
+    match name {
+        "r0" => Some(0),
+        "r90" => Some(90),
+        "r180" => Some(180),
+        "r270" => Some(270),
+        _ => None,
+    }
+}
+
+/// The wire name of a stored page rotation; `None` for a value that is not
+/// 0, 90, 180 or 270.
+pub fn rotation_name_from_degrees(degrees: i32) -> Option<&'static str> {
+    match degrees {
+        0 => Some("r0"),
+        90 => Some("r90"),
+        180 => Some("r180"),
+        270 => Some("r270"),
+        _ => None,
+    }
+}
+
+/// The PDF/A level (1, 2 or 3) a wire name stands for; any other name is
+/// `None`.
+pub fn pdfa_level_from_name(name: &str) -> Option<i32> {
+    match name {
+        "a1" => Some(1),
+        "a2" => Some(2),
+        "a3" => Some(3),
+        _ => None,
+    }
+}
+
+/// The PDF/UA level (1 or 2) a wire name stands for; any other name is
+/// `None`.
+pub fn pdfua_level_from_name(name: &str) -> Option<i32> {
+    match name {
+        "ua1" => Some(1),
+        "ua2" => Some(2),
+        _ => None,
+    }
+}
+
 /// Move a page from one index to another.
 pub fn edit_move_page(editor: &mut DocumentEditor, from: usize, to: usize) -> Result<()> {
     use crate::editor::EditableDocument;
@@ -2824,5 +2868,31 @@ mod wire_name_tests {
         assert_eq!(alignment_q_from_name("1"), None);
         assert_eq!(alignment_name_from_q(-1), None);
         assert_eq!(alignment_name_from_q(3), None);
+    }
+
+    #[test]
+    fn a_rotation_name_maps_to_its_degrees_and_back() {
+        for (name, degrees) in [("r0", 0), ("r90", 90), ("r180", 180), ("r270", 270)] {
+            assert_eq!(rotation_degrees_from_name(name), Some(degrees));
+            assert_eq!(rotation_name_from_degrees(degrees), Some(name));
+        }
+        assert_eq!(rotation_degrees_from_name("90"), None);
+        assert_eq!(rotation_degrees_from_name("R90"), None);
+        assert_eq!(rotation_name_from_degrees(45), None);
+        assert_eq!(rotation_name_from_degrees(360), None);
+    }
+
+    #[test]
+    fn a_level_name_maps_and_a_number_or_unknown_name_does_not() {
+        for (name, level) in [("a1", 1), ("a2", 2), ("a3", 3)] {
+            assert_eq!(pdfa_level_from_name(name), Some(level));
+        }
+        for (name, level) in [("ua1", 1), ("ua2", 2)] {
+            assert_eq!(pdfua_level_from_name(name), Some(level));
+        }
+        assert_eq!(pdfa_level_from_name("2"), None);
+        assert_eq!(pdfa_level_from_name("ua1"), None);
+        assert_eq!(pdfua_level_from_name("1"), None);
+        assert_eq!(pdfua_level_from_name("a1"), None);
     }
 }
