@@ -55,6 +55,8 @@ mod redact_random;
 #[cfg(feature = "rendering")]
 mod redact_save;
 #[cfg(feature = "rendering")]
+mod render_fit_crop;
+#[cfg(feature = "rendering")]
 mod render_gaps;
 #[cfg(feature = "rendering")]
 mod render_stream;

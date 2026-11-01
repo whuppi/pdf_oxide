@@ -616,11 +616,11 @@ pub fn fit_options(
     // 270 below and the page rendered unrotated. rem_euclid normalizes to 0..359,
     // matching get_page_rotation's own `((raw % 360) + 360) % 360` convention.
     let rotation = page_info.rotation.rem_euclid(360);
-    let (page_w_pt, page_h_pt) = if rotation == 90 || rotation == 270 {
-        (page_info.media_box.height.max(1.0), page_info.media_box.width.max(1.0))
-    } else {
-        (page_info.media_box.width.max(1.0), page_info.media_box.height.max(1.0))
-    };
+    // The raster is the crop box clipped to the media box (`page_render_box`), so
+    // that is the box the fit scale is taken from.
+    let render_box = page_render_box(&page_info.media_box, page_info.crop_box.as_ref());
+    let (page_w_pt, page_h_pt) = rotated_page_extent(&render_box, rotation);
+    let (page_w_pt, page_h_pt) = (page_w_pt.max(1.0), page_h_pt.max(1.0));
 
     // Compute scale as a float ratio to avoid integer-DPI quantization (issue #480).
     let scale = (fit_w_px as f32 / page_w_pt).min(fit_h_px as f32 / page_h_pt);
