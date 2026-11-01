@@ -534,17 +534,27 @@ pub fn render_page_region(
         ));
     }
 
-    let media = doc.get_page_media_box(page_num)?;
-    let page_h_pt = media.3 - media.1;
+    // The raster is the render box turned by /Rotate, so the rectangle goes
+    // through the transform that draws the page, at one pixel per point.
+    let page_info = doc.get_page_info(page_num)?;
+    let render_box = page_render_box(&page_info.media_box, page_info.crop_box.as_ref());
+    let to_raster = page_base_transform(&render_box, page_info.rotation, 1.0);
+    let mut corners = [
+        tiny_skia::Point::from_xy(crop_x_pt, crop_y_pt),
+        tiny_skia::Point::from_xy(crop_x_pt + crop_w_pt, crop_y_pt + crop_h_pt),
+    ];
+    to_raster.map_points(&mut corners);
+    let left_pt = corners[0].x.min(corners[1].x);
+    let top_pt = corners[0].y.min(corners[1].y);
+    let width_pt = (corners[0].x - corners[1].x).abs();
+    let height_pt = (corners[0].y - corners[1].y).abs();
 
     // Points → pixels at the render DPI.
     let scale = options.dpi as f32 / 72.0;
-    let crop_x_px = (crop_x_pt * scale).round().max(0.0) as u32;
-    // Image Y is top-left origin; PDF Y is bottom-left. Flip.
-    let top_y_pt = page_h_pt - (crop_y_pt + crop_h_pt);
-    let crop_y_px = (top_y_pt * scale).round().max(0.0) as u32;
-    let crop_w_px = (crop_w_pt * scale).round().max(1.0) as u32;
-    let crop_h_px = (crop_h_pt * scale).round().max(1.0) as u32;
+    let crop_x_px = (left_pt * scale).round().max(0.0) as u32;
+    let crop_y_px = (top_pt * scale).round().max(0.0) as u32;
+    let crop_w_px = (width_pt * scale).round().max(1.0) as u32;
+    let crop_h_px = (height_pt * scale).round().max(1.0) as u32;
 
     // The crop clamped to the raster, known once the raster's size is.
     let crop = std::cell::Cell::new((0u32, 0u32, 0u32, 0u32));

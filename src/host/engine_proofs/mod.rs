@@ -63,6 +63,8 @@ mod render_fit_crop;
 #[cfg(feature = "rendering")]
 mod render_gaps;
 #[cfg(feature = "rendering")]
+mod render_region_crop;
+#[cfg(feature = "rendering")]
 mod render_stream;
 #[cfg(feature = "rendering")]
 mod stencil_proof;
