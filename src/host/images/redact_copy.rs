@@ -37,36 +37,6 @@ use super::encode::{best_filtered_row, FlateRows};
 use super::execute::{Pipe, Shape, Source};
 use super::stream::SampleRows;
 
-/// One overwritten placement, recorded when the mark is called and written
-/// after the page's content. `fills` are `(rect, rgb)` pairs in first
-/// intersect-win order: which region's fill a covered pixel takes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ImagePlacement {
-    /// The `/Name` the pass writes the copy under (never a source name).
-    pub name: String,
-    /// The source image XObject.
-    pub source: ObjectRef,
-    /// The covered rect, `u0 v0 u1 v1`, fractions of the image's unit
-    /// square, lower-left origin in image space: `u0` and `v0` the lower
-    /// left corner, `u1` and `v1` the upper right.
-    pub u0: f32,
-    /// See [`ImagePlacement::u0`].
-    pub v0: f32,
-    /// See [`ImagePlacement::u0`].
-    pub u1: f32,
-    /// See [`ImagePlacement::u0`].
-    pub v1: f32,
-    /// `((u0, v0, u1, v1), rgb)` for every region the placement covers.
-    pub fills: Vec<([f32; 4], [f32; 3])>,
-}
-
-impl ImagePlacement {
-    /// The placement's covered rect as `[u0, v0, u1, v1]`.
-    pub fn covered_rect(&self) -> [f32; 4] {
-        [self.u0, self.v0, self.u1, self.v1]
-    }
-}
-
 /// What the covered pixels take.
 pub(crate) enum CopySemantics {
     /// The overlay colour, converted to the image's colour space.

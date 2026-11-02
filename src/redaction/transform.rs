@@ -13,14 +13,19 @@ mod meshes;
 mod paths;
 
 pub use meshes::{MeshPattern, MeshSource};
+#[cfg(feature = "rendering")]
 pub(crate) use meshes::{filtered_dict, write_filtered};
 
 use paths::{is_path_op, paint_of, redact_path, PathRedaction};
 use super::classify::{classify, Classification};
 use super::font_scrub::FontCodes;
-use super::image_prune::{classify_image_placement, invert_affine};
+#[cfg(feature = "rendering")]
+use super::image_prune::invert_affine;
+use super::image_prune::classify_image_placement;
 use super::options::{RedactionOptions, RedactionReport};
-use super::overlay::{region_overlay_ops, resolved_fill};
+#[cfg(feature = "rendering")]
+use super::overlay::resolved_fill;
+use super::overlay::region_overlay_ops;
 use super::region::RegionSet;
 use super::serialize::serialize_operator;
 use super::text_engine::{FontMetrics, TextPass};
@@ -29,7 +34,8 @@ use crate::content::graphics_state::Matrix;
 use crate::error::{Error, Result};
 use crate::geometry::Rect;
 use crate::host::content::{InlineImages, Mode, Operators};
-use crate::host::images::redact_copy::{covered_span, ImagePlacement};
+#[cfg(feature = "rendering")]
+use crate::host::images::redact_copy::covered_span;
 use crate::object::{Object, ObjectRef};
 
 /// How deep forms may nest inside a redacted form. A deeper tree refuses at
@@ -99,6 +105,36 @@ pub trait FormLoader {
     /// # Errors
     /// When the form's stream cannot be opened.
     fn content(&self, form: ObjectRef) -> Result<Operators<Box<dyn Read>>>;
+}
+
+/// One overwritten image placement, recorded when the mark is called and
+/// written after the page's content. `fills` are `(rect, rgb)` pairs in first
+/// intersect-win order: which region's fill a covered pixel takes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImagePlacement {
+    /// The `/Name` the pass writes the copy under (never a source name).
+    pub name: String,
+    /// The source image XObject.
+    pub source: ObjectRef,
+    /// The covered rect, `u0 v0 u1 v1`, fractions of the image's unit
+    /// square, lower-left origin in image space: `u0` and `v0` the lower
+    /// left corner, `u1` and `v1` the upper right.
+    pub u0: f32,
+    /// See [`ImagePlacement::u0`].
+    pub v0: f32,
+    /// See [`ImagePlacement::u0`].
+    pub u1: f32,
+    /// See [`ImagePlacement::u0`].
+    pub v1: f32,
+    /// `((u0, v0, u1, v1), rgb)` for every region the placement covers.
+    pub fills: Vec<([f32; 4], [f32; 3])>,
+}
+
+impl ImagePlacement {
+    /// The placement's covered rect as `[u0, v0, u1, v1]`.
+    pub fn covered_rect(&self) -> [f32; 4] {
+        [self.u0, self.v0, self.u1, self.v1]
+    }
 }
 
 /// One copy of a mesh shading with its covered primitives dropped.
@@ -223,6 +259,7 @@ pub struct LineStyle {
 
 /// Rounds the u/v keys of a covered rect: two `Do`s of one source over the
 /// same rect share one copy.
+#[cfg(feature = "rendering")]
 fn rect_key(u0: f32, v0: f32, u1: f32, v1: f32) -> u128 {
     (u0.to_bits() as u128) << 96
         | (v0.to_bits() as u128) << 64
@@ -297,10 +334,12 @@ pub struct RedactPass<'a> {
     scope: Scope,
     /// `source → name → (rect, name)`: a copy already made of the same
     /// source over the same rect, which a second placement shares.
+    #[cfg(feature = "rendering")]
     copies: HashMap<u32, HashMap<u128, String>>,
     /// Form and pattern copies already made, by source and matrix.
     copy_names: HashMap<CopyKey, String>,
     /// Mesh copies already made, by source and matrix, as indices in the scope.
+    #[cfg(feature = "rendering")]
     mesh_copies: HashMap<CopyKey, usize>,
     /// The sources the pass overwrote, dropped or copied.
     originals: Vec<u32>,
@@ -352,8 +391,10 @@ impl<'a> RedactPass<'a> {
             base: Matrix::identity(),
             active: Vec::new(),
             scope: Scope::default(),
+            #[cfg(feature = "rendering")]
             copies: HashMap::new(),
             copy_names: HashMap::new(),
+            #[cfg(feature = "rendering")]
             mesh_copies: HashMap::new(),
             originals: Vec::new(),
             nested: RedactionReport::default(),
@@ -671,6 +712,7 @@ impl<'a> RedactPass<'a> {
     /// Decides one image `Do` against the regions through the composed CTM:
     /// the placement queued, and `None` when the `Do` passes through (the
     /// kept one is written byte for byte; the caller re-serialises it).
+    #[cfg(feature = "rendering")]
     fn decide_do(&mut self, source: ObjectRef, name: &str) -> Result<Option<Decision>> {
         use super::image_prune::ImageRedaction;
         let ctm = self.text.ctm();
@@ -717,6 +759,18 @@ impl<'a> RedactPass<'a> {
                     name: copy_name,
                 })))
             },
+        }
+    }
+
+    /// Decides one image `Do` in a build without rendering: an image that
+    /// meets a region cannot be overwritten, so the pass refuses; one outside
+    /// every region passes through.
+    #[cfg(not(feature = "rendering"))]
+    fn decide_do(&mut self, _source: ObjectRef, _name: &str) -> Result<Option<Decision>> {
+        use super::image_prune::ImageRedaction;
+        match classify_image_placement(&self.text.ctm(), self.regions, self.opts.edge_padding) {
+            ImageRedaction::Keep => Ok(None),
+            _ => Err(rendering_left_out("an image")),
         }
     }
 
@@ -806,6 +860,7 @@ impl<'a> RedactPass<'a> {
     /// Decides a `sh` of the mesh `name` under the CTM: it passes when no
     /// primitive meets a region, is dropped when every one does, and
     /// otherwise names a copy without the primitives that do.
+    #[cfg(feature = "rendering")]
     fn decide_shading(&mut self, name: &str) -> Result<Option<Decision>> {
         let images = self.images;
         let Some(mesh) = images.meshes.get(name) else {
@@ -829,10 +884,43 @@ impl<'a> RedactPass<'a> {
         })))
     }
 
+    /// Decides a `sh` of the mesh `name` in a build without rendering: a mesh
+    /// that may meet a region cannot be filtered, so the pass refuses; one
+    /// outside every region passes.
+    #[cfg(not(feature = "rendering"))]
+    fn decide_shading(&mut self, name: &str) -> Result<Option<Decision>> {
+        let images = self.images;
+        let Some(mesh) = images.meshes.get(name) else {
+            return Ok(None);
+        };
+        meshes::refuse_if_met(mesh, &self.text.ctm(), self.regions, self.opts.edge_padding)?;
+        self.scope.kept_shadings.insert(name.to_string());
+        Ok(None)
+    }
+
+    /// Decides a colour operator naming the pattern `name` in a build
+    /// without rendering: a pattern whose mesh may meet a region refuses, any
+    /// other passes.
+    #[cfg(not(feature = "rendering"))]
+    fn decide_pattern(
+        &mut self,
+        name: &str,
+        _rename: impl FnOnce(String) -> Operator,
+    ) -> Result<Option<Decision>> {
+        let images = self.images;
+        if let Some(pattern) = images.patterns.get(name) {
+            let to_page = pattern.matrix.multiply(&self.base);
+            meshes::refuse_if_met(&pattern.mesh, &to_page, self.regions, self.opts.edge_padding)?;
+        }
+        self.scope.kept_patterns.insert(name.to_string());
+        Ok(None)
+    }
+
     /// Decides a colour operator naming the pattern `name`: a pattern whose
     /// mesh loses no primitive passes, any other names a copy of the pattern
     /// over a copy of the mesh, which may be empty. `rename` rebuilds the
     /// operator under the copy's name.
+    #[cfg(feature = "rendering")]
     fn decide_pattern(
         &mut self,
         name: &str,
@@ -880,6 +968,7 @@ impl<'a> RedactPass<'a> {
 
     /// The index in the scope of the copy of the mesh `source` filtered under
     /// `to_page`, made if the stream has none yet.
+    #[cfg(feature = "rendering")]
     fn mesh_copy(
         &mut self,
         stem: &str,
@@ -907,6 +996,7 @@ impl<'a> RedactPass<'a> {
     /// Every region that meets the placement through `ctm`, as its covered
     /// rect in image u/v space and the overlay fill it carries; first hit
     /// wins for a pixel.
+    #[cfg(feature = "rendering")]
     fn region_fills(&self, ctm: &Matrix) -> Result<Vec<([f32; 4], [f32; 3])>> {
         let Some(inv) = invert_affine(ctm) else {
             // The mapping is unreliable: the whole unit square is under one
@@ -954,13 +1044,30 @@ impl<'a> RedactPass<'a> {
     /// else the configured default when overlay drawing is on, else black —
     /// the plan's "else sample zero" for the pixels a mark of no colour
     /// covers.
+    #[cfg(feature = "rendering")]
     fn region_fill(&self, region: usize) -> [f32; 3] {
         resolved_fill(&self.regions.regions[region], self.opts).unwrap_or([0.0, 0.0, 0.0])
+    }
+
+    /// Decides one inline image in a build without rendering: as
+    /// [`Self::decide_do`], an inline image that meets a region refuses.
+    #[cfg(not(feature = "rendering"))]
+    fn decide_inline(
+        &mut self,
+        _dict: &std::collections::HashMap<String, Object>,
+        _data: &[u8],
+    ) -> Result<Option<Decision>> {
+        use super::image_prune::ImageRedaction;
+        match classify_image_placement(&self.text.ctm(), self.regions, self.opts.edge_padding) {
+            ImageRedaction::Keep => Ok(None),
+            _ => Err(rendering_left_out("an inline image")),
+        }
     }
 
     /// Decides one inline image: decode it whole (they are small), fill the
     /// covered pixels, re-emit the bytes the copy stores. The re-emit is
     /// raw when the source was, Flate when it was filtered.
+    #[cfg(feature = "rendering")]
     fn decide_inline(
         &mut self,
         dict: &std::collections::HashMap<String, Object>,
@@ -995,12 +1102,23 @@ fn unsupported_font() -> Error {
     )
 }
 
+/// The refusal of a build without rendering: image and mesh redaction need
+/// the codecs and the mesh reader that only rendering carries.
+#[cfg(not(feature = "rendering"))]
+pub(crate) fn rendering_left_out(what: &str) -> Error {
+    Error::Unsupported(format!(
+        "this build leaves out rendering, which image and mesh redaction needs; refusing to \
+         redact a page where {what} meets a redaction box"
+    ))
+}
+
 /// An inline image's covered pixels filled: `(dict, data)` in the re-emitted
 /// form. The pixels decode through the extractor the renderer paints them
 /// with, the fill is the overlay colour the region under a pixel carries,
 /// and the copy is the raster's own bytes: DeviceGray or DeviceRGB at 8
 /// bits, `/Decode` dropped (the samples are the physical colour now), a raw
 /// byte stream when the source was raw and a Flate one when it was filtered.
+#[cfg(feature = "rendering")]
 fn fill_inline(
     dict: &HashMap<String, Object>,
     data: &[u8],

@@ -95,7 +95,9 @@ pub use document_editor::{
     ImageInfo, PageInfo, Permissions, SaveOptions,
 };
 // ── pdf_manipulator patch: the page order's entries, read by the prune plan ──
-pub(crate) use document_editor::{PageKey, PageSlot, XrefEntries};
+pub(crate) use document_editor::{PageKey, PageSlot};
+#[cfg(feature = "rendering")]
+pub(crate) use document_editor::XrefEntries;
 // ── end pdf_manipulator patch ──
 pub use dom::{
     AnnotationId, AnnotationWrapper, ElementId, ImageElementCollectionEditor, PageEditor,

@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::extractors::HierarchicalExtractor;
 use crate::geometry::Rect;
 // ── pdf_manipulator patch: an image's redaction copy comes from the row writers ──
+#[cfg(feature = "rendering")]
 use crate::host::images::redact_copy;
 // ── end pdf_manipulator patch ──
 use crate::object::{Object, ObjectRef};
@@ -609,13 +610,16 @@ struct FormIds {
 struct CopyWork<'a> {
     /// A placement, its ids and the /ColorSpace map of the resources it is
     /// drawn from.
+    #[cfg(feature = "rendering")]
     images: Vec<(
-        &'a crate::host::images::redact_copy::ImagePlacement,
+        &'a crate::redaction::transform::ImagePlacement,
         &'a RedactionCopyIds,
         HashMap<String, Object>,
     )>,
+    #[cfg(feature = "rendering")]
     meshes: Vec<(&'a crate::redaction::transform::MeshCopy, (u32, u32))>,
     /// A pattern copy, its id and the id of the mesh copy it names.
+    #[cfg(feature = "rendering")]
     patterns: Vec<(&'a crate::redaction::transform::PatternCopy, u32, u32)>,
     forms: Vec<(&'a crate::redaction::transform::FormCopy, &'a FormIds)>,
 }
@@ -4190,6 +4194,7 @@ impl DocumentEditor {
     /// /Length the object `length_id`. Thin wrapper over
     /// [`crate::host::images::redact_copy::write_copy`]: the placement comes
     /// from the pass, the save's deflate level and encryption apply.
+    #[cfg(feature = "rendering")]
     #[allow(clippy::too_many_arguments)]
     fn write_redacted_image_copy(
         source: &PdfDocument,
@@ -4345,6 +4350,7 @@ impl DocumentEditor {
     /// Proves every image copy of `scope` and of the forms below it
     /// writable, and collects the /SMask and /Mask objects those copies
     /// replace.
+    #[cfg(feature = "rendering")]
     fn validate_scope(
         &self,
         scope: &crate::redaction::transform::Scope,
@@ -4389,6 +4395,7 @@ impl DocumentEditor {
         scope: &crate::redaction::transform::Scope,
         out: &mut Vec<Object>,
     ) -> Result<()> {
+        #[cfg(feature = "rendering")]
         for mesh in &scope.meshes {
             if let Some(mesh) = Self::mesh_source_of(source, mesh.source) {
                 out.push(Object::Dictionary(crate::redaction::transform::filtered_dict(&mesh)?));
@@ -4449,6 +4456,7 @@ impl DocumentEditor {
 
     /// Flattens `scope` and the scopes of its forms into `work`, each copy
     /// with the resources it is drawn from.
+    #[cfg(feature = "rendering")]
     fn collect_copy_work<'a>(
         source: &PdfDocument,
         forms: &DocForms,
@@ -4479,8 +4487,27 @@ impl DocumentEditor {
         Ok(())
     }
 
+    /// As the build with rendering, for the form copies alone: a build
+    /// without rendering queues no image, mesh or pattern copy.
+    #[cfg(not(feature = "rendering"))]
+    fn collect_copy_work<'a>(
+        source: &PdfDocument,
+        forms: &DocForms,
+        scope: &'a crate::redaction::transform::Scope,
+        ids: &'a ScopeIds,
+        resources: &Object,
+        work: &mut CopyWork<'a>,
+    ) -> Result<()> {
+        for (form, form_ids) in scope.forms.iter().zip(&ids.forms) {
+            Self::collect_copy_work(source, forms, &form.scope, &form_ids.inner, resources, work)?;
+            work.forms.push((form, form_ids));
+        }
+        Ok(())
+    }
+
     /// Writes the mesh copy as stream `ids.0`: the source's primitives that
     /// meet no region, decided again as the dry run decided them.
+    #[cfg(feature = "rendering")]
     #[allow(clippy::too_many_arguments)]
     fn write_mesh_copy(
         source: &PdfDocument,
@@ -4526,6 +4553,7 @@ impl DocumentEditor {
 
     /// Writes the pattern copy as object `id`: the source's dictionary, its
     /// shading the mesh copy `mesh_id`.
+    #[cfg(feature = "rendering")]
     fn write_pattern_copy(
         source: &PdfDocument,
         pattern: &crate::redaction::transform::PatternCopy,
@@ -7122,6 +7150,7 @@ impl DocumentEditor {
                                         &page_resources,
                                         &mut work,
                                     )?;
+                                    #[cfg(feature = "rendering")]
                                     for (placement, ids, colour_spaces) in &work.images {
                                         let source = &self.source;
                                         let source_dict = source
@@ -7219,6 +7248,7 @@ impl DocumentEditor {
                                         )?;
                                     }
                                     // The mesh, pattern and form copies, through the same chain.
+                                    #[cfg(feature = "rendering")]
                                     for (mesh, ids) in &work.meshes {
                                         Self::write_mesh_copy(
                                             &self.source,
@@ -7233,6 +7263,7 @@ impl DocumentEditor {
                                             &mut xref_entries,
                                         )?;
                                     }
+                                    #[cfg(feature = "rendering")]
                                     for (pattern, id, mesh_id) in &work.patterns {
                                         Self::write_pattern_copy(
                                             &self.source,
@@ -11143,9 +11174,16 @@ impl DocumentEditor {
         // asked to fail halfway with a rejected copy.
         // A placement's /SMask and /Mask stencil are copied too, so they are
         // proved and their originals kept out of the output like the image's.
-        let mut mask_originals = Vec::new();
-        self.validate_scope(&outcome.scope, &forms, &page_resources, &mut mask_originals)?;
-        for id in outcome.originals.iter().chain(&mask_originals) {
+        // A build without rendering queues no image copy, so there is
+        // nothing to prove.
+        let mut originals = outcome.originals.clone();
+        #[cfg(feature = "rendering")]
+        {
+            let mut mask_originals = Vec::new();
+            self.validate_scope(&outcome.scope, &forms, &page_resources, &mut mask_originals)?;
+            originals.extend(mask_originals);
+        }
+        for id in &originals {
             self.redacted_image_originals.insert(*id);
         }
         let dropped_annots = self.redacted_annotations(src, rs, opts)?;

@@ -50,8 +50,11 @@ mod redact_pass;
 mod redact_flatten;
 #[cfg(feature = "rendering")]
 mod redact_font_scrub;
+#[cfg(feature = "rendering")]
 mod redact_path_ink;
 mod redact_paths;
+#[cfg(not(feature = "rendering"))]
+mod redact_refusal;
 #[cfg(feature = "rendering")]
 mod redact_copies;
 #[cfg(feature = "rendering")]
