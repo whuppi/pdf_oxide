@@ -973,12 +973,17 @@ impl DocumentEditor {
     fn push_flat_set(
         &mut self,
         flat: &mut FlatPage,
-        appearances: Vec<AnnotationAppearance>,
+        #[allow(unused_mut)] mut appearances: Vec<AnnotationAppearance>,
         stem: &str,
         widgets: bool,
     ) {
         if appearances.is_empty() {
             return;
+        }
+        #[cfg(test)]
+        if let Some(first) = appearances.first_mut() {
+            let extras = crate::host::flat_extras_seam::TEST_FLAT_EXTRAS.with(|extras| extras.take());
+            first.extra_objects.extend(extras);
         }
         let xobjects: Vec<(u32, String)> = (0..appearances.len())
             .map(|at| (self.allocate_object_id(), format!("{stem}{at}")))
@@ -1137,6 +1142,25 @@ impl DocumentEditor {
             let mut dict = HashMap::new();
             dict.insert("Length".to_string(), Object::Integer(bytes.len() as i64));
             replacements.push((old.id, Object::stream(dict, bytes::Bytes::from(bytes))));
+        }
+        // A Type 3 font loses the entries of the glyphs only the removed text
+        // showed, and the streams of those procedures (and any object the
+        // rewritten font no longer names) are not written.
+        if let Some(mut table) = rewritten.char_procs.take() {
+            for name in &rewritten.procs {
+                table.remove(name);
+            }
+            rewritten.dict.insert("CharProcs".to_string(), Object::Dictionary(table));
+        }
+        for orphan in std::mem::take(&mut rewritten.orphans) {
+            if Some(orphan) == old_cmap.map(|r| r.id) {
+                continue;
+            }
+            for page in self.redacted_pages.values_mut() {
+                if let Some(flat) = page.flat.as_mut() {
+                    flat.remove_extra(orphan);
+                }
+            }
         }
         replacements.push((id, Object::Dictionary(rewritten.dict)));
         for (target, object) in replacements {

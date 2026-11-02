@@ -600,6 +600,16 @@ impl FlatPage {
         }
     }
 
+    /// Drops the object written under `id` beside an appearance: it is not
+    /// written.
+    fn remove_extra(&mut self, id: u32) {
+        for set in &mut self.sets {
+            for appearance in &mut set.appearances {
+                appearance.extra_objects.retain(|(extra_id, _)| *extra_id != id);
+            }
+        }
+    }
+
     /// Replaces the object written under `id` beside an appearance.
     fn replace_extra(&mut self, id: u32, replacement: Object) {
         for set in &mut self.sets {

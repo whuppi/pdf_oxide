@@ -17,6 +17,8 @@ pub mod dispatch;
 pub(crate) mod duplicates;
 #[cfg(test)]
 mod engine_proofs;
+#[cfg(test)]
+pub(crate) mod flat_extras_seam;
 pub mod fallback_fonts;
 pub mod lane_state;
 /// Per-op dispatch units (entry + handler + linker anchor).
