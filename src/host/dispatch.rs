@@ -2316,20 +2316,25 @@ pub enum PageOp {
     Newline,
     /// Draw inline text at the current position without advancing the line.
     Inline(String),
-    /// Draw bold inline text at the current position.
-    InlineBold(String),
-    /// Draw italic inline text at the current position.
-    InlineItalic(String),
-    /// Draw inline text in a colour at the current position.
-    InlineColor {
-        /// Red component (0.0-1.0).
-        r: f32,
-        /// Green component (0.0-1.0).
-        g: f32,
-        /// Blue component (0.0-1.0).
-        b: f32,
-        /// Inline text run.
+    /// Write a styled text or inline run: the font/size/bold/italic/colour
+    /// overrides apply to this run only — the page's font and size are
+    /// restored afterwards. `inline = true` writes at the cursor without
+    /// stepping a line; false follows `Text`'s line semantics.
+    StyledText {
+        /// The run's text.
         text: String,
+        /// Font name override for this run.
+        font: Option<String>,
+        /// Font size override in points.
+        size: Option<f32>,
+        /// Draw the run in the bold face of its font.
+        bold: bool,
+        /// Draw the run in the italic face of its font.
+        italic: bool,
+        /// RGB colour override.
+        color: Option<(f32, f32, f32)>,
+        /// Write at the cursor without stepping a line.
+        inline: bool,
     },
     /// Draw wrapped, horizontally-aligned text inside an exact rectangle.
     TextInRect {
@@ -2346,12 +2351,8 @@ pub enum PageOp {
         /// Horizontal alignment of each line.
         align: crate::writer::TextAlign,
     },
-    /// Draw an unfilled rectangle primitive.
-    Rect(f32, f32, f32, f32),
     /// Draw a filled rectangle primitive.
     FilledRect(f32, f32, f32, f32, f32, f32, f32),
-    /// Draw a straight line primitive.
-    Line(f32, f32, f32, f32),
     /// Draw a stroked rectangle.
     StrokeRect {
         /// X origin.
@@ -2463,10 +2464,6 @@ pub enum PageOp {
         /// Note text shown on the page.
         text: String,
     },
-    /// Add the preset CONFIDENTIAL watermark.
-    WatermarkConfidential,
-    /// Add the preset DRAFT watermark.
-    WatermarkDraft,
     /// Add a named-destination link to the last text element.
     LinkNamed(String),
     /// Add a JavaScript link to the last text element.
@@ -2489,25 +2486,19 @@ pub enum PageOp {
         /// Height.
         h: f32,
     },
-    /// Lay out a buffered table with per-column width and alignment.
-    BufferedTable {
-        /// Header, width (`None` = auto) and alignment per column.
-        columns: Vec<(String, Option<f32>, crate::writer::CellAlign)>,
-        /// Row-major cell text.
-        rows: Vec<Vec<String>>,
-        /// Prepend a bold header row.
-        has_header: bool,
-    },
     /// Replay a streaming table block with per-column widths and
     /// extended sizing modes.
     StreamingTableBlock {
-        /// Header, width and alignment per column.
-        config_columns: Vec<(String, f32, crate::writer::CellAlign)>,
+        /// Header, width (`None` = the writer's default, measured over by
+        /// the sample mode) and alignment per column.
+        config_columns: Vec<(String, Option<f32>, crate::writer::CellAlign)>,
         /// Repeat the header row on each page.
         repeat_header: bool,
+        /// Draw the header row at all.
+        has_header: bool,
         /// Row-major `(text, rowspan)` cells.
         rows: Vec<Vec<(String, usize)>>,
-        /// One of `fixed`, `sample`, `auto_all`.
+        /// One of `fixed`, `sample`.
         mode: String,
         /// Rows sampled for column sizing in `sample` mode.
         sample_rows: usize,
@@ -2568,17 +2559,27 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) -> Result<()> {
         PageOp::Footnote { ref_mark, note_text } => page.footnote(&ref_mark, &note_text),
         PageOp::Columns { column_count, gap_pt, text } => page.columns(column_count, gap_pt, &text),
         PageOp::Inline(ref text) => page.inline(text),
-        PageOp::InlineBold(ref text) => page.inline_bold(text),
-        PageOp::InlineItalic(ref text) => page.inline_italic(text),
-        PageOp::InlineColor { r, g, b, ref text } => page.inline_color(r, g, b, text),
+        PageOp::StyledText {
+            ref text,
+            ref font,
+            size,
+            bold,
+            italic,
+            color,
+            inline,
+        } => {
+            if inline {
+                page.inline_styled(text, font.as_deref(), size, bold, italic, color)
+            } else {
+                page.text_styled(text, font.as_deref(), size, bold, italic, color)
+            }
+        }
         PageOp::TextInRect { x, y, w, h, ref text, align } => page.text_in_rect(
             crate::geometry::Rect::new(x, y, w, h),
             text,
             align,
         ),
-        PageOp::Rect(x, y, w, h) => page.rect(x, y, w, h),
         PageOp::FilledRect(x, y, w, h, r, g, b) => page.filled_rect(x, y, w, h, r, g, b),
-        PageOp::Line(x1, y1, x2, y2) => page.line(x1, y1, x2, y2),
         PageOp::StrokeRect { x, y, w, h, width, r, g, b } => {
             page.stroke_rect(x, y, w, h, crate::writer::LineStyle::new(width, r, g, b))
         }
@@ -2616,8 +2617,6 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) -> Result<()> {
             crate::geometry::Rect::new(x, y, w, h),
             text,
         ),
-        PageOp::WatermarkConfidential => page.watermark_confidential(),
-        PageOp::WatermarkDraft => page.watermark_draft(),
         PageOp::LinkNamed(ref dest) => page.link_named(dest),
         PageOp::LinkJavaScript(ref script) => page.link_javascript(script),
         PageOp::OnOpen(ref script) => page.on_open(script),
@@ -2626,45 +2625,10 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) -> Result<()> {
             let img = page_image(&data)?;
             page.image_with_artifact(img, crate::geometry::Rect::new(x, y, w, h))
         }
-        PageOp::BufferedTable { ref columns, ref rows, has_header } => {
-            // Same construction as the WASM binding's replay:
-            // text cells, a bold header row when hasHeader, and
-            // per-column widths and alignments.
-            let cell_rows: Vec<Vec<crate::writer::TableCell>> = rows
-                .iter()
-                .map(|r| r.iter().map(|c| crate::writer::TableCell::text(c.clone())).collect())
-                .collect();
-            let cell_rows = if has_header {
-                let header: Vec<crate::writer::TableCell> = columns
-                    .iter()
-                    .map(|(h, _, _)| crate::writer::TableCell::text(h.clone()).bold())
-                    .collect();
-                let mut out = Vec::with_capacity(cell_rows.len() + 1);
-                out.push(header);
-                out.extend(cell_rows);
-                out
-            } else {
-                cell_rows
-            };
-            let mut table = crate::writer::Table::new(cell_rows);
-            if has_header {
-                table = table.with_header_row();
-            }
-            let widths: Vec<crate::writer::ColumnWidth> = columns
-                .iter()
-                .map(|(_, w, _)| match w {
-                    Some(pt) => crate::writer::ColumnWidth::Fixed(*pt),
-                    None => crate::writer::ColumnWidth::Auto,
-                })
-                .collect();
-            let aligns: Vec<crate::writer::CellAlign> =
-                columns.iter().map(|(_, _, a)| *a).collect();
-            table = table.with_column_widths(widths).with_column_aligns(aligns);
-            page.table(table)
-        }
         PageOp::StreamingTableBlock {
             ref config_columns,
             repeat_header,
+            has_header,
             ref rows,
             ref mode,
             sample_rows,
@@ -2674,20 +2638,20 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) -> Result<()> {
         } => {
             let mut cfg = crate::writer::StreamingTableConfig::new()
                 .repeat_header(repeat_header)
+                .header_row(has_header)
                 .max_rowspan(max_rowspan);
             cfg = match mode.as_str() {
                 "sample" => {
                     cfg.mode_sample(sample_rows, min_col_width_pt, max_col_width_pt)
                 },
-                "auto_all" => cfg.mode_auto_all(),
                 _ => cfg.mode_fixed(),
             };
             for (header, width, align) in config_columns {
-                cfg = cfg.column(
-                    crate::writer::StreamingColumn::new(header.clone())
-                        .width_pt(*width)
-                        .align(*align),
-                );
+                let mut column = crate::writer::StreamingColumn::new(header.clone()).align(*align);
+                if let Some(width) = width {
+                    column = column.width_pt(*width);
+                }
+                cfg = cfg.column(column);
             }
             let mut t = page.streaming_table(cfg);
             for row in rows {
@@ -2729,6 +2693,14 @@ pub fn builder_set_author(b: DocumentBuilder, author: &str) -> DocumentBuilder {
 pub fn builder_set_subject(b: DocumentBuilder, subject: &str) -> DocumentBuilder { b.subject(subject) }
 /// Set the builder's document keywords.
 pub fn builder_set_keywords(b: DocumentBuilder, keywords: &str) -> DocumentBuilder { b.keywords(keywords) }
+/// Set the builder's creator application.
+pub fn builder_set_creator(b: DocumentBuilder, creator: &str) -> DocumentBuilder { b.creator(creator) }
+/// Set the builder's producing application.
+pub fn builder_set_producer(b: DocumentBuilder, producer: &str) -> DocumentBuilder { b.producer(producer) }
+/// Set the builder's creation date (already formatted PDF date string).
+pub fn builder_set_creation_date(b: DocumentBuilder, date: &str) -> DocumentBuilder { b.creation_date(date) }
+/// Set the builder's last-modification date.
+pub fn builder_set_mod_date(b: DocumentBuilder, date: &str) -> DocumentBuilder { b.mod_date(date) }
 /// Add a custom-sized page and return a fluent page builder.
 pub fn builder_add_page(b: &mut DocumentBuilder, width: f32, height: f32) -> FluentPageBuilder<'_> { b.page(PageSize::Custom(width, height)) }
 /// Add an A4-sized page and return a fluent page builder.

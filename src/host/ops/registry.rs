@@ -11,6 +11,7 @@ use crate::host::ops::{builder, convert, doc, editor, fonts, pdfa, render, signa
 static OPS: &[&OpEntry] = &[
     // builder
     &builder::ADD_PAGE,
+    &builder::ADD_IMAGE_PAGE,
     &builder::CREATE,
     &builder::DISPOSE,
     &builder::PAGE_DONE,

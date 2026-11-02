@@ -33,6 +33,16 @@ op_unit!(
     |ctx| handle_builder_add_page(ctx.state, ctx.req)
 );
 
+op_unit!(
+    ADD_IMAGE_PAGE,
+    "builderAddImagePage",
+    pdf_op_builder_add_image_page_anchor,
+    |ctx| {
+        let source = ctx.take_source(0);
+        handle_builder_add_image_page(ctx.state, ctx.req, source)
+    }
+);
+
 op_unit!(PAGE_OP, "builderPageOp", pdf_op_builder_page_op_anchor, |ctx| {
     let source = ctx.take_source(0);
     handle_builder_page_op(ctx.state, ctx.req, source)
@@ -82,6 +92,20 @@ fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<
     if let Some(v) = req.get_str("keywords") {
         b = dispatch::builder_set_keywords(b, v);
     }
+    if let Some(v) = req.get_str("creator") {
+        b = dispatch::builder_set_creator(b, v);
+    }
+    if let Some(v) = req.get_str("producer") {
+        b = dispatch::builder_set_producer(b, v);
+    }
+    // Dates arrive as PDF date strings, the same form the editor's dates
+    // travel as.
+    if let Some(v) = req.get_str("creationDate") {
+        b = dispatch::builder_set_creation_date(b, v);
+    }
+    if let Some(v) = req.get_str("modDate") {
+        b = dispatch::builder_set_mod_date(b, v);
+    }
     state.builders.insert(hid, b);
     ok_flag("set")
 }
@@ -100,6 +124,120 @@ fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> 
     };
     builder.begin_page(size);
     ok_flag("added")
+}
+
+/// Image pixel dimensions read straight from the file header — no decode.
+/// A PNG's IHDR carries width/height at bytes 16/20; a JPEG's first SOFn
+/// frame (C0–CF but DHT C4 / JPG C8 / DAC CC) does after its payload length.
+fn image_pixel_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if data.len() >= 24 && data[..8] == PNG_MAGIC && data[12..16] == *b"IHDR" {
+        let w = u32::from_be_bytes(data[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(data[20..24].try_into().ok()?);
+        return if w > 0 && h > 0 { Some((w, h)) } else { None };
+    }
+    if data.len() > 4 && data[0] == 0xFF && data[1] == 0xD8 {
+        let mut i = 2;
+        while i + 4 <= data.len() {
+            if data[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            while i < data.len() && data[i] == 0xFF {
+                i += 1;
+            }
+            if i >= data.len() {
+                break;
+            }
+            let marker = data[i];
+            i += 1;
+            match marker {
+                // Start / end of image and one byte standalone markers.
+                0xD8 | 0xD9 | 0x01 => continue,
+                0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
+                    if i + 7 > data.len() {
+                        break;
+                    }
+                    let h = u16::from_be_bytes(data[i + 5..i + 7].try_into().ok()?) as u32;
+                    let w = u16::from_be_bytes(data[i + 7..i + 9].try_into().ok()?) as u32;
+                    return if w > 0 && h > 0 { Some((w, h)) } else { None };
+                }
+                _ => {
+                    if i + 2 > data.len() {
+                        break;
+                    }
+                    let payload = u16::from_be_bytes(data[i..i + 2].try_into().ok()?) as usize;
+                    i += payload;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One page holding one image, sized from the image's pixel dimensions unless
+/// the request names a page size. The image is placed by [fit] inside the
+/// content rect the margin leaves; `cover` may overflow the media box, which
+/// viewers clip.
+fn handle_builder_add_image_page(
+    state: &mut LaneState,
+    req: &Request<'_>,
+    mut data_reader: Option<BoxedReader>,
+) -> Vec<u8> {
+    let image_data = if let Some(ref mut reader) = data_reader {
+        read_all_from_reader(reader).unwrap_or_default()
+    } else {
+        req.get_bytes("data").unwrap_or(&[]).to_vec()
+    };
+    let Some((px_width, px_height)) = image_pixel_dimensions(&image_data) else {
+        return ResponseWriter::error_kind(
+            ErrorKind::InvalidArgument,
+            "addImagePage: the bytes are not a readable PNG or JPEG image",
+        );
+    };
+    // No explicit page size → one point per pixel, so the page is the image
+    // at its native size.
+    let size = PageSize::Custom(
+        req.get_f64("width").unwrap_or(px_width as f64) as f32,
+        req.get_f64("height").unwrap_or(px_height as f64) as f32,
+    );
+    let (page_width, page_height) = size.dimensions();
+    let margin = req.get_f64("margin").unwrap_or(0.0) as f32;
+    if margin < 0.0 || margin * 2.0 >= page_width.min(page_height) {
+        return ResponseWriter::error_kind(
+            ErrorKind::InvalidArgument,
+            "addImagePage: margin leaves no content area on the page",
+        );
+    }
+    let content_width = page_width - margin * 2.0;
+    let content_height = page_height - margin * 2.0;
+    let fit = req.get_str("fit").unwrap_or("contain");
+    let (iw, ih) = (px_width as f32, px_height as f32);
+    let (x, y, w, h) = match fit {
+        "fill" => (margin, margin, content_width, content_height),
+        "cover" => {
+            let scale = (content_width / iw).max(content_height / ih);
+            let dw = iw * scale;
+            let dh = ih * scale;
+            (margin - (dw - content_width) / 2.0, margin - (dh - content_height) / 2.0, dw, dh)
+        }
+        _ => {
+            // contain: scale to fit and centre.
+            let scale = (content_width / iw).min(content_height / ih);
+            let dw = iw * scale;
+            let dh = ih * scale;
+            (margin + (content_width - dw) / 2.0, margin + (content_height - dh) / 2.0, dw, dh)
+        }
+    };
+    let Some(builder) = state.builders.get_mut(&req_handle(req)) else {
+        return ResponseWriter::error("builder not found");
+    };
+    builder.begin_page(size);
+    let op = dispatch::PageOp::Image { data: image_data, x, y, w, h, alt: String::new() };
+    match dispatch::apply_page_op(builder, op) {
+        Ok(()) => ok_flag("added"),
+        Err(e) => ResponseWriter::error_of(&e),
+    }
 }
 
 fn handle_builder_page_op(
@@ -122,7 +260,34 @@ fn handle_builder_page_op(
             req.get_f64("x").unwrap_or(0.0) as f32,
             req.get_f64("y").unwrap_or(0.0) as f32,
         ),
-        "text" => dispatch::PageOp::Text(req.get_str("text").unwrap_or("").to_string()),
+        "text" | "inline" => {
+            let text = req.get_str("text").unwrap_or("").to_string();
+            let font = req.get_str("font");
+            let size = req.get_f64("size");
+            let bold = req.get_bool("bold").unwrap_or(false);
+            let italic = req.get_bool("italic").unwrap_or(false);
+            let color = match (req.get_f64("r"), req.get_f64("g"), req.get_f64("b")) {
+                (Some(r), Some(g), Some(b)) => Some((r as f32, g as f32, b as f32)),
+                _ => None,
+            };
+            if font.is_none() && size.is_none() && !bold && !italic && color.is_none() {
+                if page_op == "text" {
+                    dispatch::PageOp::Text(text)
+                } else {
+                    dispatch::PageOp::Inline(text)
+                }
+            } else {
+                dispatch::PageOp::StyledText {
+                    text,
+                    font: font.map(|s| s.to_string()),
+                    size: size.map(|s| s as f32),
+                    bold,
+                    italic,
+                    color,
+                    inline: page_op == "inline",
+                }
+            }
+        }
         "heading" => dispatch::PageOp::Heading(
             req.get_i32("level").unwrap_or(1) as u8,
             req.get_str("text").unwrap_or("").to_string(),
@@ -215,15 +380,6 @@ fn handle_builder_page_op(
         },
         "newline" => dispatch::PageOp::Newline,
         "newPageSameSize" => dispatch::PageOp::NewPageSameSize,
-        "inline" => dispatch::PageOp::Inline(req.get_str("text").unwrap_or("").to_string()),
-        "inlineBold" => dispatch::PageOp::InlineBold(req.get_str("text").unwrap_or("").to_string()),
-        "inlineItalic" => dispatch::PageOp::InlineItalic(req.get_str("text").unwrap_or("").to_string()),
-        "inlineColor" => dispatch::PageOp::InlineColor {
-            r: req.get_f64("r").unwrap_or(0.0) as f32,
-            g: req.get_f64("g").unwrap_or(0.0) as f32,
-            b: req.get_f64("b").unwrap_or(0.0) as f32,
-            text: req.get_str("text").unwrap_or("").to_string(),
-        },
         "textInRect" => {
             let name = req.get_str("align").unwrap_or("left");
             let Some(align) = text_align_from_name(name) else {
@@ -241,12 +397,6 @@ fn handle_builder_page_op(
                 align,
             }
         }
-        "rect" => dispatch::PageOp::Rect(
-            req.get_f64("x").unwrap_or(0.0) as f32,
-            req.get_f64("y").unwrap_or(0.0) as f32,
-            req.get_f64("width").unwrap_or(0.0) as f32,
-            req.get_f64("height").unwrap_or(0.0) as f32,
-        ),
         "filledRect" => dispatch::PageOp::FilledRect(
             req.get_f64("x").unwrap_or(0.0) as f32,
             req.get_f64("y").unwrap_or(0.0) as f32,
@@ -255,12 +405,6 @@ fn handle_builder_page_op(
             req.get_f64("r").unwrap_or(0.0) as f32,
             req.get_f64("g").unwrap_or(0.0) as f32,
             req.get_f64("b").unwrap_or(0.0) as f32,
-        ),
-        "line" => dispatch::PageOp::Line(
-            req.get_f64("x1").unwrap_or(0.0) as f32,
-            req.get_f64("y1").unwrap_or(0.0) as f32,
-            req.get_f64("x2").unwrap_or(0.0) as f32,
-            req.get_f64("y2").unwrap_or(0.0) as f32,
         ),
         "strokeRect" => {
             let dash: Vec<f32> = req
@@ -371,8 +515,6 @@ fn handle_builder_page_op(
             h: req.get_f64("height").unwrap_or(0.0) as f32,
             text: req.get_str("text").unwrap_or("").to_string(),
         },
-        "watermarkConfidential" => dispatch::PageOp::WatermarkConfidential,
-        "watermarkDraft" => dispatch::PageOp::WatermarkDraft,
         "linkNamed" => dispatch::PageOp::LinkNamed(req.get_str("destination").unwrap_or("").to_string()),
         "linkJavaScript" => dispatch::PageOp::LinkJavaScript(req.get_str("script").unwrap_or("").to_string()),
         "onOpen" => dispatch::PageOp::OnOpen(req.get_str("script").unwrap_or("").to_string()),
@@ -391,38 +533,18 @@ fn handle_builder_page_op(
                 h: req.get_f64("height").unwrap_or(0.0) as f32,
             }
         }
-        "table" => {
-            let columns = match table_columns_from_request(req) {
-                Ok(columns) => columns,
-                Err(msg) => return ResponseWriter::error_kind(ErrorKind::InvalidArgument, &msg),
-            };
-            let cells = req.get_string_list("cells").unwrap_or_default();
-            let column_count = req.get_i32("columnCount").unwrap_or(0);
-            if column_count <= 0 || cells.len() % column_count as usize != 0 {
-                return ResponseWriter::error_kind(
-                    ErrorKind::InvalidArgument,
-                    "table cells length must be a nonzero multiple of columnCount",
-                );
-            }
-            let rows: Vec<Vec<String>> = cells
-                .chunks(column_count as usize)
-                .map(|row| row.iter().map(|s| s.to_string()).collect())
-                .collect();
-            dispatch::PageOp::BufferedTable {
-                columns,
-                rows,
-                has_header: req.get_bool("hasHeader").unwrap_or(true),
-            }
-        }
         "streamingTable" => {
             let columns = match table_columns_from_request(req) {
                 Ok(columns) => columns,
                 Err(msg) => return ResponseWriter::error_kind(ErrorKind::InvalidArgument, &msg),
             };
-            if columns.iter().any(|(_, width, _)| width.is_none()) {
+            // Only the fixed mode lays out by the given widths; the measuring
+            // modes size a column without one from its content.
+            let mode = req.get_str("mode").unwrap_or("fixed").to_string();
+            if mode == "fixed" && columns.iter().any(|(_, width, _)| width.is_none()) {
                 return ResponseWriter::error_kind(
                     ErrorKind::InvalidArgument,
-                    "streamingTable requires an explicit width for every column",
+                    "a fixed-width table needs a width for every column",
                 );
             }
             let cells = req.get_string_list("cells").unwrap_or_default();
@@ -434,15 +556,12 @@ fn handle_builder_page_op(
                     return ResponseWriter::error_kind(ErrorKind::InvalidArgument, msg);
                 }
             };
-            let config_columns: Vec<(String, f32, crate::writer::CellAlign)> = columns
-                .into_iter()
-                .map(|(header, width, align)| (header, width.unwrap_or(0.0), align))
-                .collect();
             dispatch::PageOp::StreamingTableBlock {
-                config_columns,
+                config_columns: columns,
                 repeat_header: req.get_bool("repeatHeader").unwrap_or(true),
+                has_header: req.get_bool("hasHeader").unwrap_or(true),
                 rows,
-                mode: req.get_str("mode").unwrap_or("fixed").to_string(),
+                mode,
                 sample_rows: req.get_i32("sampleRows").unwrap_or(50) as usize,
                 min_col_width_pt: req.get_f64("minColWidth").unwrap_or(20.0) as f32,
                 max_col_width_pt: req.get_f64("maxColWidth").unwrap_or(400.0) as f32,
@@ -795,38 +914,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_bold_counts_as_text() {
-        let queued = vec![PageOp::InlineBold("run".into())];
-        assert_eq!(
-            refuse_unattached(&queued, &PageOp::LinkNamed("sec-1".into())),
-            None
-        );
-    }
-
-    #[test]
-    fn inline_italic_counts_as_text() {
-        let queued = vec![PageOp::InlineItalic("run".into())];
-        assert_eq!(
-            refuse_unattached(&queued, &PageOp::Underline(0.0, 0.0, 0.0)),
-            None
-        );
-    }
-
-    #[test]
-    fn inline_color_counts_as_text() {
-        let queued = vec![PageOp::InlineColor {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            text: "run".into(),
-        }];
-        assert_eq!(
-            refuse_unattached(&queued, &PageOp::Squiggly(1.0, 0.0, 0.0)),
-            None
-        );
-    }
-
-    #[test]
     fn text_in_rect_counts_as_text() {
         let queued = vec![PageOp::TextInRect {
             x: 0.0,
@@ -905,10 +992,11 @@ mod tests {
         let mut builder = DocumentBuilder::new();
         let op = PageOp::StreamingTableBlock {
             config_columns: vec![
-                ("a".into(), 100.0, crate::writer::CellAlign::Left),
-                ("b".into(), 60.0, crate::writer::CellAlign::Left),
+                ("a".into(), Some(100.0), crate::writer::CellAlign::Left),
+                ("b".into(), Some(60.0), crate::writer::CellAlign::Left),
             ],
             repeat_header: true,
+            has_header: true,
             rows: super::pack_streaming_rows(&["Saw", "3", "", "4"], &[2, 1, 1, 1], 2).unwrap(),
             mode: "fixed".into(),
             sample_rows: 50,
@@ -917,22 +1005,6 @@ mod tests {
             max_rowspan: 2,
         };
         apply_page_op(&mut builder, op).unwrap();
-    }
-
-    #[test]
-    fn auto_all_streaming_table_row_is_refused() {
-        let mut builder = DocumentBuilder::new();
-        let op = PageOp::StreamingTableBlock {
-            config_columns: vec![("h".into(), 100.0, crate::writer::CellAlign::Left)],
-            repeat_header: true,
-            rows: vec![vec![("c".into(), 1)]],
-            mode: "auto_all".into(),
-            sample_rows: 50,
-            min_col_width_pt: 20.0,
-            max_col_width_pt: 400.0,
-            max_rowspan: 1,
-        };
-        assert!(apply_page_op(&mut builder, op).is_err());
     }
 
     #[test]

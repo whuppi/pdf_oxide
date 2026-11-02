@@ -152,6 +152,9 @@ impl StreamingColumn {
 pub struct StreamingTableConfig {
     pub(crate) columns: Vec<StreamingColumn>,
     pub(crate) repeat_header: bool,
+    /// Whether the header row is drawn at all (`false` → headerless data
+    /// table; `repeat_header` only has an effect while this is true).
+    pub(crate) header_row: bool,
     pub(crate) row_padding_top: f32,
     pub(crate) row_padding_bottom: f32,
     pub(crate) horizontal_padding: f32,
@@ -176,6 +179,7 @@ impl StreamingTableConfig {
         Self {
             columns: Vec::new(),
             repeat_header: false,
+            header_row: true,
             row_padding_top: 2.0,
             row_padding_bottom: 2.0,
             horizontal_padding: 4.0,
@@ -232,6 +236,13 @@ impl StreamingTableConfig {
     /// Redraw the header row at the top of every page this table spans.
     pub fn repeat_header(mut self, yes: bool) -> Self {
         self.repeat_header = yes;
+        self
+    }
+
+    /// Draw the header row at all. Default true; a headerless table
+    /// lays out only data rows and `repeat_header` has no effect.
+    pub fn header_row(mut self, yes: bool) -> Self {
+        self.header_row = yes;
         self
     }
 
@@ -579,6 +590,9 @@ impl<'a> StreamingTable<'a> {
     }
 
     fn draw_header(&mut self) {
+        if !self.config.header_row {
+            return;
+        }
         let headers: Vec<String> = self
             .config
             .columns

@@ -4337,6 +4337,8 @@ struct WasmStreamingTableSpec {
     columns: Vec<WasmStreamingColumnSpec>,
     #[serde(default, rename = "repeatHeader", alias = "repeat_header")]
     repeat_header: bool,
+    #[serde(default, rename = "hasHeader", alias = "has_header", default = "default_true")]
+    has_header: bool,
     /// "fixed" | "sample" | "auto_all" (default "fixed")
     #[serde(default)]
     mode: Option<String>,
@@ -4527,6 +4529,7 @@ enum WasmPageOp {
     StreamingTableBlock {
         config_columns: Vec<(String, f32, WasmAlign)>,
         repeat_header: bool,
+        has_header: bool,
         /// Each cell: (text, rowspan).
         rows: Vec<Vec<(String, usize)>>,
         mode: String,
@@ -5009,6 +5012,7 @@ impl WasmDocumentBuilder {
                 WasmPageOp::StreamingTableBlock {
                     config_columns,
                     repeat_header,
+                    has_header,
                     rows,
                     mode,
                     sample_rows,
@@ -5018,6 +5022,7 @@ impl WasmDocumentBuilder {
                 } => {
                     let mut cfg = crate::writer::StreamingTableConfig::new()
                         .repeat_header(repeat_header)
+                        .header_row(has_header)
                         .max_rowspan(max_rowspan);
                     cfg = match mode.as_str() {
                         "sample" => {
@@ -5801,6 +5806,7 @@ impl WasmFluentPageBuilder {
         Ok(WasmStreamingTable {
             columns,
             repeat_header: parsed.repeat_header,
+            has_header: parsed.has_header,
             current_batch: Vec::new(),
             completed_batches: Vec::new(),
             finished: false,
@@ -5887,6 +5893,7 @@ impl WasmFluentPageBuilder {
 pub struct WasmStreamingTable {
     columns: Vec<(String, f32, WasmAlign)>,
     repeat_header: bool,
+    has_header: bool,
     /// Rows accumulating in the current (not-yet-flushed) batch.
     current_batch: Vec<Vec<(String, usize)>>,
     /// Fully-completed batches waiting to be assembled at finish().
@@ -5994,6 +6001,7 @@ impl WasmStreamingTable {
         let op = WasmPageOp::StreamingTableBlock {
             config_columns: std::mem::take(&mut self.columns),
             repeat_header: self.repeat_header,
+            has_header: self.has_header,
             rows,
             mode: self.mode.clone(),
             sample_rows: self.sample_rows,
@@ -7139,6 +7147,7 @@ mod tests {
                 ("Qty".into(), 48.0, WasmAlign::Right),
             ],
             repeat_header: true,
+            has_header: true,
             rows: (0..5)
                 .map(|i| {
                     vec![

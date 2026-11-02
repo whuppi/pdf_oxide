@@ -51,6 +51,12 @@ pub struct DocumentMetadata {
     pub keywords: Option<String>,
     /// Creator application
     pub creator: Option<String>,
+    /// Producing application producer
+    pub producer: Option<String>,
+    /// Creation date as a PDF date string (`D:YYYYMMDDHHmmSSZ`)
+    pub creation_date: Option<String>,
+    /// Last-modification date as a PDF date string
+    pub mod_date: Option<String>,
     /// PDF version (default: "1.7")
     pub version: Option<String>,
     /// When true, emit PDF/UA-1 tagged-PDF catalog entries (/MarkInfo,
@@ -96,6 +102,25 @@ impl DocumentMetadata {
     /// Set creator application.
     pub fn creator(mut self, creator: impl Into<String>) -> Self {
         self.creator = Some(creator.into());
+        self
+    }
+
+    /// Set producing application.
+    pub fn producer(mut self, producer: impl Into<String>) -> Self {
+        self.producer = Some(producer.into());
+        self
+    }
+
+    /// Set the creation date (any RFC 8690-free PDF date string the caller
+    /// already formatted).
+    pub fn creation_date(mut self, date: impl Into<String>) -> Self {
+        self.creation_date = Some(date.into());
+        self
+    }
+
+    /// Set the last-modification date.
+    pub fn mod_date(mut self, date: impl Into<String>) -> Self {
+        self.mod_date = Some(date.into());
         self
     }
 
@@ -1112,6 +1137,114 @@ impl<'a> PageBuilder<'a> {
     pub fn inline_color(&mut self, r: f32, g: f32, b: f32, text: &str) -> &mut Self {
         self.emit_inline_run(text, None, Some(crate::layout::Color { r, g, b }));
         self
+    }
+
+    /// Writes an inline run with style overrides applied to this run only:
+    /// `font`/`size` fall back to the page's current text settings, bold and
+    /// italic select the face variants of the run's font, `color` recolours
+    /// it. The page's font and size are restored before returning.
+    pub fn inline_styled(
+        &mut self,
+        text: &str,
+        font: Option<&str>,
+        size: Option<f32>,
+        bold: bool,
+        italic: bool,
+        color: Option<(f32, f32, f32)>,
+    ) -> &mut Self {
+        let saved = self.set_style_overrides(font, size, bold, italic);
+        self.emit_inline_run(
+            text,
+            None,
+            color.map(|(r, g, b)| crate::layout::Color { r, g, b }),
+        );
+        self.state_mut().text_config.font = saved.0;
+        self.state_mut().text_config.size = saved.1;
+        self
+    }
+
+    /// [`PageBuilder::text`] with the same per-run style overrides as
+    /// [`PageBuilder::inline_styled`]. Mirrors `text` — including the
+    /// tracked rect links and markup anchor to and the line step — but
+    /// emits the run in the overriden style.
+    pub fn text_styled(
+        &mut self,
+        text: &str,
+        font: Option<&str>,
+        size: Option<f32>,
+        bold: bool,
+        italic: bool,
+        color: Option<(f32, f32, f32)>,
+    ) -> &mut Self {
+        let saved = self.set_style_overrides(font, size, bold, italic);
+        let text_width = self.state().text_layout.font_manager().text_width(
+            text,
+            &self.state().text_config.font,
+            self.state().text_config.size,
+        );
+        let text_rect = Rect::new(
+            self.state().cursor_x,
+            self.state().cursor_y,
+            text_width,
+            self.state().text_config.size,
+        );
+        self.state_mut().last_text_rect = Some(text_rect);
+        let page = &mut self.builder.pages[self.page_index];
+        page.elements.push(ContentElement::Text(TextContent {
+            text: text.to_string(),
+            bbox: text_rect,
+            font: crate::elements::FontSpec {
+                name: page.state.text_config.font.clone(),
+                size: page.state.text_config.size,
+            },
+            style: crate::elements::TextStyle {
+                color: color
+                    .map(|(r, g, b)| crate::layout::Color { r, g, b })
+                    .unwrap_or(crate::layout::Color { r: 0.0, g: 0.0, b: 0.0 }),
+                ..Default::default()
+            },
+            reading_order: Some(page.elements.len()),
+            artifact_type: None,
+            origin: None,
+            rotation_degrees: None,
+            matrix: page.state.current_matrix,
+        }));
+        page.state.cursor_y -= page.state.text_config.size * page.state.text_config.line_height;
+        self.state_mut().text_config.font = saved.0;
+        self.state_mut().text_config.size = saved.1;
+        self
+    }
+
+    /// Applies the per-run font/size/face overrides to the page state and
+    /// returns the `(font, size)` to restore. The effective font resolves
+    /// from the override, else the page's current font, and bold/italic
+    /// select that font's faces (bold after italic reads as `-BoldItalic`
+    /// the same way the rich-paragraph runs compose).
+    fn set_style_overrides(
+        &mut self,
+        font: Option<&str>,
+        size: Option<f32>,
+        bold: bool,
+        italic: bool,
+    ) -> (String, f32) {
+        let saved = (
+            self.state().text_config.font.clone(),
+            self.state().text_config.size,
+        );
+        let mut name = font
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| saved.0.clone());
+        if bold {
+            name = bold_font_name(&name);
+        }
+        if italic {
+            name = italic_font_name(&name);
+        }
+        self.state_mut().text_config.font = name;
+        if let Some(s) = size {
+            self.state_mut().text_config.size = s;
+        }
+        saved
     }
 
     /// Same as [`FluentPageBuilder::newline`], applied in place.
@@ -3794,6 +3927,25 @@ impl DocumentBuilder {
         self
     }
 
+    /// Set the producing application name.
+    pub fn producer(mut self, producer: impl Into<String>) -> Self {
+        self.metadata.producer = Some(producer.into());
+        self
+    }
+
+    /// Set the creation date as an already-formatted PDF date string
+    /// (`D:YYYYMMDDHHmmSSZ`).
+    pub fn creation_date(mut self, date: impl Into<String>) -> Self {
+        self.metadata.creation_date = Some(date.into());
+        self
+    }
+
+    /// Set the last-modification date.
+    pub fn mod_date(mut self, date: impl Into<String>) -> Self {
+        self.metadata.mod_date = Some(date.into());
+        self
+    }
+
     /// Enable PDF/UA-1 tagging on this document. When enabled, `build()` emits
     /// `/MarkInfo << /Marked true >>`, `/StructTreeRoot`, `/Lang`, and
     /// `/ViewerPreferences << /DisplayDocTitle true >>` in the catalog.
@@ -3944,6 +4096,15 @@ impl DocumentBuilder {
         config.keywords = self.metadata.keywords.clone();
         if self.metadata.creator.is_some() {
             config.creator = self.metadata.creator.clone();
+        }
+        if let Some(producer) = self.metadata.producer.clone() {
+            config.producer = Some(producer);
+        }
+        if let Some(date) = &self.metadata.creation_date {
+            config.creation_date = Some(date.clone());
+        }
+        if let Some(date) = &self.metadata.mod_date {
+            config.mod_date = Some(date.clone());
         }
         // F-1/F-2/F-4: wire tagged PDF settings into writer config
         config.tagged = self.metadata.tagged;

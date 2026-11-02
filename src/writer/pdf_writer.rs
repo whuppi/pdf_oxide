@@ -44,6 +44,12 @@ pub struct PdfWriterConfig {
     pub keywords: Option<String>,
     /// Creator application
     pub creator: Option<String>,
+    /// Producing application
+    pub producer: Option<String>,
+    /// Document creation date as a PDF date string
+    pub creation_date: Option<String>,
+    /// Document last-modification date as a PDF date string
+    pub mod_date: Option<String>,
     /// Whether to compress streams
     pub compress: bool,
     /// Document-level `/OpenAction` JavaScript — runs when the PDF is
@@ -71,6 +77,9 @@ impl Default for PdfWriterConfig {
             subject: None,
             keywords: None,
             creator: Some("pdf_oxide".to_string()),
+            producer: None,
+            creation_date: None,
+            mod_date: None,
             compress: false, // Disable compression for now (requires flate2)
             open_action_script: None,
             tagged: false,
@@ -1960,6 +1969,18 @@ impl PdfWriter {
         }
         if let Some(creator) = &self.config.creator {
             info_entries.push(("Creator", ObjectSerializer::string(creator)));
+        }
+        if let Some(producer) = &self.config.producer {
+            info_entries.push(("Producer", ObjectSerializer::string(producer)));
+        }
+        if let Some(keywords) = &self.config.keywords {
+            info_entries.push(("Keywords", ObjectSerializer::string(keywords)));
+        }
+        if let Some(date) = &self.config.creation_date {
+            info_entries.push(("CreationDate", ObjectSerializer::string(date)));
+        }
+        if let Some(date) = &self.config.mod_date {
+            info_entries.push(("ModDate", ObjectSerializer::string(date)));
         }
         let info_obj = ObjectSerializer::dict(info_entries);
 
