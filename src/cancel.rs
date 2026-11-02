@@ -26,6 +26,9 @@ pub struct CancelCheck {
     flags: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
     #[cfg(target_arch = "wasm32")]
     host: bool,
+    /// Tests only: counts every poll and cancels from the `n`th on.
+    #[cfg(test)]
+    trip: Option<Arc<(std::sync::atomic::AtomicUsize, usize)>>,
 }
 
 impl CancelCheck {
@@ -37,17 +40,35 @@ impl CancelCheck {
     /// A check wired to a lane's kill flag and one job's cancel flag.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_flags(lane: Arc<AtomicBool>, job: Arc<AtomicBool>) -> Self {
-        Self { flags: Some((lane, job)) }
+        Self { flags: Some((lane, job)), ..Self::default() }
     }
 
     /// A check that reads the current job's cancel word from the host.
     #[cfg(target_arch = "wasm32")]
     pub fn from_host() -> Self {
-        Self { host: true }
+        Self { host: true, ..Self::default() }
+    }
+
+    /// A check that counts its polls and reports a cancel from the `n`th
+    /// poll on (`usize::MAX` never cancels): the cancel that lands at an
+    /// exact point of an operation. Clones share the count.
+    #[cfg(test)]
+    pub(crate) fn tripping_at(n: usize) -> Self {
+        Self { trip: Some(Arc::new((std::sync::atomic::AtomicUsize::new(0), n))), ..Self::default() }
+    }
+
+    /// The polls made so far on a check from [`Self::tripping_at`].
+    #[cfg(test)]
+    pub(crate) fn polls(&self) -> usize {
+        self.trip.as_ref().map_or(0, |trip| trip.0.load(Ordering::Relaxed))
     }
 
     /// True once the lane or the job has been cancelled.
     pub fn is_cancelled(&self) -> bool {
+        #[cfg(test)]
+        if let Some(trip) = &self.trip {
+            return trip.0.fetch_add(1, Ordering::Relaxed) + 1 >= trip.1;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             match &self.flags {

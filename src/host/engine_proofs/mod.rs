@@ -6,6 +6,8 @@
 
 #[cfg(feature = "rendering")]
 mod band_proof;
+#[cfg(feature = "rendering")]
+mod cancel_at_every_poll;
 mod content_inline;
 mod content_stream;
 mod determinism;
@@ -48,6 +50,8 @@ mod predictor_depths;
 mod image_mods_belt;
 #[cfg(feature = "rendering")]
 mod redact_after_value;
+#[cfg(feature = "rendering")]
+mod redact_all_or_nothing;
 mod redact_pass;
 #[cfg(feature = "rendering")]
 mod redact_flatten;

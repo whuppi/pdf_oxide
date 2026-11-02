@@ -44,6 +44,10 @@ const STRIP_BYTES: usize = 256 * 1024;
 
 /// Run the pipeline over every image drawn on the editor's visible pages
 /// and stage each replacement for the next save.
+///
+/// All or nothing: the replacements are collected while the loop runs and
+/// staged only once it has finished, so a cancel or an error at any image
+/// leaves the editor as it was.
 pub fn reduce_images(
     editor: &mut DocumentEditor,
     policy: &Policy,
@@ -56,8 +60,9 @@ pub fn reduce_images(
         .collect();
     let entries = document_images(editor.source(), &pages)?;
     let mut report = Report::default();
+    let mut replacements: HashMap<u32, Object> = HashMap::new();
     cancel.each(entries, |entry| {
-        let object = staged_or_source(editor, entry.object)?;
+        let object = staged_or_source(editor, &replacements, entry.object)?;
         let Object::Stream { dict, body } = &object else {
             return Ok(());
         };
@@ -65,7 +70,7 @@ pub fn reduce_images(
         let kind = classify_stored(editor.source(), dict, stored, &head(editor.source(), dict, body)?);
         let uses: Vec<Use> = entry.placements.iter().map(|&ctm| Use { ctm }).collect();
         let mask_before = match kind.masks.soft_mask {
-            Some(r) => stream_len(editor, r)?,
+            Some(r) => stream_len(editor, &replacements, r)?,
             None => 0,
         };
         let bytes_before = stored + mask_before;
@@ -85,7 +90,7 @@ pub fn reduce_images(
             Decision::Keep(reason) => outcome.keep_reason = Some(reason),
             Decision::Reencode { target, output } => {
                 let mask = match kind.masks.soft_mask {
-                    Some(r) => Some((r, staged_or_source(editor, r)?)),
+                    Some(r) => Some((r, staged_or_source(editor, &replacements, r)?)),
                     None => None,
                 };
                 match apply(
@@ -106,9 +111,9 @@ pub fn reduce_images(
                         outcome.bytes_after = applied.bytes;
                         outcome.width_after = applied.width;
                         outcome.height_after = applied.height;
-                        editor.insert_modified(entry.object.id, applied.parent);
+                        replacements.insert(entry.object.id, applied.parent);
                         if let Some((r, obj)) = applied.mask {
-                            editor.insert_modified(r.id, obj);
+                            replacements.insert(r.id, obj);
                         }
                     },
                     Ok(_) => outcome.keep_reason = Some(KeepReason::BelowMinSavings),
@@ -123,6 +128,9 @@ pub fn reduce_images(
         report.images.push(outcome);
         Ok(())
     })?;
+    for (id, object) in replacements {
+        editor.insert_modified(id, object);
+    }
     Ok(report)
 }
 
@@ -146,16 +154,28 @@ fn saves_enough(after: u64, before: u64, min_savings: f64) -> bool {
     after < before && (before - after) as f64 >= before as f64 * min_savings.clamp(0.0, 1.0)
 }
 
-/// The object as this session sees it: a staged replacement wins over the source.
-fn staged_or_source(editor: &mut DocumentEditor, r: ObjectRef) -> Result<Object> {
+/// The object as this run sees it: a replacement this run has collected wins
+/// over one the editor has staged, which wins over the source.
+fn staged_or_source(
+    editor: &mut DocumentEditor,
+    replacements: &HashMap<u32, Object>,
+    r: ObjectRef,
+) -> Result<Object> {
+    if let Some(collected) = replacements.get(&r.id) {
+        return Ok(collected.clone());
+    }
     if let Some(staged) = editor.modified_objects_mut().get(&r.id) {
         return Ok(staged.clone());
     }
     editor.source().load_object(r)
 }
 
-fn stream_len(editor: &mut DocumentEditor, r: ObjectRef) -> Result<u64> {
-    Ok(match staged_or_source(editor, r)? {
+fn stream_len(
+    editor: &mut DocumentEditor,
+    replacements: &HashMap<u32, Object>,
+    r: ObjectRef,
+) -> Result<u64> {
+    Ok(match staged_or_source(editor, replacements, r)? {
         Object::Stream { body, .. } => body.len(),
         _ => 0,
     })

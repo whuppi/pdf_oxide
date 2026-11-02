@@ -626,6 +626,17 @@ impl FlatPage {
 }
 // ── end pdf_manipulator patch ──
 
+// ── pdf_manipulator patch: a page's destruction, planned before it is recorded ──
+/// What destroying regions on one page records in the editor, worked out
+/// without changing it.
+struct DestructionPlan {
+    originals: Vec<u32>,
+    orphans: Vec<u32>,
+    report: crate::redaction::RedactionReport,
+    page: RedactedPage,
+}
+// ── end pdf_manipulator patch ──
+
 // ── pdf_manipulator patch: the ids one queued image copy is written under ──
 /// The new object ids one image copy is written from: its stream and its
 /// /Length, and the copies its `/SMask` or `/Mask` stencil stream takes
@@ -883,8 +894,25 @@ pub struct DocumentEditor {
     /// Page add, delete, move and merge change `page_order` and `merged_sources`
     /// only, never the source tree, so only a source replacement clears it.
     source_page_refs: Option<std::sync::Arc<[ObjectRef]>>,
+    /// The way back of an [`DocumentEditor::undoable`] operation that is running.
+    checkpoint: Option<Checkpoint>,
     // ── end pdf_manipulator patch ──
 }
+
+// ── pdf_manipulator patch: an operation that replaces the source can be undone ──
+/// What an undoable operation restores: the staged state the editor had when
+/// it began, and the source the operation replaced, which a commit or a
+/// source replacement would otherwise drop.
+struct Checkpoint {
+    modified_objects: HashMap<u32, Object>,
+    new_objects: Vec<Object>,
+    next_object_id: u32,
+    is_modified: bool,
+    source_page_refs: Option<std::sync::Arc<[ObjectRef]>>,
+    /// The first source the operation replaced; `None` until it replaces one.
+    source: Option<PdfDocument>,
+}
+// ── end pdf_manipulator patch ──
 
 // ── pdf_manipulator patch: the written-id set follows every xref push ──
 /// The output xref entries `(id, offset, gen, in_use)` of a full rewrite,
@@ -1201,6 +1229,7 @@ impl DocumentEditor {
             merged_acroform_dr: None,
             merged_acroform_da: None,
             source_page_refs: None,
+            checkpoint: None,
             // ── end pdf_manipulator patch ──
         })
     }
@@ -1257,6 +1286,7 @@ impl DocumentEditor {
             merged_acroform_dr: None,
             merged_acroform_da: None,
             source_page_refs: None,
+            checkpoint: None,
             // ── end pdf_manipulator patch ──
         })
     }
@@ -1317,6 +1347,7 @@ impl DocumentEditor {
             merged_acroform_dr: None,
             merged_acroform_da: None,
             source_page_refs: None,
+            checkpoint: None,
             // ── end pdf_manipulator patch ──
         })
     }
@@ -1401,7 +1432,9 @@ impl DocumentEditor {
             return Ok(());
         }
         let new_bytes = self.save_to_bytes()?;
-        self.source = PdfDocument::from_bytes(new_bytes)?;
+        // ── pdf_manipulator patch: the replaced source goes to the checkpoint ──
+        self.replace_source(PdfDocument::from_bytes(new_bytes)?);
+        // ── end pdf_manipulator patch ──
         self.source_page_refs = None;
         self.modified_objects.clear();
         self.new_objects.clear();
@@ -1410,13 +1443,60 @@ impl DocumentEditor {
         Ok(())
     }
 
+    // ── pdf_manipulator patch: an operation that replaces the source can be undone ──
+    /// Puts `source` in place of the editor's, handing the one it replaces to
+    /// the running [`Self::undoable`] operation, if there is one.
+    fn replace_source(&mut self, source: PdfDocument) {
+        let replaced = std::mem::replace(&mut self.source, source);
+        if let Some(checkpoint) = self.checkpoint.as_mut() {
+            checkpoint.source.get_or_insert(replaced);
+        }
+    }
+
+    /// Runs `operation` on the editor all or nothing: when it returns an
+    /// error, whatever it staged and any source it committed or replaced are
+    /// undone, so the editor is exactly as it was before the call. Operations
+    /// do not nest.
+    pub(crate) fn undoable<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        debug_assert!(self.checkpoint.is_none(), "undoable operations do not nest");
+        self.checkpoint = Some(Checkpoint {
+            modified_objects: self.modified_objects.clone(),
+            new_objects: self.new_objects.clone(),
+            next_object_id: self.next_object_id,
+            is_modified: self.is_modified,
+            source_page_refs: self.source_page_refs.clone(),
+            source: None,
+        });
+        let outcome = operation(self);
+        let checkpoint = self.checkpoint.take();
+        if outcome.is_err() {
+            if let Some(checkpoint) = checkpoint {
+                self.modified_objects = checkpoint.modified_objects;
+                self.new_objects = checkpoint.new_objects;
+                self.next_object_id = checkpoint.next_object_id;
+                self.is_modified = checkpoint.is_modified;
+                self.source_page_refs = checkpoint.source_page_refs;
+                if let Some(source) = checkpoint.source {
+                    self.source = source;
+                }
+            }
+        }
+        outcome
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Replace the source document wholesale from external bytes.
     ///
     /// Used when a conversion step produces a completely new PDF (e.g. transparency
     /// flattening via re-rendering) rather than mutating individual objects.
     /// Clears all staged modifications so subsequent fixes operate on the new document.
     pub(crate) fn replace_source_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
-        self.source = PdfDocument::from_bytes(bytes)?;
+        // ── pdf_manipulator patch: the replaced source goes to the checkpoint ──
+        self.replace_source(PdfDocument::from_bytes(bytes)?);
+        // ── end pdf_manipulator patch ──
         self.source_page_refs = None;
         self.modified_objects.clear();
         self.new_objects.clear();
@@ -11255,9 +11335,20 @@ impl DocumentEditor {
             }
         }
 
-        let mut total = crate::redaction::RedactionReport::default();
+        // Every page is planned before any is recorded, so an error on page N
+        // leaves the pages before it as they were.
+        let mut planned = Vec::with_capacity(pages.len());
         for src in pages {
-            let rep = self.apply_redactions_destructive_for_page(src, &opts, &[])?;
+            let rs = self.page_redaction_regions(src, &[])?;
+            let plan = self.plan_destruction(src, &rs, &opts)?;
+            planned.push((src, plan));
+        }
+
+        let mut total = crate::redaction::RedactionReport::default();
+        for (src, plan) in planned {
+            let rep = self.record_destruction(src, plan);
+            // The queued marks are applied now: they are removed with their content.
+            self.redaction_regions.remove(&src);
             total.regions += rep.regions;
             total.glyphs_removed += rep.glyphs_removed;
             total.bytes_removed += rep.bytes_removed;
@@ -11287,6 +11378,24 @@ impl DocumentEditor {
         extra: &[crate::redaction::RedactionRegion],
         // ── end pdf_manipulator patch ──
     ) -> Result<crate::redaction::RedactionReport> {
+        // ── pdf_manipulator patch: delegate to the shared per-page core ──
+        let rs = self.page_redaction_regions(src, extra)?;
+        let rep = self.destroy_regions_on_page(src, &rs, opts)?;
+        // The queued marks are applied now: they are removed with their content.
+        self.redaction_regions.remove(&src);
+        Ok(rep)
+        // ── end pdf_manipulator patch ──
+    }
+
+    // ── pdf_manipulator patch: the regions of a page's redaction, read without changing the editor ──
+    /// The regions a destructive redaction of source page `src` destroys: its
+    /// `/Redact` annotations, the marks queued on it and the `extra` regions
+    /// a caller brings (the erasures of a DOM edit).
+    fn page_redaction_regions(
+        &mut self,
+        src: usize,
+        extra: &[crate::redaction::RedactionRegion],
+    ) -> Result<crate::redaction::RegionSet> {
         use crate::redaction::{RedactionRegion, RegionSet};
         let mut rs = RegionSet::new(src);
         for rd in self.get_redaction_data(src)? {
@@ -11303,18 +11412,12 @@ impl DocumentEditor {
                 rs.push(*r);
             }
         }
-        // ── pdf_manipulator patch: the erasures of a DOM edit join the page's regions ──
         for r in extra {
             rs.push(*r);
         }
-        // ── end pdf_manipulator patch ──
-        // ── pdf_manipulator patch: delegate to the shared per-page core ──
-        let rep = self.destroy_regions_on_page(src, &rs, opts)?;
-        // The queued marks are applied now: they are removed with their content.
-        self.redaction_regions.remove(&src);
-        Ok(rep)
-        // ── end pdf_manipulator patch ──
+        Ok(rs)
     }
+    // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: scoped destructive removal ──
 
@@ -11330,14 +11433,27 @@ impl DocumentEditor {
         rs: &crate::redaction::RegionSet,
         opts: &crate::redaction::RedactionOptions,
     ) -> Result<crate::redaction::RedactionReport> {
+        let plan = self.plan_destruction(src, rs, opts)?;
+        Ok(self.record_destruction(src, plan))
+    }
+
+    /// Works out what destroying `rs` on source page `src` records, without
+    /// changing the editor: every refusal of the redaction is raised here, so
+    /// [`Self::record_destruction`] cannot fail.
+    fn plan_destruction(
+        &mut self,
+        src: usize,
+        rs: &crate::redaction::RegionSet,
+        opts: &crate::redaction::RedactionOptions,
+    ) -> Result<Option<DestructionPlan>> {
         if rs.is_empty() {
-            return Ok(crate::redaction::RedactionReport::default());
+            return Ok(None);
         }
         let page_ref = self.source.get_page_ref(src)?;
         let page_obj = self.source.load_object(page_ref)?;
         let has_contents = page_obj.as_dict().and_then(|d| d.get("Contents")).is_some();
         if !has_contents {
-            return Ok(crate::redaction::RedactionReport::default());
+            return Ok(None);
         }
         // The pass runs over the whole content now, so a refusal (a damaged
         // stream, a font whose glyphs cannot be pruned) is raised here, before
@@ -11376,39 +11492,33 @@ impl DocumentEditor {
             self.validate_scope(&outcome.scope, &forms, &page_resources, &mut mask_originals)?;
             originals.extend(mask_originals);
         }
-        for id in &originals {
-            self.redacted_image_originals.insert(*id);
-        }
         let dropped_annots = self.redacted_annotations(src, rs, opts)?;
-        let rep = crate::redaction::RedactionReport {
+        let report = crate::redaction::RedactionReport {
             annotations_removed: dropped_annots.len(),
             ..outcome.report.clone()
         };
-        // Record the original /Contents object ids so the save path
-        // hard-drops them — the removed content must not survive even
-        // as an orphaned, GC-missed object.
-        if let Ok(page_ref) = self.source.get_page_ref(src) {
-            if let Ok(page_obj) = self.source.load_object(page_ref) {
-                if let Some(d) = page_obj.as_dict() {
-                    match d.get("Contents") {
-                        Some(Object::Reference(r)) => {
-                            self.redacted_orphan_ids.insert(r.id);
-                        },
-                        Some(Object::Array(arr)) => {
-                            for it in arr {
-                                if let Object::Reference(r) = it {
-                                    self.redacted_orphan_ids.insert(r.id);
-                                }
-                            }
-                        },
-                        _ => {},
+        // The original /Contents object ids, which the save path hard-drops:
+        // the removed content must not survive even as an orphaned, GC-missed
+        // object.
+        let mut orphans = Vec::new();
+        if let Some(d) = page_obj.as_dict() {
+            match d.get("Contents") {
+                Some(Object::Reference(r)) => orphans.push(r.id),
+                Some(Object::Array(arr)) => {
+                    for it in arr {
+                        if let Object::Reference(r) = it {
+                            orphans.push(r.id);
+                        }
                     }
-                }
+                },
+                _ => {},
             }
         }
-        self.redacted_pages.insert(
-            src,
-            RedactedPage {
+        Ok(Some(DestructionPlan {
+            originals,
+            orphans,
+            report,
+            page: RedactedPage {
                 regions: rs.clone(),
                 opts: *opts,
                 fonts,
@@ -11417,10 +11527,25 @@ impl DocumentEditor {
                 scope: outcome.scope,
                 flat: None,
             },
-        );
+        }))
+    }
+
+    /// Records a plan from [`Self::plan_destruction`] and returns its report.
+    /// It reads nothing and cannot fail.
+    fn record_destruction(
+        &mut self,
+        src: usize,
+        plan: Option<DestructionPlan>,
+    ) -> crate::redaction::RedactionReport {
+        let Some(plan) = plan else {
+            return crate::redaction::RedactionReport::default();
+        };
+        self.redacted_image_originals.extend(plan.originals);
+        self.redacted_orphan_ids.extend(plan.orphans);
+        self.redacted_pages.insert(src, plan.page);
         self.apply_redactions_pages.insert(src);
         self.is_modified = true;
-        Ok(rep)
+        plan.report
     }
 
     /// Destructively erase rectangular regions on a page.
