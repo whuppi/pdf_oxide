@@ -91,4 +91,6 @@ mod text_dense_baseline;
 #[cfg(feature = "rendering")]
 mod text_render_modes;
 mod text_tj_chunks;
+#[cfg(feature = "rendering")]
+mod watermark_positions;
 mod whole_reads;

@@ -145,7 +145,7 @@ fn a_watermark_that_fails_on_a_later_page_changes_nothing() {
             let result = dispatch::edit_watermark(
                 &mut editor,
                 listed.as_ref().map(|p| &p[..]),
-                "W", 12.0, 0.0, 1.0, 0.0, 0.0, 0.0, layer, 0, &[],
+                "W", 12.0, 0.0, 1.0, 0.0, 0.0, 0.0, layer, dispatch::WatermarkPosition::Centre,
             );
             assert!(result.is_err(), "{layer} {listed:?}");
             let after = editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap();
@@ -160,7 +160,7 @@ fn a_watermark_that_fails_on_a_later_page_changes_nothing() {
 fn a_watermark_over_a_bad_page_list_stamps_nothing() {
     let mut editor = open_editor_from_bytes(&three_pages(), "watermark_bad");
     let result = dispatch::edit_watermark(
-        &mut editor, Some(&[0, 9]), "W", 12.0, 0.0, 1.0, 0.0, 0.0, 0.0, "foreground", 0, &[],
+        &mut editor, Some(&[0, 9]), "W", 12.0, 0.0, 1.0, 0.0, 0.0, 0.0, "foreground", dispatch::WatermarkPosition::Centre,
     );
     assert!(result.is_err());
     assert!(!editor.is_modified());

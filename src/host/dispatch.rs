@@ -1642,16 +1642,83 @@ pub fn convert_from_format_to_bytes(data: &[u8], format: &str) -> Result<Vec<u8>
 // No upstream patch. Uses only public APIs.
 // ═══════════════════════════════════════════════════════════════════
 
+/// The corner a corner-positioned watermark sits in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatermarkCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl WatermarkCorner {
+    /// The corner the wire name (`topLeft`, `topRight`, `bottomLeft`,
+    /// `bottomRight`) names.
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "topLeft" => Ok(Self::TopLeft),
+            "topRight" => Ok(Self::TopRight),
+            "bottomLeft" => Ok(Self::BottomLeft),
+            "bottomRight" => Ok(Self::BottomRight),
+            other => Err(Error::InvalidOperation(format!("unknown watermark corner: {other}"))),
+        }
+    }
+}
+
+/// Where a watermark goes on a page, in the units of the wire: points from
+/// the page's lower-left origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WatermarkPosition {
+    Centre,
+    Corner { corner: WatermarkCorner, margin_x: f32, margin_y: f32 },
+    Tiled { columns: u32, rows: u32 },
+    Exact { x: f32, y: f32, width: f32, height: f32 },
+}
+
+impl WatermarkPosition {
+    /// The rectangles of a `page_w` by `page_h` page the watermark is drawn in.
+    fn rects(&self, page_w: f32, page_h: f32) -> Vec<crate::geometry::Rect> {
+        use crate::geometry::Rect;
+        match *self {
+            Self::Centre => vec![Rect::new(page_w * 0.1, page_h * 0.3, page_w * 0.8, page_h * 0.4)],
+            Self::Corner { corner, margin_x, margin_y } => {
+                let (w, h) = (page_w * 0.3, page_h * 0.08);
+                vec![match corner {
+                    WatermarkCorner::TopLeft => Rect::new(margin_x, page_h - margin_y - h, w, h),
+                    WatermarkCorner::TopRight => {
+                        Rect::new(page_w - margin_x - w, page_h - margin_y - h, w, h)
+                    },
+                    WatermarkCorner::BottomLeft => Rect::new(margin_x, margin_y, w, h),
+                    WatermarkCorner::BottomRight => {
+                        Rect::new(page_w - margin_x - w, margin_y, w, h)
+                    },
+                }]
+            },
+            Self::Tiled { columns, rows } => {
+                let (columns, rows) = (columns.max(1), rows.max(1));
+                let (cell_w, cell_h) = (page_w / columns as f32, page_h / rows as f32);
+                let mut rects = Vec::with_capacity((columns * rows) as usize);
+                for row in 0..rows {
+                    for col in 0..columns {
+                        rects.push(Rect::new(col as f32 * cell_w, row as f32 * cell_h, cell_w, cell_h));
+                    }
+                }
+                rects
+            },
+            Self::Exact { x, y, width, height } => vec![Rect::new(x, y, width, height)],
+        }
+    }
+}
+
 /// Add a text watermark to the pages named, or to every page when `pages`
 /// is `None`. `layer` is the wire name `foreground` or `background`.
 pub fn edit_watermark(
     editor: &mut DocumentEditor, pages: Option<&[usize]>, text: &str,
     font_size: f32, rotation: f32, opacity: f32,
     r: f32, g: f32, b: f32,
-    layer: &str, pos_type: i32, pos_fields: &[f32],
+    layer: &str, position: WatermarkPosition,
 ) -> Result<()> {
     use crate::writer::WatermarkAnnotation;
-    use crate::geometry::Rect;
 
     let background = match layer {
         "foreground" => false,
@@ -1661,51 +1728,8 @@ pub fn edit_watermark(
         }
     };
 
-    let resolve_rect = |ed: &mut DocumentEditor, p: usize| -> Result<Vec<Rect>> {
-        let mb = ed.get_page_media_box(p)?;
-        let (pw, ph) = (mb[2], mb[3]);
-        match pos_type {
-            0 => Ok(vec![Rect::new(pw * 0.1, ph * 0.3, pw * 0.8, ph * 0.4)]),
-            1 => {
-                let corner = pos_fields.first().copied().unwrap_or(0.0) as i32;
-                let mx = pos_fields.get(1).copied().unwrap_or(20.0);
-                let my = pos_fields.get(2).copied().unwrap_or(20.0);
-                let tw = pw * 0.3;
-                let th = ph * 0.08;
-                let rect = match corner {
-                    0 => Rect::new(mx, ph - my - th, tw, th),
-                    1 => Rect::new(pw - mx - tw, ph - my - th, tw, th),
-                    2 => Rect::new(mx, my, tw, th),
-                    _ => Rect::new(pw - mx - tw, my, tw, th),
-                };
-                Ok(vec![rect])
-            }
-            2 => {
-                let cols = pos_fields.first().copied().unwrap_or(3.0).max(1.0) as usize;
-                let rows = pos_fields.get(1).copied().unwrap_or(4.0).max(1.0) as usize;
-                let cw = pw / cols as f32;
-                let ch = ph / rows as f32;
-                let mut rects = Vec::with_capacity(cols * rows);
-                for row in 0..rows {
-                    for col in 0..cols {
-                        rects.push(Rect::new(col as f32 * cw, row as f32 * ch, cw, ch));
-                    }
-                }
-                Ok(rects)
-            }
-            3 => {
-                let x = pos_fields.first().copied().unwrap_or(0.0);
-                let y = pos_fields.get(1).copied().unwrap_or(0.0);
-                let w = pos_fields.get(2).copied().unwrap_or(100.0);
-                let h = pos_fields.get(3).copied().unwrap_or(50.0);
-                Ok(vec![Rect::new(x, y, w, h)])
-            }
-            _ => Ok(vec![Rect::new(pw * 0.1, ph * 0.3, pw * 0.8, ph * 0.4)]),
-        }
-    };
-
-    let add_to_page = |ed: &mut DocumentEditor, p: usize| -> Result<()> {
-        let rects = resolve_rect(ed, p)?;
+    let add_to_page = |ed: &mut DocumentEditor, p: usize, mb: [f32; 4]| -> Result<()> {
+        let rects = position.rects(mb[2], mb[3]);
         if background {
             // Under-content: prepend watermark to page content stream.
             // Renders BEHIND existing page content.
@@ -1743,82 +1767,27 @@ pub fn edit_watermark(
         }
     };
 
-    if let Some(pages) = pages {
-        check_pages(editor, pages)?;
-        for &page in pages {
-            resolve_rect(editor, page)?;
-            check_page(editor, page)?;
-        }
-        for &page in pages {
-            add_to_page(editor, page)?;
-        }
-    } else {
-        let count = editor.current_page_count();
-        for page in 0..count {
-            check_page(editor, page)?;
-        }
-        let media_boxes = editor.all_media_boxes();
-        for i in 0..count {
-            let mb = media_boxes[i];
-            let (pw, ph) = (mb[2], mb[3]);
-            let rects = match pos_type {
-                0 => vec![Rect::new(pw * 0.1, ph * 0.3, pw * 0.8, ph * 0.4)],
-                1 => {
-                    let corner = pos_fields.first().copied().unwrap_or(0.0) as i32;
-                    let mx = pos_fields.get(1).copied().unwrap_or(20.0);
-                    let my = pos_fields.get(2).copied().unwrap_or(20.0);
-                    let tw = pw * 0.3;
-                    let th = ph * 0.08;
-                    vec![match corner {
-                        0 => Rect::new(mx, ph - my - th, tw, th),
-                        1 => Rect::new(pw - mx - tw, ph - my - th, tw, th),
-                        2 => Rect::new(mx, my, tw, th),
-                        _ => Rect::new(pw - mx - tw, my, tw, th),
-                    }]
-                }
-                2 => {
-                    let cols = pos_fields.first().copied().unwrap_or(3.0).max(1.0) as usize;
-                    let rows = pos_fields.get(1).copied().unwrap_or(4.0).max(1.0) as usize;
-                    let cw = pw / cols as f32;
-                    let ch = ph / rows as f32;
-                    let mut r = Vec::with_capacity(cols * rows);
-                    for row in 0..rows {
-                        for col in 0..cols {
-                            r.push(Rect::new(col as f32 * cw, row as f32 * ch, cw, ch));
-                        }
-                    }
-                    r
-                }
-                3 => {
-                    let x = pos_fields.first().copied().unwrap_or(0.0);
-                    let y = pos_fields.get(1).copied().unwrap_or(0.0);
-                    let w = pos_fields.get(2).copied().unwrap_or(100.0);
-                    let h = pos_fields.get(3).copied().unwrap_or(50.0);
-                    vec![Rect::new(x, y, w, h)]
-                }
-                _ => vec![Rect::new(pw * 0.1, ph * 0.3, pw * 0.8, ph * 0.4)],
-            };
-            if background {
-                let font_res = ensure_page_font(editor, i, "Helvetica")?;
-                for rect in &rects {
-                    let stream = generate_watermark_stream(
-                        text, *rect, font_size, rotation, opacity, r, g, b,
-                        &font_res,
-                    );
-                    prepend_to_page_content(editor, i, &stream)?;
-                }
-            } else {
-                for rect in rects {
-                    let wm = WatermarkAnnotation::new(text)
-                        .with_rect(rect)
-                        .with_rotation(rotation)
-                        .with_opacity(opacity)
-                        .with_color(r, g, b)
-                        .with_font("Helvetica", font_size);
-                    editor.add_page_annotation(i, wm)?;
-                }
+    let targets: Vec<(usize, [f32; 4])> = match pages {
+        Some(pages) => {
+            check_pages(editor, pages)?;
+            let mut targets = Vec::with_capacity(pages.len());
+            for &page in pages {
+                let mb = editor.get_page_media_box(page)?;
+                check_page(editor, page)?;
+                targets.push((page, mb));
             }
-        }
+            targets
+        },
+        None => {
+            let count = editor.current_page_count();
+            for page in 0..count {
+                check_page(editor, page)?;
+            }
+            editor.all_media_boxes().into_iter().enumerate().collect()
+        },
+    };
+    for (page, mb) in targets {
+        add_to_page(editor, page, mb)?;
     }
     Ok(())
 }

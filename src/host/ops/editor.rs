@@ -246,6 +246,47 @@ fn rotation_of(req: &Request<'_>) -> crate::error::Result<i32> {
         .ok_or_else(|| crate::error::Error::InvalidOperation(format!("unknown rotation: {name}")))
 }
 
+/// The watermark position the request's `posType` and its fields name. Dart
+/// always sends every field of the position it encodes, so a missing or
+/// unknown one is refused.
+fn watermark_position_of(req: &Request<'_>) -> crate::error::Result<dispatch::WatermarkPosition> {
+    use crate::error::Error;
+    use dispatch::{WatermarkCorner, WatermarkPosition};
+
+    let real = |key: &str| {
+        req.get_f64(key)
+            .map(|v| v as f32)
+            .ok_or_else(|| Error::InvalidOperation(format!("watermark position needs {key}")))
+    };
+    let count = |key: &str| {
+        req.get_i32(key)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| Error::InvalidOperation(format!("watermark position needs {key}")))
+    };
+    match req.get_i32("posType") {
+        Some(0) => Ok(WatermarkPosition::Centre),
+        Some(1) => {
+            let name = req
+                .get_str("corner")
+                .ok_or_else(|| Error::InvalidOperation("watermark position needs corner".into()))?;
+            Ok(WatermarkPosition::Corner {
+                corner: WatermarkCorner::from_name(name)?,
+                margin_x: real("marginX")?,
+                margin_y: real("marginY")?,
+            })
+        },
+        Some(2) => Ok(WatermarkPosition::Tiled { columns: count("columns")?, rows: count("rows")? }),
+        Some(3) => Ok(WatermarkPosition::Exact {
+            x: real("posX")?,
+            y: real("posY")?,
+            width: real("posW")?,
+            height: real("posH")?,
+        }),
+        Some(other) => Err(Error::InvalidOperation(format!("unknown watermark posType: {other}"))),
+        None => Err(Error::InvalidOperation("watermark position needs posType".into())),
+    }
+}
+
 fn do_editor_mutate(
     editor: &mut DocumentEditor,
     edit_op: &str,
@@ -472,8 +513,7 @@ fn do_editor_mutate(
             ok_response()
         }
         "watermark" => {
-            let pos_fields: Vec<f32> = req.get_f64_list("posFields")
-                .unwrap_or(&[]).iter().map(|&f| f as f32).collect();
+            let position = watermark_position_of(req)?;
             let pages = if req.get_bool("pagesAll").unwrap_or(false) {
                 None
             } else {
@@ -493,8 +533,7 @@ fn do_editor_mutate(
                 req.get_f64("g").unwrap_or(0.5) as f32,
                 req.get_f64("b").unwrap_or(0.5) as f32,
                 req.get_str("layer").unwrap_or("foreground"),
-                req.get_i32("posType").unwrap_or(0),
-                &pos_fields,
+                position,
             )?;
             ok_response()
         }
