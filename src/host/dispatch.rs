@@ -40,8 +40,6 @@ pub struct OpenResult {
     /// The /P word as the file stores it, ISO 32000-1 Table 22 bit positions
     /// (-1, every bit set, when the file is not encrypted).
     pub permission_bits: i32,
-    /// Per-page dimensions and rotation.
-    pub pages: Vec<PageInfo>,
     /// Document info Title field.
     pub title: String,
     /// Document info Author field.
@@ -140,11 +138,11 @@ pub struct ClassificationResult {
 
 /// A bookmark-based split range for document splitting.
 pub struct BookmarkSplit {
-    /// Bookmark title.
-    pub title: String,
+    /// Bookmark title, absent when the bookmark has none.
+    pub title: Option<String>,
     /// First page index (inclusive).
     pub start_page: usize,
-    /// Last page index (inclusive).
+    /// Exclusive end page (0-based); the range is `start_page..end_page`.
     pub end_page: usize,
 }
 
@@ -174,7 +172,9 @@ pub struct EditorMetadataResult {
 // Read operations — take &mut PdfDocument, return typed results.
 // ═══════════════════════════════════════════════════════════════════
 
-/// Open a document and return its metadata, page info, and document info strings.
+/// Open a document and return its metadata and the strings of its info
+/// dictionary. The per-page facts are a read of their own
+/// ([`page_info`]): opening a document never pays for them.
 pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     let page_count = doc.page_count()?;
     let (major, minor) = doc.version();
@@ -186,32 +186,6 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     // 0 / 0xFF are the wire's "not encrypted / all permitted" values.
     let enc_algo: u8 = doc.encryption_algorithm().unwrap_or(0);
     let perms: i32 = doc.permission_bits().unwrap_or(-1);
-
-    // One read of the /PageLabels number tree; a document without one
-    // has no labels, not labels that repeat the page numbers.
-    let labels = {
-        use crate::extractors::page_labels::PageLabelExtractor;
-        let ranges = PageLabelExtractor::extract(doc).unwrap_or_default();
-        (!ranges.is_empty()).then(|| PageLabelExtractor::get_all_labels(&ranges, page_count))
-    };
-    // The page facts are read through the bounded object cache, never
-    // through `get_page`, whose cache would hold every page dictionary.
-    let page_refs = doc.all_page_refs()?;
-    let mut pages = Vec::with_capacity(page_count);
-    for i in 0..page_count {
-        let page_ref = *page_refs
-            .get(i)
-            .ok_or_else(|| Error::InvalidPdf(format!("Page {} not found in tree", i)))?;
-        let facts = doc.page_facts(page_ref)?;
-        let [x0, y0, x1, y1] = facts.media_box.unwrap_or([0.0, 0.0, 612.0, 792.0]);
-        let rotation = facts.rotation();
-        pages.push(PageInfo {
-            width: (x1 - x0) as f64,
-            height: (y1 - y0) as f64,
-            rotation,
-            label: labels.as_ref().and_then(|l| l.get(i).cloned()),
-        });
-    }
 
     let title = doc.document_info_string("Title").unwrap_or_default();
     let author = doc.document_info_string("Author").unwrap_or_default();
@@ -225,9 +199,41 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
         page_count, version_major: major, version_minor: minor,
         is_encrypted, requires_password, is_tagged,
         encryption_algorithm: enc_algo, permission_bits: perms,
-        pages, title, author, subject, keywords,
+        title, author, subject, keywords,
         producer, creator, creation_date,
     })
+}
+
+/// The facts of the pages named: their size, their rotation and their label.
+/// The pages are read one at a time, through the bounded object cache, never
+/// through `get_page`, whose cache would hold every page dictionary.
+pub fn page_info(
+    doc: &mut PdfDocument,
+    pages: &[usize],
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<Vec<PageInfo>> {
+    use crate::extractors::page_labels::PageLabelExtractor;
+    // One read of the /PageLabels number tree; a document without one
+    // has no labels, not labels that repeat the page numbers. A label is
+    // computed for the pages asked for only, never for the whole document.
+    let ranges = PageLabelExtractor::extract(doc).unwrap_or_default();
+    let page_refs = doc.all_page_refs()?;
+    let mut out = Vec::with_capacity(pages.len());
+    for &i in pages {
+        cancel.check()?;
+        let page_ref = *page_refs
+            .get(i)
+            .ok_or_else(|| Error::InvalidPdf(format!("Page {i} not found in tree")))?;
+        let facts = doc.page_facts(page_ref)?;
+        let [x0, y0, x1, y1] = facts.media_box.unwrap_or([0.0, 0.0, 612.0, 792.0]);
+        out.push(PageInfo {
+            width: (x1 - x0) as f64,
+            height: (y1 - y0) as f64,
+            rotation: facts.rotation(),
+            label: (!ranges.is_empty()).then(|| PageLabelExtractor::get_label(&ranges, i)),
+        });
+    }
+    Ok(out)
 }
 
 /// Extract text from one page or all pages in the given format.
@@ -459,7 +465,7 @@ pub fn validate_pdf_ua(
     doc: &mut PdfDocument,
     level: i32,
     cancel: &crate::cancel::CancelCheck,
-) -> Result<bool> {
+) -> Result<ValidationResult> {
     #[cfg(not(feature = "pdfa"))]
     {
         let _ = (doc, level, cancel);
@@ -472,7 +478,12 @@ pub fn validate_pdf_ua(
             2 => PdfUaLevel::Ua2,
             _ => PdfUaLevel::Ua1,
         };
-        Ok(PdfUaValidator::new().validate_cancellable(doc, ua_level, cancel)?.is_compliant)
+        let v = PdfUaValidator::new().validate_cancellable(doc, ua_level, cancel)?;
+        Ok(ValidationResult {
+            compliant: v.is_compliant,
+            errors: v.errors.len() as i32,
+            warnings: v.warnings.len() as i32,
+        })
     }
 }
 
@@ -486,7 +497,7 @@ pub fn classify_page(doc: &mut PdfDocument, page: usize) -> Result<Classificatio
     #[cfg(feature = "extract")]
     {
         let classification = doc.classify_page(page)?;
-        Ok(ClassificationResult { type_name: format!("{:?}", classification) })
+        Ok(ClassificationResult { type_name: format!("{:?}", classification.kind) })
     }
 }
 
@@ -500,7 +511,7 @@ pub fn classify_document(doc: &mut PdfDocument) -> Result<ClassificationResult> 
     #[cfg(feature = "extract")]
     {
         let classification = doc.classify_document()?;
-        Ok(ClassificationResult { type_name: format!("{:?}", classification) })
+        Ok(ClassificationResult { type_name: format!("{:?}", classification.summary) })
     }
 }
 
@@ -510,7 +521,7 @@ pub fn plan_split_by_bookmarks(doc: &mut PdfDocument) -> Result<Vec<BookmarkSpli
     let opts = SplitByBookmarksOptions::default();
     let splits = do_plan(doc, &opts)?;
     Ok(splits.iter().map(|s| BookmarkSplit {
-        title: s.title.clone().unwrap_or_default(),
+        title: s.title.clone(),
         start_page: s.start_page,
         end_page: s.end_page,
     }).collect())

@@ -33,6 +33,7 @@ static OPS: &[&OpEntry] = &[
     &doc::EXTRACT_ATTACHMENT,
     &doc::FORM_FIELDS,
     &doc::OPEN,
+    &doc::PAGE_INFO,
     &doc::PLAN_SPLIT_BY_BOOKMARKS,
     &doc::SEARCH,
     &doc::XFA,

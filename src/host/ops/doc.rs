@@ -7,7 +7,7 @@ use crate::host::dispatch;
 use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
-    authenticate_or_refuse, handle_with_doc, ok_flag, open_source, page_of, req_handle,
+    authenticate_or_refuse, handle_with_doc, ok_flag, open_source, page_of, pages_of, req_handle,
 };
 
 op_unit!(OPEN, "open", pdf_op_open_anchor, |ctx| {
@@ -18,6 +18,38 @@ op_unit!(OPEN, "open", pdf_op_open_anchor, |ctx| {
 op_unit!(DISPOSE, "docDispose", pdf_op_doc_dispose_anchor, |ctx| {
     ctx.state.documents.remove(&req_handle(ctx.req));
     ok_flag("disposed")
+});
+
+op_unit!(PAGE_INFO, "pageInfo", pdf_op_page_info_anchor, |ctx| {
+    let cancel = ctx.cancel;
+    handle_with_doc(ctx.state, ctx.req, |doc, req| {
+        let count = doc.page_count()?;
+        let page_indices = req.get_int_list("pageIndices").unwrap_or(&[]);
+        let pages = if page_indices.is_empty() {
+            (0..count).collect()
+        } else {
+            match pages_of(page_indices, count) {
+                Ok(pages) => pages,
+                Err(resp) => return Ok(resp),
+            }
+        };
+        let infos = dispatch::page_info(doc, &pages, cancel)?;
+        let mut w = ResponseWriter::ok();
+        w.put_map_list("pages", infos.len(), |i, item| {
+            let p = &infos[i];
+            item.put_i32("index", pages[i] as i32);
+            item.put_f64("width", p.width);
+            item.put_f64("height", p.height);
+            item.put_str(
+                "rotation",
+                dispatch::rotation_name_from_degrees(p.rotation).unwrap_or("r0"),
+            );
+            if let Some(label) = &p.label {
+                item.put_str("label", label);
+            }
+        });
+        Ok(w.finish())
+    })
 });
 
 op_unit!(EXTRACT, "extract", pdf_op_extract_anchor, |ctx| {
@@ -82,7 +114,9 @@ op_unit!(
             let mut w = ResponseWriter::ok();
             w.put_map_list("splits", result.len(), |i, item| {
                 let s = &result[i];
-                item.put_str("title", &s.title);
+                if let Some(title) = &s.title {
+                    item.put_str("title", title);
+                }
                 item.put_i32("startPage", s.start_page as i32);
                 item.put_i32("endPage", s.end_page as i32);
             });
@@ -292,19 +326,6 @@ fn handle_open(
             w.put_str("producer", &result.producer);
             w.put_str("creator", &result.creator);
             w.put_str("creationDate", &result.creation_date);
-            w.put_map_list("pages", result.pages.len(), |i, item| {
-                let p = &result.pages[i];
-                item.put_i32("index", i as i32);
-                item.put_f64("width", p.width);
-                item.put_f64("height", p.height);
-                item.put_str(
-                    "rotation",
-                    dispatch::rotation_name_from_degrees(p.rotation).unwrap_or("r0"),
-                );
-                if let Some(label) = &p.label {
-                    item.put_str("label", label);
-                }
-            });
             w.finish()
         }
         Err(e) => ResponseWriter::error_of(&e),

@@ -33,7 +33,9 @@ op_unit!(
             })?;
             let result = dispatch::validate_pdf_ua(doc, level, ctx.cancel)?;
             let mut w = ResponseWriter::ok();
-            w.put_bool("valid", result);
+            w.put_bool("compliant", result.compliant);
+            w.put_i32("errors", result.errors);
+            w.put_i32("warnings", result.warnings);
             Ok(w.finish())
         })
     }
