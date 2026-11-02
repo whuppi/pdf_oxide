@@ -41,7 +41,7 @@ unsafe extern "C" fn answer_read() {
         n,
     );
     sb::write_i64(channel, rc::OFFSET_RESPONSE_LENGTH, n as i64);
-    sb::set_flag_bits(channel, rc::OFFSET_FLAGS, sb::FLAG_READY);
+    sb::host_respond(channel, rc::OFFSET_REQUEST_SEQ, rc::OFFSET_RESPONSE, sb::FLAG_READY);
 }
 
 /// A scan-like file: one 8-bit gray image of `IMAGE_BYTES` per page, stored

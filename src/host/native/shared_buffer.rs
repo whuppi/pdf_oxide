@@ -22,15 +22,40 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 // ── Flag bits (same values on both Rust and Dart sides) ────────────
+//
+// Each channel carries three u32 words, and each word has ONE writer, so
+// neither side ever read-modify-writes a word the other side writes:
+//
+//   request word  — written only by Rust. A sequence number, bumped on
+//                   every request the channel carries, for the channel's
+//                   whole life (a held channel outlives its jobs).
+//   response word — written only by Dart. Low nibble: the kind of the
+//                   response (READY / ERROR / ACK). Upper 28 bits: the
+//                   request number being answered, echoed. Rust takes a
+//                   response only when it echoes the request it waits on,
+//                   so the late answer of a cancelled request, landing
+//                   after a newer request was posted, is ignored; Dart
+//                   reads the request word again after its await and
+//                   drops an answer whose request has moved on.
+//   cancel word   — written only by Rust (the cancellers, and the lane
+//                   thread when a job adopts a held channel). Holds
+//                   FLAG_CANCELLED; sticky until that adoption.
 
-/// Flag bit: host has filled the response data.
+/// Response kind: host has filled the response data.
 pub const FLAG_READY: u32 = 1 << 0;
-/// Flag bit: host encountered an error.
+/// Response kind: host encountered an error.
 pub const FLAG_ERROR: u32 = 1 << 1;
-/// Flag bit: operation has been cancelled.
+/// Cancel-word bit: operation has been cancelled.
 pub const FLAG_CANCELLED: u32 = 1 << 2;
-/// Flag bit: host acknowledged the written chunk.
+/// Response kind: host acknowledged the written chunk.
 pub const FLAG_ACK: u32 = 1 << 3;
+
+/// Bits of the response word that carry the response kind.
+pub const RESPONSE_KIND_MASK: u32 = FLAG_READY | FLAG_ERROR | FLAG_ACK;
+/// Bit position where the echoed request number starts.
+pub const RESPONSE_SEQ_SHIFT: u32 = 4;
+/// Request numbers wrap inside the 28 bits the response word can echo.
+pub const REQUEST_SEQ_MASK: u32 = u32::MAX >> RESPONSE_SEQ_SHIFT;
 
 // ── Read channel byte layout ───────────────────────────────────────
 //
@@ -38,10 +63,11 @@ pub const FLAG_ACK: u32 = 1 << 3;
 // 0       request_offset     8      byte offset engine wants to read
 // 8       request_count      8      byte count engine wants
 // 16      response_length    8      bytes actually returned by host
-// 24      flags              4      atomic flag bits
-// 28      (padding)          4
+// 24      response           4      Dart-written word: kind + echoed request number
+// 28      cancel             4      Rust-written word: FLAG_CANCELLED
 // 32      sync_ptr           8      *mut SyncPair (Rust-side only, Dart never reads)
-// 40      (reserved)         120
+// 40      request            4      Rust-written word: request number
+// 44      (reserved)         116
 // 160     data               64KB   response byte payload
 
 /// Byte layout constants for the read (source) channel.
@@ -55,10 +81,14 @@ pub mod read_channel {
     pub const OFFSET_REQUEST_COUNT: usize = 8;
     /// Offset of the actual response length (i64).
     pub const OFFSET_RESPONSE_LENGTH: usize = 16;
-    /// Offset of the atomic flags word (u32).
-    pub const OFFSET_FLAGS: usize = 24;
+    /// Offset of the response word (u32), written only by Dart.
+    pub const OFFSET_RESPONSE: usize = 24;
+    /// Offset of the cancel word (u32), written only by Rust.
+    pub const OFFSET_CANCEL: usize = 28;
     /// Offset of the SyncPair raw pointer (usize).
     pub const OFFSET_SYNC_PTR: usize = 32;
+    /// Offset of the request-number word (u32), written only by Rust.
+    pub const OFFSET_REQUEST_SEQ: usize = 40;
     /// Offset where the payload data begins.
     pub const OFFSET_DATA: usize = 160;
 
@@ -70,10 +100,11 @@ pub mod read_channel {
 //
 // Offset  Field              Size   Purpose
 // 0       chunk_length       8      bytes in this output chunk
-// 8       flags              4      atomic flag bits
-// 12      (padding)          4
+// 8       response           4      Dart-written word: kind + echoed request number
+// 12      cancel             4      Rust-written word: FLAG_CANCELLED
 // 16      sync_ptr           8      *mut SyncPair (Rust-side only, Dart never reads)
-// 24      (reserved)         120
+// 24      request            4      Rust-written word: request number
+// 28      (reserved)         116
 // 144     data               256KB  output byte payload
 
 /// Byte layout constants for the write (output) channel.
@@ -83,10 +114,14 @@ pub mod write_channel {
 
     /// Offset of the chunk length (i64).
     pub const OFFSET_CHUNK_LENGTH: usize = 0;
-    /// Offset of the atomic flags word (u32).
-    pub const OFFSET_FLAGS: usize = 8;
+    /// Offset of the response word (u32), written only by Dart.
+    pub const OFFSET_RESPONSE: usize = 8;
+    /// Offset of the cancel word (u32), written only by Rust.
+    pub const OFFSET_CANCEL: usize = 12;
     /// Offset of the SyncPair raw pointer (usize).
     pub const OFFSET_SYNC_PTR: usize = 16;
+    /// Offset of the request-number word (u32), written only by Rust.
+    pub const OFFSET_REQUEST_SEQ: usize = 24;
     /// Offset where the payload data begins.
     pub const OFFSET_DATA: usize = 144;
 
@@ -125,47 +160,73 @@ pub unsafe fn data_ptr(base: *mut u8, offset: usize) -> *mut u8 {
 }
 
 #[inline]
-/// Atomically load the flags word from the buffer.
-pub fn load_flags(base: *const u8, flags_offset: usize) -> u32 {
-    unsafe { flags_ref(base, flags_offset).load(Ordering::Acquire) }
+/// Load the response word (written only by Dart) with Acquire, so the
+/// payload Dart wrote before it is visible once the word has changed.
+pub fn load_response(base: *const u8, response_offset: usize) -> u32 {
+    unsafe { flags_ref(base, response_offset).load(Ordering::Acquire) }
 }
 
 #[inline]
-/// Atomically store the flags word into the buffer.
-pub fn store_flags(base: *mut u8, flags_offset: usize, value: u32) {
-    unsafe { flags_ref(base, flags_offset).store(value, Ordering::Release) }
+/// Load the cancel word (written only by Rust).
+pub fn load_cancel(base: *const u8, cancel_offset: usize) -> u32 {
+    unsafe { flags_ref(base, cancel_offset).load(Ordering::Acquire) }
 }
 
 #[inline]
-/// Atomically OR the given bits into the flags word.
-pub fn set_flag_bits(base: *mut u8, flags_offset: usize, bits: u32) {
-    unsafe { flags_ref(base, flags_offset).fetch_or(bits, Ordering::Release) };
+/// Check whether the channel's cancel word holds FLAG_CANCELLED.
+pub fn is_cancelled(base: *const u8, cancel_offset: usize) -> bool {
+    load_cancel(base, cancel_offset) & FLAG_CANCELLED != 0
 }
 
 #[inline]
-/// Clear all flags to zero.
-pub fn clear_flags(base: *mut u8, flags_offset: usize) {
-    store_flags(base, flags_offset, 0);
-}
-
-/// The response bits the host sets to answer one request.
-pub const RESPONSE_FLAGS: u32 = FLAG_READY | FLAG_ERROR | FLAG_ACK;
-
-#[inline]
-/// Clear only the response bits, preserving FLAG_CANCELLED.
+/// Set FLAG_CANCELLED in the cancel word.
 ///
 /// Cancellation is STICKY on a channel: once set it survives every
-/// request cycle, so a cancel can never be erased by a racing
-/// `clear`. A held channel that was collaterally flagged is revived
-/// explicitly by the host between jobs — never implicitly here.
-pub fn clear_response_flags(base: *mut u8, flags_offset: usize) {
-    unsafe { flags_ref(base, flags_offset).fetch_and(!RESPONSE_FLAGS, Ordering::AcqRel) };
+/// request cycle, so a cancel can never be erased by a racing request.
+/// Only [`clear_cancelled`] revives a channel.
+pub fn set_cancelled(base: *mut u8, cancel_offset: usize) {
+    unsafe { flags_ref(base, cancel_offset).fetch_or(FLAG_CANCELLED, Ordering::Release) };
 }
 
 #[inline]
-/// Check whether a specific flag bit is set.
-pub fn has_flag(base: *const u8, flags_offset: usize, bit: u32) -> bool {
-    load_flags(base, flags_offset) & bit != 0
+/// Revive a held channel collaterally flagged by a finished job's cancel.
+/// Called only by the lane thread, strictly between the moments a cancel
+/// can name the channel (see `ChannelRegistry::register`).
+pub fn clear_cancelled(base: *mut u8, cancel_offset: usize) {
+    unsafe { flags_ref(base, cancel_offset).fetch_and(!FLAG_CANCELLED, Ordering::Release) };
+}
+
+#[inline]
+/// Load the request number (written only by Rust).
+pub fn load_request(base: *const u8, request_offset: usize) -> u32 {
+    unsafe { flags_ref(base, request_offset).load(Ordering::Acquire) }
+}
+
+/// Number a new request: bump the channel's request word and return the
+/// new number. Only the lane thread posts requests on a channel, one at a
+/// time, so a load-then-store is the whole story. Zero is never used: it
+/// is what a fresh response word reads as.
+pub fn next_request(base: *mut u8, request_offset: usize) -> u32 {
+    let mut next = load_request(base, request_offset).wrapping_add(1) & REQUEST_SEQ_MASK;
+    if next == 0 {
+        next = 1;
+    }
+    unsafe { flags_ref(base, request_offset).store(next, Ordering::Release) };
+    next
+}
+
+#[cfg(test)]
+/// Answer request number `request` the way the Dart host does: publish the
+/// response kind and the echoed request number in one store.
+pub fn host_respond_to(base: *mut u8, response_offset: usize, request: u32, kind: u32) {
+    let word = (request << RESPONSE_SEQ_SHIFT) | kind;
+    unsafe { flags_ref(base, response_offset).store(word, Ordering::Release) };
+}
+
+#[cfg(test)]
+/// Answer the latest request on the channel.
+pub fn host_respond(base: *mut u8, request_offset: usize, response_offset: usize, kind: u32) {
+    host_respond_to(base, response_offset, load_request(base, request_offset), kind);
 }
 
 // ── SyncPair — heap-allocated, pointer stored in buffer ────────────
@@ -236,25 +297,32 @@ pub unsafe fn notify(base: *mut u8, ptr_offset: usize) {
     pair.condvar.notify_one();
 }
 
-/// Wait for any of the specified flag bits, or cancellation.
+/// Wait for the host's answer to the request just posted, or cancellation.
+///
+/// `request` is the number [`next_request`] gave the request just posted;
+/// the host answers by echoing it in the response word, and any other
+/// number (the late answer of an earlier, cancelled request) is ignored.
+/// Returns the answer's kind bits (`FLAG_READY` / `FLAG_ERROR` /
+/// `FLAG_ACK`), plus `FLAG_CANCELLED` when the channel's cancel word is set.
 ///
 /// Caller MUST hold the mutex (via `get_sync().mutex.lock()`) before
 /// calling this — the mutex must be held across the entire
 /// setup → wait → response cycle to prevent lost wakeups.
 ///
-/// There is deliberately NO timeout. The only exits are the flags
+/// There is deliberately NO timeout. The only exits are the answer
 /// arriving or the token being cancelled — behavior never depends on
 /// how slow the device or the host is. The periodic wake below is a
 /// belt-and-suspenders token re-check plus a debug-build diagnostic
 /// for long parks; it decides nothing. Every canceller also signals
 /// the condvar (after setting its flag, under this mutex), so
 /// cancellation latency does not depend on the heartbeat either.
-pub fn wait_for_flags(
+pub fn wait_for_response(
     pair: &SyncPair,
     mut guard: MutexGuard<'_, ()>,
     buf: *const u8,
-    flags_offset: usize,
-    target_bits: u32,
+    response_offset: usize,
+    cancel_offset: usize,
+    request: u32,
     token: &CancelToken,
 ) -> Result<u32, std::io::Error> {
     const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -264,9 +332,12 @@ pub fn wait_for_flags(
             return Err(crate::host::native::cancel::cancelled());
         }
 
-        let flags = load_flags(buf, flags_offset);
-        if flags & target_bits != 0 {
-            return Ok(flags);
+        let response = load_response(buf, response_offset);
+        let cancelled = is_cancelled(buf, cancel_offset);
+        let answered_here = response >> RESPONSE_SEQ_SHIFT == request;
+        if answered_here || cancelled {
+            let answered = if answered_here { response & RESPONSE_KIND_MASK } else { 0 };
+            return Ok(answered | if cancelled { FLAG_CANCELLED } else { 0 });
         }
 
         let (new_guard, timeout_result) = pair.condvar.wait_timeout(guard, HEARTBEAT).unwrap();
@@ -275,7 +346,7 @@ pub fn wait_for_flags(
         #[cfg(debug_assertions)]
         if timeout_result.timed_out() {
             eprintln!(
-                "[pdf_oxide] I/O wait parked > {}s (flags_offset={flags_offset}) — \
+                "[pdf_oxide] I/O wait parked > {}s (response_offset={response_offset}) — \
                  host slow or stalled; still waiting",
                 HEARTBEAT.as_secs()
             );
@@ -291,46 +362,79 @@ mod tests {
 
     #[test]
     fn read_channel_layout() {
+        assert_eq!(read_channel::OFFSET_RESPONSE, 24);
+        assert_eq!(read_channel::OFFSET_CANCEL, 28);
+        assert_eq!(read_channel::OFFSET_SYNC_PTR, 32);
+        assert_eq!(read_channel::OFFSET_REQUEST_SEQ, 40);
         assert_eq!(read_channel::OFFSET_DATA, 160);
         assert_eq!(read_channel::TOTAL_SIZE, 160 + read_channel::DATA_CAPACITY);
     }
 
     #[test]
     fn write_channel_layout() {
+        assert_eq!(write_channel::OFFSET_RESPONSE, 8);
+        assert_eq!(write_channel::OFFSET_CANCEL, 12);
+        assert_eq!(write_channel::OFFSET_SYNC_PTR, 16);
+        assert_eq!(write_channel::OFFSET_REQUEST_SEQ, 24);
         assert_eq!(write_channel::OFFSET_DATA, 144);
         assert_eq!(write_channel::TOTAL_SIZE, 144 + write_channel::DATA_CAPACITY);
     }
 
     #[test]
-    fn cancelled_flag_is_sticky_across_response_clears() {
+    fn the_three_words_never_share_bytes() {
         let mut buf = vec![0u8; 64];
         let base = buf.as_mut_ptr();
 
-        set_flag_bits(base, 0, FLAG_READY | FLAG_ERROR | FLAG_ACK | FLAG_CANCELLED);
-        clear_response_flags(base, 0);
+        let request = next_request(base, 8);
+        set_cancelled(base, 4);
+        host_respond(base, 8, 0, FLAG_READY);
+        assert!(is_cancelled(base, 4));
+        assert_eq!(load_response(base, 0) & RESPONSE_KIND_MASK, FLAG_READY);
+        assert_eq!(load_request(base, 8), request);
 
-        assert!(has_flag(base, 0, FLAG_CANCELLED));
-        assert!(!has_flag(base, 0, FLAG_READY));
-        assert!(!has_flag(base, 0, FLAG_ERROR));
-        assert!(!has_flag(base, 0, FLAG_ACK));
+        clear_cancelled(base, 4);
+        assert!(!is_cancelled(base, 4));
+        assert_eq!(load_response(base, 0) & RESPONSE_KIND_MASK, FLAG_READY);
+        assert_eq!(load_request(base, 8), request);
     }
 
     #[test]
-    fn flag_operations() {
+    fn cancelled_flag_is_sticky_across_requests_and_responses() {
         let mut buf = vec![0u8; 64];
         let base = buf.as_mut_ptr();
 
-        assert!(!has_flag(base, 0, FLAG_READY));
-        set_flag_bits(base, 0, FLAG_READY);
-        assert!(has_flag(base, 0, FLAG_READY));
-        assert!(!has_flag(base, 0, FLAG_ERROR));
+        set_cancelled(base, 4);
+        next_request(base, 8);
+        host_respond(base, 8, 0, FLAG_READY);
+        next_request(base, 8);
+        host_respond(base, 8, 0, FLAG_ACK);
+        assert!(is_cancelled(base, 4));
+    }
 
-        set_flag_bits(base, 0, FLAG_ERROR);
-        assert!(has_flag(base, 0, FLAG_READY));
-        assert!(has_flag(base, 0, FLAG_ERROR));
+    #[test]
+    fn every_request_gets_a_new_nonzero_number() {
+        let mut buf = vec![0u8; 64];
+        let base = buf.as_mut_ptr();
 
-        clear_flags(base, 0);
-        assert!(!has_flag(base, 0, FLAG_READY));
+        let mut last = 0;
+        for _ in 0..3 {
+            let now = next_request(base, 8);
+            assert_ne!(now, 0, "zero is what a fresh response word reads as");
+            assert_ne!(now, last);
+            last = now;
+        }
+    }
+
+    #[test]
+    fn request_numbers_wrap_inside_what_the_response_word_can_echo() {
+        let mut buf = vec![0u8; 64];
+        let base = buf.as_mut_ptr();
+        unsafe { flags_ref(base, 8).store(REQUEST_SEQ_MASK, Ordering::Release) };
+
+        let wrapped = next_request(base, 8);
+        assert_eq!(wrapped, 1, "zero is skipped on the wrap");
+        host_respond(base, 8, 0, FLAG_READY);
+        assert_eq!(load_response(base, 0) >> RESPONSE_SEQ_SHIFT, wrapped);
     }
 
     #[test]
@@ -360,22 +464,60 @@ mod tests {
     }
 
     #[test]
-    fn wait_immediate_flag() {
+    fn wait_returns_at_once_for_the_answer_to_its_request() {
         let mut buf = vec![0u8; 256];
         let ptr_offset = 32;
-        let flags_offset = 24;
         unsafe {
             init_sync(buf.as_mut_ptr(), ptr_offset);
-            set_flag_bits(buf.as_mut_ptr(), flags_offset, FLAG_READY);
+            let request = next_request(buf.as_mut_ptr(), 40);
+            host_respond(buf.as_mut_ptr(), 40, 24, FLAG_READY);
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
             let token = CancelToken::unconnected();
-            let result = wait_for_flags(
-                pair, guard, buf.as_ptr(), flags_offset,
-                FLAG_READY | FLAG_ERROR, &token,
-            );
-            assert!(result.is_ok());
-            assert!(result.unwrap() & FLAG_READY != 0);
+            let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, request, &token);
+            assert_eq!(result.unwrap(), FLAG_READY);
+            destroy_sync(buf.as_mut_ptr(), ptr_offset);
+        }
+    }
+
+    #[test]
+    fn wait_ignores_the_late_answer_of_an_earlier_request() {
+        // Request 1 was cancelled and its slow answer lands while request 2
+        // is posted. Waiting for 2 must not take it, or the engine would
+        // read request 1's bytes as its own.
+        let mut buf = vec![0u8; 256];
+        let ptr_offset = 32;
+        unsafe {
+            init_sync(buf.as_mut_ptr(), ptr_offset);
+            let first = next_request(buf.as_mut_ptr(), 40);
+            let second = next_request(buf.as_mut_ptr(), 40);
+            assert_ne!(first, second);
+
+            let base = buf.as_mut_ptr() as usize;
+            let host = std::thread::spawn(move || {
+                let base = base as *mut u8;
+                std::thread::sleep(Duration::from_millis(30));
+                let pair = get_sync(base, 32);
+                {
+                    let _guard = pair.mutex.lock().unwrap();
+                    host_respond_to(base, 24, first, FLAG_ERROR);
+                    pair.condvar.notify_all();
+                }
+                std::thread::sleep(Duration::from_millis(30));
+                let _guard = pair.mutex.lock().unwrap();
+                host_respond_to(base, 24, second, FLAG_READY);
+                pair.condvar.notify_all();
+            });
+
+            let started = std::time::Instant::now();
+            let pair = get_sync(buf.as_ptr(), ptr_offset);
+            let guard = pair.mutex.lock().unwrap();
+            let token = CancelToken::unconnected();
+            let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, second, &token);
+            assert_eq!(result.unwrap(), FLAG_READY, "took the earlier request's answer");
+            assert!(started.elapsed() >= Duration::from_millis(50), "returned on the stale answer");
+
+            host.join().unwrap();
             destroy_sync(buf.as_mut_ptr(), ptr_offset);
         }
     }
@@ -387,17 +529,13 @@ mod tests {
 
         let mut buf = vec![0u8; 256];
         let ptr_offset = 32;
-        let flags_offset = 24;
         unsafe {
             init_sync(buf.as_mut_ptr(), ptr_offset);
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
             let lane = Arc::new(AtomicBool::new(true));
             let token = CancelToken::new(lane, Arc::new(AtomicBool::new(false)));
-            let result = wait_for_flags(
-                pair, guard, buf.as_ptr(), flags_offset,
-                FLAG_READY, &token,
-            );
+            let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, 1, &token);
             let err = result.unwrap_err();
             // Must NOT be Interrupted — std combinators retry that kind.
             assert_ne!(err.kind(), std::io::ErrorKind::Interrupted);
@@ -414,7 +552,6 @@ mod tests {
         // non-retryable cancelled error).
         let mut buf = vec![0u8; 256];
         let ptr_offset = 32;
-        let flags_offset = 24;
         unsafe {
             init_sync(buf.as_mut_ptr(), ptr_offset);
 
@@ -424,17 +561,14 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(50));
                 let pair = get_sync(base, 32);
                 let _guard = pair.mutex.lock().unwrap();
-                set_flag_bits(base, 24, FLAG_CANCELLED);
+                set_cancelled(base, 28);
                 pair.condvar.notify_all();
             });
 
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
             let token = CancelToken::unconnected();
-            let result = wait_for_flags(
-                pair, guard, buf.as_ptr(), flags_offset,
-                FLAG_READY | FLAG_ERROR | FLAG_CANCELLED, &token,
-            );
+            let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, 1, &token);
             assert!(result.unwrap() & FLAG_CANCELLED != 0);
 
             canceller.join().unwrap();

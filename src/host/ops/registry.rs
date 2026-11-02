@@ -7,6 +7,8 @@
 // collection — nothing else in the layer changes.
 
 use crate::host::ops::{builder, convert, doc, editor, fonts, pdfa, render, signatures, OpEntry};
+#[cfg(feature = "test-support")]
+use crate::host::ops::test_support;
 
 static OPS: &[&OpEntry] = &[
     // builder
@@ -62,6 +64,9 @@ static OPS: &[&OpEntry] = &[
     &signatures::GET_SIGNATURES,
     &signatures::SIGN,
     &signatures::VERIFY_SIGNATURES,
+    // test-support: a deliberate panic, outside the wire contract
+    #[cfg(feature = "test-support")]
+    &test_support::PANIC,
 ];
 
 /// Looks up the unit for a wire op name. None means the op is unknown to

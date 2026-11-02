@@ -125,9 +125,13 @@ impl ChannelRegistry {
     /// time, so any channel parked during this job belongs to it.
     fn register(&self, job: &Job) {
         let mut entries = self.entries.lock().unwrap();
-        for (_, owner) in entries.values_mut() {
+        for (&buf, (kind, owner)) in entries.iter_mut() {
             if *owner == HELD_OWNER {
                 *owner = job.job_id;
+                // A cancel of an earlier job may have flagged this held
+                // channel; this job starts with it live. The registry lock
+                // orders the revival before any cancel of THIS job.
+                unsafe { revive_channel(buf as *mut u8, *kind) };
             }
         }
         for s in &job.sources {
@@ -205,14 +209,27 @@ impl Default for ChannelRegistry {
 /// # Safety
 /// `buf` must be a live channel buffer initialized via `sb::init_sync`.
 unsafe fn cancel_channel(buf: *mut u8, kind: ChannelKind) {
-    let (sync_offset, flags_offset) = match kind {
-        ChannelKind::Read => (rc::OFFSET_SYNC_PTR, rc::OFFSET_FLAGS),
-        ChannelKind::Write => (wc::OFFSET_SYNC_PTR, wc::OFFSET_FLAGS),
+    let (sync_offset, cancel_offset) = match kind {
+        ChannelKind::Read => (rc::OFFSET_SYNC_PTR, rc::OFFSET_CANCEL),
+        ChannelKind::Write => (wc::OFFSET_SYNC_PTR, wc::OFFSET_CANCEL),
     };
     let pair = sb::get_sync(buf, sync_offset);
     let _guard = pair.mutex.lock().unwrap();
-    sb::set_flag_bits(buf, flags_offset, sb::FLAG_CANCELLED);
+    sb::set_cancelled(buf, cancel_offset);
     pair.condvar.notify_all();
+}
+
+/// Clear one channel's cancel word. Only the lane thread calls this, from
+/// `ChannelRegistry::register`, for a channel no job owns.
+///
+/// # Safety
+/// `buf` must be a live channel buffer.
+unsafe fn revive_channel(buf: *mut u8, kind: ChannelKind) {
+    let cancel_offset = match kind {
+        ChannelKind::Read => rc::OFFSET_CANCEL,
+        ChannelKind::Write => wc::OFFSET_CANCEL,
+    };
+    sb::clear_cancelled(buf, cancel_offset);
 }
 
 // ── LaneController — the cross-thread control surface ──────────────
@@ -233,21 +250,77 @@ pub struct LaneController {
     /// submit (before enqueue, so a cancel can always find its job),
     /// removed by the lane thread when the job finishes.
     pub(crate) tickets: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    /// The job the lane thread is executing now, `None` while it is idle
+    /// or has not dequeued the next one. Lets a cancel tell a queued job
+    /// from a running one.
+    pub(crate) running: Mutex<Option<u64>>,
+    /// Set once by the lane thread, BEFORE it posts the result of the job
+    /// whose engine panicked: a panic kills the lane, and the host reads
+    /// this flag when that post arrives.
+    pub dead: AtomicBool,
 }
+
+impl LaneController {
+    /// A controller for a lane that has accepted no job yet.
+    pub(crate) fn new(sender: crossbeam_channel::Sender<Job>) -> Self {
+        Self {
+            mailbox: Mutex::new(Some(sender)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            channels: ChannelRegistry::new(),
+            tickets: Mutex::new(HashMap::new()),
+            running: Mutex::new(None),
+            dead: AtomicBool::new(false),
+        }
+    }
+
+    /// Cancel one job. Returns true when the job had not started, so the
+    /// lane will skip it without touching the engine.
+    ///
+    /// `running` is held across the flag store: the lane thread marks a job
+    /// running before it reads the job's flag, so every cancel either
+    /// lands first (the lane skips the job) or finds it running (its I/O
+    /// is woken below).
+    pub fn cancel_job(&self, job_id: u64) -> bool {
+        let running = self.running.lock().unwrap();
+        let Some(flag) = self.tickets.lock().unwrap().get(&job_id).cloned() else {
+            return false;
+        };
+        flag.store(true, Ordering::SeqCst);
+        let queued = *running != Some(job_id);
+        self.channels.cancel_job(job_id);
+        queued
+    }
+}
+
+/// Error every job posts that reaches a lane after its engine panicked.
+pub const LANE_DEAD_MESSAGE: &str = "the engine lane stopped after an engine operation panicked";
 
 // ── The lane body ───────────────────────────────────────────────────
 
 /// The lane thread's main loop. Creates the lane's state, drains the
 /// mailbox, exits when the sender is dropped (kill or shutdown).
 ///
+/// A panic in the engine ends the lane's service: its state is dropped,
+/// the mailbox is closed to new jobs, and every job already queued posts
+/// an error. The thread lives on only until the last sender is gone, so a
+/// job racing the close still gets its one post.
+///
 /// Budget-slot release is NOT done here — the lane table wraps this
 /// call in an RAII guard at the spawn site, so the slot is returned
 /// even if this thread unwinds.
 pub fn lane_main(mailbox: Receiver<Job>, controller: Arc<LaneController>) {
-    let mut state = LaneState::new();
+    let mut state = Some(LaneState::new());
 
     while let Ok(job) = mailbox.recv() {
-        run_job(&mut state, &controller, job);
+        match state.as_mut() {
+            Some(live) => {
+                if !run_job(live, &controller, job) {
+                    state = None;
+                    *controller.mailbox.lock().unwrap() = None;
+                }
+            }
+            None => fail_job(&controller, job),
+        }
     }
 
     // Mailbox closed: the lane is dead. `state` drops here, freeing
@@ -255,8 +328,40 @@ pub fn lane_main(mailbox: Receiver<Job>, controller: Arc<LaneController>) {
     // that ever touched it.
 }
 
-/// Execute one job against the lane's state and post the result.
-fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) {
+/// Post the lane-dead error for a job that arrives after a panic.
+fn fail_job(controller: &LaneController, job: Job) {
+    post_result(job.result_port, ResponseWriter::error(LANE_DEAD_MESSAGE));
+    controller.tickets.lock().unwrap().remove(&job.job_id);
+}
+
+/// What a finished job posts, and whether the lane survives it.
+///
+/// A success is never rewritten, cancel or not: an op that creates a handle
+/// and finishes in the same window as its cancel has already put a
+/// document in the lane, and only the Router, which names the handle,
+/// can dispose it. A non-success cannot hold a handle, so a cancel that
+/// landed mid-op makes the engine's I/O error read as the typed cancelled
+/// status, identical to a pre-dequeue cancel. A panic is reported as a
+/// panic and ends the lane.
+fn outcome(result: std::thread::Result<Vec<u8>>, cancelled: bool) -> (Vec<u8>, bool) {
+    match result {
+        Ok(bytes) if bytes.first() == Some(&1) => (bytes, true),
+        Ok(_) if cancelled => (ResponseWriter::cancelled(), true),
+        Ok(bytes) => (bytes, true),
+        Err(_) => (
+            ResponseWriter::error("internal error: engine operation panicked"),
+            false,
+        ),
+    }
+}
+
+/// Execute one job against the lane's state and post the result. Returns
+/// false when the engine panicked and the lane must stop serving.
+fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) -> bool {
+    // Marked before the job's flag is read, so a cancel either lands first
+    // (and the job is skipped) or finds the job running; see `cancel_job`.
+    *controller.running.lock().unwrap() = Some(job.job_id);
+
     // Dequeued after a kill or a per-job cancel: the notify callbacks
     // may be dead and the buffers may be gone. Touch neither. The
     // Dart Router already resolved this job's task as cancelled (it
@@ -265,7 +370,8 @@ fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) {
     if controller.cancel.load(Ordering::SeqCst) || job.cancel.load(Ordering::SeqCst) {
         post_result(job.result_port, ResponseWriter::cancelled());
         controller.tickets.lock().unwrap().remove(&job.job_id);
-        return;
+        *controller.running.lock().unwrap() = None;
+        return true;
     }
 
     // Register channels BEFORE constructing readers/writers. The
@@ -317,22 +423,18 @@ fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) {
     controller.channels.release_job(&job);
     controller.tickets.lock().unwrap().remove(&job.job_id);
 
-    // A cancel that landed mid-op makes the engine unwind with an
-    // I/O error — but the caller must see the typed cancelled status,
-    // identical to a pre-dequeue cancel. The flags are set-once, so
-    // this check cannot misfire on a job that finished normally.
+    // The flags are set-once, so this check cannot misfire on a job that
+    // finished normally.
     let was_cancelled = controller.cancel.load(Ordering::SeqCst)
         || job.cancel.load(Ordering::SeqCst);
 
-    let bytes = if was_cancelled {
-        ResponseWriter::cancelled()
-    } else {
-        match result {
-            Ok(bytes) => bytes,
-            Err(_) => ResponseWriter::error("internal error: engine operation panicked"),
-        }
-    };
+    let (bytes, survives) = outcome(result, was_cancelled);
+    if !survives {
+        controller.dead.store(true, Ordering::SeqCst);
+    }
+    *controller.running.lock().unwrap() = None;
     post_result(job.result_port, bytes);
+    survives
 }
 
 /// Post result bytes to the job's Dart port. A closed port (job
@@ -383,7 +485,7 @@ mod tests {
 
         // A cancel for a FINISHED job must not touch the held channel.
         registry.cancel_job(1);
-        assert!(!sb::has_flag(buf.as_ptr(), rc::OFFSET_FLAGS, sb::FLAG_CANCELLED));
+        assert!(!sb::is_cancelled(buf.as_ptr(), rc::OFFSET_CANCEL));
 
         // Job 2 (no channels of its own) adopts the held channel —
         // cancelling job 2 now wakes the held reader it may be
@@ -398,7 +500,7 @@ mod tests {
         };
         registry.register(&job2);
         registry.cancel_job(2);
-        assert!(sb::has_flag(buf.as_ptr(), rc::OFFSET_FLAGS, sb::FLAG_CANCELLED));
+        assert!(sb::is_cancelled(buf.as_ptr(), rc::OFFSET_CANCEL));
 
         // After job 2 the channel parks back under HELD...
         registry.release_job(&job2);
@@ -423,5 +525,77 @@ mod tests {
         assert_eq!(registry.live_count(), 0);
 
         unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR) };
+    }
+
+    #[test]
+    fn a_job_revives_the_held_channel_a_finished_jobs_cancel_flagged() {
+        let registry = ChannelRegistry::new();
+        let mut buf = read_buf();
+
+        let job1 = job_with_source(1, &mut buf, true);
+        registry.register(&job1);
+        // Job 1 is cancelled while it runs: its held channel is flagged.
+        registry.cancel_job(1);
+        assert!(sb::is_cancelled(buf.as_ptr(), rc::OFFSET_CANCEL));
+        registry.release_job(&job1);
+
+        // Job 2 adopts the held channel and must find it live.
+        let job2 = Job {
+            job_id: 2,
+            request: vec![],
+            sources: vec![],
+            sinks: vec![],
+            result_port: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        registry.register(&job2);
+        assert!(!sb::is_cancelled(buf.as_ptr(), rc::OFFSET_CANCEL));
+
+        // A cancel of job 2 still wakes it, after the revival.
+        registry.cancel_job(2);
+        assert!(sb::is_cancelled(buf.as_ptr(), rc::OFFSET_CANCEL));
+
+        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR) };
+    }
+
+    #[test]
+    fn a_success_is_never_rewritten_by_a_cancel() {
+        let created = ResponseWriter::ok().finish();
+        let (bytes, survives) = outcome(Ok(created.clone()), true);
+        assert_eq!(bytes, created);
+        assert!(survives);
+    }
+
+    #[test]
+    fn a_failure_after_a_cancel_reads_as_cancelled() {
+        let (bytes, survives) = outcome(Ok(ResponseWriter::error("host read failed")), true);
+        assert_eq!(bytes, ResponseWriter::cancelled());
+        assert!(survives);
+
+        let failure = ResponseWriter::error("not found");
+        assert_eq!(outcome(Ok(failure.clone()), false).0, failure);
+    }
+
+    #[test]
+    fn a_panic_is_reported_and_ends_the_lane_even_when_cancelled() {
+        let panicked = std::panic::catch_unwind(|| -> Vec<u8> { panic!("engine bug") });
+        let (bytes, survives) = outcome(panicked, true);
+        assert_eq!(bytes, ResponseWriter::error("internal error: engine operation panicked"));
+        assert!(!survives);
+    }
+
+    #[test]
+    fn a_cancel_tells_a_queued_job_from_a_running_one() {
+        let (sender, _receiver) = crossbeam_channel::unbounded::<Job>();
+        let controller = LaneController::new(sender);
+        for id in [1, 2] {
+            controller.tickets.lock().unwrap().insert(id, Arc::new(AtomicBool::new(false)));
+        }
+        *controller.running.lock().unwrap() = Some(1);
+
+        assert!(!controller.cancel_job(1), "job 1 is running");
+        assert!(controller.cancel_job(2), "job 2 has not started");
+        assert!(!controller.cancel_job(3), "job 3 is unknown, or already finished");
+        assert!(controller.tickets.lock().unwrap()[&2].load(Ordering::SeqCst));
     }
 }

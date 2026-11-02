@@ -12,17 +12,20 @@
 //!
 //! Lifecycle:
 //!   1. Lane thread locks the mutex
-//!   2. Lane thread writes (offset, count) to shared buffer, clears flags
+//!   2. Lane thread writes (offset, count) to shared buffer and notes the
+//!      response word it will wait to see change
 //!   3. Lane thread calls notify_fn (wakes Dart listener)
 //!   4. Lane thread blocks on condvar (atomically unlocks mutex + parks)
 //!   5. Dart reads from DataSource, writes bytes to shared buffer
-//!   6. Dart sets FLAG_READY, locks mutex, signals condvar, unlocks mutex
+//!   6. Dart publishes READY in the response word, locks mutex, signals
+//!      condvar, unlocks mutex
 //!   7. Lane thread wakes (mutex re-locked), copies bytes, unlocks, returns
 //!
-//! Cancellation: FLAG_CANCELLED is STICKY on the channel — each
-//! request clears only the response bits, so a cancel can never be
-//! erased by a racing request cycle. The token is checked before each
-//! request and re-checked (with the sticky flag) before notifying.
+//! Cancellation: FLAG_CANCELLED lives in the channel's own cancel word,
+//! written only by Rust, and is STICKY — a request never touches it, so a
+//! cancel can never be erased by a racing request cycle. The token is
+//! checked before each request and re-checked (with the sticky flag)
+//! before notifying.
 //! Because the killer takes this buffer's pair mutex before flagging,
 //! a kill can never land between the re-check and the notify call —
 //! so once a kill returns, this reader will never invoke `notify_fn`
@@ -64,8 +67,7 @@ impl CallbackReader {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.token.is_cancelled()
-            || sb::has_flag(self.buf, rc::OFFSET_FLAGS, sb::FLAG_CANCELLED)
+        self.token.is_cancelled() || sb::is_cancelled(self.buf, rc::OFFSET_CANCEL)
     }
 }
 
@@ -105,13 +107,15 @@ impl Read for CallbackReader {
         let pair = unsafe { sb::get_sync(self.buf, rc::OFFSET_SYNC_PTR) };
         let guard = pair.mutex.lock().unwrap();
 
+        // Dart answers by echoing this number; an answer to any earlier
+        // request on the channel (a cancelled one, answered late) is not ours.
+        let request = sb::next_request(self.buf, rc::OFFSET_REQUEST_SEQ);
         unsafe {
             sb::write_i64(self.buf, rc::OFFSET_REQUEST_OFFSET, self.position as i64);
             sb::write_i64(self.buf, rc::OFFSET_REQUEST_COUNT, to_read as i64);
-            sb::clear_response_flags(self.buf, rc::OFFSET_FLAGS);
         }
 
-        // Re-check after clearing response bits: FLAG_CANCELLED is
+        // Re-check after the request is written: FLAG_CANCELLED is
         // sticky, so both a token kill and a buffer-flag cancel are
         // caught here — before notify_fn could ring a dead callback.
         if self.is_cancelled() {
@@ -120,12 +124,13 @@ impl Read for CallbackReader {
 
         unsafe { (self.notify_fn)(); }
 
-        let flags = sb::wait_for_flags(
+        let flags = sb::wait_for_response(
             pair,
             guard,
             self.buf,
-            rc::OFFSET_FLAGS,
-            sb::FLAG_READY | sb::FLAG_ERROR | sb::FLAG_CANCELLED,
+            rc::OFFSET_RESPONSE,
+            rc::OFFSET_CANCEL,
+            request,
             &self.token,
         )?;
 
@@ -229,7 +234,7 @@ mod tests {
     fn read_with_cancelled_buffer_flag_returns_non_retryable_error() {
         let mut buf = vec![0u8; rc::TOTAL_SIZE];
         unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
-        sb::set_flag_bits(buf.as_mut_ptr(), rc::OFFSET_FLAGS, sb::FLAG_CANCELLED);
+        sb::set_cancelled(buf.as_mut_ptr(), rc::OFFSET_CANCEL);
 
         let mut reader = unsafe {
             CallbackReader::new(buf.as_mut_ptr(), noop_notify, 1000, CancelToken::unconnected())

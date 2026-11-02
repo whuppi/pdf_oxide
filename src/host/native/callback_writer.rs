@@ -14,7 +14,8 @@
 //! in flight at any time. The output is never buffered in memory.
 //!
 //! Cancellation mirrors CallbackReader: FLAG_CANCELLED is sticky
-//! (each flush clears only the response bits), and the token + flag
+//! (it lives in the channel's Rust-written cancel word, which a flush
+//! never touches), and the token + flag
 //! are re-checked before notifying, under the pair mutex the killer
 //! must take first — so once a kill returns, this writer will never
 //! invoke `notify_fn` again.
@@ -50,8 +51,7 @@ impl CallbackWriter {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.token.is_cancelled()
-            || sb::has_flag(self.buf, wc::OFFSET_FLAGS, sb::FLAG_CANCELLED)
+        self.token.is_cancelled() || sb::is_cancelled(self.buf, wc::OFFSET_CANCEL)
     }
 
     fn flush_pending(&mut self) -> io::Result<()> {
@@ -66,13 +66,12 @@ impl CallbackWriter {
         let pair = unsafe { sb::get_sync(self.buf, wc::OFFSET_SYNC_PTR) };
         let guard = pair.mutex.lock().unwrap();
 
+        let request = sb::next_request(self.buf, wc::OFFSET_REQUEST_SEQ);
         unsafe {
             sb::write_i64(self.buf, wc::OFFSET_CHUNK_LENGTH, self.pending as i64);
-            sb::clear_response_flags(self.buf, wc::OFFSET_FLAGS);
-            sb::set_flag_bits(self.buf, wc::OFFSET_FLAGS, sb::FLAG_READY);
         }
 
-        // Re-check after clearing response bits — same protocol as
+        // Re-check after the chunk is written — same protocol as
         // the reader: sticky flag + token, before ringing a possibly
         // dead callback.
         if self.is_cancelled() {
@@ -82,12 +81,13 @@ impl CallbackWriter {
 
         unsafe { (self.notify_fn)(); }
 
-        let flags = sb::wait_for_flags(
+        let flags = sb::wait_for_response(
             pair,
             guard,
             self.buf,
-            wc::OFFSET_FLAGS,
-            sb::FLAG_ACK | sb::FLAG_ERROR | sb::FLAG_CANCELLED,
+            wc::OFFSET_RESPONSE,
+            wc::OFFSET_CANCEL,
+            request,
             &self.token,
         )?;
 

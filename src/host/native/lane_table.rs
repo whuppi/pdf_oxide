@@ -30,7 +30,7 @@
 
 use crate::host::binary_codec::ResponseWriter;
 use crate::host::native::lane::{
-    lane_main, post_result, ChannelRegistry, Job, LaneController, SinkChannel, SourceChannel,
+    lane_main, post_result, Job, LaneController, SinkChannel, SourceChannel, LANE_DEAD_MESSAGE,
 };
 use crossbeam_channel::{unbounded, Receiver};
 use std::collections::{HashMap, VecDeque};
@@ -127,12 +127,7 @@ fn start_thread(key: u64, mailbox: Receiver<Job>, controller: Arc<LaneController
 /// never errors.
 pub fn spawn() -> u64 {
     let (sender, receiver) = unbounded::<Job>();
-    let controller = Arc::new(LaneController {
-        mailbox: Mutex::new(Some(sender)),
-        cancel: Arc::new(AtomicBool::new(false)),
-        channels: ChannelRegistry::new(),
-        tickets: Mutex::new(HashMap::new()),
-    });
+    let controller = Arc::new(LaneController::new(sender));
 
     let key = NEXT_LANE_KEY.fetch_add(1, Ordering::Relaxed);
     table().lock().unwrap().insert(key, controller.clone());
@@ -178,27 +173,38 @@ pub fn submit(lane_key: u64, job: Job) {
             }
         }
         None => {
-            // Killed between the table lookup and here.
+            // Killed, or stopped after a panic, between the table lookup
+            // and here.
             controller.tickets.lock().unwrap().remove(&job.job_id);
-            post_result(job.result_port, ResponseWriter::cancelled());
+            let bytes = if controller.dead.load(Ordering::SeqCst) {
+                ResponseWriter::error(LANE_DEAD_MESSAGE)
+            } else {
+                ResponseWriter::cancelled()
+            };
+            post_result(job.result_port, bytes);
         }
     }
 }
 
 /// Cancel one job. Instant, idempotent. Queued → it will be skipped
-/// at dequeue. Running → its I/O wakes with FLAG_CANCELLED and the
-/// op unwinds at the next I/O boundary. The lane and every other job
-/// on it are untouched.
-pub fn cancel_job(lane_key: u64, job_id: u64) {
+/// at dequeue, never reaches the engine, and this returns true so the
+/// host can complete it at once. Running → its I/O wakes with
+/// FLAG_CANCELLED and the op unwinds at the next I/O boundary. The lane
+/// and every other job on it are untouched.
+pub fn cancel_job(lane_key: u64, job_id: u64) -> bool {
     let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
-        return;
+        return false;
     };
+    controller.cancel_job(job_id)
+}
 
-    if let Some(flag) = controller.tickets.lock().unwrap().get(&job_id) {
-        flag.store(true, Ordering::SeqCst);
-    }
-    // Wake the job's parked I/O (no-op if it has none registered).
-    controller.channels.cancel_job(job_id);
+/// True once the lane's engine panicked and the lane stopped serving.
+pub fn is_dead(lane_key: u64) -> bool {
+    table()
+        .lock()
+        .unwrap()
+        .get(&lane_key)
+        .is_some_and(|controller| controller.dead.load(Ordering::SeqCst))
 }
 
 /// Kill a lane. Instant, idempotent, never joins. After this returns
@@ -304,10 +310,17 @@ pub unsafe extern "C" fn lane_submit(
     );
 }
 
-/// Cancel one job on a lane.
+/// Cancel one job on a lane. Returns 1 when the job had not started and
+/// the lane will skip it, 0 otherwise.
 #[no_mangle]
-pub extern "C" fn lane_job_cancel(lane_key: u64, job_id: u64) {
-    cancel_job(lane_key, job_id);
+pub extern "C" fn lane_job_cancel(lane_key: u64, job_id: u64) -> u8 {
+    cancel_job(lane_key, job_id) as u8
+}
+
+/// 1 when the lane's engine panicked and the lane stopped serving, else 0.
+#[no_mangle]
+pub extern "C" fn lane_is_dead(lane_key: u64) -> u8 {
+    is_dead(lane_key) as u8
 }
 
 /// Kill a lane and everything on it. Instant; never blocks.
@@ -673,5 +686,81 @@ mod tests {
             }),
             "killed lanes still present in table"
         );
+    }
+
+    /// The test-support op that panics the engine.
+    #[cfg(feature = "test-support")]
+    fn panic_request() -> Vec<u8> {
+        let mut bytes = vec![9u8];
+        bytes.extend_from_slice(b"testPanic");
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes
+    }
+
+    #[cfg(feature = "test-support")]
+    fn panic_job(job_id: u64) -> Job {
+        Job {
+            job_id,
+            request: panic_request(),
+            sources: vec![],
+            sinks: vec![],
+            result_port: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cancelling_a_queued_job_skips_it_and_nothing_reaches_the_engine() {
+        // The queued job would panic the engine if it ran, so a lane still
+        // alive afterwards proves it never reached it.
+        let mut parked = ParkedSource::new();
+        let key = spawn();
+        let controller = controller_for(key).unwrap();
+
+        submit(key, parked_job(1, &mut parked));
+        assert!(wait_running(&controller), "lane never started job 1");
+        submit(key, panic_job(2));
+
+        assert!(cancel_job(key, 2), "job 2 had not started");
+        assert!(!cancel_job(key, 1), "job 1 is running");
+        assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
+        assert!(!is_dead(key), "the cancelled job reached the engine");
+        assert!(!cancel_job(key, 2), "a finished job is no longer queued");
+
+        kill(key);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_panic_ends_the_lane_and_every_job_behind_it_fails() {
+        let mut parked = ParkedSource::new();
+        let key = spawn();
+        let controller = controller_for(key).unwrap();
+
+        submit(key, parked_job(1, &mut parked));
+        assert!(wait_running(&controller), "lane never started job 1");
+        submit(key, panic_job(2));
+        submit(key, panic_job(3));
+        submit(key, panic_job(4));
+
+        // Job 1 yields to its cancel; job 2 panics; 3 and 4 are failed
+        // without running.
+        assert!(!cancel_job(key, 1));
+        assert!(
+            wait_until(Duration::from_secs(5), || is_dead(key) && tickets_empty(&controller)),
+            "the lane did not stop after a panic"
+        );
+
+        // A job arriving after the panic is failed at the door.
+        submit(key, panic_job(5));
+        assert!(tickets_empty(&controller));
+        assert!(controller.mailbox.lock().unwrap().is_none());
+
+        // A fresh lane serves as before.
+        let other = spawn();
+        assert!(!is_dead(other));
+        kill(other);
+        kill(key);
     }
 }
