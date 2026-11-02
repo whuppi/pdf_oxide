@@ -7737,7 +7737,7 @@ impl DocumentEditor {
         // ── end pdf_manipulator patch ──
 
         let all_source_ids = self.source.all_object_ids();
-        for obj_id in all_source_ids {
+        for obj_id in all_source_ids.iter().copied() {
             if obj_id == 0 || xref_entries.contains_id(obj_id) {
                 continue;
             }
@@ -7860,6 +7860,16 @@ impl DocumentEditor {
                 .modified_objects
                 .iter()
                 .filter(|(&id, _)| !xref_entries.contains_id(id))
+                // ── pdf_manipulator patch: a staged source object the sweep found unreachable stays out ──
+                // A flattened widget is staged by the form flush (its new /V) yet
+                // no page or field names it any more; writing it here would name
+                // its /AP stream, which the sweep above did not write.
+                .filter(|(&id, _)| {
+                    reachable_ids.as_ref().is_none_or(|reachable| {
+                        reachable.contains(&id) || all_source_ids.binary_search(&id).is_err()
+                    })
+                })
+                // ── end pdf_manipulator patch ──
                 // ── pdf_manipulator patch: dropped pages never written (#261) ──
                 .filter(|(&id, _)| !prune.excluded.contains(&id) && !dropped_only.contains(&id))
                 // ── end pdf_manipulator patch ──

@@ -46,6 +46,8 @@ mod pattern_paint;
 mod predictor_depths;
 #[cfg(feature = "rendering")]
 mod image_mods_belt;
+#[cfg(feature = "rendering")]
+mod redact_after_value;
 mod redact_pass;
 #[cfg(feature = "rendering")]
 mod redact_flatten;
