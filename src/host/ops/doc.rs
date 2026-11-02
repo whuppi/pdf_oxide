@@ -7,7 +7,8 @@ use crate::host::dispatch;
 use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
-    authenticate_or_refuse, handle_with_doc, ok_flag, open_source, page_of, pages_of, req_handle,
+    authenticate_or_refuse, handle_with_doc, ok_flag, open_source, page_of, pages_of,
+    put_page_infos, req_handle,
 };
 
 op_unit!(OPEN, "open", pdf_op_open_anchor, |ctx| {
@@ -35,19 +36,7 @@ op_unit!(PAGE_INFO, "pageInfo", pdf_op_page_info_anchor, |ctx| {
         };
         let infos = dispatch::page_info(doc, &pages, cancel)?;
         let mut w = ResponseWriter::ok();
-        w.put_map_list("pages", infos.len(), |i, item| {
-            let p = &infos[i];
-            item.put_i32("index", pages[i] as i32);
-            item.put_f64("width", p.width);
-            item.put_f64("height", p.height);
-            item.put_str(
-                "rotation",
-                dispatch::rotation_name_from_degrees(p.rotation).unwrap_or("r0"),
-            );
-            if let Some(label) = &p.label {
-                item.put_str("label", label);
-            }
-        });
+        put_page_infos(&mut w, &pages, &infos);
         Ok(w.finish())
     })
 });
@@ -326,6 +315,7 @@ fn handle_open(
             w.put_str("producer", &result.producer);
             w.put_str("creator", &result.creator);
             w.put_str("creationDate", &result.creation_date);
+            w.put_str("modDate", &result.mod_date);
             w.finish()
         }
         Err(e) => ResponseWriter::error_of(&e),

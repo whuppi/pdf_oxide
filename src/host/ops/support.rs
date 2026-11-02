@@ -44,6 +44,52 @@ pub(crate) fn pages_of(pages: &[i32], count: usize) -> Result<Vec<usize>, Vec<u8
     pages.iter().map(|&p| page_of(p, count)).collect()
 }
 
+/// The pages a request names, checked against a document of `count` pages:
+/// every page when `pagesAll` is set, else the `pages` list. The first bad
+/// entry is the one answered. An empty or repeating list is the edit's to
+/// refuse.
+pub(crate) fn page_set_of(req: &Request<'_>, count: usize) -> Result<Vec<usize>, Vec<u8>> {
+    if req.get_bool("pagesAll").unwrap_or(false) {
+        return Ok((0..count).collect());
+    }
+    pages_of(req.get_int_list("pages").unwrap_or(&[]), count)
+}
+
+/// Writes the `pages` list of a page-info response: one map per page, its
+/// index (`indices[i]`), media box origin and size, the page's own crop box
+/// when it has one, rotation and label.
+pub(crate) fn put_page_infos(
+    w: &mut ResponseWriter,
+    indices: &[usize],
+    infos: &[crate::host::dispatch::PageInfo],
+) {
+    w.put_map_list("pages", infos.len(), |i, item| {
+        let p = &infos[i];
+        item.put_i32("index", indices[i] as i32);
+        item.put_f64("x", p.x);
+        item.put_f64("y", p.y);
+        item.put_f64("width", p.width);
+        item.put_f64("height", p.height);
+        match p.crop_box {
+            Some([x, y, width, height]) => {
+                item.put_bool("hasCrop", true);
+                item.put_f64("cropX", x);
+                item.put_f64("cropY", y);
+                item.put_f64("cropWidth", width);
+                item.put_f64("cropHeight", height);
+            }
+            None => item.put_bool("hasCrop", false),
+        }
+        item.put_str(
+            "rotation",
+            crate::host::dispatch::rotation_name_from_degrees(p.rotation).unwrap_or("r0"),
+        );
+        if let Some(label) = &p.label {
+            item.put_str("label", label);
+        }
+    });
+}
+
 /// A success response carrying a single `true` flag.
 pub(crate) fn ok_flag(key: &str) -> Vec<u8> {
     let mut w = ResponseWriter::ok();

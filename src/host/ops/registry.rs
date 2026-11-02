@@ -47,9 +47,8 @@ static OPS: &[&OpEntry] = &[
     &editor::MERGE_FROM,
     &editor::MUTATE,
     &editor::OPEN,
-    &editor::PAGE_CROP_BOX,
     &editor::PAGE_IMAGES,
-    &editor::PAGE_MEDIA_BOX,
+    &editor::PAGE_INFO,
     &editor::REDACTION_COUNT,
     &editor::SAVE,
     // fonts

@@ -8,7 +8,7 @@ use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
     authenticate_or_refuse, handle_with_editor, ok_flag, ok_response, open_source, page_of,
-    pages_of, read_all_from_reader, req_handle,
+    page_set_of, pages_of, put_page_infos, read_all_from_reader, req_handle,
 };
 
 use crate::editor::DocumentEditor;
@@ -37,8 +37,10 @@ op_unit!(
             w.put_str("author", &m.author);
             w.put_str("subject", &m.subject);
             w.put_str("keywords", &m.keywords);
+            w.put_str("creator", &m.creator);
             w.put_str("producer", &m.producer);
             w.put_str("creationDate", &m.creation_date);
+            w.put_str("modDate", &m.mod_date);
             Ok(w.finish())
         })
     }
@@ -59,48 +61,19 @@ op_unit!(
 );
 
 op_unit!(
-    PAGE_MEDIA_BOX,
-    "editorPageMediaBox",
-    pdf_op_editor_page_media_box_anchor,
+    PAGE_INFO,
+    "editorPageInfo",
+    pdf_op_editor_page_info_anchor,
     |ctx| {
+        let cancel = ctx.cancel;
         handle_with_editor(ctx.state, ctx.req, |editor, req| {
-            let page = match page_of(req.get_i32("page").unwrap_or(0), editor.current_page_count()) {
-                Ok(i) => i,
+            let pages = match page_set_of(req, editor.current_page_count()) {
+                Ok(pages) => pages,
                 Err(resp) => return Ok(resp),
             };
-            let (x, y, w2, h) = dispatch::edit_page_media_box(editor, page)?;
+            let infos = dispatch::edit_page_info(editor, &pages, cancel)?;
             let mut w = ResponseWriter::ok();
-            w.put_f64("x", x as f64);
-            w.put_f64("y", y as f64);
-            w.put_f64("width", w2 as f64);
-            w.put_f64("height", h as f64);
-            Ok(w.finish())
-        })
-    }
-);
-
-op_unit!(
-    PAGE_CROP_BOX,
-    "editorPageCropBox",
-    pdf_op_editor_page_crop_box_anchor,
-    |ctx| {
-        handle_with_editor(ctx.state, ctx.req, |editor, req| {
-            let page = match page_of(req.get_i32("page").unwrap_or(0), editor.current_page_count()) {
-                Ok(i) => i,
-                Err(resp) => return Ok(resp),
-            };
-            let cropped = dispatch::edit_page_crop_box(editor, page)?;
-            let mut w = ResponseWriter::ok();
-            match cropped {
-                Some((x, y, w2, h)) => {
-                    w.put_bool("has", true);
-                    w.put_f64("x", x as f64);
-                    w.put_f64("y", y as f64);
-                    w.put_f64("width", w2 as f64);
-                    w.put_f64("height", h as f64);
-                }
-                None => w.put_bool("has", false),
-            }
+            put_page_infos(&mut w, &pages, &infos);
             Ok(w.finish())
         })
     }
@@ -224,10 +197,14 @@ fn handle_editor_merge_from(
         return ResponseWriter::error("editor not found");
     };
     let result = if let Some(reader) = merge_reader {
-        match pages {
-            Some(ref pages) => editor.merge_pages_from_reader(reader.0, pages),
-            None => editor.merge_from_reader(reader.0),
+        let source = match DocumentEditor::open_merge_source(reader.0) {
+            Ok(doc) => doc,
+            Err(e) => return ResponseWriter::error_of(&e),
+        };
+        if let Some(resp) = authenticate_or_refuse(&source, req.get_str("password")) {
+            return resp;
         }
+        editor.merge_document(source, pages.as_deref())
     } else if let Some(other) = req.get_bytes("otherBytes") {
         editor.merge_from_bytes(other)
     } else {
@@ -291,7 +268,7 @@ fn do_editor_mutate(
     }
 
     match edit_op {
-        "selectPages" => {
+        "keepPages" => {
             let pages = match pages_of(req.get_int_list("pages").unwrap_or(&[]), count) {
                 Ok(p) => p,
                 Err(resp) => return Ok(resp),
@@ -299,18 +276,49 @@ fn do_editor_mutate(
             dispatch::edit_select_pages(editor, &pages)?;
             ok_response()
         }
-        "deletePage" => {
-            let page = page!();
-            dispatch::edit_delete_pages(editor, &[page])?;
+        "deletePages" => {
+            let pages = match page_set_of(req, count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
+            dispatch::edit_delete_pages(editor, &pages)?;
             ok_response()
         }
-        "rotatePage" => {
-            let page = page!();
-            dispatch::edit_rotate_pages(editor, &[(page, rotation_of(req)?)])?;
+        "rotatePages" => {
+            let pages = match page_set_of(req, count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
+            dispatch::edit_rotate_pages(editor, &pages, rotation_of(req)?)?;
             ok_response()
         }
-        "rotateAll" => {
-            dispatch::edit_rotate_all(editor, rotation_of(req)?)?;
+        "setRotation" => {
+            let pages = match page_set_of(req, count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
+            dispatch::edit_set_rotation(editor, &pages, rotation_of(req)?)?;
+            ok_response()
+        }
+        "setMetadata" => {
+            // An empty string is an absent field: it is left out of the
+            // saved info dictionary.
+            let field = |key: &str| {
+                req.get_str(key).filter(|s| !s.is_empty()).map(str::to_string)
+            };
+            dispatch::edit_set_metadata(
+                editor,
+                crate::editor::DocumentInfo {
+                    title: field("title"),
+                    author: field("author"),
+                    subject: field("subject"),
+                    keywords: field("keywords"),
+                    creator: field("creator"),
+                    producer: field("producer"),
+                    creation_date: field("creationDate"),
+                    mod_date: field("modDate"),
+                },
+            )?;
             ok_response()
         }
         "movePage" => {
@@ -366,27 +374,31 @@ fn do_editor_mutate(
             )?;
             ok_response()
         }
-        "setPageMediaBox" => {
-            let page = page!();
+        "setMediaBox" => {
+            let pages = match page_set_of(req, count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
             let x = req.get_f64("x").unwrap_or(0.0) as f32;
             let y = req.get_f64("y").unwrap_or(0.0) as f32;
             let width = req.get_f64("width").unwrap_or(0.0) as f32;
             let height = req.get_f64("height").unwrap_or(0.0) as f32;
-            dispatch::edit_set_page_media_box(editor, page, [x, y, x + width, y + height])?;
+            dispatch::edit_set_media_box(editor, &pages, [x, y, x + width, y + height])?;
             ok_response()
         }
-        "setPageCropBox" => {
-            let page = page!();
-            let x = req.get_f64("x").unwrap_or(0.0) as f32;
-            let y = req.get_f64("y").unwrap_or(0.0) as f32;
-            let width = req.get_f64("width").unwrap_or(0.0) as f32;
-            let height = req.get_f64("height").unwrap_or(0.0) as f32;
-            dispatch::edit_set_page_crop_box(editor, page, [x, y, x + width, y + height])?;
-            ok_response()
-        }
-        "setPageRotation" => {
-            let page = page!();
-            dispatch::edit_set_page_rotation(editor, page, rotation_of(req)?)?;
+        "setCropBox" => {
+            let pages = match page_set_of(req, count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
+            // No `width` key means no box: the pages lose their own crop box.
+            let crop = req.get_f64("width").map(|width| {
+                let x = req.get_f64("x").unwrap_or(0.0) as f32;
+                let y = req.get_f64("y").unwrap_or(0.0) as f32;
+                let height = req.get_f64("height").unwrap_or(0.0) as f32;
+                [x, y, x + width as f32, y + height]
+            });
+            dispatch::edit_set_crop_box(editor, &pages, crop)?;
             ok_response()
         }
         "reduceImages" => {
@@ -462,16 +474,17 @@ fn do_editor_mutate(
         "watermark" => {
             let pos_fields: Vec<f32> = req.get_f64_list("posFields")
                 .unwrap_or(&[]).iter().map(|&f| f as f32).collect();
-            // A negative page means every page; only a named page is checked.
-            let page = req.get_i32("page").unwrap_or(-1);
-            if page >= 0 {
-                if let Err(resp) = page_of(page, count) {
-                    return Ok(resp);
+            let pages = if req.get_bool("pagesAll").unwrap_or(false) {
+                None
+            } else {
+                match page_set_of(req, count) {
+                    Ok(p) => Some(p),
+                    Err(resp) => return Ok(resp),
                 }
-            }
+            };
             dispatch::edit_watermark(
                 editor,
-                page,
+                pages.as_deref(),
                 req.get_str("text").unwrap_or("WATERMARK"),
                 req.get_f64("fontSize").unwrap_or(48.0) as f32,
                 req.get_f64("rotation").unwrap_or(45.0) as f32,
@@ -517,30 +530,6 @@ fn do_editor_mutate(
             )?;
             ok_response()
         }
-        "setTitle" => {
-            dispatch::edit_set_title(editor, req.get_str("title").unwrap_or(""));
-            ok_response()
-        }
-        "setAuthor" => {
-            dispatch::edit_set_author(editor, req.get_str("author").unwrap_or(""));
-            ok_response()
-        }
-        "setSubject" => {
-            dispatch::edit_set_subject(editor, req.get_str("subject").unwrap_or(""));
-            ok_response()
-        }
-        "setKeywords" => {
-            dispatch::edit_set_keywords(editor, req.get_str("keywords").unwrap_or(""));
-            ok_response()
-        }
-        "setProducer" => {
-            dispatch::edit_set_producer(editor, req.get_str("producer").unwrap_or(""));
-            ok_response()
-        }
-        "setCreationDate" => {
-            dispatch::edit_set_creation_date(editor, req.get_str("creationDate").unwrap_or(""));
-            ok_response()
-        }
         "unembedStandardFonts" => {
             let count = dispatch::edit_unembed_standard_fonts(editor)?;
             let mut w = ResponseWriter::ok();
@@ -578,26 +567,6 @@ fn do_editor_mutate(
             let level = dispatch::pdfa_level_from_name(name)
                 .ok_or_else(|| Error::InvalidOperation(format!("unknown PDF/A level: {name}")))?;
             dispatch::edit_convert_to_pdf_a(editor, level, cancel)?;
-            ok_response()
-        }
-        "resizeImage" => {
-            dispatch::edit_resize_image(
-                editor,
-                page!(),
-                req.get_str("imageName").unwrap_or(""),
-                req.get_f64("width").unwrap_or(100.0) as f32,
-                req.get_f64("height").unwrap_or(100.0) as f32,
-            )?;
-            ok_response()
-        }
-        "repositionImage" => {
-            dispatch::edit_reposition_image(
-                editor,
-                page!(),
-                req.get_str("imageName").unwrap_or(""),
-                req.get_f64("x").unwrap_or(0.0) as f32,
-                req.get_f64("y").unwrap_or(0.0) as f32,
-            )?;
             ok_response()
         }
         "setImageBounds" => {

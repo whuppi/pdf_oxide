@@ -18,6 +18,7 @@ mod editor_nested;
 mod editor_objstm;
 mod editor_orphans;
 mod editor_packed;
+mod editor_page_sets;
 mod editor_trailer;
 #[cfg(feature = "rendering")]
 mod ext_gstate_lines;

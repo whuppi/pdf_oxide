@@ -54,14 +54,23 @@ pub struct OpenResult {
     pub creator: String,
     /// Document info CreationDate field (raw PDF date string).
     pub creation_date: String,
+    /// Document info ModDate field (raw PDF date string).
+    pub mod_date: String,
 }
 
-/// Dimensions and rotation of a single page.
+/// Dimensions, boxes and rotation of a single page.
 pub struct PageInfo {
+    /// The media box's left edge in points.
+    pub x: f64,
+    /// The media box's bottom edge in points.
+    pub y: f64,
     /// Page width in points.
     pub width: f64,
     /// Page height in points.
     pub height: f64,
+    /// The page's `/CropBox` as `[x, y, width, height]` in points, when it
+    /// has one.
+    pub crop_box: Option<[f64; 4]>,
     /// Page rotation in degrees (0, 90, 180, 270).
     pub rotation: i32,
     /// The page's label from the catalog's `/PageLabels`, when it has one.
@@ -162,10 +171,14 @@ pub struct EditorMetadataResult {
     pub subject: String,
     /// Document keywords.
     pub keywords: String,
+    /// Document creator application.
+    pub creator: String,
     /// Document producer.
     pub producer: String,
     /// Document creation date (raw PDF date string).
     pub creation_date: String,
+    /// Document modification date (raw PDF date string).
+    pub mod_date: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -194,13 +207,14 @@ pub fn open_document(doc: &mut PdfDocument) -> Result<OpenResult> {
     let producer = doc.document_info_string("Producer").unwrap_or_default();
     let creator = doc.document_info_string("Creator").unwrap_or_default();
     let creation_date = doc.document_info_string("CreationDate").unwrap_or_default();
+    let mod_date = doc.document_info_string("ModDate").unwrap_or_default();
 
     Ok(OpenResult {
         page_count, version_major: major, version_minor: minor,
         is_encrypted, requires_password, is_tagged,
         encryption_algorithm: enc_algo, permission_bits: perms,
         title, author, subject, keywords,
-        producer, creator, creation_date,
+        producer, creator, creation_date, mod_date,
     })
 }
 
@@ -227,8 +241,13 @@ pub fn page_info(
         let facts = doc.page_facts(page_ref)?;
         let [x0, y0, x1, y1] = facts.media_box.unwrap_or([0.0, 0.0, 612.0, 792.0]);
         out.push(PageInfo {
+            x: x0 as f64,
+            y: y0 as f64,
             width: (x1 - x0) as f64,
             height: (y1 - y0) as f64,
+            crop_box: facts.crop_box.map(|[cx0, cy0, cx1, cy1]| {
+                [cx0 as f64, cy0 as f64, (cx1 - cx0) as f64, (cy1 - cy0) as f64]
+            }),
             rotation: facts.rotation(),
             label: (!ranges.is_empty()).then(|| PageLabelExtractor::get_label(&ranges, i)),
         });
@@ -711,17 +730,21 @@ pub fn doc_export_form_data<W: std::io::Write>(
 
 /// Read current metadata from the editor.
 pub fn edit_get_metadata(editor: &mut DocumentEditor) -> EditorMetadataResult {
+    use crate::editor::EditableDocument;
     let version = editor.version();
+    let info = editor.get_info().unwrap_or_default();
     EditorMetadataResult {
         page_count: editor.current_page_count(),
         version_major: version.0,
         version_minor: version.1,
-        title: editor.title().ok().flatten().unwrap_or_default(),
-        author: editor.author().ok().flatten().unwrap_or_default(),
-        subject: editor.subject().ok().flatten().unwrap_or_default(),
-        keywords: editor.keywords().ok().flatten().unwrap_or_default(),
-        producer: editor.producer().ok().flatten().unwrap_or_default(),
-        creation_date: editor.creation_date().ok().flatten().unwrap_or_default(),
+        title: info.title.unwrap_or_default(),
+        author: info.author.unwrap_or_default(),
+        subject: info.subject.unwrap_or_default(),
+        keywords: info.keywords.unwrap_or_default(),
+        creator: info.creator.unwrap_or_default(),
+        producer: info.producer.unwrap_or_default(),
+        creation_date: info.creation_date.unwrap_or_default(),
+        mod_date: info.mod_date.unwrap_or_default(),
     }
 }
 
@@ -730,56 +753,104 @@ pub fn edit_is_modified(editor: &DocumentEditor) -> bool {
     editor.is_modified()
 }
 
-/// Get the media box (x, y, width, height) for a page. `get_page_media_box`
-/// returns `[x0, y0, x1, y1]`; the corners are converted to an origin and a
-/// size so the wire never carries a box a caller could add the origin to
-/// twice.
-pub fn edit_page_media_box(editor: &mut DocumentEditor, page: usize) -> Result<(f32, f32, f32, f32)> {
-    let mb = editor.get_page_media_box(page)?;
-    Ok((mb[0], mb[1], mb[2] - mb[0], mb[3] - mb[1]))
+/// The facts of the editor's pages named, as the edited document has them
+/// now: media box, the page's own crop box (absent when it has none),
+/// rotation and the label the catalog's `/PageLabels` gives that position.
+/// The boxes are converted from corners to an origin and a size so the wire
+/// never carries a box a caller could add the origin to twice.
+pub fn edit_page_info(
+    editor: &mut DocumentEditor,
+    pages: &[usize],
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<Vec<PageInfo>> {
+    use crate::extractors::page_labels::PageLabelExtractor;
+    let ranges = PageLabelExtractor::extract(editor.source_mut()).unwrap_or_default();
+    let mut out = Vec::with_capacity(pages.len());
+    for &i in pages {
+        cancel.check()?;
+        let [x0, y0, x1, y1] = editor.get_page_media_box(i)?;
+        let crop_box = editor
+            .get_page_crop_box(i)?
+            .map(|[cx0, cy0, cx1, cy1]| {
+                [cx0 as f64, cy0 as f64, (cx1 - cx0) as f64, (cy1 - cy0) as f64]
+            });
+        out.push(PageInfo {
+            x: x0 as f64,
+            y: y0 as f64,
+            width: (x1 - x0) as f64,
+            height: (y1 - y0) as f64,
+            crop_box,
+            rotation: editor.get_page_rotation(i)?,
+            label: (!ranges.is_empty()).then(|| PageLabelExtractor::get_label(&ranges, i)),
+        });
+    }
+    Ok(out)
 }
 
-/// Get the crop box (x, y, width, height) for a page, or `None` when the
-/// page has no `/CropBox` — it then defaults to the MediaBox, and we
-/// report the absence rather than inventing the inherited value.
-pub fn edit_page_crop_box(
+/// Set the MediaBox of every page named, from an `[x0, y0, x1, y1]`
+/// rectangle. The pages are checked before the first is changed.
+pub fn edit_set_media_box(
     editor: &mut DocumentEditor,
-    page: usize,
-) -> Result<Option<(f32, f32, f32, f32)>> {
-    let cb = editor.get_page_crop_box(page)?;
-    Ok(cb.map(|c| (c[0], c[1], c[2] - c[0], c[3] - c[1])))
-}
-
-/// Set the MediaBox of a page from an `[x0, y0, x1, y1]` rectangle.
-pub fn edit_set_page_media_box(
-    editor: &mut DocumentEditor,
-    page: usize,
+    pages: &[usize],
     box_: [f32; 4],
 ) -> Result<()> {
-    editor.set_page_media_box(page, box_)
+    check_pages(editor, pages)?;
+    for &page in pages {
+        editor.set_page_media_box(page, box_)?;
+    }
+    Ok(())
 }
 
-/// Set the CropBox of a page from an `[x0, y0, x1, y1]` rectangle.
-pub fn edit_set_page_crop_box(
+/// Set the CropBox of every page named, or remove the page's own crop box
+/// when `box_` is `None`. The pages are checked before the first is changed.
+pub fn edit_set_crop_box(
     editor: &mut DocumentEditor,
-    page: usize,
-    box_: [f32; 4],
+    pages: &[usize],
+    box_: Option<[f32; 4]>,
 ) -> Result<()> {
-    editor.set_page_crop_box(page, box_)
+    check_pages(editor, pages)?;
+    for &page in pages {
+        match box_ {
+            Some(box_) => editor.set_page_crop_box(page, box_)?,
+            None => editor.remove_page_crop_box(page)?,
+        }
+    }
+    Ok(())
 }
 
-/// Set a page's absolute rotation (0/90/180/270). Unlike `edit_rotate_pages`
-/// (relative, additive), this replaces the stored rotation outright.
-pub fn edit_set_page_rotation(
+/// Set the absolute rotation (0/90/180/270) of every page named. Unlike
+/// `edit_rotate_pages` (relative, additive), this replaces the stored
+/// rotation outright. The pages are checked before the first is changed.
+pub fn edit_set_rotation(
     editor: &mut DocumentEditor,
-    page: usize,
+    pages: &[usize],
     degrees: i32,
 ) -> Result<()> {
-    editor.set_page_rotation(page, degrees)
+    check_pages(editor, pages)?;
+    for &page in pages {
+        editor.set_page_rotation(page, degrees)?;
+    }
+    Ok(())
+}
+
+/// Refuses a page list that is empty, names a page twice or names a page
+/// the editor does not have, before any of its pages is changed.
+fn check_pages(editor: &DocumentEditor, pages: &[usize]) -> Result<()> {
+    if pages.is_empty() {
+        return Err(Error::InvalidOperation("pages must not be empty".into()));
+    }
+    refuse_repeated_pages(pages.iter().copied())?;
+    let count = editor.current_page_count();
+    match pages.iter().find(|&&p| p >= count) {
+        Some(p) => Err(Error::InvalidOperation(format!(
+            "page {p} out of range (document has {count} pages)"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// List the image XObjects placed on a page: resource name, placement
-/// bounds and the full transform. The name is what `edit_resize_image`
+/// bounds and the full transform. The name is what `edit_set_image_bounds`
 /// takes; an out-of-range page is an error, a page without images an
 /// empty list.
 pub fn edit_page_images(
@@ -798,42 +869,24 @@ pub fn edit_page_images(
         .collect())
 }
 
-// ── Metadata setters ──
+// ── Metadata ──
 
-/// Set the document title.
-pub fn edit_set_title(editor: &mut DocumentEditor, value: &str) {
-    editor.set_title(value);
-}
-
-/// Set the document author.
-pub fn edit_set_author(editor: &mut DocumentEditor, value: &str) {
-    editor.set_author(value);
-}
-
-/// Set the document subject.
-pub fn edit_set_subject(editor: &mut DocumentEditor, value: &str) {
-    editor.set_subject(value);
-}
-
-/// Set the document keywords.
-pub fn edit_set_keywords(editor: &mut DocumentEditor, value: &str) {
-    editor.set_keywords(value);
-}
-
-/// Set the document producer.
-pub fn edit_set_producer(editor: &mut DocumentEditor, value: &str) {
-    editor.set_producer(value);
-}
-
-/// Set the document creation date (raw PDF date string, e.g. "D:20240101120000Z").
-pub fn edit_set_creation_date(editor: &mut DocumentEditor, value: &str) {
-    editor.set_creation_date(value);
+/// Replace the document's standard info fields with `info`: a field it
+/// leaves `None` is removed from the saved document. Dates are raw PDF date
+/// strings, e.g. "D:20240101120000Z".
+pub fn edit_set_metadata(editor: &mut DocumentEditor, info: crate::editor::DocumentInfo) -> Result<()> {
+    use crate::editor::EditableDocument;
+    editor.set_info(info)
 }
 
 // ── Page manipulation ──
 
-/// Keep only the specified pages (by index), removing all others.
+/// Keep only the specified pages (by index), in the order given, removing
+/// all others. Keeping no page is refused: a document has at least one.
 pub fn edit_select_pages(editor: &mut DocumentEditor, pages: &[usize]) -> Result<()> {
+    if pages.is_empty() {
+        return Err(Error::InvalidOperation("a document keeps at least one page".into()));
+    }
     refuse_repeated_pages(pages.iter().copied())?;
     editor.select_pages(pages)
 }
@@ -852,24 +905,22 @@ pub(crate) fn refuse_repeated_pages(pages: impl IntoIterator<Item = usize>) -> R
 }
 
 /// Delete pages by index. Uses select_pages with the inverse set —
-/// no upstream patch needed.
+/// no upstream patch needed. Deleting every page is refused.
 pub fn edit_delete_pages(editor: &mut DocumentEditor, pages: &[usize]) -> Result<()> {
+    check_pages(editor, pages)?;
     let total = editor.current_page_count();
     let keep: Vec<usize> = (0..total).filter(|i| !pages.contains(i)).collect();
-    editor.select_pages(&keep)
+    edit_select_pages(editor, &keep)
 }
 
-/// Rotate specific pages by the given degrees.
-pub fn edit_rotate_pages(editor: &mut DocumentEditor, rotations: &[(usize, i32)]) -> Result<()> {
-    for &(page, degrees) in rotations {
+/// Turn every page named by `degrees` on top of its current rotation. The
+/// pages are checked before the first is changed.
+pub fn edit_rotate_pages(editor: &mut DocumentEditor, pages: &[usize], degrees: i32) -> Result<()> {
+    check_pages(editor, pages)?;
+    for &page in pages {
         editor.rotate_page_by(page, degrees)?;
     }
     Ok(())
-}
-
-/// Rotate all pages by the given degrees.
-pub fn edit_rotate_all(editor: &mut DocumentEditor, degrees: i32) -> Result<()> {
-    editor.rotate_all_pages(degrees)
 }
 
 /// The degrees a wire rotation name stands for; any other name is `None`.
@@ -1330,22 +1381,6 @@ pub fn edit_set_form_field_flags(editor: &mut DocumentEditor, name: &str, flags:
     editor.set_form_field_flags(name, flags)
 }
 
-/// Resize a named image XObject on a page.
-pub fn edit_resize_image(editor: &mut DocumentEditor, page: usize, name: &str, width: f32, height: f32) -> Result<()> {
-    editor.resize_image(page, name, width, height)
-}
-
-/// Move a named image XObject on a page to a new lower-left corner.
-pub fn edit_reposition_image(
-    editor: &mut DocumentEditor,
-    page: usize,
-    name: &str,
-    x: f32,
-    y: f32,
-) -> Result<()> {
-    editor.reposition_image(page, name, x, y)
-}
-
 /// Move and resize a named image XObject on a page in one edit.
 pub fn edit_set_image_bounds(
     editor: &mut DocumentEditor,
@@ -1607,10 +1642,10 @@ pub fn convert_from_format_to_bytes(data: &[u8], format: &str) -> Result<Vec<u8>
 // No upstream patch. Uses only public APIs.
 // ═══════════════════════════════════════════════════════════════════
 
-/// Add a text watermark to one page (page >= 0) or all pages (page < 0).
-/// `layer` is the wire name `foreground` or `background`.
+/// Add a text watermark to the pages named, or to every page when `pages`
+/// is `None`. `layer` is the wire name `foreground` or `background`.
 pub fn edit_watermark(
-    editor: &mut DocumentEditor, page: i32, text: &str,
+    editor: &mut DocumentEditor, pages: Option<&[usize]>, text: &str,
     font_size: f32, rotation: f32, opacity: f32,
     r: f32, g: f32, b: f32,
     layer: &str, pos_type: i32, pos_fields: &[f32],
@@ -1698,8 +1733,30 @@ pub fn edit_watermark(
         Ok(())
     };
 
-    if page < 0 {
+    // Everything that can fail on a page is read before the first page is
+    // changed, so an error on any page leaves the editor as it was.
+    let check_page = |ed: &mut DocumentEditor, p: usize| -> Result<()> {
+        if background {
+            plan_page_font(ed, p, "Helvetica").map(|_| ())
+        } else {
+            ed.source_page_index(p).map(|_| ())
+        }
+    };
+
+    if let Some(pages) = pages {
+        check_pages(editor, pages)?;
+        for &page in pages {
+            resolve_rect(editor, page)?;
+            check_page(editor, page)?;
+        }
+        for &page in pages {
+            add_to_page(editor, page)?;
+        }
+    } else {
         let count = editor.current_page_count();
+        for page in 0..count {
+            check_page(editor, page)?;
+        }
         let media_boxes = editor.all_media_boxes();
         for i in 0..count {
             let mb = media_boxes[i];
@@ -1762,8 +1819,6 @@ pub fn edit_watermark(
                 }
             }
         }
-    } else {
-        add_to_page(editor, page as usize)?;
     }
     Ok(())
 }
@@ -1816,7 +1871,29 @@ fn ensure_page_font(
     page: usize,
     base_font: &str,
 ) -> Result<String> {
-    use crate::object::{Object, ObjectRef};
+    let plan = plan_page_font(editor, page, base_font)?;
+    Ok(apply_page_font(editor, plan, base_font))
+}
+
+/// What [`ensure_page_font`] found on a page: everything it reads, so the
+/// part that can fail runs without staging anything.
+struct PageFontPlan {
+    page_ref: crate::object::ObjectRef,
+    page_dict: std::collections::HashMap<String, crate::object::Object>,
+    resources: std::collections::HashMap<String, crate::object::Object>,
+    fonts: std::collections::HashMap<String, crate::object::Object>,
+    /// The resource name of a registration of the font the page already has.
+    found: Option<String>,
+}
+
+/// Reads the page, its resources and its fonts for [`ensure_page_font`],
+/// staging nothing; every failure of the font step is raised here.
+fn plan_page_font(
+    editor: &mut DocumentEditor,
+    page: usize,
+    base_font: &str,
+) -> Result<PageFontPlan> {
+    use crate::object::Object;
 
     let page_ref = editor.source_mut().get_page_ref(page)?;
     // Staged-preferred: an earlier edit on this editor may already have
@@ -1859,8 +1936,8 @@ fn ensure_page_font(
         }
     }
 
-    let mut resources = deref_dict(editor, page_dict.get("Resources"))?;
-    let mut fonts = deref_dict(editor, resources.get("Font"))?;
+    let resources = deref_dict(editor, page_dict.get("Resources"))?;
+    let fonts = deref_dict(editor, resources.get("Font"))?;
 
     // Reuse an existing registration of the same standard font.
     for (name, value) in fonts.clone() {
@@ -1883,9 +1960,28 @@ fn ensure_page_font(
             if d.get("BaseFont").and_then(|o| o.as_name()) == Some(base_font)
                 && d.get("Subtype").and_then(|o| o.as_name()) == Some("Type1")
             {
-                return Ok(name);
+                return Ok(PageFontPlan {
+                    page_ref,
+                    page_dict,
+                    resources,
+                    fonts,
+                    found: Some(name),
+                });
             }
         }
+    }
+
+    Ok(PageFontPlan { page_ref, page_dict, resources, fonts, found: None })
+}
+
+/// Stages what [`plan_page_font`] found: nothing when the page already has
+/// the font, else a new font object and the page dict that names it. Cannot
+/// fail.
+fn apply_page_font(editor: &mut DocumentEditor, plan: PageFontPlan, base_font: &str) -> String {
+    use crate::object::{Object, ObjectRef};
+    let PageFontPlan { page_ref, page_dict, mut resources, mut fonts, found } = plan;
+    if let Some(name) = found {
+        return name;
     }
 
     // Register fresh under a collision-free name.
@@ -1915,7 +2011,7 @@ fn ensure_page_font(
     let mut new_page = page_dict;
     new_page.insert("Resources".into(), Object::Dictionary(resources));
     editor.insert_modified(page_ref.id, Object::Dictionary(new_page));
-    Ok(name)
+    name
 }
 
 /// Prepend a content stream to a page so it renders BEHIND the

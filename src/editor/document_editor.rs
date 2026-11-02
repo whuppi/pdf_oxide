@@ -1018,6 +1018,10 @@ pub struct ModifiedPageProps {
     pub media_box: Option<[f32; 4]>,
     /// New CropBox
     pub crop_box: Option<[f32; 4]>,
+    // ── pdf_manipulator patch: a page's own /CropBox can be removed ──
+    /// The page's own `/CropBox` is dropped on save.
+    pub crop_box_removed: bool,
+    // ── end pdf_manipulator patch ──
 }
 
 /// Stores annotation appearance data for flattening.
@@ -1458,6 +1462,11 @@ impl DocumentEditor {
             ]);
             new_dict.insert("CropBox".to_string(), box_array);
         }
+        // ── pdf_manipulator patch: a page's own /CropBox can be removed ──
+        if props.crop_box_removed {
+            new_dict.remove("CropBox");
+        }
+        // ── end pdf_manipulator patch ──
 
         Ok(Object::Dictionary(new_dict))
     }
@@ -1945,6 +1954,25 @@ impl DocumentEditor {
     ) -> Result<usize> {
         let source_doc = PdfDocument::from_external_reader_bounded(reader, MERGED_CACHE_BYTES)?;
         self.merge_pages_from_document(source_doc, pages)
+    }
+
+    /// Opens `reader` as a document to merge from, with the merge's small
+    /// object cache. The caller authenticates it before [`Self::merge_document`].
+    pub(crate) fn open_merge_source(reader: Box<dyn crate::document::ReadSeek>) -> Result<PdfDocument> {
+        PdfDocument::from_external_reader_bounded(reader, MERGED_CACHE_BYTES)
+    }
+
+    /// Imports `pages` (every page when `None`) of a document the caller
+    /// opened and authenticated, in the order given.
+    pub(crate) fn merge_document(
+        &mut self,
+        source_doc: PdfDocument,
+        pages: Option<&[usize]>,
+    ) -> Result<usize> {
+        match pages {
+            Some(pages) => self.merge_pages_from_document(source_doc, pages),
+            None => self.merge_from_document(source_doc),
+        }
     }
 
     fn merge_from_document(&mut self, source_doc: PdfDocument) -> Result<usize> {
@@ -8571,8 +8599,13 @@ impl DocumentEditor {
         let source_index = match self.page_key(index) {
             PageKey::Source(source_index) => source_index,
             PageKey::Merged(merged) => {
-                if let Some(crop_box) = self.merged_page_props.get(&merged).and_then(|p| p.crop_box) {
-                    return Ok(Some(crop_box));
+                if let Some(props) = self.merged_page_props.get(&merged) {
+                    if let Some(crop_box) = props.crop_box {
+                        return Ok(Some(crop_box));
+                    }
+                    if props.crop_box_removed {
+                        return Ok(None);
+                    }
                 }
                 return Ok(Self::box_of(&self.merged_page_dict(merged)?, "CropBox"));
             },
@@ -8583,6 +8616,11 @@ impl DocumentEditor {
             if let Some(crop_box) = props.crop_box {
                 return Ok(Some(crop_box));
             }
+            // ── pdf_manipulator patch: a page's own /CropBox can be removed ──
+            if props.crop_box_removed {
+                return Ok(None);
+            }
+            // ── end pdf_manipulator patch ──
         }
 
         // Get from original document
@@ -8630,10 +8668,30 @@ impl DocumentEditor {
 
         let props = self.page_props_mut(index);
         props.crop_box = Some(box_);
+        // ── pdf_manipulator patch: a page's own /CropBox can be removed ──
+        props.crop_box_removed = false;
+        // ── end pdf_manipulator patch ──
 
         self.is_modified = true;
         Ok(())
     }
+
+    // ── pdf_manipulator patch: a page's own /CropBox can be removed ──
+    /// Drops the page's own `/CropBox`, so the page falls back to its
+    /// media box.
+    pub fn remove_page_crop_box(&mut self, index: usize) -> Result<()> {
+        if index >= self.current_page_count() {
+            return Err(Error::InvalidPdf(format!("Page index {} out of range", index)));
+        }
+
+        let props = self.page_props_mut(index);
+        props.crop_box = None;
+        props.crop_box_removed = true;
+
+        self.is_modified = true;
+        Ok(())
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Crop margins from all pages.
     ///
@@ -12601,6 +12659,7 @@ mod tests {
             rotation: Some(90),
             media_box: Some([0.0, 0.0, 612.0, 792.0]),
             crop_box: Some([10.0, 10.0, 602.0, 782.0]),
+            ..Default::default()
         };
         assert_eq!(props.rotation, Some(90));
         assert_eq!(props.media_box, Some([0.0, 0.0, 612.0, 792.0]));
@@ -12660,6 +12719,7 @@ mod tests {
             rotation: Some(90),
             media_box: None,
             crop_box: None,
+            ..Default::default()
         };
 
         let result = editor
@@ -12681,6 +12741,7 @@ mod tests {
             rotation: None,
             media_box: Some([0.0, 0.0, 300.0, 400.0]),
             crop_box: None,
+            ..Default::default()
         };
 
         let result = editor
@@ -12703,6 +12764,7 @@ mod tests {
             rotation: None,
             media_box: None,
             crop_box: Some([10.0, 10.0, 602.0, 782.0]),
+            ..Default::default()
         };
 
         let result = editor
@@ -12724,6 +12786,7 @@ mod tests {
             rotation: Some(180),
             media_box: Some([0.0, 0.0, 500.0, 700.0]),
             crop_box: Some([20.0, 20.0, 480.0, 680.0]),
+            ..Default::default()
         };
 
         let result = editor
