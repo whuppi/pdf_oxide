@@ -1422,7 +1422,9 @@ fn resolve_bytes_via_pdf_encoding(
 /// ASCII range 0x20-0x7E shares glyph names with WinAnsi; 0x80-0xFF is
 /// the Mac OS Roman repertoire (which is *not* ISO-8859-1). The Apple-logo
 /// glyph at 0xF0 (PUA U+F8FF) has no portable glyph name and returns `None`.
-fn mac_roman_byte_to_name(byte: u8) -> Option<&'static str> {
+// ── pdf_manipulator patch: the redaction reads a Type 3 font's base encoding ──
+pub(crate) fn mac_roman_byte_to_name(byte: u8) -> Option<&'static str> {
+    // ── end pdf_manipulator patch ──
     use crate::fonts::font_dict::FontInfo;
     if (0x20..=0x7E).contains(&byte) {
         return FontInfo::gid_to_standard_glyph_name(byte as u16);
@@ -1569,7 +1571,9 @@ fn mac_roman_byte_to_name(byte: u8) -> Option<&'static str> {
 /// at 0xAE/0xAF, etc.) which differs sharply from WinAnsi.
 ///
 /// Bytes left unassigned by StandardEncoding return `None`.
-fn standard_encoding_byte_to_name(byte: u8) -> Option<&'static str> {
+// ── pdf_manipulator patch: the redaction reads a Type 3 font's base encoding ──
+pub(crate) fn standard_encoding_byte_to_name(byte: u8) -> Option<&'static str> {
+    // ── end pdf_manipulator patch ──
     use crate::fonts::font_dict::FontInfo;
     if (0x20..=0x7E).contains(&byte) {
         return FontInfo::gid_to_standard_glyph_name(byte as u16);

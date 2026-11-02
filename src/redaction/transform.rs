@@ -61,6 +61,57 @@ pub struct ImageResources {
     /// Resource name → the `/MCID` of a marked-content property list the
     /// stream names with `BDC`.
     pub mcids: HashMap<String, u32>,
+    /// Resource name → the marked-content property list a `BDC` names.
+    pub properties: HashMap<String, PropertyList>,
+}
+
+/// The keys of a marked-content property list that hold text of the content
+/// they mark.
+pub const MARKED_STRINGS: [&str; 3] = ["ActualText", "Alt", "E"];
+
+/// A `/Properties` entry.
+#[derive(Clone, Debug)]
+pub struct PropertyList {
+    /// The list's object when it is indirect.
+    pub reference: Option<ObjectRef>,
+    /// The list, its values as the resources hold them.
+    pub dict: HashMap<String, Object>,
+}
+
+impl PropertyList {
+    /// Whether the list carries any of [`MARKED_STRINGS`].
+    fn has_strings(&self) -> bool {
+        MARKED_STRINGS.iter().any(|key| self.dict.contains_key(*key))
+    }
+
+    /// The list without its text keys.
+    fn without_strings(&self) -> HashMap<String, Object> {
+        let mut dict = self.dict.clone();
+        for key in MARKED_STRINGS {
+            dict.remove(key);
+        }
+        dict
+    }
+}
+
+/// The /Properties name a copy of the list `name` is written under: the
+/// first `name_rp`, with `x` added while the resources already hold it.
+fn property_copy_name(images: &ImageResources, name: &str) -> String {
+    let mut copy = format!("{name}_rp");
+    while images.properties.contains_key(&copy) {
+        copy.push('x');
+    }
+    copy
+}
+
+/// A marked-content sequence open at the operator being read.
+struct MarkedSeq {
+    mcid: Option<u32>,
+    /// For a `BDC` that carries [`MARKED_STRINGS`]: its place among those
+    /// `BDC`s of the stream, and the /Properties name when the list is named.
+    strings: Option<(u32, Option<String>)>,
+    /// Whether the sequence lost or changed a mark.
+    tainted: bool,
 }
 
 impl ImageResources {
@@ -74,6 +125,7 @@ impl ImageResources {
             patterns: HashMap::new(),
             line_styles: HashMap::new(),
             mcids: HashMap::new(),
+            properties: HashMap::new(),
         }
     }
 }
@@ -197,6 +249,7 @@ pub fn redact_form<R: Read, W: Write>(
 ) -> Result<PassOutcome> {
     RedactPass::new(regions, opts, &*view.fonts, &view.resources)
         .with_forms(loader)
+        .with_marked_plan(&form.scope.tainted_marked)
         .starting(form.ctm, vec![form.source], &form.style)
         .run_form(content, out)
 }
@@ -230,6 +283,29 @@ pub struct Scope {
     pub fonts: Vec<(String, FontCodes)>,
     /// The `/MCID`s of the marked content that lost or changed a mark.
     pub mcids: BTreeSet<u32>,
+    /// The places, among the stream's `BDC` operators that carry
+    /// [`MARKED_STRINGS`], of those whose marked content lost or changed a
+    /// mark. The save writes these without the strings.
+    pub tainted_marked: BTreeSet<u32>,
+    /// One per property list a tainted `BDC` named: the copy without the
+    /// strings that the tainted `BDC`s name instead.
+    pub properties: Vec<PropertyCopy>,
+    /// The /Properties names a surviving `BDC` still uses, and those a
+    /// copy replaced: a replaced name stays only when also kept.
+    pub kept_properties: HashSet<String>,
+    /// See [`Scope::kept_properties`].
+    pub replaced_properties: HashSet<String>,
+}
+
+/// A marked-content property list written again without its text keys.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropertyCopy {
+    /// The /Properties name the tainted `BDC`s use for the copy.
+    pub name: String,
+    /// The source list's name.
+    pub source: String,
+    /// The list without [`MARKED_STRINGS`].
+    pub dict: HashMap<String, Object>,
 }
 
 impl Scope {
@@ -359,9 +435,13 @@ pub struct RedactPass<'a> {
     path: Vec<Operator>,
     paths_pruned: usize,
     specialized: usize,
-    /// The marked-content sequences open at the operator being read, each
-    /// with its `/MCID` when it has one.
-    marked: Vec<Option<u32>>,
+    /// The marked-content sequences open at the operator being read.
+    marked: Vec<MarkedSeq>,
+    /// How many `BDC`s that carry [`MARKED_STRINGS`] the stream has shown.
+    strings_seen: u32,
+    /// The `BDC`s the save writes without their strings: the places the
+    /// dry run recorded in [`Scope::tainted_marked`].
+    marked_plan: Option<&'a BTreeSet<u32>>,
 }
 
 /// Records a source id once in `originals`, the set the page's overwritten
@@ -408,12 +488,23 @@ impl<'a> RedactPass<'a> {
             paths_pruned: 0,
             specialized: 0,
             marked: Vec::new(),
+            strings_seen: 0,
+            marked_plan: None,
         }
     }
 
     /// Lets the pass redact the forms its content draws, opened by `loader`.
     pub fn with_forms(mut self, loader: &'a dyn FormLoader) -> Self {
         self.loader = Some(loader);
+        self
+    }
+
+    /// Makes the pass write the `BDC`s at the places of `plan`, the
+    /// [`Scope::tainted_marked`] of a dry run over the same stream, without
+    /// their [`MARKED_STRINGS`]. Without a plan every `BDC` is written as it
+    /// was read.
+    pub fn with_marked_plan(mut self, plan: &'a BTreeSet<u32>) -> Self {
+        self.marked_plan = Some(plan);
         self
     }
 
@@ -529,8 +620,12 @@ impl<'a> RedactPass<'a> {
                 ));
             }
             match &op {
-                Operator::BeginMarkedContent { .. } => self.marked.push(None),
-                Operator::BeginMarkedContentDict { properties, .. } => {
+                Operator::BeginMarkedContent { .. } => self.marked.push(MarkedSeq {
+                    mcid: None,
+                    strings: None,
+                    tainted: false,
+                }),
+                Operator::BeginMarkedContentDict { tag, properties } => {
                     let mcid = match &**properties {
                         Object::Dictionary(dict) => dict
                             .get("MCID")
@@ -539,10 +634,17 @@ impl<'a> RedactPass<'a> {
                         Object::Name(name) => self.images.mcids.get(name.as_str()).copied(),
                         _ => None,
                     };
-                    self.marked.push(mcid);
+                    let strings = self.marked_strings(properties);
+                    self.marked.push(MarkedSeq { mcid, strings, tainted: false });
+                    if let Some(written) = self.rewrite_marked(tag, properties) {
+                        self.emit(out, &written)?;
+                        continue;
+                    }
                 },
                 Operator::EndMarkedContent => {
-                    self.marked.pop();
+                    if let Some(seq) = self.marked.pop() {
+                        self.keep_properties_of(&seq);
+                    }
                 },
                 _ => {},
             }
@@ -641,6 +743,9 @@ impl<'a> RedactPass<'a> {
     /// The outcome of the stream the pass has read: its own counts plus those
     /// of the form copies it queued.
     fn finish(mut self) -> PassOutcome {
+        for seq in std::mem::take(&mut self.marked) {
+            self.keep_properties_of(&seq);
+        }
         let totals = self.text.result();
         self.scope.fonts = totals
             .fonts
@@ -676,7 +781,86 @@ impl<'a> RedactPass<'a> {
     /// Notes that every marked-content sequence open now lost or changed a
     /// mark, so the structure elements that own them lose their strings.
     fn touch_marked(&mut self) {
-        self.scope.mcids.extend(self.marked.iter().flatten());
+        let images = self.images;
+        for seq in &mut self.marked {
+            self.scope.mcids.extend(seq.mcid);
+            if seq.tainted {
+                continue;
+            }
+            seq.tainted = true;
+            let Some((place, named)) = &seq.strings else { continue };
+            self.scope.tainted_marked.insert(*place);
+            let Some(name) = named else { continue };
+            self.scope.replaced_properties.insert(name.clone());
+            if self.scope.properties.iter().any(|copy| copy.source == *name) {
+                continue;
+            }
+            if let Some(list) = images.properties.get(name) {
+                if let Some(reference) = list.reference {
+                    note_original(&mut self.originals, reference.id);
+                }
+                self.scope.properties.push(PropertyCopy {
+                    name: property_copy_name(images, name),
+                    source: name.clone(),
+                    dict: list.without_strings(),
+                });
+            }
+        }
+    }
+
+    /// The place and the /Properties name of a `BDC` that carries
+    /// [`MARKED_STRINGS`], counted among such `BDC`s; `None` for any other.
+    fn marked_strings(&mut self, properties: &Object) -> Option<(u32, Option<String>)> {
+        let named = match properties {
+            Object::Dictionary(dict) => {
+                if !MARKED_STRINGS.iter().any(|key| dict.contains_key(*key)) {
+                    return None;
+                }
+                None
+            },
+            Object::Name(name) => {
+                if !self.images.properties.get(name.as_str()).is_some_and(PropertyList::has_strings) {
+                    return None;
+                }
+                Some(name.clone())
+            },
+            _ => return None,
+        };
+        let place = self.strings_seen;
+        self.strings_seen += 1;
+        Some((place, named))
+    }
+
+    /// The `BDC` the plan writes in place of the one just read: its strings
+    /// dropped from an inline list, a named list replaced by its copy.
+    fn rewrite_marked(&self, tag: &str, properties: &Object) -> Option<Operator> {
+        let plan = self.marked_plan?;
+        let (place, named) = self.marked.last()?.strings.as_ref()?;
+        if !plan.contains(place) {
+            return None;
+        }
+        let properties = match (properties, named) {
+            (Object::Dictionary(dict), None) => {
+                let mut dict = dict.clone();
+                for key in MARKED_STRINGS {
+                    dict.remove(key);
+                }
+                Object::Dictionary(dict)
+            },
+            (_, Some(name)) => Object::Name(property_copy_name(self.images, name)),
+            _ => return None,
+        };
+        Some(Operator::BeginMarkedContentDict {
+            tag: tag.to_string(),
+            properties: Box::new(properties),
+        })
+    }
+
+    /// Notes that a named list is still used by a sequence that lost nothing.
+    fn keep_properties_of(&mut self, seq: &MarkedSeq) {
+        if let (false, Some((_, Some(name)))) = (seq.tainted, &seq.strings) {
+            self.scope.kept_properties.insert(name.clone());
+        }
     }
 
     /// A resource name for a copy of `name`, not one the stream's resources

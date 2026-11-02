@@ -569,6 +569,50 @@ impl FlatPage {
             Some(set.appearances[at].form_object())
         })
     }
+
+    /// The object written under `id` beside an appearance (its fallback
+    /// font's graph), when it is one of the page's.
+    fn extra(&self, id: u32) -> Option<&Object> {
+        self.sets
+            .iter()
+            .flat_map(|set| &set.appearances)
+            .flat_map(|appearance| &appearance.extra_objects)
+            .find_map(|(extra_id, object)| (*extra_id == id).then_some(object))
+    }
+
+    /// `object` with every reference to an object of [`Self::extra`] replaced
+    /// by that object, so a reader that knows only the source document can
+    /// read the graph. A graph deeper than `depth`, or a cycle, keeps its
+    /// reference.
+    fn inline_extras(&self, object: &Object, depth: usize) -> Object {
+        match object {
+            Object::Reference(r) if depth > 0 => match self.extra(r.id) {
+                Some(extra) => self.inline_extras(extra, depth - 1),
+                None => object.clone(),
+            },
+            Object::Dictionary(dict) => Object::Dictionary(
+                dict.iter().map(|(key, value)| (key.clone(), self.inline_extras(value, depth))).collect(),
+            ),
+            Object::Array(items) => {
+                Object::Array(items.iter().map(|item| self.inline_extras(item, depth)).collect())
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Replaces the object written under `id` beside an appearance.
+    fn replace_extra(&mut self, id: u32, replacement: Object) {
+        for set in &mut self.sets {
+            for appearance in &mut set.appearances {
+                for (extra_id, object) in &mut appearance.extra_objects {
+                    if *extra_id == id {
+                        *object = replacement;
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 // ── end pdf_manipulator patch ──
 
@@ -701,7 +745,7 @@ impl crate::redaction::transform::FormLoader for DocForms<'_> {
             matrix,
             bbox: Rect::from_points(b[0].min(b[2]), b[1].min(b[3]), b[0].max(b[2]), b[1].max(b[3])),
             resources: DocumentEditor::image_resources_of(self.source, &resources, None)?,
-            fonts: Box::new(DocumentEditor::font_metrics_of(self.source, &resources)?),
+            fonts: Box::new(DocumentEditor::font_metrics_of(self.source, &resources, self.flat)?),
         })
     }
 
@@ -3818,6 +3862,8 @@ impl DocumentEditor {
         let images = Self::image_resources_of(source, &page_resources, flat)?;
         let forms = DocForms { source, page_resources, flat };
         let overlay: &[u8] = flat.map_or(&[], |flat| flat.overlay.as_slice());
+        let mods = mods.map(|mods| Self::mods_for_copies(mods, &images, &page.scope));
+        let mods = mods.as_ref();
         let mut outcome = None;
         Self::write_pass_stream(
             (content_id, length_id),
@@ -3841,6 +3887,7 @@ impl DocumentEditor {
                             &forms,
                             ops,
                             overlay,
+                            Some(&page.scope.tainted_marked),
                             &mut stage,
                         )?;
                         stage.finish()?;
@@ -3854,6 +3901,7 @@ impl DocumentEditor {
                         &forms,
                         ops,
                         overlay,
+                        Some(&page.scope.tainted_marked),
                         out,
                     )?,
                 });
@@ -3870,6 +3918,28 @@ impl DocumentEditor {
             )));
         }
         Ok(())
+    }
+
+    /// `mods` with the modification of each image the redaction copied
+    /// also under the copy's name: the belt sees the names the redacted
+    /// content draws, and the caller named the source image.
+    fn mods_for_copies(
+        mods: &HashMap<String, ImageModification>,
+        images: &crate::redaction::transform::ImageResources,
+        scope: &crate::redaction::transform::Scope,
+    ) -> HashMap<String, ImageModification> {
+        let mut out = mods.clone();
+        let mut names: Vec<&String> = mods.keys().collect();
+        names.sort();
+        for placement in &scope.placements {
+            let named = names
+                .iter()
+                .find(|name| images.images.get(name.as_str()) == Some(&placement.source));
+            if let Some(name) = named {
+                out.insert(placement.name.clone(), mods[name.as_str()].clone());
+            }
+        }
+        out
     }
 
     /// Writes stream `ids.0` with `dict` and its /Length as the object
@@ -3934,10 +4004,14 @@ impl DocumentEditor {
         forms: &dyn crate::redaction::transform::FormLoader,
         ops: crate::host::content::Operators<R>,
         appended: &[u8],
+        marked_plan: Option<&std::collections::BTreeSet<u32>>,
         mut out: &mut dyn Write,
     ) -> Result<crate::redaction::transform::PassOutcome> {
-        let pass =
+        let mut pass =
             crate::redaction::transform::RedactPass::new(regions, opts, fonts, images).with_forms(forms);
+        if let Some(plan) = marked_plan {
+            pass = pass.with_marked_plan(plan);
+        }
         pass.run_then(
             ops,
             crate::host::content::Operators::new(appended, crate::host::content::Mode::Full),
@@ -4102,15 +4176,25 @@ impl DocumentEditor {
             line_styles.insert(name.clone(), Self::line_style_of(source, value));
         }
         let mut mcids = std::collections::HashMap::new();
+        let mut properties = std::collections::HashMap::new();
         for (name, value) in &entries("Properties")? {
-            let Ok(properties) = source.resolve_object(value) else { continue };
-            let mcid = properties
+            let Ok(list) = source.resolve_object(value) else { continue };
+            let mcid = list
                 .as_dict()
                 .and_then(|d| d.get("MCID"))
                 .and_then(|m| m.as_integer())
                 .and_then(|m| u32::try_from(m).ok());
             if let Some(mcid) = mcid {
                 mcids.insert(name.clone(), mcid);
+            }
+            if let Some(dict) = list.as_dict() {
+                properties.insert(
+                    name.clone(),
+                    crate::redaction::transform::PropertyList {
+                        reference: value.as_reference(),
+                        dict: dict.clone(),
+                    },
+                );
             }
         }
         Ok(ImageResources {
@@ -4120,6 +4204,7 @@ impl DocumentEditor {
             patterns,
             line_styles,
             mcids,
+            properties,
         })
     }
 
@@ -4128,6 +4213,7 @@ impl DocumentEditor {
     fn font_metrics_of(
         source: &PdfDocument,
         resources: &Object,
+        flat: Option<&FlatPage>,
     ) -> Result<crate::redaction::FontInfoMetrics> {
         let mut map: HashMap<String, std::sync::Arc<crate::fonts::FontInfo>> = HashMap::new();
         if let Some(res_dict) = resources.as_dict() {
@@ -4139,9 +4225,15 @@ impl DocumentEditor {
                 if let Some(font_dict) = font_dict_obj.as_dict() {
                     for (name, val) in font_dict {
                         let resolved = match val.as_reference() {
-                            Some(r) => match source.load_object(r) {
-                                Ok(o) => o,
-                                Err(_) => continue,
+                            Some(r) => match flat.and_then(|flat| flat.extra(r.id)) {
+                                Some(extra) => flat.map_or_else(
+                                    || extra.clone(),
+                                    |flat| flat.inline_extras(extra, 8),
+                                ),
+                                None => match source.load_object(r) {
+                                    Ok(o) => o,
+                                    Err(_) => continue,
+                                },
                             },
                             None => val.clone(),
                         };
@@ -4331,6 +4423,13 @@ impl DocumentEditor {
         for (pattern, id) in scope.patterns.iter().zip(&ids.patterns) {
             pattern_dict.insert(pattern.name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
         }
+        let mut property_dict = entries("Properties")?;
+        property_dict.retain(|name, _| {
+            scope.kept_properties.contains(name) || !scope.replaced_properties.contains(name)
+        });
+        for copy in &scope.properties {
+            property_dict.insert(copy.name.clone(), Object::Dictionary(copy.dict.clone()));
+        }
         if !ids.fonts.is_empty() {
             let mut font_dict = entries("Font")?;
             for (name, entry) in &ids.fonts {
@@ -4339,7 +4438,11 @@ impl DocumentEditor {
             resources_dict.insert("Font".to_string(), Object::Dictionary(font_dict));
         }
         resources_dict.insert("XObject".to_string(), Object::Dictionary(xobject_dict));
-        for (key, dict) in [("Shading", shading_dict), ("Pattern", pattern_dict)] {
+        for (key, dict) in [
+            ("Shading", shading_dict),
+            ("Pattern", pattern_dict),
+            ("Properties", property_dict),
+        ] {
             if !dict.is_empty() || resources_dict.contains_key(key) {
                 resources_dict.insert(key.to_string(), Object::Dictionary(dict));
             }
@@ -7096,24 +7199,31 @@ impl DocumentEditor {
                                     )?;
                                     // ── end pdf_manipulator patch ──
                                     // ── pdf_manipulator patch: the flattened appearances a surviving `Do` still draws ──
-                                    // One the redaction dropped or replaced by a copy is not written.
+                                    // One the redaction dropped is not written; one it replaced by a
+                                    // copy is not either, but its extra objects are, since the copy
+                                    // draws the fonts they hold.
                                     for set in page.flat.iter().flat_map(|flat| &flat.sets) {
                                         for ((id, name), appearance) in
                                             set.xobjects.iter().zip(&set.appearances)
                                         {
-                                            if !page.scope.kept_xobject_names.contains(name) {
+                                            let kept = page.scope.kept_xobject_names.contains(name);
+                                            let copied =
+                                                page.scope.forms.iter().any(|form| form.source.id == *id);
+                                            if !kept && !copied {
                                                 continue;
                                             }
-                                            let offset = writer.position();
-                                            write_obj(
-                                                &mut *writer,
-                                                &serializer,
-                                                *id,
-                                                0,
-                                                &appearance.form_object(),
-                                                &encryption_handler,
-                                            )?;
-                                            xref_entries.push((*id, offset, 0, true));
+                                            if kept {
+                                                let offset = writer.position();
+                                                write_obj(
+                                                    &mut *writer,
+                                                    &serializer,
+                                                    *id,
+                                                    0,
+                                                    &appearance.form_object(),
+                                                    &encryption_handler,
+                                                )?;
+                                                xref_entries.push((*id, offset, 0, true));
+                                            }
                                             for (extra_id, extra_obj) in &appearance.extra_objects {
                                                 let off = writer.position();
                                                 write_obj(
@@ -11030,7 +11140,7 @@ impl DocumentEditor {
         // No resources ⇒ empty map ⇒ the engine reports unknown fonts
         // non-simple and *refuses* (fail closed, never under-redact).
         let resources = Self::inherited_resources(&self.source, source_page)?;
-        Self::font_metrics_of(&self.source, &resources)
+        Self::font_metrics_of(&self.source, &resources, None)
     }
 
     /// Destructively apply every queued redaction (programmatic
@@ -11075,6 +11185,10 @@ impl DocumentEditor {
             total.bytes_removed += rep.bytes_removed;
             total.annotations_removed += rep.annotations_removed;
             total.fonts_scrubbed += rep.fonts_scrubbed;
+            total.images_modified += rep.images_modified;
+            total.images_removed += rep.images_removed;
+            total.paths_pruned += rep.paths_pruned;
+            total.xobjects_specialized += rep.xobjects_specialized;
         }
         // ── end pdf_manipulator patch ──
         self.is_modified = true;
@@ -11166,6 +11280,7 @@ impl DocumentEditor {
             &forms,
             self.source.page_operators(src)?,
             &[],
+            None,
             &mut std::io::sink(),
         )?;
         // Each queued copy's source is proved writable now: a source the row writers cannot read (a filter the engine does not

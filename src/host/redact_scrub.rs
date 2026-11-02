@@ -13,7 +13,7 @@
 use super::{AnnotationAppearance, DocForms, DocumentEditor, FlatPage, FlatSet, ScopeIds};
 use crate::content::operators::Operator;
 use crate::document::PdfDocument;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fonts::cmap::parse_tounicode_cmap;
 use crate::host::content::{InlineImages, Operators};
 use crate::host::page_prune::PagePrune;
@@ -63,6 +63,16 @@ struct Rewritten {
     char_procs: Option<HashMap<String, Object>>,
     /// Source objects the font no longer names.
     orphans: Vec<u32>,
+    /// The CID font a Type 0 font names, rewritten, when its object is
+    /// indirect: the objects the writer places it with.
+    descendant: Option<Descendant>,
+}
+
+/// A descendant CID font with the widths of the removed codes gone.
+struct Descendant {
+    /// The source object, which an in-place scrub overrides.
+    reference: ObjectRef,
+    dict: HashMap<String, Object>,
 }
 
 /// What a save's scrub decided, before any object has an id.
@@ -114,6 +124,29 @@ impl Scrub {
             path.push(form.source.id);
             self.attach_below(src, path, &form.scope, &mut form_ids.inner);
             path.pop();
+        }
+    }
+}
+
+/// Reads the objects of the source and those a flattened appearance carries
+/// beside it (its fallback font's graph), which the source does not hold.
+struct Reader<'a> {
+    source: &'a PdfDocument,
+    flats: Vec<&'a FlatPage>,
+}
+
+impl Reader<'_> {
+    fn load_object(&self, reference: ObjectRef) -> Result<Object> {
+        match self.flats.iter().find_map(|flat| flat.extra(reference.id)) {
+            Some(extra) => Ok(extra.clone()),
+            None => self.source.load_object(reference),
+        }
+    }
+
+    fn resolve_object(&self, object: &Object) -> Result<Object> {
+        match object {
+            Object::Reference(reference) => self.load_object(*reference),
+            other => self.source.resolve_object(other),
         }
     }
 }
@@ -193,7 +226,7 @@ impl Counter<'_> {
             matches!(entry, FontEntry::Reference(r) if self.states.contains_key(&r.id))
         });
         let xobjects = xobject_refs(self.source, resources)?;
-        let metrics = DocumentEditor::font_metrics_of(self.source, resources)?;
+        let metrics = DocumentEditor::font_metrics_of(self.source, resources, None)?;
         let none = RegionSet::new(0);
         let mut pass = TextPass::new(&none, 0.0, &metrics);
         let mut scratch = Vec::new();
@@ -334,7 +367,7 @@ impl Counter<'_> {
 /// is dropped: the font keeps no mapping rather than a mapping that cannot be
 /// scrubbed.
 fn rewrite_font(
-    source: &PdfDocument,
+    source: &Reader,
     font: &HashMap<String, Object>,
     removed: &CodeSet,
     surviving: &CodeSet,
@@ -406,8 +439,15 @@ fn rewrite_font(
     let mut char_procs = None;
     if subtype.as_deref() == Some("Type3") {
         let mut names: HashMap<u32, String> = HashMap::new();
+        let mut base = None;
         if let Some(encoding) = dict.get("Encoding") {
             let encoding = source.resolve_object(encoding)?;
+            if let Some(name) = encoding.as_name() {
+                base = Some(name.to_string());
+            }
+            if let Some(name) = encoding.as_dict().and_then(|d| d.get("BaseEncoding")) {
+                base = source.resolve_object(name)?.as_name().map(str::to_string);
+            }
             if let Some(differences) = encoding.as_dict().and_then(|d| d.get("Differences")) {
                 let differences = source.resolve_object(differences)?;
                 let mut code = 0u32;
@@ -421,6 +461,26 @@ fn rewrite_font(
                         _ => {},
                     }
                 }
+            }
+        }
+        // A code no /Differences entry names reaches its procedure through the
+        // base encoding, as a renderer reads it. A code that reaches no name
+        // has a procedure that cannot be found, so it cannot be shown to be gone.
+        for code in removed.iter().chain(surviving.iter()) {
+            if names.contains_key(&code) {
+                continue;
+            }
+            match type3_base_name(base.as_deref(), code) {
+                Some(name) => {
+                    names.insert(code, name.to_string());
+                },
+                None if removed.contains(code) && !surviving.contains(code) => {
+                    return Err(Error::Unsupported(format!(
+                        "the Type 3 font shows code {code}, which its /Encoding does not name; \
+                         refusing to redact a glyph whose procedure cannot be found"
+                    )));
+                },
+                None => {},
             }
         }
         let kept: HashSet<&String> = surviving.iter().filter_map(|c| names.get(&c)).collect();
@@ -451,6 +511,27 @@ fn rewrite_font(
         }
     }
 
+    let mut descendant = None;
+    let mut cid_widths_scrubbed = false;
+    if let Some(value) = dict.get("DescendantFonts").cloned() {
+        if let Some(found) = rewrite_descendant(source, &value, removed, surviving)? {
+            cid_widths_scrubbed = true;
+            orphans.extend(found.orphans);
+            match found.reference {
+                Some(reference) => descendant = Some(Descendant { reference, dict: found.dict }),
+                None => {
+                    if let Some(list) = value.as_reference() {
+                        orphans.push(list.id);
+                    }
+                    dict.insert(
+                        "DescendantFonts".to_string(),
+                        Object::Array(vec![Object::Dictionary(found.dict)]),
+                    );
+                },
+            }
+        }
+    }
+
     let result = scrub_font(&FontScrubInput {
         first_char,
         widths: widths.clone(),
@@ -459,7 +540,7 @@ fn rewrite_font(
         removed_codes: removed.to_set(),
         surviving_codes: surviving.to_set(),
     });
-    if result.codes_scrubbed == 0 && procs.is_empty() {
+    if result.codes_scrubbed == 0 && procs.is_empty() && !cid_widths_scrubbed {
         return Ok(None);
     }
     if result.widths != widths {
@@ -478,7 +559,142 @@ fn rewrite_font(
             cmap = Some(cmap_bytes(&result.to_unicode, code_width, wmode, &notdef));
         }
     }
-    Ok(Some(Rewritten { dict, to_unicode: cmap, procs, char_procs, orphans }))
+    Ok(Some(Rewritten { dict, to_unicode: cmap, procs, char_procs, orphans, descendant }))
+}
+
+/// The glyph name the base encoding `base` (a Type 3 font's `/Encoding` name
+/// or `/BaseEncoding`; `StandardEncoding` when it names none) gives `code`.
+fn type3_base_name(base: Option<&str>, code: u32) -> Option<&'static str> {
+    use crate::fonts::cff_encoding::{mac_roman_byte_to_name, standard_encoding_byte_to_name};
+    let byte = u8::try_from(code).ok()?;
+    match base {
+        Some("WinAnsiEncoding") => crate::fonts::FontInfo::gid_to_standard_glyph_name(u16::from(byte)),
+        Some("MacRomanEncoding") => mac_roman_byte_to_name(byte),
+        _ => standard_encoding_byte_to_name(byte),
+    }
+}
+
+/// A descendant CID font whose `/W` lost the widths of the removed codes.
+struct RewrittenDescendant {
+    /// The font's object when `DescendantFonts` names it indirectly.
+    reference: Option<ObjectRef>,
+    dict: HashMap<String, Object>,
+    /// Source objects the rewritten font no longer names.
+    orphans: Vec<u32>,
+}
+
+/// The descendant font `fonts` (a Type 0 font's `/DescendantFonts`) names,
+/// with the `/W` entries of the codes in `removed` and not in `surviving`
+/// left out, which reads them as `/DW`. `None` when no width of such a code
+/// is listed.
+///
+/// # Errors
+/// [`Error::Unsupported`] when the `/W` array cannot be read: a width that
+/// cannot be found cannot be shown to be gone.
+fn rewrite_descendant(
+    source: &Reader,
+    fonts: &Object,
+    removed: &CodeSet,
+    surviving: &CodeSet,
+) -> Result<Option<RewrittenDescendant>> {
+    let list = source.resolve_object(fonts)?;
+    let Some(first) = list.as_array().and_then(|items| items.first()) else {
+        return Ok(None);
+    };
+    let reference = first.as_reference();
+    let font = source.resolve_object(first)?;
+    let Some(font) = font.as_dict() else {
+        return Ok(None);
+    };
+    let Some(widths) = font.get("W") else {
+        return Ok(None);
+    };
+    let unreadable = || {
+        Error::Unsupported(
+            "a CID font's /W array cannot be read; refusing to redact a page whose font keeps \
+             widths that cannot be found"
+                .to_string(),
+        )
+    };
+    let widths_ref = widths.as_reference();
+    let widths = source.resolve_object(widths)?;
+    let items = widths.as_array().ok_or_else(unreadable)?;
+    let doomed: BTreeSet<u32> = removed.iter().filter(|code| !surviving.contains(*code)).collect();
+    if doomed.is_empty() {
+        return Ok(None);
+    }
+    let cid = |item: &Object| -> Result<u32> {
+        let value = source.resolve_object(item)?.as_integer().ok_or_else(unreadable)?;
+        Ok(value.clamp(0, i64::from(u16::MAX)) as u32)
+    };
+    let mut out: Vec<Object> = Vec::new();
+    let mut changed = false;
+    let mut at = 0;
+    while at < items.len() {
+        let first = cid(&items[at])?;
+        let entry = items.get(at + 1).ok_or_else(unreadable)?;
+        let entry = source.resolve_object(entry)?;
+        if let Some(run) = entry.as_array() {
+            at += 2;
+            let last = first + run.len() as u32;
+            if doomed.range(first..last).next().is_none() {
+                out.push(items[at - 2].clone());
+                out.push(entry.clone());
+                continue;
+            }
+            changed = true;
+            let mut kept: Vec<Object> = Vec::new();
+            let mut start = first;
+            for (offset, width) in run.iter().enumerate() {
+                if doomed.contains(&(first + offset as u32)) {
+                    if !kept.is_empty() {
+                        out.push(Object::Integer(i64::from(start)));
+                        out.push(Object::Array(std::mem::take(&mut kept)));
+                    }
+                    start = first + offset as u32 + 1;
+                } else {
+                    kept.push(width.clone());
+                }
+            }
+            if !kept.is_empty() {
+                out.push(Object::Integer(i64::from(start)));
+                out.push(Object::Array(kept));
+            }
+        } else {
+            let last = cid(&entry)?;
+            let width = items.get(at + 2).ok_or_else(unreadable)?;
+            at += 3;
+            if last < first || doomed.range(first..=last).next().is_none() {
+                out.extend([Object::Integer(i64::from(first)), Object::Integer(i64::from(last)), width.clone()]);
+                continue;
+            }
+            changed = true;
+            let mut start = first;
+            for hit in doomed.range(first..=last) {
+                if *hit > start {
+                    out.extend([
+                        Object::Integer(i64::from(start)),
+                        Object::Integer(i64::from(*hit - 1)),
+                        width.clone(),
+                    ]);
+                }
+                start = *hit + 1;
+            }
+            if start <= last {
+                out.extend([Object::Integer(i64::from(start)), Object::Integer(i64::from(last)), width.clone()]);
+            }
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let mut dict = font.clone();
+    dict.insert("W".to_string(), Object::Array(out));
+    Ok(Some(RewrittenDescendant {
+        reference,
+        dict,
+        orphans: widths_ref.map(|r| r.id).into_iter().collect(),
+    }))
 }
 
 /// A `/ToUnicode` CMap holding `entries`.
@@ -738,6 +954,7 @@ impl DocumentEditor {
                     &forms,
                     self.source.page_operators(src)?,
                     flat.as_ref().map_or(&[][..], |flat| flat.overlay.as_slice()),
+                    None,
                     &mut std::io::sink(),
                 )?
             };
@@ -815,6 +1032,10 @@ impl DocumentEditor {
         });
         directs.retain(|(_, _, _, codes)| codes.has_redaction_only_code());
 
+        let reader = Reader {
+            source: &self.source,
+            flats: sources.iter().filter_map(|src| self.redacted_pages[src].flat.as_ref()).collect(),
+        };
         let mut rewrites: Vec<(u32, bool, Rewritten)> = Vec::new();
         if !states.is_empty() {
             self.count_users(&sources, &forms, &mut states)?;
@@ -823,16 +1044,16 @@ impl DocumentEditor {
                 if !state.uncountable {
                     surviving.union_with(&state.counted);
                 }
-                let font = self.source.load_object(ObjectRef::new(*id, 0))?;
+                let font = reader.load_object(ObjectRef::new(*id, 0))?;
                 let Some(dict) = font.as_dict() else { continue };
-                if let Some(rewritten) = rewrite_font(&self.source, dict, &state.removed, &surviving)? {
+                if let Some(rewritten) = rewrite_font(&reader, dict, &state.removed, &surviving)? {
                     rewrites.push((*id, !state.uncountable, rewritten));
                 }
             }
         }
         let mut direct_rewrites: Vec<(ScopeKey, String, Rewritten)> = Vec::new();
         for (key, name, dict, codes) in &directs {
-            if let Some(rewritten) = rewrite_font(&self.source, dict, &codes.removed, &codes.surviving)? {
+            if let Some(rewritten) = rewrite_font(&reader, dict, &codes.removed, &codes.surviving)? {
                 direct_rewrites.push((key.clone(), name.clone(), rewritten));
             }
         }
@@ -853,6 +1074,12 @@ impl DocumentEditor {
 
         let mut copies: HashMap<u32, u32> = HashMap::new();
         for (id, in_place, mut rewritten) in rewrites {
+            if self.is_flat_extra(id) {
+                self.rewrite_flat_font(id, rewritten);
+                scrub.fonts_scrubbed += 1;
+                continue;
+            }
+            self.place_descendant(&mut rewritten, in_place, prune, &mut scrub);
             self.finish_font(&mut rewritten, &mut scrub);
             let font = Object::Dictionary(rewritten.dict);
             prune.redacted_image_originals.extend(rewritten.orphans);
@@ -866,6 +1093,7 @@ impl DocumentEditor {
             scrub.fonts_scrubbed += 1;
         }
         for (key, name, mut rewritten) in direct_rewrites {
+            self.place_descendant(&mut rewritten, false, prune, &mut scrub);
             self.finish_font(&mut rewritten, &mut scrub);
             prune.redacted_image_originals.extend(rewritten.orphans);
             scrub.fonts.entry(key).or_default().insert(name, Object::Dictionary(rewritten.dict));
@@ -886,6 +1114,65 @@ impl DocumentEditor {
             prune.overrides.insert(id, element);
         }
         Ok(scrub)
+    }
+
+    /// Whether `id` is an object a flattened appearance of a redacted page
+    /// carries beside it, which only the appearance holds.
+    fn is_flat_extra(&self, id: u32) -> bool {
+        self.redacted_pages
+            .values()
+            .any(|page| page.flat.as_ref().is_some_and(|flat| flat.extra(id).is_some()))
+    }
+
+    /// Writes the scrubbed font `rewritten` over the objects of the fallback
+    /// font `id` that a flattened appearance carries: the appearance is the
+    /// only user of its font, so the font is rewritten where it is.
+    fn rewrite_flat_font(&mut self, id: u32, mut rewritten: Rewritten) {
+        let old_cmap = rewritten.dict.get("ToUnicode").and_then(Object::as_reference);
+        let mut replacements: Vec<(u32, Object)> = Vec::new();
+        if let Some(descendant) = rewritten.descendant.take() {
+            replacements.push((descendant.reference.id, Object::Dictionary(descendant.dict)));
+        }
+        if let (Some(bytes), Some(old)) = (rewritten.to_unicode.take(), old_cmap) {
+            let mut dict = HashMap::new();
+            dict.insert("Length".to_string(), Object::Integer(bytes.len() as i64));
+            replacements.push((old.id, Object::stream(dict, bytes::Bytes::from(bytes))));
+        }
+        replacements.push((id, Object::Dictionary(rewritten.dict)));
+        for (target, object) in replacements {
+            for page in self.redacted_pages.values_mut() {
+                if let Some(flat) = page.flat.as_mut() {
+                    if flat.extra(target).is_some() {
+                        flat.replace_extra(target, object);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Places the descendant CID font `rewritten` carries: over its object
+    /// when the font is rewritten where it is, else as a new object the
+    /// font copy names.
+    fn place_descendant(
+        &mut self,
+        rewritten: &mut Rewritten,
+        in_place: bool,
+        prune: &mut PagePrune,
+        scrub: &mut Scrub,
+    ) {
+        let Some(descendant) = rewritten.descendant.take() else { return };
+        let font = Object::Dictionary(descendant.dict);
+        if in_place {
+            prune.overrides.insert(descendant.reference.id, font);
+            return;
+        }
+        let copy = self.allocate_object_id();
+        scrub.objects.push((copy, font));
+        rewritten.dict.insert(
+            "DescendantFonts".to_string(),
+            Object::Array(vec![Object::Reference(ObjectRef::new(copy, 0))]),
+        );
     }
 
     /// Allocates the streams `rewritten` names and sets the entries that
