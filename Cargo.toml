@@ -424,9 +424,12 @@ legacy-crypto = ["dep:md-5"]
 # Python bindings (v0.1.0)
 python = [
     # ── pdf_manipulator patch ── python API exposes office conversion +
-    # full extraction ──
+    # full extraction, PDF/A (crate::compliance); the always-built host layer
+    # needs native-bridge's crates ──
     "office",
     "extract",
+    "pdfa",
+    "native-bridge",
     # ── end pdf_manipulator patch ──
     "pyo3",
     "pyo3-log",
@@ -491,7 +494,8 @@ debug-span-merging = []
 # reachable graph into the binary, defeating LTO dead-code elimination.
 # Default OFF here; enable for upstream-style standalone use and for
 # `cargo test` (the test suites cover these surfaces).
-public-api = ["signatures", "barcodes", "office", "extract"]
+# pdfa: ffi.rs and wasm.rs both call crate::compliance.
+public-api = ["signatures", "barcodes", "office", "extract", "pdfa"]
 # ── end pdf_manipulator patch ──
 
 # ── pdf_manipulator patch ── PDF↔office conversion (DOCX/PPTX/XLSX import +

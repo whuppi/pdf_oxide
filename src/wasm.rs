@@ -4332,12 +4332,20 @@ struct WasmTableColumnSpec {
     align: Option<i32>,
 }
 
+// ── pdf_manipulator patch: `default_true` was referenced but never defined ──
+fn default_true() -> bool {
+    true
+}
+// ── end pdf_manipulator patch ──
+
 #[derive(serde::Deserialize)]
 struct WasmStreamingTableSpec {
     columns: Vec<WasmStreamingColumnSpec>,
     #[serde(default, rename = "repeatHeader", alias = "repeat_header")]
     repeat_header: bool,
-    #[serde(default, rename = "hasHeader", alias = "has_header", default = "default_true")]
+    // ── pdf_manipulator patch: duplicate serde `default` attribute does not compile ──
+    #[serde(rename = "hasHeader", alias = "has_header", default = "default_true")]
+    // ── end pdf_manipulator patch ──
     has_header: bool,
     /// "fixed" | "sample" | "auto_all" (default "fixed")
     #[serde(default)]

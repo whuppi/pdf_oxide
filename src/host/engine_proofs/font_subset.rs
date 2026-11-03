@@ -789,3 +789,119 @@ fn twin_fonts(font: &[u8]) -> Vec<u8> {
     ];
     pdf_from_objects(&objects)
 }
+
+// ── fonts with GSUB ──────────────────────────────────────────────────
+
+const DEJAVU: &[u8] = include_bytes!("../../fonts/assets/DejaVuSans.ttf");
+
+/// The glyph id of `ch` in `face`.
+fn gid_of(face: &ttf_parser::Face, ch: char) -> u16 {
+    face.glyph_index(ch).unwrap_or_else(|| panic!("no glyph for {ch:?}")).0
+}
+
+/// A document showing `text` in `font` as a simple TrueType font
+/// (`Kind::Simple`, WinAnsi codes) or as a CIDFontType2 under Identity-H
+/// (`Kind::CidTrueType`, glyph ids as a producer shaped them: a ligature
+/// character is shown by its own glyph id).
+fn real_pdf(kind: Kind, font: &[u8], lines: &[&str]) -> Vec<u8> {
+    let face = ttf_parser::Face::parse(font, 0).unwrap();
+    let scale = 1000.0 / face.units_per_em() as f32;
+    let width = |ch: char| (face.glyph_hor_advance(face.glyph_index(ch).unwrap()).unwrap() as f32 * scale).round() as u32;
+    let mut content = String::new();
+    let mut unicode = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let y = 70 - 40 * i as u32;
+        let operand = match kind {
+            Kind::Simple => format!("({line})"),
+            _ => {
+                let mut hex = String::new();
+                for ch in line.chars() {
+                    let gid = gid_of(&face, ch);
+                    hex += &format!("{gid:04X}");
+                    let decoded: String = match ch {
+                        '\u{FB00}' => "ff".into(),
+                        '\u{FB01}' => "fi".into(),
+                        '\u{FB02}' => "fl".into(),
+                        c => c.to_string(),
+                    };
+                    let utf16: String = decoded.encode_utf16().map(|u| format!("{u:04X}")).collect();
+                    unicode += &format!("<{gid:04X}> <{utf16}>\n");
+                }
+                format!("<{hex}>")
+            }
+        };
+        content += &format!("BT /F1 24 Tf 10 {y} Td {operand} Tj ET\n");
+    }
+    let to_unicode = format!(
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n/CMapName /T def /CMapType 2 def\n\
+         1 begincodespacerange <0000> <FFFF> endcodespacerange\n{} beginbfchar\n{unicode}endbfchar\n\
+         endcmap end end\n",
+        unicode.lines().count()
+    );
+    let widths = (32u8..=126).map(|c| width(c as char).to_string()).collect::<Vec<_>>().join(" ");
+    let font_dict = match kind {
+        Kind::Simple => format!(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /DejaVuSans /FirstChar 32 /LastChar 126 \
+             /Widths [{widths}] /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>"
+        ),
+        _ => "<< /Type /Font /Subtype /Type0 /BaseFont /DejaVuSans /Encoding /Identity-H \
+              /DescendantFonts [10 0 R] /ToUnicode 11 0 R >>"
+            .to_string(),
+    };
+    let mut objects = vec![
+        plain(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        plain(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        plain(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Contents 4 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>",
+        ),
+        stream_object(4, "", content.as_bytes()),
+        plain(5, &font_dict),
+        plain(
+            6,
+            "<< /Type /FontDescriptor /FontName /DejaVuSans /Flags 32 /FontBBox [-1000 -300 2000 1000] \
+             /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 7 0 R >>",
+        ),
+        stream_object(7, &format!("/Length1 {}", font.len()), font),
+    ];
+    if kind == Kind::CidTrueType {
+        objects.push(plain(8, "null"));
+        objects.push(plain(9, "null"));
+        objects.push(plain(
+            10,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /DejaVuSans /CIDToGIDMap /Identity \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+             /FontDescriptor 6 0 R /DW 600 >>",
+        ));
+        objects.push(stream_object(11, "", to_unicode.as_bytes()));
+    }
+    pdf_from_objects(&objects)
+}
+
+/// Proves a real font with a `GSUB` table (DejaVu Sans, `liga` among its
+/// features) is left whole, as a simple TrueType font and as a CIDFontType2
+/// under Identity-H, for text whose letters a shaper joins ("office",
+/// "fluffy"). The renderer shapes the decoded text of a TrueType font with
+/// its GSUB, so "fi" paints the `fi` ligature glyph although the content
+/// shows only `f` and `i`; a program cut to the shown glyphs lost that
+/// outline and the page rendered differently (measured with the skip
+/// removed, at 100 dpi, in both kinds). No Dart-level test can observe it:
+/// the page renders the same whether the font was left whole or never
+/// reached by the pass, and only the program's bytes tell them apart.
+#[test]
+fn a_real_gsub_font_is_left_whole() {
+    let shaped = ["o\u{FB00}ice \u{FB02}u\u{FB00}y", "a\u{FB01}x \u{FB00}\u{FB01} \u{FB02}ow"];
+    let letters = ["office fluffy", "afix ffi flow"];
+    for (kind, lines) in [(Kind::CidTrueType, &shaped), (Kind::Simple, &letters)] {
+        let source = real_pdf(kind, DEJAVU, lines);
+        let cut = save(&source, pruning());
+        let (before, _) = stored(&source);
+        let (after, _) = stored(&cut);
+        assert!(before == after, "{kind:?}: a font with GSUB was cut");
+        let blank = render(&source);
+        assert!(blank.iter().any(|&b| b != blank[0]), "{kind:?}: the page renders blank");
+        assert!(blank == render(&cut), "{kind:?}: the page renders differently");
+        assert_eq!(text(&source), text(&cut), "{kind:?}: the extracted text changed");
+    }
+}
