@@ -30,7 +30,8 @@
 
 use crate::host::binary_codec::ResponseWriter;
 use crate::host::native::lane::{
-    lane_main, post_result, Job, LaneController, SinkChannel, SourceChannel, LANE_DEAD_MESSAGE,
+    lane_main, post_result, Job, LaneController, Mail, SinkChannel, SourceChannel,
+    LANE_DEAD_MESSAGE,
 };
 use crossbeam_channel::{unbounded, Receiver};
 use std::collections::{HashMap, VecDeque};
@@ -57,7 +58,7 @@ fn table() -> &'static Mutex<HashMap<u64, Arc<LaneController>>> {
 struct PendingStart {
     key: u64,
     controller: Arc<LaneController>,
-    mailbox: Receiver<Job>,
+    mailbox: Receiver<Mail>,
 }
 
 struct Budget {
@@ -87,11 +88,12 @@ impl Drop for SlotGuard {
                 // host's memory-safe signal to free the job's buffers.
                 // Then hand the slot to the next waiter.
                 Some(p) if p.controller.cancel.load(Ordering::SeqCst) => {
-                    while let Ok(job) = p.mailbox.try_recv() {
-                        post_result(
-                            job.result_port,
-                            ResponseWriter::cancelled(),
-                        );
+                    while let Ok(mail) = p.mailbox.try_recv() {
+                        let port = match mail {
+                            Mail::Job(job) => job.result_port,
+                            Mail::Reset { result_port } => result_port,
+                        };
+                        post_result(port, ResponseWriter::cancelled());
                     }
                     p.controller.tickets.lock().unwrap().clear();
                     continue;
@@ -110,7 +112,7 @@ impl Drop for SlotGuard {
     }
 }
 
-fn start_thread(key: u64, mailbox: Receiver<Job>, controller: Arc<LaneController>) {
+fn start_thread(key: u64, mailbox: Receiver<Mail>, controller: Arc<LaneController>) {
     thread::Builder::new()
         .name(format!("pdf-lane-{key}"))
         .spawn(move || {
@@ -126,7 +128,7 @@ fn start_thread(key: u64, mailbox: Receiver<Job>, controller: Arc<LaneController
 /// (budget permitting) or when a slot frees (FIFO). Never blocks,
 /// never errors.
 pub fn spawn() -> u64 {
-    let (sender, receiver) = unbounded::<Job>();
+    let (sender, receiver) = unbounded::<Mail>();
     let controller = Arc::new(LaneController::new(sender));
 
     let key = NEXT_LANE_KEY.fetch_add(1, Ordering::Relaxed);
@@ -143,10 +145,23 @@ pub fn spawn() -> u64 {
     key
 }
 
-/// Submit a job to a lane. Never blocks (unbounded mailbox). If the
-/// lane is gone, posts a "lane disposed" error to the result port —
-/// the caller always gets exactly one completion signal per job.
-pub fn submit(lane_key: u64, job: Job) {
+/// Start a new lease on a lane and return its id, or 0 when the lane is
+/// gone, has a job outstanding, or died. Ids count up from 1, per lane,
+/// and are never reused; from this call on, a message under an older
+/// lease is dropped.
+pub fn begin_lease(lane_key: u64) -> u64 {
+    let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
+        return 0;
+    };
+    controller.begin_lease().unwrap_or(0)
+}
+
+/// Submit a job to a lane under `lease`. Never blocks (unbounded mailbox).
+/// If the lane is gone, posts a "lane disposed" error to the result port;
+/// under a lease that is not current, posts the stale-lease error and
+/// touches nothing else — the caller always gets exactly one completion
+/// signal per job.
+pub fn submit(lane_key: u64, lease: u64, job: Job) {
     let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
         post_result(job.result_port, ResponseWriter::cancelled());
         return;
@@ -154,18 +169,17 @@ pub fn submit(lane_key: u64, job: Job) {
 
     // Ticket goes in BEFORE the enqueue so a cancel arriving right
     // after submit can always find its job.
-    controller
-        .tickets
-        .lock()
-        .unwrap()
-        .insert(job.job_id, job.cancel.clone());
+    if let Err(refusal) = controller.admit_job(lease, &job) {
+        post_result(job.result_port, ResponseWriter::error(refusal));
+        return;
+    }
 
     let sender = controller.mailbox.lock().unwrap().clone();
     match sender {
         Some(sender) => {
             let result_port = job.result_port;
             let job_id = job.job_id;
-            if sender.send(job).is_err() {
+            if sender.send(Mail::Job(job)).is_err() {
                 // Receiver gone: lane was killed while waiting for a
                 // budget slot and its mailbox was discarded.
                 controller.tickets.lock().unwrap().remove(&job_id);
@@ -190,12 +204,28 @@ pub fn submit(lane_key: u64, job: Job) {
 /// at dequeue, never reaches the engine, and this returns true so the
 /// host can complete it at once. Running → its I/O wakes with
 /// FLAG_CANCELLED and the op unwinds at the next I/O boundary. The lane
-/// and every other job on it are untouched.
-pub fn cancel_job(lane_key: u64, job_id: u64) -> bool {
+/// and every other job on it are untouched. A cancel under a lease that
+/// is not current changes nothing.
+pub fn cancel_job(lane_key: u64, lease: u64, job_id: u64) -> bool {
     let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
         return false;
     };
-    controller.cancel_job(job_id)
+    controller.cancel_job(lease, job_id)
+}
+
+/// Replace a lane's engine state with a fresh one and post the answer to
+/// `result_port` exactly once: success once the thread has done it, or the
+/// error that refused it (stale lease, a job outstanding, a dead lane).
+/// The thread takes the reset between jobs, so a reset never interrupts
+/// the engine.
+pub fn reset(lane_key: u64, lease: u64, result_port: i64) {
+    let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
+        post_result(result_port, ResponseWriter::cancelled());
+        return;
+    };
+    if let Err(refusal) = controller.request_reset(lease, result_port) {
+        post_result(result_port, ResponseWriter::error(refusal));
+    }
 }
 
 /// True once the lane's engine panicked and the lane stopped serving.
@@ -248,7 +278,24 @@ pub extern "C" fn lane_spawn() -> u64 {
     spawn()
 }
 
-/// Submit one job to a lane.
+/// Start a new lease on a lane. Returns the lease id (from 1, never
+/// reused on a lane), or 0 when the lane is gone, has a job outstanding or
+/// a held channel registered, or died.
+#[no_mangle]
+pub extern "C" fn lane_lease_begin(lane_key: u64) -> u64 {
+    begin_lease(lane_key)
+}
+
+/// Replace the lane's engine state with a fresh one. The answer is posted
+/// to `result_port` exactly once: a success once the lane has reset, or an
+/// error that refuses it (stale lease, a job outstanding, a dead lane).
+#[no_mangle]
+pub extern "C" fn lane_reset(lane_key: u64, lease: u64, result_port: i64) {
+    reset(lane_key, lease, result_port);
+}
+
+/// Submit one job to a lane under `lease`. A lease that is not the lane's
+/// current one makes the lane post the stale-lease error and nothing else.
 ///
 /// Sources: parallel arrays of (buffer ptr, notify fn ptr, length,
 /// keep flag), `source_count` entries each. A keep flag of 1 marks a
@@ -266,6 +313,7 @@ pub extern "C" fn lane_spawn() -> u64 {
 #[no_mangle]
 pub unsafe extern "C" fn lane_submit(
     lane_key: u64,
+    lease: u64,
     job_id: u64,
     request_ptr: *const u8,
     request_len: i32,
@@ -299,6 +347,7 @@ pub unsafe extern "C" fn lane_submit(
 
     submit(
         lane_key,
+        lease,
         Job {
             job_id,
             request,
@@ -311,10 +360,11 @@ pub unsafe extern "C" fn lane_submit(
 }
 
 /// Cancel one job on a lane. Returns 1 when the job had not started and
-/// the lane will skip it, 0 otherwise.
+/// the lane will skip it, 0 otherwise, and always 0, changing nothing,
+/// under a lease that is not current.
 #[no_mangle]
-pub extern "C" fn lane_job_cancel(lane_key: u64, job_id: u64) -> u8 {
-    cancel_job(lane_key, job_id) as u8
+pub extern "C" fn lane_job_cancel(lane_key: u64, lease: u64, job_id: u64) -> u8 {
+    cancel_job(lane_key, lease, job_id) as u8
 }
 
 /// 1 when the lane's engine panicked and the lane stopped serving, else 0.
@@ -331,11 +381,15 @@ pub extern "C" fn lane_kill(lane_key: u64) {
 
 /// Release one held channel (its handle was disposed). The caller
 /// must free the buffer only AFTER this returns. No-op if the lane
-/// is already gone (kill covers its channels).
+/// is already gone (kill covers its channels) or the lease is not current
+/// (a lease changes hands only once no held channel is registered, so a
+/// stale lease owes no release).
 #[no_mangle]
-pub extern "C" fn lane_channel_release(lane_key: u64, buf: *mut u8) {
+pub extern "C" fn lane_channel_release(lane_key: u64, lease: u64, buf: *mut u8) {
     if let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() {
-        controller.channels.release_one(buf as usize);
+        if controller.is_current(lease) {
+            controller.channels.release_one(buf as usize);
+        }
     }
 }
 
@@ -442,6 +496,14 @@ mod tests {
 
     unsafe extern "C" fn noop_notify() {}
 
+    /// A fresh lane and the first lease on it.
+    fn spawn_leased() -> (u64, u64) {
+        let key = spawn();
+        let lease = begin_lease(key);
+        assert_ne!(lease, 0, "a fresh lane could not be leased");
+        (key, lease)
+    }
+
     /// A live read-channel buffer whose host never answers — any
     /// reader on it parks forever until cancelled.
     struct ParkedSource {
@@ -495,6 +557,174 @@ mod tests {
         wait_until(Duration::from_secs(20), || controller.channels.live_count() > 0)
     }
 
+    fn kept_job(job_id: u64, source: &mut ParkedSource) -> Job {
+        let mut channel = source.channel();
+        channel.keep = true;
+        Job {
+            job_id,
+            request: open_request(),
+            sources: vec![channel],
+            sinks: vec![],
+            result_port: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Run a job that keeps its source's channel, cancel it while it is
+    /// parked on that channel, and wait until the channel is parked as a
+    /// held one, as a document's source is after its open.
+    fn leave_held_channel(
+        key: u64,
+        lease: u64,
+        controller: &Arc<LaneController>,
+        job_id: u64,
+        source: &mut ParkedSource,
+    ) {
+        submit(key, lease, kept_job(job_id, source));
+        assert!(wait_running(controller), "lane never started the job");
+        cancel_job(key, lease, job_id);
+        assert!(wait_until(Duration::from_secs(5), || {
+            tickets_empty(controller) && controller.channels.live_count() == 1
+        }));
+    }
+
+    fn quiet_job(job_id: u64) -> Job {
+        Job {
+            job_id,
+            request: open_request(),
+            sources: vec![],
+            sinks: vec![],
+            result_port: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn a_stale_submit_and_a_stale_cancel_never_reach_the_current_lease() {
+        let (key, stale) = spawn_leased();
+        let controller = controller_for(key).unwrap();
+        let current = begin_lease(key);
+        assert!(current > stale);
+
+        // The stale submit files no ticket and runs nothing: its job would
+        // park the lane, and the channel registry stays empty.
+        let mut source = ParkedSource::new();
+        submit(key, stale, parked_job(1, &mut source));
+        assert!(tickets_empty(&controller));
+        assert_eq!(controller.channels.live_count(), 0);
+
+        // Both leases count job ids from 1, so the stale cancel names the
+        // current lease's job. It must not flag it.
+        let mut running = ParkedSource::new();
+        submit(key, current, parked_job(1, &mut running));
+        assert!(wait_running(&controller), "lane never started the job");
+        assert!(!cancel_job(key, stale, 1));
+        let flagged = controller.tickets.lock().unwrap()[&1].load(Ordering::SeqCst);
+        assert!(!flagged, "a stale cancel flagged the current lease's job");
+
+        cancel_job(key, current, 1);
+        assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
+        kill(key);
+    }
+
+    #[test]
+    fn the_mailbox_buffers_a_second_job_but_the_lane_never_runs_two() {
+        let (key, lease) = spawn_leased();
+        let controller = controller_for(key).unwrap();
+        let mut first = ParkedSource::new();
+        let mut second = ParkedSource::new();
+
+        submit(key, lease, parked_job(1, &mut first));
+        assert!(wait_running(&controller), "lane never started job 1");
+        submit(key, lease, parked_job(2, &mut second));
+
+        // The mailbox accepted job 2 while job 1 runs...
+        assert_eq!(controller.tickets.lock().unwrap().len(), 2);
+        // ...and the thread has not touched it: only job 1's channel is
+        // registered, however long job 2 waits.
+        for _ in 0..25 {
+            assert_eq!(controller.channels.live_count(), 1);
+            assert_eq!(*controller.running.lock().unwrap(), Some(1));
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Job 2 starts when job 1 has posted, not before.
+        cancel_job(key, lease, 1);
+        assert!(wait_until(Duration::from_secs(5), || {
+            *controller.running.lock().unwrap() == Some(2) && controller.channels.live_count() == 1
+        }));
+        assert_eq!(controller.tickets.lock().unwrap().len(), 1);
+
+        cancel_job(key, lease, 2);
+        assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
+        kill(key);
+    }
+
+    #[test]
+    fn a_reset_drops_the_held_channels_and_an_idle_lane_resets_again() {
+        let (key, lease) = spawn_leased();
+        let controller = controller_for(key).unwrap();
+        let mut source = ParkedSource::new();
+
+        leave_held_channel(key, lease, &controller, 1, &mut source);
+        assert_eq!(begin_lease(key), 0, "a lease does not change hands over a held channel");
+
+        for _ in 0..2 {
+            reset(key, lease, 0);
+            assert!(
+                wait_until(Duration::from_secs(5), || controller.channels.live_count() == 0),
+                "the reset left a held channel registered"
+            );
+        }
+        assert!(!is_dead(key));
+        assert!(begin_lease(key) > lease, "a reset lane takes the next lease");
+        kill(key);
+    }
+
+    #[test]
+    fn a_reset_while_a_job_runs_is_refused_and_never_queued() {
+        let (key, lease) = spawn_leased();
+        let controller = controller_for(key).unwrap();
+        let mut source = ParkedSource::new();
+
+        submit(key, lease, kept_job(1, &mut source));
+        assert!(wait_running(&controller), "lane never started the job");
+        reset(key, lease, 0);
+        assert_eq!(*controller.running.lock().unwrap(), Some(1));
+
+        // The job ends and parks its kept channel as a held one. A reset
+        // wrongly queued behind it would run before the quiet job below
+        // finishes, and drop that channel.
+        cancel_job(key, lease, 1);
+        assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
+        submit(key, lease, quiet_job(2));
+        assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
+        assert_eq!(controller.channels.live_count(), 1, "the refused reset ran after all");
+        kill(key);
+    }
+
+    #[test]
+    fn a_stale_reset_is_refused_and_changes_nothing() {
+        let (key, stale) = spawn_leased();
+        let controller = controller_for(key).unwrap();
+        let mut source = ParkedSource::new();
+        leave_held_channel(key, stale, &controller, 1, &mut source);
+
+        // A new lease cannot start over the held channel, so the held one
+        // is dropped first; a stale reset after that must not drop what the
+        // next tenant holds.
+        reset(key, stale, 0);
+        assert!(wait_until(Duration::from_secs(5), || controller.channels.live_count() == 0));
+        let current = begin_lease(key);
+        let mut next = ParkedSource::new();
+        leave_held_channel(key, current, &controller, 1, &mut next);
+        reset(key, stale, 0);
+        submit(key, current, quiet_job(2));
+        assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
+        assert_eq!(controller.channels.live_count(), 1, "a stale reset dropped the current lease's channel");
+        kill(key);
+    }
+
     #[test]
     fn spawn_and_kill_lane_with_no_jobs() {
         let key = spawn();
@@ -511,10 +741,10 @@ mod tests {
         // that no host will ever answer must die promptly on kill —
         // not after a timeout, not never.
         let mut source = ParkedSource::new();
-        let key = spawn();
+        let (key, lease) = spawn_leased();
         let controller = controller_for(key).unwrap();
 
-        submit(key, parked_job(1, &mut source));
+        submit(key, lease, parked_job(1, &mut source));
 
         // The job is genuinely running and parked on its I/O channel.
         assert!(wait_running(&controller), "lane never started the job");
@@ -534,13 +764,13 @@ mod tests {
     #[test]
     fn job_cancel_kills_one_job_and_lane_survives() {
         let mut source = ParkedSource::new();
-        let key = spawn();
+        let (key, lease) = spawn_leased();
         let controller = controller_for(key).unwrap();
 
-        submit(key, parked_job(7, &mut source));
+        submit(key, lease, parked_job(7, &mut source));
         assert!(wait_running(&controller), "lane never started the job");
 
-        cancel_job(key, 7);
+        cancel_job(key, lease, 7);
         assert!(
             wait_until(Duration::from_secs(5), || tickets_empty(&controller)),
             "cancelled job did not unwind"
@@ -549,9 +779,9 @@ mod tests {
         // Lane is alive and accepts further work.
         assert!(controller_for(key).is_some());
         let mut source2 = ParkedSource::new();
-        submit(key, parked_job(8, &mut source2));
+        submit(key, lease, parked_job(8, &mut source2));
         assert!(wait_running(&controller), "lane did not run the second job");
-        cancel_job(key, 8);
+        cancel_job(key, lease, 8);
         assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
 
         kill(key);
@@ -560,14 +790,15 @@ mod tests {
     #[test]
     fn queued_jobs_complete_as_cancelled_on_kill() {
         let mut parked = ParkedSource::new();
-        let key = spawn();
+        let (key, lease) = spawn_leased();
         let controller = controller_for(key).unwrap();
 
         // Job 1 parks the lane; jobs 2 and 3 queue behind it.
-        submit(key, parked_job(1, &mut parked));
+        submit(key, lease, parked_job(1, &mut parked));
         assert!(wait_running(&controller), "lane never started job 1");
         submit(
             key,
+            lease,
             Job {
                 job_id: 2,
                 request: open_request(),
@@ -579,6 +810,7 @@ mod tests {
         );
         submit(
             key,
+            lease,
             Job {
                 job_id: 3,
                 request: open_request(),
@@ -600,12 +832,12 @@ mod tests {
 
     #[test]
     fn submit_to_dead_lane_is_safe() {
-        let key = spawn();
+        let (key, lease) = spawn_leased();
         kill(key);
 
         let mut source = ParkedSource::new();
         // Must not panic, must not leave a ticket anywhere.
-        submit(key, parked_job(42, &mut source));
+        submit(key, lease, parked_job(42, &mut source));
     }
 
     #[test]
@@ -633,8 +865,11 @@ mod tests {
         // A lane beyond the cap accepts a job (queued, not running).
         let last = *keys.last().unwrap();
         let controller = controller_for(last).unwrap();
+        let lease = begin_lease(last);
+        assert_ne!(lease, 0, "a lane that has not started can still be leased");
         submit(
             last,
+            lease,
             Job {
                 job_id: 1,
                 request: open_request(),
@@ -715,18 +950,18 @@ mod tests {
         // The queued job would panic the engine if it ran, so a lane still
         // alive afterwards proves it never reached it.
         let mut parked = ParkedSource::new();
-        let key = spawn();
+        let (key, lease) = spawn_leased();
         let controller = controller_for(key).unwrap();
 
-        submit(key, parked_job(1, &mut parked));
+        submit(key, lease, parked_job(1, &mut parked));
         assert!(wait_running(&controller), "lane never started job 1");
-        submit(key, panic_job(2));
+        submit(key, lease, panic_job(2));
 
-        assert!(cancel_job(key, 2), "job 2 had not started");
-        assert!(!cancel_job(key, 1), "job 1 is running");
+        assert!(cancel_job(key, lease, 2), "job 2 had not started");
+        assert!(!cancel_job(key, lease, 1), "job 1 is running");
         assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
         assert!(!is_dead(key), "the cancelled job reached the engine");
-        assert!(!cancel_job(key, 2), "a finished job is no longer queued");
+        assert!(!cancel_job(key, lease, 2), "a finished job is no longer queued");
 
         kill(key);
     }
@@ -735,25 +970,25 @@ mod tests {
     #[test]
     fn a_panic_ends_the_lane_and_every_job_behind_it_fails() {
         let mut parked = ParkedSource::new();
-        let key = spawn();
+        let (key, lease) = spawn_leased();
         let controller = controller_for(key).unwrap();
 
-        submit(key, parked_job(1, &mut parked));
+        submit(key, lease, parked_job(1, &mut parked));
         assert!(wait_running(&controller), "lane never started job 1");
-        submit(key, panic_job(2));
-        submit(key, panic_job(3));
-        submit(key, panic_job(4));
+        submit(key, lease, panic_job(2));
+        submit(key, lease, panic_job(3));
+        submit(key, lease, panic_job(4));
 
         // Job 1 yields to its cancel; job 2 panics; 3 and 4 are failed
         // without running.
-        assert!(!cancel_job(key, 1));
+        assert!(!cancel_job(key, lease, 1));
         assert!(
             wait_until(Duration::from_secs(5), || is_dead(key) && tickets_empty(&controller)),
             "the lane did not stop after a panic"
         );
 
         // A job arriving after the panic is failed at the door.
-        submit(key, panic_job(5));
+        submit(key, lease, panic_job(5));
         assert!(tickets_empty(&controller));
         assert!(controller.mailbox.lock().unwrap().is_none());
 

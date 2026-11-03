@@ -39,7 +39,7 @@ use crate::host::native::shared_buffer::{self as sb, read_channel as rc, write_c
 use crossbeam_channel::Receiver;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ── Job — one operation, routed to exactly one lane ────────────────
@@ -84,6 +84,21 @@ pub struct Job {
     /// This job's cancel flag (also held in the controller's ticket
     /// map so `lane_job_cancel` can reach it).
     pub cancel: Arc<AtomicBool>,
+}
+
+/// What the lane thread takes from its mailbox, strictly one item at a
+/// time: the mailbox may buffer a second job while one runs, but the
+/// thread starts nothing until the item in hand has posted.
+pub enum Mail {
+    /// One operation.
+    Job(Job),
+    /// Replace the engine state with a fresh one. Accepted only while no
+    /// job is outstanding (see `LaneController::admit_reset`), so the
+    /// thread sees it between jobs.
+    Reset {
+        /// allo-isolate port that receives the answer.
+        result_port: i64,
+    },
 }
 
 // ── ChannelRegistry — live I/O buffers, woken on cancellation ──────
@@ -172,6 +187,14 @@ impl ChannelRegistry {
         self.entries.lock().unwrap().remove(&buf);
     }
 
+    /// Forget every held channel (the lane's state was reset, so no handle
+    /// reads them any more). Only the lane thread calls this, between jobs,
+    /// when every registered channel is a held one. The caller frees the
+    /// buffers only after this returns.
+    fn release_held(&self) {
+        self.entries.lock().unwrap().retain(|_, (_, owner)| *owner != HELD_OWNER);
+    }
+
     /// Wake every registered channel with FLAG_CANCELLED (lane kill).
     pub fn cancel_all(&self) {
         let entries = self.entries.lock().unwrap();
@@ -239,9 +262,9 @@ unsafe fn revive_channel(buf: *mut u8, kind: ChannelKind) {
 /// thread holds its own clone so the controller outlives a racing
 /// table removal.
 pub struct LaneController {
-    /// Job intake. `None` after kill — the lane thread drains the
+    /// Intake. `None` after kill — the lane thread drains the
     /// channel and exits when the sender is gone.
-    pub(crate) mailbox: Mutex<Option<crossbeam_channel::Sender<Job>>>,
+    pub(crate) mailbox: Mutex<Option<crossbeam_channel::Sender<Mail>>>,
     /// Lane-wide kill flag. Set once by `lane_kill`, never cleared.
     pub cancel: Arc<AtomicBool>,
     /// Live I/O channels for wake-on-cancel.
@@ -258,11 +281,17 @@ pub struct LaneController {
     /// whose engine panicked: a panic kills the lane, and the host reads
     /// this flag when that post arrives.
     pub dead: AtomicBool,
+    /// The lease whose messages the lane serves; 0 before the first
+    /// `begin_lease`. Written only while `tickets` is locked, so a check
+    /// of it under that lock is exact.
+    lease: AtomicU64,
+    /// The last lease handed out. Ids count up from 1 and are never reused.
+    last_lease: AtomicU64,
 }
 
 impl LaneController {
     /// A controller for a lane that has accepted no job yet.
-    pub(crate) fn new(sender: crossbeam_channel::Sender<Job>) -> Self {
+    pub(crate) fn new(sender: crossbeam_channel::Sender<Mail>) -> Self {
         Self {
             mailbox: Mutex::new(Some(sender)),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -270,21 +299,87 @@ impl LaneController {
             tickets: Mutex::new(HashMap::new()),
             running: Mutex::new(None),
             dead: AtomicBool::new(false),
+            lease: AtomicU64::new(0),
+            last_lease: AtomicU64::new(0),
         }
     }
 
+    /// Start a new lease on this lane and make it the current one: every
+    /// message that carries an older lease is dropped from now on. Returns
+    /// `None`, changing nothing, while a job is outstanding, while a held
+    /// channel is still registered, or after the engine panicked: a lease
+    /// changes hands only on an idle, live lane that holds nothing, which
+    /// is what a reset leaves. The earlier lease then has no channel whose
+    /// release it could still owe.
+    pub fn begin_lease(&self) -> Option<u64> {
+        let tickets = self.tickets.lock().unwrap();
+        if !tickets.is_empty()
+            || self.channels.live_count() != 0
+            || self.dead.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let lease = self.last_lease.fetch_add(1, Ordering::SeqCst) + 1;
+        self.lease.store(lease, Ordering::SeqCst);
+        Some(lease)
+    }
+
+    /// File a job's ticket when `lease` is the current lease, else leave
+    /// the lane untouched and return the refusal to post.
+    pub(crate) fn admit_job(&self, lease: u64, job: &Job) -> Result<(), &'static str> {
+        let mut tickets = self.tickets.lock().unwrap();
+        if self.lease.load(Ordering::SeqCst) != lease {
+            return Err(STALE_LEASE_MESSAGE);
+        }
+        tickets.insert(job.job_id, job.cancel.clone());
+        Ok(())
+    }
+
+    /// Queue a reset when `lease` is current, the lane is alive and no job
+    /// is outstanding, queued or running. The lock on `tickets` is held
+    /// through the enqueue, so no job can be filed between the check and
+    /// the reset.
+    pub(crate) fn request_reset(&self, lease: u64, result_port: i64) -> Result<(), &'static str> {
+        let tickets = self.tickets.lock().unwrap();
+        if self.lease.load(Ordering::SeqCst) != lease {
+            return Err(STALE_LEASE_MESSAGE);
+        }
+        if self.dead.load(Ordering::SeqCst) {
+            return Err(LANE_DEAD_MESSAGE);
+        }
+        if !tickets.is_empty() {
+            return Err(LANE_BUSY_MESSAGE);
+        }
+        match self.mailbox.lock().unwrap().as_ref() {
+            Some(sender) if sender.send(Mail::Reset { result_port }).is_ok() => Ok(()),
+            _ => Err(LANE_DEAD_MESSAGE),
+        }
+    }
+
+    /// Whether `lease` is the lease the lane serves.
+    pub(crate) fn is_current(&self, lease: u64) -> bool {
+        self.lease.load(Ordering::SeqCst) == lease
+    }
+
     /// Cancel one job. Returns true when the job had not started, so the
-    /// lane will skip it without touching the engine.
+    /// lane will skip it without touching the engine. A cancel under a
+    /// lease that is not current changes nothing and returns false: the
+    /// job ids of two leases come from two counters and may collide.
     ///
     /// `running` is held across the flag store: the lane thread marks a job
     /// running before it reads the job's flag, so every cancel either
     /// lands first (the lane skips the job) or finds it running (its I/O
     /// is woken below).
-    pub fn cancel_job(&self, job_id: u64) -> bool {
+    pub fn cancel_job(&self, lease: u64, job_id: u64) -> bool {
         let running = self.running.lock().unwrap();
-        let Some(flag) = self.tickets.lock().unwrap().get(&job_id).cloned() else {
+        let tickets = self.tickets.lock().unwrap();
+        if self.lease.load(Ordering::SeqCst) != lease {
+            return false;
+        }
+        let Some(flag) = tickets.get(&job_id).cloned() else {
             return false;
         };
+        drop(tickets);
         flag.store(true, Ordering::SeqCst);
         let queued = *running != Some(job_id);
         self.channels.cancel_job(job_id);
@@ -294,6 +389,13 @@ impl LaneController {
 
 /// Error every job posts that reaches a lane after its engine panicked.
 pub const LANE_DEAD_MESSAGE: &str = "the engine lane stopped after an engine operation panicked";
+
+/// Error a job, or a reset, posts when its lease is not the lane's current
+/// one. The message is dropped without touching the engine.
+pub const STALE_LEASE_MESSAGE: &str = "the lane's lease was replaced; this message is stale";
+
+/// Error a reset posts when a job is still outstanding on the lane.
+pub const LANE_BUSY_MESSAGE: &str = "the lane cannot reset while a job is outstanding";
 
 // ── The lane body ───────────────────────────────────────────────────
 
@@ -308,24 +410,50 @@ pub const LANE_DEAD_MESSAGE: &str = "the engine lane stopped after an engine ope
 /// Budget-slot release is NOT done here — the lane table wraps this
 /// call in an RAII guard at the spawn site, so the slot is returned
 /// even if this thread unwinds.
-pub fn lane_main(mailbox: Receiver<Job>, controller: Arc<LaneController>) {
+pub fn lane_main(mailbox: Receiver<Mail>, controller: Arc<LaneController>) {
     let mut state = Some(LaneState::new());
 
-    while let Ok(job) = mailbox.recv() {
-        match state.as_mut() {
-            Some(live) => {
-                if !run_job(live, &controller, job) {
-                    state = None;
-                    *controller.mailbox.lock().unwrap() = None;
+    while let Ok(mail) = mailbox.recv() {
+        match mail {
+            Mail::Job(job) => match state.as_mut() {
+                Some(live) => {
+                    if !run_job(live, &controller, job) {
+                        state = None;
+                        *controller.mailbox.lock().unwrap() = None;
+                    }
                 }
+                None => fail_job(&controller, job),
+            },
+            Mail::Reset { result_port } => {
+                let answer = match state.as_mut() {
+                    // Dequeued after a kill: the lane is going away, and
+                    // the engine state with it.
+                    Some(_) if controller.cancel.load(Ordering::SeqCst) => {
+                        ResponseWriter::cancelled()
+                    }
+                    Some(live) => {
+                        reset_lane(live, &controller);
+                        ResponseWriter::ok().finish()
+                    }
+                    None => ResponseWriter::error(LANE_DEAD_MESSAGE),
+                };
+                post_result(result_port, answer);
             }
-            None => fail_job(&controller, job),
         }
     }
 
     // Mailbox closed: the lane is dead. `state` drops here, freeing
     // every handle this lane owned — on this thread, the only thread
     // that ever touched it.
+}
+
+/// Replace the lane's engine state with a fresh one and forget the held
+/// channels that belonged to it. Runs between jobs on the lane thread, so
+/// no reader is parked on a channel and no other thread touches the state.
+/// Dart frees the held buffers after the reset's answer, never before.
+fn reset_lane(state: &mut LaneState, controller: &LaneController) {
+    *state = LaneState::new();
+    controller.channels.release_held();
 }
 
 /// Post the lane-dead error for a job that arrives after a panic.
@@ -586,16 +714,141 @@ mod tests {
 
     #[test]
     fn a_cancel_tells_a_queued_job_from_a_running_one() {
-        let (sender, _receiver) = crossbeam_channel::unbounded::<Job>();
+        let (sender, _receiver) = crossbeam_channel::unbounded::<Mail>();
         let controller = LaneController::new(sender);
+        let lease = controller.begin_lease().unwrap();
         for id in [1, 2] {
             controller.tickets.lock().unwrap().insert(id, Arc::new(AtomicBool::new(false)));
         }
         *controller.running.lock().unwrap() = Some(1);
 
-        assert!(!controller.cancel_job(1), "job 1 is running");
-        assert!(controller.cancel_job(2), "job 2 has not started");
-        assert!(!controller.cancel_job(3), "job 3 is unknown, or already finished");
+        assert!(!controller.cancel_job(lease, 1), "job 1 is running");
+        assert!(controller.cancel_job(lease, 2), "job 2 has not started");
+        assert!(!controller.cancel_job(lease, 3), "job 3 is unknown, or already finished");
         assert!(controller.tickets.lock().unwrap()[&2].load(Ordering::SeqCst));
+    }
+
+    fn bare_job(job_id: u64) -> Job {
+        Job {
+            job_id,
+            request: vec![],
+            sources: vec![],
+            sinks: vec![],
+            result_port: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn leases_count_up_from_one_and_start_only_on_an_idle_live_lane() {
+        let (sender, _receiver) = crossbeam_channel::unbounded::<Mail>();
+        let controller = LaneController::new(sender);
+        assert_eq!(controller.begin_lease(), Some(1));
+        assert_eq!(controller.begin_lease(), Some(2));
+        assert!(controller.is_current(2));
+        assert!(!controller.is_current(1));
+
+        let job = bare_job(1);
+        controller.admit_job(2, &job).unwrap();
+        assert_eq!(controller.begin_lease(), None, "a job is outstanding");
+        assert!(controller.is_current(2), "a refused begin changes nothing");
+        controller.tickets.lock().unwrap().remove(&1);
+
+        let mut buf = read_buf();
+        let kept = job_with_source(1, &mut buf, true);
+        controller.channels.register(&kept);
+        controller.channels.release_job(&kept);
+        assert_eq!(controller.begin_lease(), None, "a held channel is still registered");
+        controller.channels.release_held();
+        assert_eq!(controller.begin_lease(), Some(3));
+        unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR) };
+
+        controller.dead.store(true, Ordering::SeqCst);
+        assert_eq!(controller.begin_lease(), None, "a dead lane is never leased again");
+    }
+
+    #[test]
+    fn a_job_under_a_stale_lease_is_refused_and_files_no_ticket() {
+        let (sender, _receiver) = crossbeam_channel::unbounded::<Mail>();
+        let controller = LaneController::new(sender);
+        let first = controller.begin_lease().unwrap();
+        let second = controller.begin_lease().unwrap();
+
+        assert_eq!(controller.admit_job(first, &bare_job(1)), Err(STALE_LEASE_MESSAGE));
+        assert!(controller.tickets.lock().unwrap().is_empty());
+        assert_eq!(controller.admit_job(second, &bare_job(1)), Ok(()));
+        assert_eq!(controller.tickets.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_cancel_under_a_stale_lease_never_reaches_the_current_job() {
+        // Two leases count their job ids separately, so the stale cancel
+        // names a job id the current lease also holds.
+        let (sender, _receiver) = crossbeam_channel::unbounded::<Mail>();
+        let controller = LaneController::new(sender);
+        let stale = controller.begin_lease().unwrap();
+        let current = controller.begin_lease().unwrap();
+        let job = bare_job(1);
+        controller.admit_job(current, &job).unwrap();
+
+        assert!(!controller.cancel_job(stale, 1));
+        assert!(!job.cancel.load(Ordering::SeqCst), "the stale cancel flagged the job");
+
+        controller.cancel_job(current, 1);
+        assert!(job.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_reset_is_queued_only_for_the_current_lease_on_an_idle_live_lane() {
+        let (sender, receiver) = crossbeam_channel::unbounded::<Mail>();
+        let controller = LaneController::new(sender);
+        let stale = controller.begin_lease().unwrap();
+        let current = controller.begin_lease().unwrap();
+
+        assert_eq!(controller.request_reset(stale, 7), Err(STALE_LEASE_MESSAGE));
+        assert!(receiver.try_recv().is_err(), "a stale reset reached the mailbox");
+
+        let job = bare_job(1);
+        controller.admit_job(current, &job).unwrap();
+        assert_eq!(controller.request_reset(current, 7), Err(LANE_BUSY_MESSAGE));
+        assert!(receiver.try_recv().is_err(), "a reset behind a running job was queued");
+        controller.tickets.lock().unwrap().remove(&1);
+
+        // An idle executor resets, and resets again.
+        for _ in 0..2 {
+            assert_eq!(controller.request_reset(current, 7), Ok(()));
+            assert!(matches!(receiver.try_recv(), Ok(Mail::Reset { result_port: 7 })));
+        }
+
+        controller.dead.store(true, Ordering::SeqCst);
+        assert_eq!(controller.request_reset(current, 7), Err(LANE_DEAD_MESSAGE));
+    }
+
+    #[test]
+    fn a_reset_forgets_every_held_channel_and_keeps_a_jobs_own() {
+        let registry = ChannelRegistry::new();
+        let mut held = read_buf();
+        let mut running = read_buf();
+
+        let kept = job_with_source(1, &mut held, true);
+        registry.register(&kept);
+        registry.release_job(&kept);
+        assert_eq!(registry.live_count(), 1);
+
+        // Between jobs only held channels exist: all of them go.
+        registry.release_held();
+        assert_eq!(registry.live_count(), 0);
+
+        // Job-owned entries are not held ones and stay.
+        let job = job_with_source(2, &mut running, false);
+        registry.register(&job);
+        registry.release_held();
+        assert_eq!(registry.live_count(), 1);
+        registry.release_job(&job);
+
+        unsafe {
+            sb::destroy_sync(held.as_mut_ptr(), rc::OFFSET_SYNC_PTR);
+            sb::destroy_sync(running.as_mut_ptr(), rc::OFFSET_SYNC_PTR);
+        }
     }
 }
