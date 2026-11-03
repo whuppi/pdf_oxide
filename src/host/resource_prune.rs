@@ -43,12 +43,25 @@
 //!   `/Resources` that cannot be read;
 //! - another object than the ones walked points at the dictionary;
 //! - the page is edited while the save writes it.
+//!
+//! The same walk feeds the font cut (`host::font_subset`) when the scope
+//! holds a [`Collector`]: every operator it reads is also offered to the
+//! collector, so no content is opened for the cut a second time. The cut
+//! needs the glyphs of every content a viewer may paint, which is more than
+//! the names the prune follows: an entry no name reaches, in a dictionary
+//! the prune leaves whole, still stays in the file. So the walk also reads,
+//! once, each content that its resource dictionaries hold and no name
+//! reached, after the names of the dictionary are final. Those reads feed
+//! the collector and nothing else: they record no name, pin nothing, and a
+//! resource dictionary only they reach is never cut. A content that some
+//! name reaches is read once for both.
 
 use crate::cancel::CancelCheck;
 use crate::content::operators::Operator;
 use crate::document::PdfDocument;
 use crate::error::Result;
 use crate::host::content::inline::components;
+use crate::host::font_subset::{Collector, Feed};
 use crate::host::content::parts::{decoded_reader, PartsReader};
 use crate::host::content::{consumed_names, InlineImages, Mode, Operators, Resolver};
 use crate::object::{Object, ObjectRef};
@@ -187,6 +200,20 @@ enum Target {
     Own { owner: u32, value: Object },
 }
 
+/// What a work item is for, as bits. A content read for several purposes is
+/// read once.
+///
+/// A prune that feeds no collector only ever asks for [`NAMES`].
+type Need = u8;
+/// Record the names the content resolves and queue what they paint.
+const NAMES: Need = 1;
+/// Offer the content's operators to the collector.
+const FEED: Need = 2;
+/// The fonts of the dictionary the content is read against stay whole: a
+/// form field can use them, or the save edits the page. Reached contents
+/// are read for the collector as well.
+const POISON: Need = 4;
+
 /// Content to read against a resource dictionary.
 struct Work {
     content: Content,
@@ -195,6 +222,9 @@ struct Work {
     /// cannot be read.
     painter: Option<Rc<Ctx>>,
     chain: Option<Rc<Link>>,
+    /// The purposes of this read that no earlier read of the same content
+    /// against the same dictionary served.
+    need: Need,
 }
 
 /// What the prune cuts out of one object, by the names of dictionaries
@@ -266,7 +296,7 @@ pub(crate) struct ScopePage {
 }
 
 /// One document a save writes objects from, in its own numbering.
-pub(crate) struct Scope<'a> {
+pub(crate) struct Scope<'a, 'c> {
     pub doc: &'a PdfDocument,
     /// Objects the editor stages over the document's own.
     pub staged: &'a HashMap<u32, Object>,
@@ -283,13 +313,16 @@ pub(crate) struct Scope<'a> {
     /// The ids of the objects the save writes from this document, or
     /// `None` for every object of the document that is not excluded.
     pub writers: Option<Vec<u32>>,
+    /// The font cut that reads the contents along with the prune.
+    pub glyphs: Option<&'a mut Collector<'c>>,
 }
 
 /// Cuts the resource dictionaries of the pages of `scope` down: the cuts
 /// go into `scope.cuts`, keyed by id in the numbering of the scope's
 /// document.
-pub(crate) fn plan(scope: Scope<'_>, cancel: &CancelCheck) -> Result<()> {
-    let Scope { doc, staged, overrides, cuts, excluded, pages, page_object, writers } = scope;
+pub(crate) fn plan(scope: Scope<'_, '_>, cancel: &CancelCheck) -> Result<()> {
+    let Scope { doc, staged, overrides, cuts, excluded, pages, page_object, writers, glyphs } =
+        scope;
     let mut pruner = Pruner {
         doc,
         staged,
@@ -298,38 +331,38 @@ pub(crate) fn plan(scope: Scope<'_>, cancel: &CancelCheck) -> Result<()> {
         excluded,
         writers,
         page_object,
+        glyphs,
         cache: HashMap::new(),
         ctxs: HashMap::new(),
         subs: HashMap::new(),
         used: HashMap::new(),
         pinned: HashSet::new(),
         seen: HashMap::new(),
-        visited: HashSet::new(),
+        visited: HashMap::new(),
         work: Vec::new(),
         created: Vec::new(),
         local_visited: HashMap::new(),
         finished: HashSet::new(),
+        unnamed: HashSet::new(),
+        poisoned: HashSet::new(),
+        unioned: HashSet::new(),
     };
     let mut done = HashSet::new();
     for ScopePage { id: page, held } in pages {
         cancel.check()?;
         if done.insert(page) {
             pruner.page(page, held);
-            while let Some(work) = pruner.work.pop() {
-                cancel.check()?;
-                pruner.process(work, cancel)?;
-                pruner.settle();
-            }
-            pruner.settle();
+            pruner.drain(cancel)?;
         }
     }
+    pruner.finish_unnamed(cancel)?;
     pruner.close_color_spaces();
     pruner.pin_shared(cancel)?;
     pruner.cut_shared();
     Ok(())
 }
 
-struct Pruner<'a> {
+struct Pruner<'a, 'c> {
     doc: &'a PdfDocument,
     staged: &'a HashMap<u32, Object>,
     overrides: &'a HashMap<u32, Object>,
@@ -337,6 +370,7 @@ struct Pruner<'a> {
     excluded: &'a HashSet<u32>,
     writers: Option<Vec<u32>>,
     page_object: Option<&'a dyn Fn(u32) -> Option<Object>>,
+    glyphs: Option<&'a mut Collector<'c>>,
     /// Objects as the walk reads them; a stream is its dictionary and its
     /// extent, never its data.
     cache: HashMap<u32, Option<Rc<Object>>>,
@@ -349,7 +383,8 @@ struct Pruner<'a> {
     /// Indirect dictionaries the walk reached, with the ids of the objects
     /// it found the reference in.
     seen: HashMap<u32, HashSet<u32>>,
-    visited: HashSet<(Visit, Slot)>,
+    /// What each content has been read for against each dictionary.
+    visited: HashMap<(Visit, Slot), Need>,
     work: Vec<Work>,
     /// The resource dictionaries held directly in an object that are being
     /// walked: a direct subdictionary has one owner, so what is known about
@@ -360,9 +395,18 @@ struct Pruner<'a> {
     local_visited: HashMap<Slot, Vec<Visit>>,
     /// The objects whose own direct resources are done.
     finished: HashSet<u32>,
+    /// The dictionaries only a read for the collector reached: no name is
+    /// recorded against them, so they are never cut.
+    unnamed: HashSet<Slot>,
+    /// The dictionaries whose fonts stay whole, and so the contents they
+    /// hold: those are read as poisoned.
+    poisoned: HashSet<Slot>,
+    /// The dictionaries whose entries no name reached have been queued for
+    /// the collector, and whether as poisoned.
+    unioned: HashSet<(Slot, bool)>,
 }
 
-impl Pruner<'_> {
+impl Pruner<'_, '_> {
     /// The staged or replacing object for `id`, if the save has one.
     fn replaced(&self, id: u32) -> Option<&Object> {
         self.overrides.get(&id).or_else(|| self.staged.get(&id))
@@ -409,11 +453,16 @@ impl Pruner<'_> {
     }
 
     /// The resource dictionary `value` (the `/Resources` entry of the
-    /// object `holder`), with the slots of its subdictionaries.
-    fn context(&mut self, holder: u32, value: &Object) -> Option<Rc<Ctx>> {
+    /// object `holder`), with the slots of its subdictionaries. `named` is
+    /// whether names are recorded against it: a dictionary met only for the
+    /// collector is not, and the prune leaves it and the objects it points
+    /// at as the walk of names would have found them.
+    fn context(&mut self, holder: u32, value: &Object, named: bool) -> Option<Rc<Ctx>> {
         let (slot, dict) = match value {
             Object::Reference(r) => {
-                self.seen.entry(r.id).or_default().insert(holder);
+                if named {
+                    self.seen.entry(r.id).or_default().insert(holder);
+                }
                 let obj = self.object(r.id)?;
                 let Object::Dictionary(dict) = &*obj else { return None };
                 (Slot { owner: r.id, path: Path::EMPTY }, dict.clone())
@@ -423,14 +472,22 @@ impl Pruner<'_> {
             },
             _ => return None,
         };
-        if let Some(ctx) = self.ctxs.get(&slot) {
-            return Some(ctx.clone());
+        if let Some(ctx) = self.ctxs.get(&slot).cloned() {
+            if named && self.unnamed.remove(&slot) {
+                for sub in ctx.subs.iter().flatten().filter(|sub| sub.path.is_empty()) {
+                    self.seen.entry(sub.owner).or_default().insert(slot.owner);
+                }
+            }
+            return Some(ctx);
         }
+        let mut font_holder = None;
         let mut subs: [Option<Slot>; 7] = Default::default();
         for (kind, key) in KINDS.iter().enumerate() {
             let (sub_slot, sub_dict) = match dict.get(*key) {
                 Some(Object::Reference(r)) => {
-                    self.seen.entry(r.id).or_default().insert(slot.owner);
+                    if named {
+                        self.seen.entry(r.id).or_default().insert(slot.owner);
+                    }
                     let Some(obj) = self.object(r.id) else { continue };
                     let Object::Dictionary(sub_dict) = &*obj else { continue };
                     (Slot { owner: r.id, path: Path::EMPTY }, sub_dict.clone())
@@ -449,14 +506,25 @@ impl Pruner<'_> {
             }
             let sub = self.subs.get_mut(&sub_slot).expect("the subdictionary was just inserted");
             if sub.kind != kind {
-                self.pinned.insert(sub_slot);
+                if named {
+                    self.pinned.insert(sub_slot);
+                }
                 continue;
             }
             if !sub.holders.contains(&slot) {
                 sub.holders.push(slot.clone());
             }
             self.used.entry(sub_slot.clone()).or_default();
+            if kind == FONT {
+                font_holder = Some(sub_slot.owner);
+            }
             subs[kind] = Some(sub_slot);
+        }
+        if let (Some(glyphs), Some(holder)) = (self.glyphs.as_mut(), font_holder) {
+            glyphs.reached(holder);
+        }
+        if !named {
+            self.unnamed.insert(slot.clone());
         }
         if !slot.path.is_empty() {
             self.created.push(slot.clone());
@@ -464,6 +532,12 @@ impl Pruner<'_> {
         let ctx = Rc::new(Ctx { slot: slot.clone(), subs });
         self.ctxs.insert(slot, ctx.clone());
         Some(ctx)
+    }
+
+    /// Whether a resource dictionary that holds `sub` has had names recorded
+    /// against it: a subdictionary only unnamed dictionaries hold is not cut.
+    fn is_named_sub(&self, sub: &Sub) -> bool {
+        sub.holders.iter().any(|holder| !self.unnamed.contains(holder))
     }
 
     /// The component count of each entry of a `/ColorSpace` dictionary.
@@ -504,21 +578,61 @@ impl Pruner<'_> {
             .any(|slot| self.subs.get(slot).is_some_and(|sub| sub.dict.contains_key(name)))
     }
 
-    /// Queues `content` against `target`, once per dictionary.
+    /// What a read of a content is for: `names` to record the names it
+    /// resolves, and, when a collector is fed, to offer it the operators
+    /// (`poison`: and to keep the fonts of the dictionary whole).
+    fn need(&self, names: bool, poison: bool) -> Need {
+        let mut need = 0;
+        if names {
+            need |= NAMES;
+        }
+        if self.glyphs.is_some() {
+            need |= FEED;
+            if poison {
+                need |= POISON;
+            }
+        }
+        need
+    }
+
+    /// The plan of the font cut cannot be trusted: a content could not be
+    /// read to its end.
+    fn glyphs_damaged(&mut self) {
+        if let Some(glyphs) = self.glyphs.as_mut() {
+            glyphs.disable();
+        }
+    }
+
+    /// Leaves whole the programs of the fonts `ctx` holds, and of everything
+    /// the dictionaries reached from it hold.
+    fn poison_ctx(&mut self, ctx: &Ctx) {
+        self.poisoned.insert(ctx.slot);
+        let Some(fonts) = ctx.subs[FONT].as_ref().and_then(|slot| self.subs.get(slot)) else {
+            return;
+        };
+        if let Some(glyphs) = self.glyphs.as_mut() {
+            glyphs.poison_map(&fonts.dict);
+        }
+    }
+
+    /// Queues `content` against `target`, once per dictionary and purpose.
     fn push(
         &mut self,
         content: Content,
         target: Target,
         painter: Option<Rc<Ctx>>,
         chain: Option<Rc<Link>>,
+        need: Need,
     ) {
         let slot = match &target {
             Target::Ready(ctx) => ctx.slot.clone(),
             Target::Own { owner, value } => match slot_of(*owner, value) {
                 Some(slot) => slot,
                 None => {
-                    if let Some(painter) = &painter {
-                        self.pin(painter);
+                    if need & NAMES != 0 {
+                        if let Some(painter) = &painter {
+                            self.pin(painter);
+                        }
                     }
                     return;
                 },
@@ -528,13 +642,20 @@ impl Pruner<'_> {
             Content::Page { parts, .. } => Visit::Page(parts.as_slice().into()),
             Content::Form(id) => Visit::Form(*id),
         };
-        if !self.visited.insert((visit.clone(), slot)) {
+        let done = self.visited.get(&(visit.clone(), slot)).copied().unwrap_or(0);
+        let remaining = need & !done;
+        if remaining == 0 {
             return;
         }
-        if !slot.path.is_empty() {
+        // A read only for the collector is moot once the plan is dropped.
+        if remaining & NAMES == 0 && self.glyphs.as_ref().map_or(true, |g| g.is_disabled()) {
+            return;
+        }
+        self.visited.insert((visit.clone(), slot), done | need);
+        if done == 0 && !slot.path.is_empty() {
             self.local_visited.entry(slot).or_default().push(visit);
         }
-        self.work.push(Work { content, target, painter, chain });
+        self.work.push(Work { content, target, painter, chain, need: remaining });
     }
 
     /// Queues what a kept page paints: its contents against its resources,
@@ -542,40 +663,81 @@ impl Pruner<'_> {
     fn page(&mut self, id: u32, held: bool) {
         let Some(obj) = self.object(id) else { return };
         let Some(dict) = dict_of(&obj) else { return };
-        let ctx = dict.get("Resources").and_then(|value| self.context(id, value));
+        let own = dict.get("Resources").and_then(|value| self.context(id, value, true));
+        let glyphs = self.glyphs.is_some();
         if held {
-            if let Some(ctx) = &ctx {
+            if let Some(ctx) = &own {
                 self.pin(ctx);
             }
-            return;
+            if !glyphs {
+                return;
+            }
         }
-        if let (Some(ctx), Some(contents)) = (&ctx, dict.get("Contents")) {
-            match self.content_ids(contents) {
+        // The collector reads a page against the nearest resources it
+        // inherits, which the prune never cuts.
+        let ctx = match (&own, glyphs) {
+            (None, true) => self.inherited_resources(id),
+            _ => own.clone(),
+        };
+        if held {
+            if let Some(ctx) = &ctx {
+                self.poison_ctx(ctx);
+            }
+        }
+        let names = !held && own.is_some();
+        let need = self.need(names, held);
+        match (&ctx, dict.get("Contents")) {
+            (Some(ctx), Some(contents)) => match self.content_ids(contents) {
                 Some((parts, _)) if parts.is_empty() => {},
                 Some((parts, single)) => self.push(
                     Content::Page { parts, single },
                     Target::Ready(ctx.clone()),
                     Some(ctx.clone()),
                     None,
+                    need,
                 ),
-                None => self.pin(ctx),
-            }
+                None => {
+                    if names {
+                        self.pin(ctx);
+                    }
+                    self.glyphs_damaged();
+                },
+            },
+            // A page with no resources shows no font; one with text is damage.
+            (None, Some(_)) => self.glyphs_damaged(),
+            _ => {},
         }
-        for form in self.appearance_forms(dict) {
+        for (form, names, poison) in self.appearance_forms(dict, held) {
             let Some(obj) = self.object(form) else { continue };
             let Some(form_dict) = dict_of(&obj) else { continue };
             // Some viewers read an appearance stream without resources of
             // its own against the page's.
-            let target = match form_dict.get("Resources") {
-                Some(value) if self.is_done(form, value) => continue,
-                Some(value) => Target::Own { owner: form, value: value.clone() },
+            let (target, names) = match form_dict.get("Resources") {
+                Some(value) if self.is_done(form, value, poison) => continue,
+                Some(value) => (Target::Own { owner: form, value: value.clone() }, names),
                 None => match &ctx {
-                    Some(ctx) => Target::Ready(ctx.clone()),
+                    Some(ctx) => (Target::Ready(ctx.clone()), names && own.is_some()),
                     None => continue,
                 },
             };
-            self.enter(form, target, ctx.clone(), &None);
+            let need = self.need(names, poison);
+            self.enter(form, target, ctx.clone(), &None, need);
         }
+    }
+
+    /// The resources the nearest ancestor of `page` holds, when the page has
+    /// none of its own.
+    fn inherited_resources(&mut self, page: u32) -> Option<Rc<Ctx>> {
+        let mut at = page;
+        for _ in 0..MAX_NESTING {
+            let obj = self.object(at)?;
+            let dict = dict_of(&obj)?;
+            if let Some(value) = dict.get("Resources") {
+                return self.context(at, value, false);
+            }
+            at = dict.get("Parent")?.as_reference()?.id;
+        }
+        None
     }
 
     /// The content streams `value` (a page's `/Contents`) names, and
@@ -600,27 +762,46 @@ impl Pruner<'_> {
         Some((parts, false))
     }
 
-    /// The appearance streams of the annotations a page lists.
-    fn appearance_forms(&mut self, page: &Dict) -> Vec<u32> {
+    /// The appearance streams of the annotations a page lists, each with
+    /// whether its names count (the prune walks the annotations the save
+    /// writes and holds by reference) and whether its fonts stay whole (a
+    /// form field, or a page the save edits). The collector is also given
+    /// the annotations the prune does not walk, since they stay in the file
+    /// when the save writes them.
+    fn appearance_forms(&mut self, page: &Dict, held: bool) -> Vec<(u32, bool, bool)> {
+        let glyphs = self.glyphs.is_some();
         let Some(annots) = page.get("Annots").and_then(|v| self.resolved(v)) else {
             return Vec::new();
         };
         let Object::Array(annots) = &*annots else { return Vec::new() };
         let mut forms = Vec::new();
         for annot in annots {
-            let Object::Reference(r) = annot else { continue };
-            if self.excluded.contains(&r.id) {
-                continue;
-            }
-            let Some(annot) = self.object(r.id) else { continue };
-            let Some(ap) = dict_of(&annot).and_then(|d| d.get("AP")) else { continue };
+            let (names, annot) = match annot {
+                Object::Reference(r) => {
+                    let names = !self.excluded.contains(&r.id);
+                    if !names && !glyphs {
+                        continue;
+                    }
+                    let Some(annot) = self.object(r.id) else { continue };
+                    (names, annot)
+                },
+                direct if glyphs => (false, Rc::new(direct.clone())),
+                _ => continue,
+            };
+            let Some(annot) = dict_of(&annot) else { continue };
+            let poison = held
+                || annot.get("Subtype").and_then(|s| s.as_name()) == Some("Widget")
+                || annot.contains_key("FT");
+            let Some(ap) = annot.get("AP") else { continue };
             let Some(ap) = self.resolved(ap) else { continue };
             let Object::Dictionary(ap) = &*ap else { continue };
+            let mut found = Vec::new();
             for key in ["N", "R", "D"] {
                 if let Some(value) = ap.get(key) {
-                    self.streams_of(value, true, &mut forms);
+                    self.streams_of(value, true, &mut found);
                 }
             }
+            forms.extend(found.into_iter().map(|form| (form, names, poison)));
         }
         forms
     }
@@ -679,43 +860,90 @@ impl Pruner<'_> {
     }
 
     /// Reads one content: records what it names against its context and
-    /// queues what it paints.
+    /// queues what it paints, and offers its operators to the collector.
+    /// A work item for a content that an earlier read already took the
+    /// operators of reads it only for the names, and one that asks only to
+    /// keep fonts whole reads nothing.
     fn process(&mut self, work: Work, cancel: &CancelCheck) -> Result<()> {
-        let Work { content, target, painter, chain } = work;
+        let Work { content, target, painter, chain, need } = work;
+        let wants_names = need & NAMES != 0;
+        let feeds = need & FEED != 0;
+        let poison = need & POISON != 0;
         let ctx = match target {
             Target::Ready(ctx) => ctx,
-            Target::Own { owner, value } => match self.context(owner, &value) {
+            Target::Own { owner, value } => match self.context(owner, &value, wants_names) {
                 Some(ctx) => ctx,
                 None => {
-                    if let Some(painter) = &painter {
-                        self.pin(painter);
+                    if wants_names {
+                        if let Some(painter) = &painter {
+                            self.pin(painter);
+                        }
+                    }
+                    // A viewer may fall back to the painter's resources.
+                    if let Some(painter) = painter.filter(|_| feeds) {
+                        let target = Target::Ready(painter.clone());
+                        self.push(content, target, Some(painter), chain, need & !NAMES);
                     }
                     return Ok(());
                 },
             },
         };
+        if poison {
+            self.poison_ctx(&ctx);
+        }
+        if need & (NAMES | FEED) == 0 {
+            return Ok(());
+        }
         let Some(mut ops) = self.open(&content, &ctx, cancel) else {
-            self.pin(&ctx);
+            if wants_names {
+                self.pin(&ctx);
+            }
+            if feeds {
+                self.glyphs_damaged();
+            }
             return Ok(());
         };
         let mut names = Names::default();
         let mut unexplained = false;
+        let mut feed = Feed::new();
+        let no_fonts = Dict::new();
         while let Some(op) = ops.next() {
             let op = op?;
-            let consumed = consumed_names(&op);
-            // A name the operator held that no arm of it uses may be a
-            // resource the source misread.
-            if ops
-                .pending_names()
-                .iter()
-                .any(|name| !consumed.contains(&name.as_str()) && self.is_key(&ctx, name))
-            {
-                unexplained = true;
-                break;
+            if wants_names && !unexplained {
+                let consumed = consumed_names(&op);
+                // A name the operator held that no arm of it uses may be a
+                // resource the source misread.
+                if ops
+                    .pending_names()
+                    .iter()
+                    .any(|name| !consumed.contains(&name.as_str()) && self.is_key(&ctx, name))
+                {
+                    unexplained = true;
+                    if !feeds {
+                        break;
+                    }
+                } else {
+                    record(&op, &consumed, &mut names);
+                }
             }
-            record(&op, &consumed, &mut names);
+            if feeds {
+                let fonts = ctx.subs[FONT]
+                    .as_ref()
+                    .and_then(|slot| self.subs.get(slot))
+                    .map_or(&no_fonts, |sub| &sub.dict);
+                if let Some(glyphs) = self.glyphs.as_mut() {
+                    glyphs.op(&mut feed, &op, fonts, poison);
+                }
+            }
         }
-        if unexplained || !ops.damage().is_clean() {
+        let damaged = !ops.damage().is_clean();
+        if damaged && feeds {
+            self.glyphs_damaged();
+        }
+        if !wants_names {
+            return Ok(());
+        }
+        if unexplained || damaged {
             self.pin(&ctx);
             return Ok(());
         }
@@ -725,15 +953,23 @@ impl Pruner<'_> {
                 self.used.entry(slot.clone()).or_default().extend(names.sets[kind].iter().cloned());
             }
         }
-        if !self.follow(&names, &ctx, &chain) {
+        if !self.follow(&names, &ctx, &chain, poison) {
             self.pin(&ctx);
         }
         Ok(())
     }
 
     /// Queues what `names` paint against `ctx`. `false` when one of them
-    /// cannot be read.
-    fn follow(&mut self, names: &Names, ctx: &Rc<Ctx>, chain: &Option<Rc<Link>>) -> bool {
+    /// cannot be read. `poison` is whether the painting content's fonts stay
+    /// whole, and so what it paints.
+    fn follow(
+        &mut self,
+        names: &Names,
+        ctx: &Rc<Ctx>,
+        chain: &Option<Rc<Link>>,
+        poison: bool,
+    ) -> bool {
+        let need = self.need(true, poison);
         for name in &names.sets[XOBJECT] {
             let Some(Object::Reference(r)) = self.entry(ctx, XOBJECT, name) else { continue };
             // Not cached: a page that paints thousands of forms would hold
@@ -743,7 +979,7 @@ impl Pruner<'_> {
             match dict.get("Subtype").and_then(|s| s.as_name()) {
                 Some("Image") => self.dictionary_spaces(dict, ctx),
                 Some("PS") => {},
-                _ => self.paint(r.id, dict, ctx, chain),
+                _ => self.paint(r.id, dict, ctx, chain, need),
             }
         }
         for name in &names.sets[FONT] {
@@ -760,8 +996,8 @@ impl Pruner<'_> {
                 continue;
             }
             let child = match (holder, dict.get("Resources")) {
-                (Some(holder), Some(value)) if self.is_done(holder, value) => continue,
-                (Some(holder), Some(value)) => match self.context(holder, value) {
+                (Some(holder), Some(value)) if self.is_done(holder, value, poison) => continue,
+                (Some(holder), Some(value)) => match self.context(holder, value, true) {
                     Some(own) => own,
                     None => {
                         self.pin(ctx);
@@ -784,7 +1020,7 @@ impl Pruner<'_> {
                 procs.values().filter_map(|v| v.as_reference()).map(|r| r.id).collect();
             ids.sort_unstable();
             for id in ids {
-                self.enter(id, Target::Ready(child.clone()), Some(ctx.clone()), chain);
+                self.enter(id, Target::Ready(child.clone()), Some(ctx.clone()), chain, need);
             }
         }
         for name in &names.sets[EXT_G_STATE] {
@@ -797,7 +1033,7 @@ impl Pruner<'_> {
             };
             let Some(form) = self.object(group.id) else { return false };
             if let Object::Stream { dict, .. } = &*form {
-                self.paint(group.id, dict, ctx, chain);
+                self.paint(group.id, dict, ctx, chain, need);
             }
         }
         for name in &names.sets[PATTERN] {
@@ -805,7 +1041,7 @@ impl Pruner<'_> {
             let Some(pattern) = self.resolved(&entry) else { return false };
             match (&*pattern, &entry) {
                 (Object::Stream { dict, .. }, Object::Reference(r)) => {
-                    self.paint(r.id, dict, ctx, chain)
+                    self.paint(r.id, dict, ctx, chain, need)
                 },
                 (Object::Dictionary(dict), _) => {
                     if let Some(shading) = dict.get("Shading").and_then(|v| self.resolved(v)) {
@@ -832,33 +1068,50 @@ impl Pruner<'_> {
     /// has none. Resources it has that cannot be read keep the painter
     /// whole and the stream unwalked: a viewer may fall back to the
     /// painter's for any name.
-    fn paint(&mut self, id: u32, dict: &Dict, painter: &Rc<Ctx>, chain: &Option<Rc<Link>>) {
+    fn paint(
+        &mut self,
+        id: u32,
+        dict: &Dict,
+        painter: &Rc<Ctx>,
+        chain: &Option<Rc<Link>>,
+        need: Need,
+    ) {
         let target = match dict.get("Resources") {
-            Some(value) if self.is_done(id, value) => return,
+            Some(value) if self.is_done(id, value, need & POISON != 0) => return,
             Some(value) => Target::Own { owner: id, value: value.clone() },
             None => Target::Ready(painter.clone()),
         };
-        self.enter(id, target, Some(painter.clone()), chain);
+        self.enter(id, target, Some(painter.clone()), chain, need);
     }
 
     /// Whether the resources `value` that object `owner` holds directly were
     /// already cut. They are not met again: a walk would find them whole
-    /// and cut them as it did.
-    fn is_done(&self, owner: u32, value: &Object) -> bool {
-        matches!(value, Object::Dictionary(_)) && self.finished.contains(&owner)
+    /// and cut them as it did, and the collector has had their contents. A
+    /// request to keep their fonts whole is met again.
+    fn is_done(&self, owner: u32, value: &Object, poison: bool) -> bool {
+        !poison && matches!(value, Object::Dictionary(_)) && self.finished.contains(&owner)
     }
 
     /// Queues stream `id` against `child`. A form already being walked, or
-    /// nested deeper than [`MAX_NESTING`], keeps both contexts whole.
+    /// nested deeper than [`MAX_NESTING`], keeps both contexts whole; a
+    /// read for the collector only never keeps anything whole, and drops
+    /// the plan of the font cut when it is nested too deep.
     fn enter(
         &mut self,
         id: u32,
         target: Target,
         painter: Option<Rc<Ctx>>,
         chain: &Option<Rc<Link>>,
+        need: Need,
     ) {
         let depth = chain.as_ref().map_or(1, |link| link.depth + 1);
         if depth > MAX_NESTING || in_chain(chain, id) {
+            if depth > MAX_NESTING {
+                self.glyphs_damaged();
+            }
+            if need & NAMES == 0 {
+                return;
+            }
             if let Some(painter) = &painter {
                 self.pin(painter);
             }
@@ -866,7 +1119,7 @@ impl Pruner<'_> {
                 Target::Ready(ctx) => self.pin(&ctx),
                 // Met now, while the walk that is cut off still holds it.
                 Target::Own { owner, value } => {
-                    if let Some(ctx) = self.context(owner, &value) {
+                    if let Some(ctx) = self.context(owner, &value, true) {
                         self.pin(&ctx);
                     }
                 },
@@ -874,7 +1127,7 @@ impl Pruner<'_> {
             return;
         }
         let link = Rc::new(Link { id, depth, parent: chain.clone() });
-        self.push(Content::Form(id), target, painter, Some(link));
+        self.push(Content::Form(id), target, painter, Some(link), need);
     }
 
     /// Marks the color spaces `dict` (an image, a shading or a pattern)
@@ -951,14 +1204,34 @@ impl Pruner<'_> {
     /// final, so their cuts are made and what the walk knew of them is
     /// dropped. What a walk reaches through an indirect dictionary stays
     /// until the end, since other pages name against it too.
+    ///
+    /// With a collector, a dictionary that no work item reads against any
+    /// more first has the contents its entries hold that no name reached
+    /// queued for the collector, and ends once those are read.
     fn settle(&mut self) {
         self.cache.clear();
-        let ended: Vec<Slot> = self
-            .created
-            .iter()
-            .filter(|slot| self.ctxs.get(*slot).map_or(true, |ctx| Rc::strong_count(ctx) == 1))
-            .cloned()
-            .collect();
+        let mut ended: Vec<Slot> = Vec::new();
+        let mut unreached: Vec<Rc<Ctx>> = Vec::new();
+        for slot in &self.created {
+            match self.ctxs.get(slot) {
+                None => ended.push(*slot),
+                Some(ctx) if Rc::strong_count(ctx) == 1 => {
+                    if self.glyphs.is_some()
+                        && !self.unioned.contains(&(*slot, self.poisoned.contains(slot)))
+                    {
+                        unreached.push(ctx.clone());
+                    } else {
+                        ended.push(*slot);
+                    }
+                },
+                Some(_) => {},
+            }
+        }
+        for ctx in unreached {
+            let poison = self.poisoned.contains(&ctx.slot);
+            self.unioned.insert((ctx.slot, poison));
+            self.union_follow(&ctx, poison);
+        }
         if ended.is_empty() {
             return;
         }
@@ -978,14 +1251,145 @@ impl Pruner<'_> {
             for visit in self.local_visited.remove(&slot).unwrap_or_default() {
                 self.visited.remove(&(visit, slot));
             }
-            self.finished.insert(slot.owner);
+            if !self.unnamed.remove(&slot) {
+                self.finished.insert(slot.owner);
+            }
+            self.poisoned.remove(&slot);
+            self.unioned.remove(&(slot, false));
+            self.unioned.remove(&(slot, true));
         }
+    }
+
+    /// Reads every queued content until none is left.
+    fn drain(&mut self, cancel: &CancelCheck) -> Result<()> {
+        loop {
+            while let Some(work) = self.work.pop() {
+                cancel.check()?;
+                self.process(work, cancel)?;
+                self.settle();
+            }
+            self.settle();
+            if self.work.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// With a collector, queues for it, in every dictionary that has not
+    /// been, the contents its entries hold that no name reached, and reads
+    /// them: the dictionaries held by reference live until here.
+    fn finish_unnamed(&mut self, cancel: &CancelCheck) -> Result<()> {
+        if self.glyphs.is_none() {
+            return Ok(());
+        }
+        loop {
+            let pending: Vec<Rc<Ctx>> = self
+                .ctxs
+                .values()
+                .filter(|ctx| !self.unioned.contains(&(ctx.slot, self.poisoned.contains(&ctx.slot))))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for ctx in pending {
+                cancel.check()?;
+                let poison = self.poisoned.contains(&ctx.slot);
+                self.unioned.insert((ctx.slot, poison));
+                self.union_follow(&ctx, poison);
+            }
+            self.drain(cancel)?;
+        }
+    }
+
+    /// The entries of subdictionary `kind` of `ctx`, in the order of their names.
+    fn sub_values(&self, ctx: &Ctx, kind: usize) -> Vec<Object> {
+        let Some(sub) = ctx.subs[kind].as_ref().and_then(|slot| self.subs.get(slot)) else {
+            return Vec::new();
+        };
+        let mut names: Vec<&String> = sub.dict.keys().collect();
+        names.sort();
+        names.into_iter().filter_map(|name| sub.dict.get(name).cloned()).collect()
+    }
+
+    /// Queues for the collector, and only for it, the contents `ctx` holds
+    /// that a viewer may paint: every form, pattern, soft-mask group and Type 3
+    /// glyph procedure its entries name, whether or not a content names the
+    /// entry. A content some name reached has been read, and is not read again.
+    fn union_follow(&mut self, ctx: &Rc<Ctx>, poison: bool) {
+        if self.glyphs.as_ref().map_or(true, |glyphs| glyphs.is_disabled()) {
+            return;
+        }
+        let need = self.need(false, poison);
+        for value in self.sub_values(ctx, XOBJECT) {
+            let Object::Reference(r) = value else { continue };
+            let Some(Object::Stream { dict, .. }) = self.read(r.id) else { continue };
+            if !matches!(dict.get("Subtype").and_then(|s| s.as_name()), Some("Image" | "PS")) {
+                self.paint(r.id, &dict, ctx, &None, need);
+            }
+        }
+        for value in self.sub_values(ctx, PATTERN) {
+            let Object::Reference(r) = value else { continue };
+            if let Some(Object::Stream { dict, .. }) = self.read(r.id) {
+                self.paint(r.id, &dict, ctx, &None, need);
+            }
+        }
+        for value in self.sub_values(ctx, EXT_G_STATE) {
+            let Some(state) = self.resolved(&value) else { continue };
+            let Some(mask) = dict_of(&state).and_then(|d| d.get("SMask")) else { continue };
+            let Some(mask) = self.resolved(mask) else { continue };
+            let Some(Object::Reference(group)) = dict_of(&mask).and_then(|d| d.get("G")) else {
+                continue;
+            };
+            if let Some(Object::Stream { dict, .. }) = self.read(group.id) {
+                self.paint(group.id, &dict, ctx, &None, need);
+            }
+        }
+        for value in self.sub_values(ctx, FONT) {
+            let Object::Reference(r) = value else { continue };
+            let Some(font) = self.object(r.id) else { continue };
+            let Some(font) = dict_of(&font) else { continue };
+            if font.get("Subtype").and_then(|s| s.as_name()) != Some("Type3") {
+                continue;
+            }
+            let child = match font.get("Resources") {
+                Some(value) if self.is_done(r.id, value, poison) => continue,
+                Some(value) => self.context(r.id, value, false).unwrap_or_else(|| ctx.clone()),
+                None => ctx.clone(),
+            };
+            let Some(procs) = font.get("CharProcs").and_then(|v| self.resolved(v)) else {
+                continue;
+            };
+            let Object::Dictionary(procs) = &*procs else { continue };
+            let mut ids: Vec<u32> =
+                procs.values().filter_map(|v| v.as_reference()).map(|r| r.id).collect();
+            ids.sort_unstable();
+            if poison {
+                self.poison_ctx(&child);
+            }
+            for id in ids {
+                self.enter(id, Target::Ready(child.clone()), Some(ctx.clone()), &None, need);
+            }
+        }
+    }
+
+    /// Whether the save writes object `id` of a document that has no writers
+    /// list: it is not dropped, and not a free entry.
+    fn is_written(&self, id: u32) -> bool {
+        id != 0
+            && !self.excluded.contains(&id)
+            && (self.replaced(id).is_some() || !self.doc.is_free_entry(id))
     }
 
     /// Keeps whole the subdictionaries some object the walk did not reach
     /// also points at: the object may resolve names against them.
+    ///
+    /// This is the one pass over every object of the document, so it is also
+    /// where the collector is offered each object, once the walk is done:
+    /// the objects it reads are in the source's cache for the references.
     fn pin_shared(&mut self, cancel: &CancelCheck) -> Result<()> {
-        if self.seen.is_empty() {
+        let scanning = self.glyphs.as_ref().is_some_and(|glyphs| glyphs.wants_scan());
+        if self.seen.is_empty() && !scanning {
             return Ok(());
         }
         let ids = match &self.writers {
@@ -996,11 +1400,9 @@ impl Pruner<'_> {
                 ids.extend(self.overrides.keys().copied());
                 ids.sort_unstable();
                 ids.dedup();
-                ids.retain(|&id| {
-                    id != 0
-                        && !self.excluded.contains(&id)
-                        && (self.replaced(id).is_some() || !self.doc.is_free_entry(id))
-                });
+                if !scanning {
+                    ids.retain(|&id| self.is_written(id));
+                }
                 ids
             },
         };
@@ -1008,12 +1410,25 @@ impl Pruner<'_> {
         let mut refs: Vec<u32> = Vec::new();
         for id in ids {
             cancel.check()?;
+            if scanning {
+                if let Some(glyphs) = self.glyphs.as_mut() {
+                    glyphs.scan_object(id);
+                }
+                if self.seen.is_empty() || (self.writers.is_none() && !self.is_written(id)) {
+                    continue;
+                }
+            }
             refs.clear();
             self.refs_of(id, &mut refs);
             for target in &refs {
                 if self.seen.get(target).is_some_and(|holders| !holders.contains(&id)) {
                     stray.insert(*target);
                 }
+            }
+        }
+        if scanning {
+            if let Some(glyphs) = self.glyphs.as_mut() {
+                glyphs.scanned();
             }
         }
         for (slot, sub) in &self.subs {
@@ -1042,6 +1457,9 @@ impl Pruner<'_> {
     /// Records the cut of subdictionary `sub` at `slot` down to the entries
     /// named in `used`.
     fn replace(&mut self, slot: &Slot, sub: &Sub, used: &HashSet<String>) {
+        if !self.is_named_sub(sub) {
+            return;
+        }
         let mut keep: Vec<String> =
             sub.dict.keys().filter(|name| used.contains(*name)).cloned().collect();
         if keep.len() == sub.dict.len() {

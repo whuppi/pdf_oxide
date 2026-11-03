@@ -3,11 +3,14 @@
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
-//! A full rewrite that prunes resources asks [`plan`] last. It reads every
-//! content of the kept pages one at a time (the page, the forms, patterns,
-//! soft-mask groups and Type 3 glyph procedures its resources hold, and the
-//! appearance streams of its annotations), as operators, and collects for
-//! each font program the glyph ids its fonts show. It answers with the
+//! A full rewrite that prunes resources starts a [`Collector`] before the
+//! unused-resource walk (`host::resource_prune`) and hands it to that walk.
+//! The walk reads every content of the kept pages once (the page, the forms,
+//! patterns, soft-mask groups and Type 3 glyph procedures its resources hold,
+//! and the appearance streams of its annotations), and passes each operator to
+//! [`Collector::op`], which collects for each font program the glyph ids its
+//! fonts show. No content is opened for the font cut on its own. After the
+//! save has settled its aliases, [`Collector::finish`] answers with the
 //! replacement stream of each program it could shrink; the save writes those
 //! in place of the source's.
 //!
@@ -37,8 +40,9 @@
 //! and the glyph of a `/Differences` name. That is more than one renderer
 //! paints and exactly what any of them may.
 //!
-//! The memory of a plan is the glyph sets, the fonts met, and one font
-//! program at a time: a content is never held.
+//! The memory of a plan is the glyph sets, the fonts met, the ids of the
+//! font maps a walk reached, and one font program at a time: a content is
+//! never held.
 
 pub(crate) mod cff;
 pub(crate) mod truetype;
@@ -49,40 +53,12 @@ use crate::document::PdfDocument;
 use crate::error::Result;
 use crate::fonts::unicode_decode::TextCharIter;
 use crate::fonts::{CIDToGIDMap, FontInfo};
-use crate::host::content::inline::components;
-use crate::host::content::parts::{decoded_reader, PartsReader};
-use crate::host::content::{InlineImages, Mode, Operators};
+use crate::host::content::parts::decoded_reader;
 use crate::object::{Object, ObjectRef};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
-use std::rc::Rc;
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
 
-type Dict = HashMap<String, Object>;
-
-/// Forms painted from forms deeper than this are not walked, and the plan
-/// is dropped.
-const MAX_NESTING: usize = 64;
-
-/// A font-map holder no walk reaches.
-const NEVER: u32 = u32::MAX;
-
-/// What a plan reads, and how it writes.
-pub(crate) struct Scope<'a> {
-    pub doc: &'a PdfDocument,
-    /// Objects the editor stages over the document's own.
-    pub staged: &'a HashMap<u32, Object>,
-    /// Objects the save replaces.
-    pub overrides: &'a HashMap<u32, Object>,
-    /// The duplicate-to-kept map of the save: a program written once for
-    /// two streams must hold the glyphs of both.
-    pub aliases: &'a HashMap<u32, u32>,
-    /// The kept pages, and whether the save edits each while writing.
-    pub pages: Vec<(u32, bool)>,
-    /// The Flate level of the save.
-    pub level: u32,
-}
+pub(crate) type Dict = HashMap<String, Object>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -98,22 +74,6 @@ struct Entry {
     memo: HashMap<u16, Vec<u16>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum ResId {
-    Obj(u32),
-    Direct(u32),
-}
-
-/// A resource dictionary as the walk meets it.
-struct Res {
-    id: ResId,
-    dict: Dict,
-    fonts: Dict,
-    /// The id of the object that holds the font map itself.
-    holder: u32,
-    spaces: Arc<HashMap<String, usize>>,
-}
-
 /// The font a content has selected.
 #[derive(Clone, Copy)]
 enum Current {
@@ -124,7 +84,21 @@ enum Current {
     Font(u32),
 }
 
-struct Walker<'a> {
+/// What a content has selected so far: the current font and the ones its
+/// `q` operators saved. One per content read.
+pub(crate) struct Feed {
+    current: Current,
+    saved: Vec<Current>,
+}
+
+impl Feed {
+    pub(crate) fn new() -> Feed {
+        Feed { current: Current::Unset, saved: Vec::new() }
+    }
+}
+
+/// The glyphs, fonts and poisoned programs the contents of one save show.
+pub(crate) struct Collector<'a> {
     doc: &'a PdfDocument,
     staged: &'a HashMap<u32, Object>,
     overrides: &'a HashMap<u32, Object>,
@@ -133,9 +107,7 @@ struct Walker<'a> {
     glyphs: HashMap<u32, BTreeSet<u16>>,
     poisoned: HashSet<u32>,
     walked: HashSet<u32>,
-    resources: HashMap<ResId, Rc<Res>>,
-    visited: HashSet<(u32, ResId, bool)>,
-    done: HashSet<(ResId, bool)>,
+    scanned: bool,
     disabled: bool,
     cancel: CancelCheck,
 }
@@ -149,23 +121,23 @@ fn dict_of(obj: &Object) -> Option<&Dict> {
 }
 
 /// The programs `font`'s descriptors hold, whatever the kind of font.
-fn descriptor_files(walker: &Walker<'_>, font: &Dict) -> Vec<u32> {
+fn descriptor_files(collector: &Collector<'_>, font: &Dict) -> Vec<u32> {
     let mut out = Vec::new();
     let mut descriptors = Vec::new();
     descriptors.extend(font.get("FontDescriptor").cloned());
-    if let Some(list) = font.get("DescendantFonts").and_then(|v| walker.resolve(v)) {
+    if let Some(list) = font.get("DescendantFonts").and_then(|v| collector.resolve(v)) {
         let items: Vec<Object> = match &list {
             Object::Array(items) => items.clone(),
             other => vec![other.clone()],
         };
         for item in items {
-            if let Some(cid) = walker.resolve(&item) {
+            if let Some(cid) = collector.resolve(&item) {
                 descriptors.extend(dict_of(&cid).and_then(|d| d.get("FontDescriptor")).cloned());
             }
         }
     }
     for descriptor in descriptors {
-        let Some(descriptor) = walker.resolve(&descriptor) else { continue };
+        let Some(descriptor) = collector.resolve(&descriptor) else { continue };
         let Some(dict) = dict_of(&descriptor) else { continue };
         for key in ["FontFile", "FontFile2", "FontFile3"] {
             if let Some(Object::Reference(r)) = dict.get(key) {
@@ -176,7 +148,49 @@ fn descriptor_files(walker: &Walker<'_>, font: &Dict) -> Vec<u32> {
     out
 }
 
-impl<'a> Walker<'a> {
+impl<'a> Collector<'a> {
+    /// A collector for a save that writes `doc` with `staged` objects over
+    /// its own and `overrides` in place of them. It meets a font program
+    /// only when a content shows text in a font that holds one, so a document
+    /// with none costs no read of its own.
+    pub(crate) fn new(
+        doc: &'a PdfDocument,
+        staged: &'a HashMap<u32, Object>,
+        overrides: &'a HashMap<u32, Object>,
+        cancel: &CancelCheck,
+    ) -> Collector<'a> {
+        Collector {
+            doc,
+            staged,
+            overrides,
+            fonts: HashMap::new(),
+            kinds: HashMap::new(),
+            glyphs: HashMap::new(),
+            poisoned: HashSet::new(),
+            walked: HashSet::new(),
+            scanned: false,
+            disabled: false,
+            cancel: cancel.clone(),
+        }
+    }
+
+    /// Whether the plan has been dropped: nothing more is to be offered.
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Drops the plan: a content cannot be trusted to show what it shows.
+    pub(crate) fn disable(&mut self) {
+        self.disabled = true;
+    }
+
+    /// Records that a walk reached the font map held by object `holder`
+    /// (a font dictionary held by a resource dictionary is held by the
+    /// object the resource dictionary is in, or is its own object).
+    pub(crate) fn reached(&mut self, holder: u32) {
+        self.walked.insert(holder);
+    }
+
     fn read(&self, id: u32) -> Option<Object> {
         match self.overrides.get(&id).or_else(|| self.staged.get(&id)) {
             Some(obj) => Some(obj.clone()),
@@ -220,59 +234,11 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn poison_map(&mut self, map: &Dict) {
+    /// Leaves whole the program of every font in `map`.
+    pub(crate) fn poison_map(&mut self, map: &Dict) {
         for value in map.values() {
             self.poison_font_value(value);
         }
-    }
-
-    fn resources(&mut self, owner: u32, value: &Object) -> Option<Rc<Res>> {
-        let (id, dict, font_owner) = match value {
-            Object::Reference(r) => {
-                let obj = self.read(r.id)?;
-                (ResId::Obj(r.id), dict_of(&obj)?.clone(), r.id)
-            },
-            Object::Dictionary(dict) => (ResId::Direct(owner), dict.clone(), owner),
-            _ => return None,
-        };
-        if let Some(hit) = self.resources.get(&id) {
-            return Some(hit.clone());
-        }
-        let (fonts, holder) = match dict.get("Font") {
-            Some(Object::Reference(r)) => match self.dict_value(&Object::Reference(*r)) {
-                Some(map) => (map, r.id),
-                None => (Dict::new(), NEVER),
-            },
-            Some(Object::Dictionary(map)) => (map.clone(), font_owner),
-            _ => (Dict::new(), NEVER),
-        };
-        let mut spaces = HashMap::new();
-        if let Some(map) = dict.get("ColorSpace").and_then(|v| self.dict_value(v)) {
-            for (name, value) in &map {
-                if let Some(space) = self.resolve(value) {
-                    if let Some(n) = components(&space, None) {
-                        spaces.insert(name.clone(), n);
-                    }
-                }
-            }
-        }
-        let res = Rc::new(Res { id, dict, fonts, holder, spaces: Arc::new(spaces) });
-        self.resources.insert(id, res.clone());
-        Some(res)
-    }
-
-    /// The resources a page uses: its own, or the nearest ancestor's.
-    fn page_resources(&mut self, page: u32) -> Option<Rc<Res>> {
-        let mut at = page;
-        for _ in 0..MAX_NESTING {
-            let obj = self.read(at)?;
-            let dict = dict_of(&obj)?;
-            if let Some(value) = dict.get("Resources") {
-                return self.resources(at, value);
-            }
-            at = dict.get("Parent")?.as_reference()?.id;
-        }
-        None
     }
 
     fn classify(&self, font: &Dict) -> Option<(Kind, u32)> {
@@ -359,66 +325,48 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn operators(
-        &self,
-        reader: Box<dyn Read>,
-        res: &Res,
-        parts: Option<Arc<AtomicU64>>,
-    ) -> Operators<Box<dyn Read>> {
-        let mut ops = Operators::new(reader, Mode::Full);
-        if let Some(parts) = parts {
-            ops = ops.with_parts_counter(parts);
+    /// Takes the next operator of a content read against the font map
+    /// `fonts`: collects what it shows. `poison` is whether the content
+    /// belongs to a form field or a page the save edits, whose fonts stay
+    /// whole.
+    pub(crate) fn op(&mut self, feed: &mut Feed, op: &Operator, fonts: &Dict, poison: bool) {
+        if self.disabled {
+            return;
         }
-        let spaces = res.spaces.clone();
-        ops.with_cancel(self.cancel.clone())
-            .with_inline_images(InlineImages::Skip)
-            .with_resolver(Box::new(move |name| spaces.get(name).copied()))
-    }
-
-    /// Reads one content against `res`, collecting what it shows.
-    fn run(&mut self, mut ops: Operators<Box<dyn Read>>, res: &Res, poison: bool) -> Result<()> {
-        let mut current = Current::Unset;
-        let mut saved: Vec<Current> = Vec::new();
-        while let Some(op) = ops.next() {
-            match op? {
-                Operator::SaveState => saved.push(current),
-                Operator::RestoreState => {
-                    if let Some(previous) = saved.pop() {
-                        current = previous;
-                    }
-                },
-                Operator::Tf { font, .. } => {
-                    current = match res.fonts.get(&font) {
-                        Some(Object::Reference(r)) => {
-                            if poison {
-                                self.poison_font(r.id);
-                            }
-                            self.font(r.id);
-                            Current::Font(r.id)
-                        },
-                        Some(direct) => {
-                            self.poison_font_value(direct);
-                            Current::Other
-                        },
-                        None => Current::Unresolved,
-                    };
-                },
-                Operator::Tj { text } | Operator::Quote { text } => self.shown(current, &text),
-                Operator::DoubleQuote { text, .. } => self.shown(current, &text),
-                Operator::TJ { array } => {
-                    for item in array {
-                        if let TextElement::String(text) = item {
-                            self.shown(current, &text);
+        match op {
+            Operator::SaveState => feed.saved.push(feed.current),
+            Operator::RestoreState => {
+                if let Some(previous) = feed.saved.pop() {
+                    feed.current = previous;
+                }
+            },
+            Operator::Tf { font, .. } => {
+                feed.current = match fonts.get(font) {
+                    Some(Object::Reference(r)) => {
+                        if poison {
+                            self.poison_font(r.id);
                         }
+                        self.font(r.id);
+                        Current::Font(r.id)
+                    },
+                    Some(direct) => {
+                        self.poison_font_value(direct);
+                        Current::Other
+                    },
+                    None => Current::Unresolved,
+                };
+            },
+            Operator::Tj { text } | Operator::Quote { text } => self.shown(feed.current, text),
+            Operator::DoubleQuote { text, .. } => self.shown(feed.current, text),
+            Operator::TJ { array } => {
+                for item in array {
+                    if let TextElement::String(text) = item {
+                        self.shown(feed.current, text);
                     }
-                },
-                _ => {},
-            }
+                }
+            },
+            _ => {},
         }
-        if !ops.damage().is_clean() {
-            self.disabled = true;
-        }
-        Ok(())
     }
 
     fn shown(&mut self, current: Current, text: &[u8]) {
@@ -429,200 +377,46 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Walks everything `res` holds that has content of its own.
-    fn context(&mut self, res: &Rc<Res>, poison: bool, depth: usize) -> Result<()> {
-        if res.holder != NEVER {
-            self.walked.insert(res.holder);
-        }
-        if poison {
-            let map = res.fonts.clone();
-            self.poison_map(&map);
-        }
-        if !self.done.insert((res.id, poison)) {
-            return Ok(());
-        }
-        let sorted = |map: Dict| -> Vec<Object> {
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            keys.into_iter().filter_map(|k| map.get(&k).cloned()).collect()
-        };
-        if let Some(map) = res.dict.get("XObject").and_then(|v| self.dict_value(v)) {
-            for value in sorted(map) {
-                let Object::Reference(r) = value else { continue };
-                let Some(Object::Stream { dict, .. }) = self.read(r.id) else { continue };
-                if !matches!(dict.get("Subtype").and_then(|s| s.as_name()), Some("Image" | "PS")) {
-                    self.stream(r.id, res, poison, depth + 1)?;
-                }
-            }
-        }
-        if let Some(map) = res.dict.get("Pattern").and_then(|v| self.dict_value(v)) {
-            for value in sorted(map) {
-                let Object::Reference(r) = value else { continue };
-                if matches!(self.read(r.id), Some(Object::Stream { .. })) {
-                    self.stream(r.id, res, poison, depth + 1)?;
-                }
-            }
-        }
-        if let Some(map) = res.dict.get("ExtGState").and_then(|v| self.dict_value(v)) {
-            for value in sorted(map) {
-                let Some(state) = self.dict_value(&value) else { continue };
-                let Some(mask) = state.get("SMask").and_then(|v| self.dict_value(v)) else {
-                    continue;
-                };
-                if let Some(Object::Reference(group)) = mask.get("G") {
-                    self.stream(group.id, res, poison, depth + 1)?;
-                }
-            }
-        }
-        for value in sorted(res.fonts.clone()) {
-            let Object::Reference(r) = value else { continue };
-            let Some(font) = self.read(r.id) else { continue };
-            let Some(font) = dict_of(&font) else { continue };
-            if font.get("Subtype").and_then(|s| s.as_name()) != Some("Type3") {
-                continue;
-            }
-            let own = match font.get("Resources") {
-                Some(value) => self.resources(r.id, value).unwrap_or_else(|| res.clone()),
-                None => res.clone(),
-            };
-            let Some(procs) = font.get("CharProcs").and_then(|v| self.dict_value(v)) else {
-                continue;
-            };
-            for proc in sorted(procs) {
-                if let Object::Reference(p) = proc {
-                    self.stream(p.id, &own, poison, depth + 1)?;
-                }
-            }
-            self.context(&own, poison, depth + 1)?;
-        }
-        Ok(())
+    /// Whether the objects of the document are still to be offered to
+    /// [`Collector::scan_object`]: some font program is to be cut.
+    pub(crate) fn wants_scan(&self) -> bool {
+        !self.disabled && !self.glyphs.is_empty() && !self.scanned
     }
 
-    /// Walks stream `id`, a form or similar, against its own resources or
-    /// `inherited`.
-    fn stream(&mut self, id: u32, inherited: &Rc<Res>, poison: bool, depth: usize) -> Result<()> {
-        self.cancel.check()?;
-        if depth > MAX_NESTING {
-            self.disabled = true;
-            return Ok(());
-        }
-        let Some(obj) = self.read(id) else { return Ok(()) };
-        let Some(dict) = dict_of(&obj) else { return Ok(()) };
-        let res = match dict.get("Resources") {
-            Some(value) => self.resources(id, value).unwrap_or_else(|| inherited.clone()),
-            None => inherited.clone(),
-        };
-        if !self.visited.insert((id, res.id, poison)) {
-            return Ok(());
-        }
-        let Ok(reader) = decoded_reader(&obj) else {
-            self.disabled = true;
-            return Ok(());
-        };
-        let ops = self.operators(reader, &res, None);
-        self.run(ops, &res, poison)?;
-        self.context(&res, poison, depth)
+    /// Notes that every object of the document has been offered to
+    /// [`Collector::scan_object`] after the last content was read.
+    pub(crate) fn scanned(&mut self) {
+        self.scanned = true;
     }
 
-    /// The parts of a page's `/Contents`, and whether it is one stream.
-    fn contents(&self, value: &Object) -> Option<(Vec<Object>, bool)> {
-        let items = match value {
-            Object::Reference(r) => match self.read(r.id)? {
-                stream @ Object::Stream { .. } => return Some((vec![stream], true)),
-                Object::Array(items) => items,
-                _ => return None,
-            },
-            Object::Array(items) => items.clone(),
-            _ => return None,
-        };
-        let mut parts = Vec::with_capacity(items.len());
-        for item in &items {
-            match item {
-                Object::Null => {},
-                other => parts.push(self.read(other.as_reference()?.id)?),
-            }
+    /// Poisons the fonts a resource dictionary no walk reached holds in
+    /// object `id`, the fonts an `ExtGState` names and those of a `/DR`.
+    /// Every object of the document is offered once the walk is done: a
+    /// walk that has not reached a font map cannot say that no field uses it.
+    pub(crate) fn scan_object(&mut self, id: u32) {
+        // A free entry holds nothing, and asking the document for one makes
+        // it search the whole source for the object.
+        let replaced = self.overrides.contains_key(&id) || self.staged.contains_key(&id);
+        if id == 0 || (!replaced && self.doc.is_free_entry(id)) {
+            return;
         }
-        Some((parts, false))
+        let Some(obj) = self.read(id) else { return };
+        let Some(dict) = dict_of(&obj) else { return };
+        self.scan_dict(dict, Some(id), true);
     }
 
-    fn page(&mut self, id: u32, held: bool) -> Result<()> {
-        self.cancel.check()?;
-        let Some(obj) = self.read(id) else { return Ok(()) };
-        let Some(dict) = dict_of(&obj) else { return Ok(()) };
-        let Some(res) = self.page_resources(id) else {
-            // A page with no resources shows no font; one with text is damage.
-            if dict.get("Contents").is_some() {
-                self.disabled = true;
-            }
-            return Ok(());
-        };
-        if let Some(contents) = dict.get("Contents") {
-            match self.contents(contents) {
-                Some((parts, _)) if parts.is_empty() => {},
-                Some((mut parts, single)) => {
-                    let unreadable = Arc::new(AtomicU64::new(0));
-                    let source: Box<dyn Read> = if single {
-                        match decoded_reader(&parts.remove(0)) {
-                            Ok(reader) => {
-                                Box::new(PartsReader::of_one(reader, Arc::clone(&unreadable)))
-                            },
-                            Err(_) => {
-                                self.disabled = true;
-                                return Ok(());
-                            },
-                        }
-                    } else {
-                        Box::new(PartsReader::of_array(parts, Arc::clone(&unreadable)))
-                    };
-                    let ops = self.operators(source, &res, Some(unreadable));
-                    self.run(ops, &res, held)?;
-                },
-                None => self.disabled = true,
-            }
-        }
-        self.context(&res, held, 0)?;
-        self.annotations(dict, &res, held)
-    }
-
-    fn annotations(&mut self, page: &Dict, res: &Rc<Res>, held: bool) -> Result<()> {
-        let Some(Object::Array(annots)) = page.get("Annots").and_then(|v| self.resolve(v)) else {
-            return Ok(());
-        };
-        for annot in &annots {
-            let Some(annot) = self.dict_value(annot) else { continue };
-            let poison = held
-                || annot.get("Subtype").and_then(|s| s.as_name()) == Some("Widget")
-                || annot.contains_key("FT");
-            let Some(ap) = annot.get("AP").and_then(|v| self.dict_value(v)) else { continue };
-            for key in ["N", "D", "R"] {
-                let Some(entry) = ap.get(key) else { continue };
-                let mut streams = Vec::new();
-                match self.resolve(entry) {
-                    Some(Object::Stream { .. }) => {
-                        streams.extend(entry.as_reference().map(|r| r.id));
-                    },
-                    Some(Object::Dictionary(states)) => {
-                        streams.extend(states.values().filter_map(|v| v.as_reference()).map(|r| r.id));
-                    },
-                    _ => {},
-                }
-                for id in streams {
-                    self.stream(id, res, poison, 1)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Poisons the fonts a resource dictionary no walk reached holds, the
-    /// fonts an `ExtGState` names and those of every `/DR`.
-    fn scan(&mut self, ids: Vec<u32>) -> Result<()> {
+    fn scan_all(&mut self) -> Result<()> {
+        let mut ids = self.doc.all_object_ids();
+        let source_ids: HashSet<u32> = ids.iter().copied().collect();
+        ids.extend(self.staged.keys().copied().filter(|id| !source_ids.contains(id)));
+        ids.extend(self.overrides.keys().copied().filter(|id| !source_ids.contains(id)));
+        ids.sort_unstable();
+        ids.dedup();
         for id in ids {
             self.cancel.check()?;
-            let Some(obj) = self.read(id) else { continue };
-            let Some(dict) = dict_of(&obj) else { continue };
-            self.scan_dict(dict, Some(id), true);
+            self.scan_object(id);
         }
+        self.scanned = true;
         Ok(())
     }
 
@@ -656,7 +450,7 @@ impl<'a> Walker<'a> {
 
     fn scan_fonts(&mut self, value: &Object, owner: Option<u32>) {
         let (map, holder) = match value {
-            Object::Dictionary(map) => (map.clone(), owner.unwrap_or(NEVER)),
+            Object::Dictionary(map) => (map.clone(), owner.unwrap_or(u32::MAX)),
             Object::Reference(r) => match self.dict_value(value) {
                 Some(map) => (map, r.id),
                 None => return,
@@ -676,8 +470,29 @@ impl<'a> Walker<'a> {
         self.poison_map(&map);
     }
 
-    /// The replacement stream of each program the glyph sets let shrink.
-    fn finish(
+    /// The replacement stream of each program the glyph sets let shrink,
+    /// by object id, once every content has been offered. `aliases` is the
+    /// duplicate-to-kept map of the save: a program written once for two
+    /// streams holds the glyphs of both. `level` is the save's Flate level.
+    pub(crate) fn finish(
+        mut self,
+        aliases: &HashMap<u32, u32>,
+        level: u32,
+    ) -> Result<HashMap<u32, Object>> {
+        // No content showed a font that holds a program: nothing is to cut,
+        // and no object has to be read to say which fonts stay whole.
+        if self.disabled || self.glyphs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if !self.scanned {
+            self.scan_all()?;
+        }
+        let mut own_ids: HashSet<u32> = self.doc.all_object_ids().into_iter().collect();
+        own_ids.extend(self.staged.keys().copied());
+        Ok(self.cut(aliases, level, &own_ids))
+    }
+
+    fn cut(
         &mut self,
         aliases: &HashMap<u32, u32>,
         level: u32,
@@ -823,56 +638,4 @@ impl Entry {
         self.memo.insert(code, out.clone());
         out
     }
-}
-
-/// The replacement streams of the font programs of `scope`'s pages that the
-/// glyphs shown let shrink, by object id.
-pub(crate) fn plan(scope: Scope<'_>, cancel: &CancelCheck) -> Result<HashMap<u32, Object>> {
-    let Scope { doc, staged, overrides, aliases, pages, level } = scope;
-    let mut walker = Walker {
-        doc,
-        staged,
-        overrides,
-        fonts: HashMap::new(),
-        kinds: HashMap::new(),
-        glyphs: HashMap::new(),
-        poisoned: HashSet::new(),
-        walked: HashSet::new(),
-        resources: HashMap::new(),
-        visited: HashSet::new(),
-        done: HashSet::new(),
-        disabled: false,
-        cancel: cancel.clone(),
-    };
-    // Nothing to cut, nothing to read: no content is opened.
-    let mut has_program = false;
-    for id in doc.all_object_ids() {
-        cancel.check()?;
-        if let Some(obj) = walker.read(id) {
-            has_program |= dict_of(&obj)
-                .is_some_and(|d| d.contains_key("FontFile2") || d.contains_key("FontFile3"));
-        }
-        if has_program {
-            break;
-        }
-    }
-    if !has_program {
-        return Ok(HashMap::new());
-    }
-    for (page, held) in pages {
-        walker.page(page, held)?;
-        if walker.disabled {
-            return Ok(HashMap::new());
-        }
-    }
-    let mut ids = doc.all_object_ids();
-    let source_ids: HashSet<u32> = ids.iter().copied().collect();
-    ids.extend(staged.keys().copied().filter(|id| !source_ids.contains(id)));
-    ids.extend(overrides.keys().copied().filter(|id| !source_ids.contains(id)));
-    ids.sort_unstable();
-    ids.dedup();
-    let mut own_ids = source_ids;
-    own_ids.extend(staged.keys().copied());
-    walker.scan(ids)?;
-    Ok(walker.finish(aliases, level, &own_ids))
 }

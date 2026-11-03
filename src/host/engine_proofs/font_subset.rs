@@ -21,7 +21,7 @@ use crate::object::Object;
 use crate::rendering::{PageRenderer, RenderOptions};
 use std::collections::BTreeSet;
 
-const GLYPHS: usize = 24;
+pub(super) const GLYPHS: usize = 24;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -132,7 +132,7 @@ fn sfnt(tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
 
 /// What shapes a generated TrueType font.
 #[derive(Clone, Copy)]
-struct TrueType {
+pub(super) struct TrueType {
     long_loca: bool,
     /// Every glyph carries one trailing byte, so no length is even.
     odd_glyphs: bool,
@@ -140,9 +140,9 @@ struct TrueType {
     composite: bool,
 }
 
-const PLAIN: TrueType = TrueType { long_loca: false, odd_glyphs: false, composite: false };
+pub(super) const PLAIN: TrueType = TrueType { long_loca: false, odd_glyphs: false, composite: false };
 
-fn truetype(shape: TrueType) -> Vec<u8> {
+pub(super) fn truetype(shape: TrueType) -> Vec<u8> {
     let mut glyphs: Vec<Vec<u8>> = vec![simple_glyph(&[(50, 0), (450, 0), (450, 700), (50, 700)])];
     for gid in 1..GLYPHS as u32 {
         glyphs.push(simple_glyph(&star(gid, 40)));
@@ -904,4 +904,152 @@ fn a_real_gsub_font_is_left_whole() {
         assert!(blank == render(&cut), "{kind:?}: the page renders differently");
         assert_eq!(text(&source), text(&cut), "{kind:?}: the extracted text changed");
     }
+}
+
+/// A page showing glyphs 1 and 3 ('A' and 'C') in a simple TrueType font
+/// held by object 5, laid out by the caller: `pages_extra` and `page_extra`
+/// are entries of the page tree node and the page, `content` the page's
+/// content, `more` the objects from 8 on.
+fn loose_pdf(pages_extra: &str, page_extra: &str, content: &str, more: Vec<Vec<u8>>) -> Vec<u8> {
+    let font_program = program(Kind::Simple, PLAIN);
+    let mut objects = vec![
+        plain(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        plain(2, &format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {pages_extra} >>")),
+        plain(
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 120] /Contents 4 0 R {page_extra} >>"
+            ),
+        ),
+        stream_object(4, "", content.as_bytes()),
+        plain(
+            5,
+            &format!(
+                "<< /Type /Font /Subtype /TrueType /BaseFont /TestFont /FirstChar 65 /LastChar {} \
+                 /Widths [{}] /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+                65 + GLYPHS - 2,
+                vec!["600"; GLYPHS - 1].join(" ")
+            ),
+        ),
+        plain(
+            6,
+            "<< /Type /FontDescriptor /FontName /TestFont /Flags 32 /FontBBox [0 0 1000 1000] \
+             /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 7 0 R >>",
+        ),
+        stream_object(7, &format!("/Length1 {}", font_program.len()), &font_program),
+    ];
+    objects.extend(more);
+    pdf_from_objects(&objects)
+}
+
+const SHOWS_AC: &str = "BT /F1 36 Tf 10 70 Td (AC) Tj ET\n";
+
+/// A form that shows glyph 15 ('O') in the font of `loose_pdf`.
+fn form_of_o(id: u32) -> Vec<u8> {
+    stream_object(
+        id,
+        "/Type /XObject /Subtype /Form /BBox [0 0 200 120] /Resources << /Font << /F1 5 0 R >> >>",
+        b"BT /F1 36 Tf 10 20 Td (O) Tj ET",
+    )
+}
+
+/// Proves a page that inherits its resources from the page tree node is cut
+/// to the glyphs it shows, and keeps its fonts: the glyph the page shows
+/// is in the program and the others are not, and the page renders as it did.
+/// No Dart-level test can observe it: it needs the program's glyphs, which
+/// no rendering of the page tells apart from a program that was never cut.
+#[test]
+fn a_page_with_inherited_resources_is_cut() {
+    let source = loose_pdf("/Resources << /Font << /F1 5 0 R >> >>", "", SHOWS_AC, Vec::new());
+    let cut = save(&source, pruning());
+    let (program_cut, _) = stored(&cut);
+    for gid in 1..GLYPHS {
+        assert_eq!(has_outline(Kind::Simple, &program_cut, gid), gid == 1 || gid == 3, "glyph {gid}");
+    }
+    let before = render(&source);
+    assert!(before.iter().any(|&b| b != before[0]), "the page renders blank");
+    assert!(before == render(&cut), "the cut document renders differently");
+}
+
+/// Proves a form no content names, in a resource dictionary the prune leaves
+/// whole (an object outside the page also points at it), keeps its glyphs:
+/// the form stays in the file, and a viewer that paints it needs them. No
+/// Dart-level test can observe it: the answer is which outlines the program
+/// holds, and the page renders the same without them.
+#[test]
+fn a_form_no_name_reaches_keeps_its_glyphs_where_the_dictionary_stays() {
+    let resources = plain(8, "<< /Font << /F1 5 0 R >> /XObject << /Fm1 9 0 R >> >>");
+    let strays = plain(10, "<< /Resources 8 0 R >>");
+    let source = loose_pdf("", "/Resources 8 0 R", SHOWS_AC, vec![resources, form_of_o(9), strays]);
+    let cut = save(&source, pruning());
+    assert!(super::support::contains(&cut, b"/Subtype /Form"), "the form was dropped, the proof holds for nothing");
+    let (program_cut, _) = stored(&cut);
+    for gid in 1..GLYPHS {
+        assert_eq!(
+            has_outline(Kind::Simple, &program_cut, gid),
+            matches!(gid, 1 | 3 | 15),
+            "glyph {gid}"
+        );
+    }
+}
+
+/// Proves the same for a resource dictionary held directly in the page, which
+/// the prune leaves whole because a name of the content is a key that no
+/// operator used (`/Fm1 MP` is a marked point, not a paint of the form).
+/// No Dart-level test can observe it: see the proof above.
+#[test]
+fn a_form_in_a_direct_dictionary_the_prune_leaves_whole_keeps_its_glyphs() {
+    let content = format!("{SHOWS_AC}/Fm1 MP\n");
+    let page = "/Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 8 0 R >> >>";
+    let source = loose_pdf("", page, &content, vec![form_of_o(8)]);
+    let cut = save(&source, pruning());
+    assert!(super::support::contains(&cut, b"/Subtype /Form"), "the form was dropped, the proof holds for nothing");
+    let (program_cut, _) = stored(&cut);
+    for gid in 1..GLYPHS {
+        assert_eq!(
+            has_outline(Kind::Simple, &program_cut, gid),
+            matches!(gid, 1 | 3 | 15),
+            "glyph {gid}"
+        );
+    }
+}
+
+/// Proves a page the save edits while it writes keeps its font program as
+/// the source has it: the edit may show any glyph the program holds. No
+/// Dart-level test can observe it: the program is the same size on screen
+/// whether it was cut or kept, and only its bytes tell the two apart.
+#[test]
+fn a_page_the_save_edits_keeps_its_fonts_whole() {
+    let source = loose_pdf("", "/Resources << /Font << /F1 5 0 R >> >>", SHOWS_AC, Vec::new());
+    let mut editor = DocumentEditor::from_bytes(source.clone()).unwrap();
+    editor.erase_region(0, [150.0, 100.0, 190.0, 110.0]).unwrap();
+    let kept = editor.save_to_bytes_with_options(pruning()).unwrap();
+    assert!(stored(&source).0 == stored(&kept).0, "the font of an edited page was cut");
+    let untouched = save(&source, pruning());
+    assert!(stored(&untouched).0.len() < stored(&source).0.len(), "the unedited page was not cut");
+}
+
+/// Proves the font a form field's appearance lists keeps its program whole
+/// although the appearance shows nothing in it and no AcroForm `/DR` holds
+/// it: the field may be regenerated with any glyph. No Dart-level test can
+/// observe it: see `form_field_font_is_not_cut`.
+#[test]
+fn a_font_a_widget_appearance_lists_is_not_cut() {
+    let widget = plain(
+        8,
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (field) /Rect [100 70 190 110] /AP << /N 9 0 R >> >>",
+    );
+    let appearance = stream_object(
+        9,
+        "/Type /XObject /Subtype /Form /BBox [0 0 90 40] /Resources << /Font << /F1 5 0 R >> >>",
+        b"q Q",
+    );
+    let source = loose_pdf(
+        "",
+        "/Resources << /Font << /F1 5 0 R >> >> /Annots [8 0 R]",
+        SHOWS_AC,
+        vec![widget, appearance],
+    );
+    let kept = save(&source, pruning());
+    assert!(stored(&source).0 == stored(&kept).0, "the font a widget lists was cut");
 }

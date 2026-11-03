@@ -34,6 +34,8 @@ mod fax_proof;
 #[cfg(feature = "rendering")]
 mod font_subset;
 #[cfg(feature = "rendering")]
+mod font_subset_walk;
+#[cfg(feature = "rendering")]
 mod group_proof;
 #[cfg(feature = "rendering")]
 mod reduce_proof;

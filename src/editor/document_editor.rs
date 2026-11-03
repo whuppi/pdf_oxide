@@ -2481,6 +2481,7 @@ impl DocumentEditor {
                     pages,
                     page_object: Some(&page_object),
                     writers: Some(writers),
+                    glyphs: None,
                 },
                 cancel,
             )?;
@@ -4801,7 +4802,15 @@ impl DocumentEditor {
         // ── pdf_manipulator patch: the merged pages and objects the save drops ──
         let (merged_kept, mut merged_left_out) = self.merged_prune(&HashMap::new())?;
         // ── end pdf_manipulator patch ──
-        // ── pdf_manipulator patch: unused resources dropped ──
+        // ── pdf_manipulator patch: unused resources dropped, and the glyphs the font cut needs collected by the same walk ──
+        let mut glyphs = options.prune_resources.then(|| {
+            crate::host::font_subset::Collector::new(
+                &self.source,
+                &self.modified_objects,
+                &prune.overrides,
+                cancel,
+            )
+        });
         let merged_cuts = if options.prune_resources {
             use crate::host::resource_prune::{plan, Scope, ScopePage};
 
@@ -4820,6 +4829,7 @@ impl DocumentEditor {
                         .collect(),
                     page_object: None,
                     writers: None,
+                    glyphs: glyphs.as_mut(),
                 },
                 cancel,
             )?;
@@ -4841,23 +4851,8 @@ impl DocumentEditor {
         )?);
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: embedded font programs cut down to the glyphs shown, ids kept ──
-        if options.prune_resources {
-            let held = self.pages_edited_while_writing();
-            let fonts = crate::host::font_subset::plan(
-                crate::host::font_subset::Scope {
-                    doc: &self.source,
-                    staged: &self.modified_objects,
-                    overrides: &prune.overrides,
-                    aliases: &aliases,
-                    pages: prune
-                        .kept_pages
-                        .iter()
-                        .map(|&id| (id, held.contains(&id)))
-                        .collect(),
-                    level: options.deflate_level,
-                },
-                cancel,
-            )?;
+        if let Some(glyphs) = glyphs {
+            let fonts = glyphs.finish(&aliases, options.deflate_level)?;
             prune.overrides.extend(fonts);
         }
         // ── end pdf_manipulator patch ──
