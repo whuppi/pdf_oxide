@@ -1646,9 +1646,13 @@ pub fn convert_from_format_to_bytes(data: &[u8], format: &str) -> Result<Vec<u8>
 /// The corner a corner-positioned watermark sits in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatermarkCorner {
+    /// The page's top-left corner.
     TopLeft,
+    /// The page's top-right corner.
     TopRight,
+    /// The page's bottom-left corner.
     BottomLeft,
+    /// The page's bottom-right corner.
     BottomRight,
 }
 
@@ -1670,10 +1674,35 @@ impl WatermarkCorner {
 /// the page's lower-left origin.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WatermarkPosition {
+    /// Centred on the page.
     Centre,
-    Corner { corner: WatermarkCorner, margin_x: f32, margin_y: f32 },
-    Tiled { columns: u32, rows: u32 },
-    Exact { x: f32, y: f32, width: f32, height: f32 },
+    /// In one corner, inset from its two edges.
+    Corner {
+        /// The corner it sits in.
+        corner: WatermarkCorner,
+        /// The inset from the left or right edge, in points.
+        margin_x: f32,
+        /// The inset from the top or bottom edge, in points.
+        margin_y: f32,
+    },
+    /// Repeated in a grid that covers the page.
+    Tiled {
+        /// The number of copies across.
+        columns: u32,
+        /// The number of copies down.
+        rows: u32,
+    },
+    /// In one rectangle the caller gives.
+    Exact {
+        /// The rectangle's left edge, in points.
+        x: f32,
+        /// The rectangle's bottom edge, in points.
+        y: f32,
+        /// The rectangle's width, in points.
+        width: f32,
+        /// The rectangle's height, in points.
+        height: f32,
+    },
 }
 
 impl WatermarkPosition {

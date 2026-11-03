@@ -50,12 +50,6 @@ fn checksum(bytes: &[u8]) -> u32 {
     sum
 }
 
-/// Whether the font has a `GSUB` table: a shaper may then substitute a
-/// glyph no code names, so such a font is not subset.
-pub(crate) fn has_substitutions(data: &[u8]) -> bool {
-    tables(data).is_none_or(|all| all.iter().any(|t| &t.tag == b"GSUB"))
-}
-
 /// The ids a composite glyph is made of.
 fn components(glyph: &[u8]) -> Option<Vec<u16>> {
     const WORDS: u16 = 0x1;
