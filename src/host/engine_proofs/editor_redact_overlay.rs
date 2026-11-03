@@ -2,6 +2,7 @@
 //! applies only its own regions and keeps the marks queued beside them, and a
 //! refused `redact` changes nothing.
 
+use crate::cancel::CancelCheck;
 use super::support::{open_editor_from_bytes, pdf_from_objects, stream_object};
 use crate::editor::{DocumentEditor, SaveOptions};
 use crate::error::Error;
@@ -82,7 +83,7 @@ fn an_overlay_of_none_removes_the_text_and_draws_no_box() {
     assert!(before > 0, "the secret line has ink");
 
     let mut erased = editor();
-    edit_redact(&mut erased, 0, &[SECRET_BOX], None).expect("the region redacts");
+    edit_redact(&mut erased, 0, &[SECRET_BOX], None, &CancelCheck::none()).expect("the region redacts");
     let bytes = saved(&mut erased);
     assert!(!text(&bytes).contains("SECRET"), "the text is still in the file: {:?}", text(&bytes));
     assert!(text(&bytes).contains("PUBLIC"), "the other line was removed");
@@ -91,7 +92,7 @@ fn an_overlay_of_none_removes_the_text_and_draws_no_box() {
     assert!(ink_in(&img, PUBLIC_BOX) > 0, "the line outside kept its ink");
 
     let mut boxed = editor();
-    edit_redact(&mut boxed, 0, &[SECRET_BOX], Some([0.0, 0.0, 0.0])).expect("the region redacts");
+    edit_redact(&mut boxed, 0, &[SECRET_BOX], Some([0.0, 0.0, 0.0]), &CancelCheck::none()).expect("the region redacts");
     let filled = ink_in(&render(&saved(&mut boxed)), SECRET_BOX);
     assert!(filled > (SECRET_BOX[2] - SECRET_BOX[0]) as usize * 20, "a fill overlay draws its box: {filled}");
 }
@@ -104,7 +105,7 @@ fn a_mark_without_an_overlay_draws_no_box_when_applied() {
     let mut editor = editor();
     edit_add_redaction(&mut editor, 0, SECRET_BOX, None).unwrap();
     edit_add_redaction(&mut editor, 0, PUBLIC_BOX, Some([0.0, 0.0, 0.0])).unwrap();
-    edit_apply_redactions(&mut editor).expect("the marks apply");
+    edit_apply_redactions(&mut editor, &CancelCheck::none()).expect("the marks apply");
     let bytes = saved(&mut editor);
     assert!(!text(&bytes).contains("SECRET") && !text(&bytes).contains("PUBLIC"));
     let img = render(&bytes);
@@ -122,7 +123,7 @@ fn a_mark_without_an_overlay_draws_no_box_when_applied() {
 fn redact_keeps_the_marks_queued_and_survives_a_later_apply_on_the_page() {
     let mut editor = editor();
     edit_add_redaction(&mut editor, 0, PUBLIC_BOX, None).unwrap();
-    let report = edit_redact(&mut editor, 0, &[SECRET_BOX], None).expect("the region redacts");
+    let report = edit_redact(&mut editor, 0, &[SECRET_BOX], None, &CancelCheck::none()).expect("the region redacts");
     assert_eq!(report.regions, 1, "the report counts the one region of this call");
     assert!(report.glyphs_removed > 0);
     assert_eq!(editor.redaction_count(0).unwrap(), 1, "the queued mark stays queued");
@@ -130,7 +131,7 @@ fn redact_keeps_the_marks_queued_and_survives_a_later_apply_on_the_page() {
     assert!(!after_redact.contains("SECRET"), "{after_redact:?}");
     assert!(after_redact.contains("PUBLIC"), "redact applied a mark it does not own: {after_redact:?}");
 
-    let applied = edit_apply_redactions(&mut editor).expect("the mark applies");
+    let applied = edit_apply_redactions(&mut editor, &CancelCheck::none()).expect("the mark applies");
     assert_eq!(applied.regions, 1, "the apply reports its own mark only");
     let after_apply = text(&saved(&mut editor));
     assert!(!after_apply.contains("PUBLIC"), "{after_apply:?}");
@@ -143,8 +144,8 @@ fn redact_keeps_the_marks_queued_and_survives_a_later_apply_on_the_page() {
 #[test]
 fn two_redactions_on_one_page_both_hold() {
     let mut editor = editor();
-    edit_redact(&mut editor, 0, &[SECRET_BOX], None).unwrap();
-    let second = edit_redact(&mut editor, 0, &[PUBLIC_BOX], None).unwrap();
+    edit_redact(&mut editor, 0, &[SECRET_BOX], None, &CancelCheck::none()).unwrap();
+    let second = edit_redact(&mut editor, 0, &[PUBLIC_BOX], None, &CancelCheck::none()).unwrap();
     assert_eq!(second.regions, 1);
     let out = text(&saved(&mut editor));
     assert!(!out.contains("SECRET") && !out.contains("PUBLIC"), "{out:?}");
@@ -161,7 +162,7 @@ fn clearing_the_marks_drops_them_all_and_applies_nothing() {
     assert_eq!(editor.redaction_count(0).unwrap(), 2);
     edit_clear_redactions(&mut editor);
     assert_eq!(editor.redaction_count(0).unwrap(), 0);
-    edit_apply_redactions(&mut editor).expect("nothing to apply");
+    edit_apply_redactions(&mut editor, &CancelCheck::none()).expect("nothing to apply");
     let out = text(&saved(&mut editor));
     assert!(out.contains("SECRET") && out.contains("PUBLIC"), "{out:?}");
 }
@@ -184,7 +185,7 @@ fn a_refused_redact_changes_nothing() {
     let mut editor = open_editor_from_bytes(&bytes, "editor_redact_refused");
     edit_add_redaction(&mut editor, 0, SECRET_BOX, None).unwrap();
     let before = saved(&mut editor);
-    let error = edit_redact(&mut editor, 0, &[[90.0, 90.0, 210.0, 110.0]], None)
+    let error = edit_redact(&mut editor, 0, &[[90.0, 90.0, 210.0, 110.0]], None, &CancelCheck::none())
         .expect_err("the page is refused");
     assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
     assert!(saved(&mut editor) == before, "a refused redact changed the editor");

@@ -58,7 +58,7 @@ pub fn reduce_images(
         .iter()
         .map(|&i| i as usize)
         .collect();
-    let entries = document_images(editor.source(), &pages)?;
+    let entries = document_images(editor.source(), &pages, cancel)?;
     let mut report = Report::default();
     let mut replacements: HashMap<u32, Object> = HashMap::new();
     cancel.each(entries, |entry| {

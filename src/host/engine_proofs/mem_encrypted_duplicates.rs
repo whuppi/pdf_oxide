@@ -176,11 +176,11 @@ fn two_encrypted_streams_are_the_same_only_when_every_decrypted_byte_is() {
         let last = PdfDocument::from_bytes(encrypted(&data, &last_differs)).unwrap();
         let long = PdfDocument::from_bytes(encrypted(&data, &longer)).unwrap();
 
-        let same = |doc: &PdfDocument| same_stream_data(&origin(doc), 4, &origin(doc), 5).unwrap();
+        let same = |doc: &PdfDocument| same_stream_data(&origin(doc), 4, &origin(doc), 5, &crate::cancel::CancelCheck::none()).unwrap();
         assert!(same(&equal), "equal streams");
         assert!(!same(&last), "the last byte differs");
         assert!(!same(&long), "one stream is a byte longer");
         // The first streams of two files are equal data, each under its own key.
-        assert!(same_stream_data(&origin(&equal), 4, &origin(&last), 4).unwrap());
+        assert!(same_stream_data(&origin(&equal), 4, &origin(&last), 4, &crate::cancel::CancelCheck::none()).unwrap());
     });
 }

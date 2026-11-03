@@ -484,6 +484,12 @@ wasm-ml = ["wasm-ocr"]
 native-bridge = ["dep:bumpalo", "dep:crossbeam-channel", "dep:allo-isolate"]
 # ── end pdf_manipulator patch ──
 
+# ── pdf_manipulator patch: fuel probe for tool/fuelprobe, never in a shipped build ──
+# On wasm32 every CancelCheck::is_cancelled also calls the imported
+# `fuelprobe.poll()`, so a wasmtime host can meter the work between two polls.
+fuel-probe = []
+# ── end pdf_manipulator patch ──
+
 # Debug feature for span merging analysis
 debug-span-merging = []
 

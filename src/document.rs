@@ -1105,8 +1105,18 @@ impl PdfDocument {
     // The reader is called on demand throughout the document's lifetime.
     // Used by the Flutter bridge with CallbackReader (condvar-backed).
     pub(crate) fn from_external_reader(reader: Box<dyn ReadSeek>) -> Result<Self> {
+        Self::from_external_reader_cancellable(reader, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`from_external_reader`](Self::from_external_reader) that stops with
+    /// the cancelled error once `cancel` reports cancelled, polled while a
+    /// damaged file's cross-reference table is rebuilt.
+    pub(crate) fn from_external_reader_cancellable(
+        reader: Box<dyn ReadSeek>,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Self> {
         let buf_reader = PdfReader::External(BufReader::new(reader));
-        Self::open_from_reader(buf_reader)
+        Self::open_from_reader_cancellable(buf_reader, cancel)
     }
     // ── end pdf_manipulator patch ──
 
@@ -1175,7 +1185,16 @@ impl PdfDocument {
         Self::from_bytes(data)
     }
 
-    fn open_from_reader(mut reader: PdfReader) -> Result<Self> {
+    fn open_from_reader(reader: PdfReader) -> Result<Self> {
+        // ── pdf_manipulator patch: the cancellable twin does the work ──
+        Self::open_from_reader_cancellable(reader, &crate::cancel::CancelCheck::none())
+    }
+
+    fn open_from_reader_cancellable(
+        mut reader: PdfReader,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Self> {
+        // ── end pdf_manipulator patch ──
         // Parse header with lenient mode by default (handle PDFs with binary prefixes)
         let (major, minor, header_offset) = parse_header(&mut reader, true)?;
         let version = (major, minor);
@@ -1201,7 +1220,7 @@ impl PdfDocument {
                         "Regular xref parsing succeeded but table is empty, attempting reconstruction"
                     );
                     xref_reconstructed = true;
-                    let (x, t, syn) = Self::try_reconstruct_xref(&mut reader)?;
+                    let (x, t, syn) = Self::try_reconstruct_xref(&mut reader, cancel)?;
                     synthetic_objects = syn;
                     (x, t)
                 } else {
@@ -1215,7 +1234,7 @@ impl PdfDocument {
                 log::warn!("Regular xref parsing failed: {}, attempting reconstruction", e);
 
                 // Fall back to xref reconstruction
-                match Self::try_reconstruct_xref(&mut reader) {
+                match Self::try_reconstruct_xref(&mut reader, cancel) {
                     Ok((reconstructed_xref, reconstructed_trailer, syn)) => {
                         log::info!("Successfully reconstructed xref table");
                         xref_reconstructed = true;
@@ -1223,6 +1242,9 @@ impl PdfDocument {
                         (reconstructed_xref, reconstructed_trailer)
                     },
                     Err(recon_err) => {
+                        // ── pdf_manipulator patch: a cancelled rebuild is a cancel, not a damaged file ──
+                        cancel.check()?;
+                        // ── end pdf_manipulator patch ──
                         log::error!("XRef reconstruction also failed: {}", recon_err);
                         return Err(e); // Return original error
                     },
@@ -1267,13 +1289,18 @@ impl PdfDocument {
             log::warn!(
                 "Root object not loadable after xref parse, falling back to xref reconstruction"
             );
-            match Self::try_reconstruct_xref(&mut reader) {
+            match Self::try_reconstruct_xref(&mut reader, cancel) {
                 Ok((x, t, syn)) => {
                     xref_reconstructed = true;
                     synthetic_objects = syn;
                     (x, t)
                 },
-                Err(_) => (xref, trailer), // Use original if reconstruction also fails
+                Err(_) => {
+                    // ── pdf_manipulator patch: a cancelled rebuild is a cancel, not a damaged file ──
+                    cancel.check()?;
+                    // ── end pdf_manipulator patch ──
+                    (xref, trailer) // Use original if reconstruction also fails
+                },
             }
         } else {
             (xref, trailer)
@@ -1423,8 +1450,13 @@ impl PdfDocument {
     /// ordinary case.
     fn try_reconstruct_xref<R: Read + Seek>(
         reader: &mut R,
+        // ── pdf_manipulator patch: polled while the file is scanned ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<(CrossRefTable, Object, Vec<(ObjectRef, Object)>)> {
-        crate::xref_reconstruction::reconstruct_xref(reader)
+        // ── pdf_manipulator patch: polled while the file is scanned ──
+        crate::xref_reconstruction::reconstruct_xref_cancellable(reader, cancel)
+        // ── end pdf_manipulator patch ──
     }
 
     /// Initialize encryption handler lazily if PDF is encrypted.
@@ -2163,11 +2195,25 @@ impl PdfDocument {
     /// per-page failure degrades to `Empty` (graceful — only security
     /// ops fail closed).
     pub fn classify_document(&self) -> Result<crate::extractors::auto::DocumentClassification> {
+        // ── pdf_manipulator patch: the cancellable twin does the work ──
+        self.classify_document_cancellable(&crate::cancel::CancelCheck::none())
+    }
+
+    /// [`classify_document`](Self::classify_document) that stops with the
+    /// cancelled error once `cancel` reports cancelled, polled before each page.
+    pub fn classify_document_cancellable(
+        &self,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<crate::extractors::auto::DocumentClassification> {
+        // ── end pdf_manipulator patch ──
         use crate::extractors::auto::{summarise, DocumentClassification, PageKind};
         let n = self.page_count()?;
         let mut kinds = Vec::with_capacity(n);
         let mut need = Vec::new();
         for p in 0..n {
+            // ── pdf_manipulator patch: a cancel stops the walk before the next page ──
+            cancel.check()?;
+            // ── end pdf_manipulator patch ──
             let k = match self.classify_page(p) {
                 Ok(c) => c.kind,
                 // Security op: propagate, never mask as Empty (case L).
@@ -2439,6 +2485,16 @@ impl PdfDocument {
     /// `/Kids` array is recursed into, anything else is a leaf.
     // ── end pdf_manipulator patch ──
     pub(crate) fn all_page_refs(&self) -> Result<Vec<ObjectRef>> {
+        self.all_page_refs_cancellable(&crate::cancel::CancelCheck::none())
+    }
+
+    /// [`all_page_refs`](Self::all_page_refs) that stops with the cancelled
+    /// error once `cancel` reports cancelled, polled before each kid of the
+    /// page tree is read.
+    pub(crate) fn all_page_refs_cancellable(
+        &self,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Vec<ObjectRef>> {
         let catalog = self.catalog()?;
         let catalog_dict = catalog.as_dict().ok_or_else(|| Error::InvalidObjectType {
             expected: "Dictionary".to_string(),
@@ -2451,7 +2507,7 @@ impl PdfDocument {
 
         let mut out: Vec<ObjectRef> = Vec::new();
         let mut visited: HashSet<ObjectRef> = HashSet::new();
-        self.collect_page_refs(pages_ref, &mut out, &mut visited)?;
+        self.collect_page_refs(pages_ref, &mut out, &mut visited, cancel)?;
         Ok(out)
     }
 
@@ -2460,6 +2516,7 @@ impl PdfDocument {
         node_ref: ObjectRef,
         out: &mut Vec<ObjectRef>,
         visited: &mut HashSet<ObjectRef>,
+        cancel: &crate::cancel::CancelCheck,
     ) -> Result<()> {
         if !visited.insert(node_ref) {
             return Ok(());
@@ -2486,7 +2543,8 @@ impl PdfDocument {
 
         for kid in kids {
             if let Some(kid_ref) = kid.as_reference() {
-                self.collect_page_refs(kid_ref, out, visited)?;
+                cancel.check()?;
+                self.collect_page_refs(kid_ref, out, visited, cancel)?;
             }
         }
         Ok(())
@@ -6295,7 +6353,9 @@ impl PdfDocument {
         // in a thread-local sink; scope them to this call so a document
         // read earlier on this thread cannot claim them.
         let _sink = self.sink_scope();
-        let base_spans = self.extract_spans(page_index)?;
+        // ── pdf_manipulator patch: the page's operators poll the cancel check ──
+        let base_spans = self.extract_spans_cancellable(page_index, cancel)?;
+        // ── end pdf_manipulator patch ──
         // Vertical CJK (tategaki, ISO 32000-1 §9.7.4.3 vertical writing mode):
         // glyphs run top-to-bottom in columns that progress right-to-left, so
         // the horizontal row-major assembler shreds the reading order. When the
@@ -13130,13 +13190,38 @@ impl PdfDocument {
     /// # }
     /// ```
     pub fn extract_spans(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
+        // ── pdf_manipulator patch: the cancellable twin does the work ──
+        self.extract_spans_cancellable(page_index, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`extract_spans`](Self::extract_spans) that stops with the cancelled
+    /// error once `cancel` reports cancelled, polled as the page's content
+    /// operators are read.
+    pub(crate) fn extract_spans_cancellable(
+        &self,
+        page_index: usize,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Vec<crate::layout::TextSpan>> {
+        // ── end pdf_manipulator patch ──
         // Serve repeat per-page extractions from cache (the converters reach
         // here twice per page; see `page_spans_cache`).
         if let Some(cached) = self.page_spans_cache.lock_or_recover().get(&page_index) {
             return Ok((**cached).clone());
         }
-        let spans = self.extract_spans_raw(page_index)?;
-        let spans = self.postprocess_spans(page_index, spans)?;
+        // ── pdf_manipulator patch: the page's operators poll the cancel check ──
+        let spans = self.extract_spans_impl(
+            page_index,
+            crate::extractors::TextExtractionConfig::default(),
+            HashSet::new(),
+            HashSet::new(),
+            cancel,
+        )?;
+        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: the cancel check rides to the pre-pass ──
+        let spans = self.postprocess_spans(page_index, spans, cancel)?;
+        // A page a cancel cut short is never cached as the page's spans.
+        cancel.check()?;
+        // ── end pdf_manipulator patch ──
         self.page_spans_cache
             .lock_or_recover()
             .insert(page_index, std::sync::Arc::new(spans.clone()));
@@ -13151,10 +13236,24 @@ impl PdfDocument {
         &self,
         page_index: usize,
     ) -> Result<std::sync::Arc<crate::search::SearchPageIndex>> {
+        // ── pdf_manipulator patch: the cancellable twin does the work ──
+        self.search_page_index_cancellable(page_index, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`search_page_index`](Self::search_page_index) that stops with the
+    /// cancelled error once `cancel` reports cancelled.
+    pub(crate) fn search_page_index_cancellable(
+        &self,
+        page_index: usize,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<std::sync::Arc<crate::search::SearchPageIndex>> {
+        // ── end pdf_manipulator patch ──
         if let Some(cached) = self.search_index.lock_or_recover().get(&page_index) {
             return Ok(std::sync::Arc::clone(cached));
         }
-        let spans = self.extract_spans(page_index)?;
+        // ── pdf_manipulator patch: the page's operators poll the cancel check ──
+        let spans = self.extract_spans_cancellable(page_index, cancel)?;
+        // ── end pdf_manipulator patch ──
         let index = std::sync::Arc::new(crate::search::SearchPageIndex::from_spans(&spans));
         self.search_index
             .lock_or_recover()
@@ -13188,7 +13287,9 @@ impl PdfDocument {
         excluded_inks: HashSet<String>,
     ) -> Result<Vec<crate::layout::TextSpan>> {
         let spans = self.extract_spans_raw_filtered(page_index, excluded_layers, excluded_inks)?;
-        self.postprocess_spans(page_index, spans)
+        // ── pdf_manipulator patch: no cancel on this path ──
+        self.postprocess_spans(page_index, spans, &crate::cancel::CancelCheck::none())
+        // ── end pdf_manipulator patch ──
     }
 
     /// Map a span rectangle (already translated so the page origin is at
@@ -13512,6 +13613,9 @@ impl PdfDocument {
         &self,
         page_index: usize,
         raw_spans: Vec<crate::layout::TextSpan>,
+        // ── pdf_manipulator patch: polled by the document-wide running-header pre-pass ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<Vec<crate::layout::TextSpan>> {
         let mut spans = raw_spans;
 
@@ -13695,7 +13799,9 @@ impl PdfDocument {
         // normalized text recurs on >=50% of pages and sits near the top or
         // bottom of the page are flagged as artifacts so downstream filters
         // drop them.
-        self.mark_running_artifact_spans(page_index, &mut spans)?;
+        // ── pdf_manipulator patch: the cancel check rides to the pre-pass ──
+        self.mark_running_artifact_spans(page_index, &mut spans, cancel)?;
+        // ── end pdf_manipulator patch ──
 
         // Normalize Unicode typographic spaces (U+2000–U+200B, U+202F, U+205F)
         // to ASCII space. Some PDF producers encode word separators as hair-space
@@ -13755,7 +13861,9 @@ impl PdfDocument {
         // spec-aligned positions instead of drifting prefix-sums. Runs last, on
         // the fully post-processed spans, so alignment sees the same text the
         // consumers do.
-        self.stamp_char_x_offsets(page_index, &mut spans);
+        // ── pdf_manipulator patch: the cancel check rides to the char extraction ──
+        self.stamp_char_x_offsets(page_index, &mut spans, cancel);
+        // ── end pdf_manipulator patch ──
 
         Ok(spans)
     }
@@ -13803,7 +13911,14 @@ impl PdfDocument {
     /// spans (`rotation_degrees != 0`) have been mapped into the displayed frame
     /// (see `postprocess_spans`) and their glyphs run along a rotated axis, so a
     /// horizontal-x stamp would misalign — those individual spans are skipped.
-    fn stamp_char_x_offsets(&self, page_index: usize, spans: &mut [crate::layout::TextSpan]) {
+    fn stamp_char_x_offsets(
+        &self,
+        page_index: usize,
+        spans: &mut [crate::layout::TextSpan],
+        // ── pdf_manipulator patch: polled as the page's operators are read ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
+    ) {
         // Horizontal-x offsets only make sense in an unrotated frame; the 180°
         // mirror is the one rotation that leaves ALL spans in the displayed frame.
         if self
@@ -13815,7 +13930,9 @@ impl PdfDocument {
             return;
         }
 
-        let accurate = match self.cached_page_chars(page_index) {
+        // ── pdf_manipulator patch: the page's operators poll the cancel check ──
+        let accurate = match self.cached_page_chars(page_index, cancel) {
+        // ── end pdf_manipulator patch ──
             Ok(chars) if !chars.is_empty() => chars,
             _ => return,
         };
@@ -17374,6 +17491,9 @@ impl PdfDocument {
 
     fn ensure_running_artifact_signatures(
         &self,
+        // ── pdf_manipulator patch: polled before each page the pre-pass reads ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<std::sync::Arc<std::collections::HashMap<String, RunningArtifactSignature>>> {
         {
             let guard = self.running_artifact_signatures.lock_or_recover();
@@ -17438,7 +17558,15 @@ impl PdfDocument {
             bool,
             Vec<(String, crate::geometry::Rect, String)>,
         )> {
-            let spans = self.extract_spans_raw(pi).ok()?;
+            let spans = self
+                .extract_spans_impl(
+                    pi,
+                    crate::extractors::TextExtractionConfig::default(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    cancel,
+                )
+                .ok()?;
             let (page_width, page_height) = match self.get_page_media_box(pi) {
                 Ok((_, _, w, h)) if h > 0.0 => (w, h),
                 _ => return None,
@@ -17473,6 +17601,7 @@ impl PdfDocument {
         let mut pages_per_signature: std::collections::HashMap<u64, usize> =
             std::collections::HashMap::new();
         for pi in 0..page_count {
+            cancel.check()?;
             let Some((_, band)) = scan_page(pi) else {
                 continue;
             };
@@ -17488,6 +17617,7 @@ impl PdfDocument {
             .map(|(hash, _)| hash)
             .collect();
         for pi in 0..page_count {
+            cancel.check()?;
             let Some((has_body_content, band)) = scan_page(pi) else {
                 continue;
             };
@@ -17574,6 +17704,9 @@ impl PdfDocument {
                 )
             })
             .collect();
+        // ── pdf_manipulator patch: a pre-pass a cancel cut short is never cached ──
+        cancel.check()?;
+        // ── end pdf_manipulator patch ──
         let signatures = std::sync::Arc::new(signatures);
         *self.running_artifact_signatures.lock_or_recover() =
             Some(std::sync::Arc::clone(&signatures));
@@ -17610,6 +17743,9 @@ impl PdfDocument {
         &self,
         page_index: usize,
         spans: &mut [crate::layout::TextSpan],
+        // ── pdf_manipulator patch: polled by the document-wide pre-pass ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<()> {
         let (_, _, page_width, page_height) = match self.get_page_media_box(page_index) {
             Ok(mb) => mb,
@@ -17630,7 +17766,9 @@ impl PdfDocument {
             .collect();
         // Signature set may be empty (no repeated headers/footers); the
         // bare-page-number rule below still runs.
-        let signatures = self.ensure_running_artifact_signatures()?;
+        // ── pdf_manipulator patch: the cancel check rides to the pre-pass ──
+        let signatures = self.ensure_running_artifact_signatures(cancel)?;
+        // ── end pdf_manipulator patch ──
         for s in spans.iter_mut() {
             if s.artifact_type.is_some() {
                 continue;
@@ -17721,7 +17859,15 @@ impl PdfDocument {
         page_index: usize,
         config: crate::extractors::TextExtractionConfig,
     ) -> Result<Vec<crate::layout::TextSpan>> {
-        self.extract_spans_impl(page_index, config, HashSet::new(), HashSet::new())
+        // ── pdf_manipulator patch: no cancel on this path ──
+        self.extract_spans_impl(
+            page_index,
+            config,
+            HashSet::new(),
+            HashSet::new(),
+            &crate::cancel::CancelCheck::none(),
+        )
+        // ── end pdf_manipulator patch ──
     }
 
     fn extract_spans_raw_filtered(
@@ -17735,6 +17881,9 @@ impl PdfDocument {
             crate::extractors::TextExtractionConfig::default(),
             excluded_layers,
             excluded_inks,
+            // ── pdf_manipulator patch: no cancel on this path ──
+            &crate::cancel::CancelCheck::none(),
+            // ── end pdf_manipulator patch ──
         )
     }
 
@@ -17744,6 +17893,9 @@ impl PdfDocument {
         config: crate::extractors::TextExtractionConfig,
         excluded_layers: HashSet<String>,
         excluded_inks: HashSet<String>,
+        // ── pdf_manipulator patch: polled as the page's operators are read ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<Vec<crate::layout::TextSpan>> {
         if self.is_encrypted_unreadable() {
             log::warn!("PDF is encrypted and could not be decrypted; returning no spans");
@@ -17762,7 +17914,7 @@ impl PdfDocument {
         }
 
         // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
-        let source = match self.page_text_source(page_index) {
+        let source = match self.page_text_source_cancellable(page_index, cancel) {
             Ok(source) => source,
             Err(e) => {
                 log::warn!(
@@ -18772,7 +18924,9 @@ impl PdfDocument {
     /// Character extraction is typically 30-50% faster than span extraction
     /// because it skips the text grouping and merging logic.
     pub fn extract_chars(&self, page_index: usize) -> Result<Vec<crate::layout::TextChar>> {
-        Ok((*self.cached_page_chars(page_index)?).clone())
+        // ── pdf_manipulator patch: no cancel on this path ──
+        Ok((*self.cached_page_chars(page_index, &crate::cancel::CancelCheck::none())?).clone())
+        // ── end pdf_manipulator patch ──
     }
 
     /// Shared, cached character sequence for a page — identical to what
@@ -18782,6 +18936,9 @@ impl PdfDocument {
     fn cached_page_chars(
         &self,
         page_index: usize,
+        // ── pdf_manipulator patch: polled as the page's operators are read ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<std::sync::Arc<Vec<crate::layout::TextChar>>> {
         if let Some(cached) = self.page_chars_cache.lock_or_recover().get(&page_index) {
             return Ok(std::sync::Arc::clone(cached));
@@ -18790,7 +18947,13 @@ impl PdfDocument {
             page_index,
             HashSet::new(),
             HashSet::new(),
+            // ── pdf_manipulator patch: the page's operators poll the cancel check ──
+            cancel,
+            // ── end pdf_manipulator patch ──
         )?);
+        // ── pdf_manipulator patch: chars a cancel cut short are never cached ──
+        cancel.check()?;
+        // ── end pdf_manipulator patch ──
         self.page_chars_cache
             .lock_or_recover()
             .insert(page_index, std::sync::Arc::clone(&chars));
@@ -18810,7 +18973,14 @@ impl PdfDocument {
         excluded_layers: HashSet<String>,
         excluded_inks: HashSet<String>,
     ) -> Result<Vec<crate::layout::TextChar>> {
-        self.extract_chars_impl(page_index, excluded_layers, excluded_inks)
+        // ── pdf_manipulator patch: no cancel on this path ──
+        self.extract_chars_impl(
+            page_index,
+            excluded_layers,
+            excluded_inks,
+            &crate::cancel::CancelCheck::none(),
+        )
+        // ── end pdf_manipulator patch ──
     }
 
     fn extract_chars_impl(
@@ -18818,6 +18988,9 @@ impl PdfDocument {
         page_index: usize,
         excluded_layers: HashSet<String>,
         excluded_inks: HashSet<String>,
+        // ── pdf_manipulator patch: polled as the page's operators are read ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
     ) -> Result<Vec<crate::layout::TextChar>> {
         use crate::extractors::TextExtractor;
 
@@ -18828,7 +19001,7 @@ impl PdfDocument {
         })?;
 
         // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
-        let source = match self.page_text_source(page_index) {
+        let source = match self.page_text_source_cancellable(page_index, cancel) {
             Ok(source) => source,
             Err(e) => {
                 log::warn!(
@@ -19975,11 +20148,23 @@ impl PdfDocument {
         &self,
         page_index: usize,
     ) -> Result<Arc<crate::extractors::text::OperatorSource<'_>>> {
+        self.page_text_source_cancellable(page_index, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`page_text_source`](Self::page_text_source) whose operator streams
+    /// poll `cancel` as they are read.
+    pub(crate) fn page_text_source_cancellable(
+        &self,
+        page_index: usize,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Arc<crate::extractors::text::OperatorSource<'_>>> {
         use crate::host::content::Mode;
 
+        let cancel = cancel.clone();
         let source: Arc<crate::extractors::text::OperatorSource<'_>> = Arc::new(move || {
-            Ok(Box::new(self.page_operators(page_index)?.with_mode(Mode::Text))
-                as Box<dyn crate::host::content::OperatorStream>)
+            Ok(Box::new(
+                self.page_operators(page_index)?.with_mode(Mode::Text).with_cancel(cancel.clone()),
+            ) as Box<dyn crate::host::content::OperatorStream>)
         });
         drop(source()?);
         Ok(source)

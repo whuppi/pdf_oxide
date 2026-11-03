@@ -595,7 +595,10 @@ impl PdfAConverter {
         result: &mut ConversionResult,
     ) -> Result<()> {
         let font_name = error.location.as_deref().unwrap_or("Unknown").to_string();
-        let font_objects = collect_font_objects_by_name(editor.source_mut(), &font_name)?;
+        // ── pdf_manipulator patch: the walk polls the cancel check ──
+        let font_objects =
+            collect_font_objects_by_name(editor.source_mut(), &font_name, &self.cancel)?;
+        // ── end pdf_manipulator patch ──
         if font_objects.is_empty() {
             result.add_error(ConversionError::new(
                 ErrorCode::FontNotEmbedded,
@@ -632,6 +635,9 @@ impl PdfAConverter {
 
         // Update every matching font object to reference a FontDescriptor with FontFile2.
         for (font_id, mut font_dict) in font_objects {
+            // ── pdf_manipulator patch: a cancel stops the rewrite before the next font ──
+            self.cancel.check()?;
+            // ── end pdf_manipulator patch ──
             // Build or update the FontDescriptor.
             let desc_id = match font_dict
                 .get("FontDescriptor")
@@ -1372,16 +1378,25 @@ fn strip_js_from_aa(
 fn collect_font_objects_by_name(
     doc: &mut PdfDocument,
     target: &str,
+    // ── pdf_manipulator patch: polled before each page ──
+    cancel: &crate::cancel::CancelCheck,
+    // ── end pdf_manipulator patch ──
 ) -> Result<Vec<(u32, std::collections::HashMap<String, Object>)>> {
     let page_count = doc.page_count()?;
+    // ── pdf_manipulator patch: one tree walk, not one per page ──
+    let page_refs = doc.all_page_refs().unwrap_or_default();
+    // ── end pdf_manipulator patch ──
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut found: Vec<(u32, std::collections::HashMap<String, Object>)> = Vec::new();
 
     for idx in 0..page_count {
-        let page_ref = match doc.get_page_ref(idx) {
-            Ok(r) => r,
-            Err(_) => continue,
+        // ── pdf_manipulator patch: a cancel stops the walk before the next page ──
+        cancel.check()?;
+        let page_ref = match page_refs.get(idx) {
+            Some(r) => *r,
+            None => continue,
         };
+        // ── end pdf_manipulator patch ──
         let page_obj = match doc.load_object(page_ref) {
             Ok(o) => o,
             Err(_) => continue,

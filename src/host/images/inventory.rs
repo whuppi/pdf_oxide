@@ -26,9 +26,14 @@ pub struct Entry {
 /// Every image XObject painted on `source_pages` (source page indices),
 /// grouped by object, ascending object id. Inline images have no object
 /// and are not listed.
-pub fn document_images(source: &PdfDocument, source_pages: &[usize]) -> Result<Vec<Entry>> {
+pub fn document_images(
+    source: &PdfDocument,
+    source_pages: &[usize],
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<Vec<Entry>> {
     let mut by_object: BTreeMap<u32, Entry> = BTreeMap::new();
     for &page in source_pages {
+        cancel.check()?;
         for handle in source.page_image_handles(page)? {
             let Some(object) = handle.object_ref() else {
                 continue;

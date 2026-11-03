@@ -19,6 +19,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+// ── pdf_manipulator patch: the import tool/fuelprobe's host provides ──
+#[cfg(all(feature = "fuel-probe", target_arch = "wasm32"))]
+#[link(wasm_import_module = "fuelprobe")]
+extern "C" {
+    #[link_name = "poll"]
+    fn fuelprobe_poll();
+}
+// ── end pdf_manipulator patch ──
+
 /// Cheap-to-clone cancellation probe.
 #[derive(Clone, Default, Debug)]
 pub struct CancelCheck {
@@ -63,8 +72,24 @@ impl CancelCheck {
         self.trip.as_ref().map_or(0, |trip| trip.0.load(Ordering::Relaxed))
     }
 
+    // ── pdf_manipulator patch: the check tool/fuelprobe runs every op under; it never cancels ──
+    /// A check that is never cancelled and, with `fuel-probe` on wasm32,
+    /// reports every poll to the host.
+    #[cfg(feature = "fuel-probe")]
+    pub fn probe() -> Self {
+        Self::default()
+    }
+    // ── end pdf_manipulator patch ──
+
     /// True once the lane or the job has been cancelled.
     pub fn is_cancelled(&self) -> bool {
+        // ── pdf_manipulator patch: tell the fuel probe a poll happened ──
+        #[cfg(all(feature = "fuel-probe", target_arch = "wasm32"))]
+        // SAFETY: `fuelprobe.poll` takes nothing and returns nothing.
+        unsafe {
+            fuelprobe_poll()
+        }
+        // ── end pdf_manipulator patch ──
         #[cfg(test)]
         if let Some(trip) = &self.trip {
             return trip.0.fetch_add(1, Ordering::Relaxed) + 1 >= trip.1;

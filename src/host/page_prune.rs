@@ -105,7 +105,30 @@ pub(crate) fn plan(
     redacted_image_originals: &HashSet<u32>,
     // ── end pdf_manipulator patch ──
 ) -> PagePrune {
+    plan_cancellable(
+        doc,
+        staged,
+        page_order,
+        dropped_annots,
+        redacted_image_originals,
+        &crate::cancel::CancelCheck::none(),
+    )
+    .expect("a plan that cannot be cancelled succeeds")
+}
+
+/// [`plan`] that stops with the cancelled error once `cancel` reports
+/// cancelled, polled while the page tree is walked and before each kept page
+/// is reparented. The plan reads and changes nothing but itself.
+pub(crate) fn plan_cancellable(
+    doc: &PdfDocument,
+    staged: &HashMap<u32, Object>,
+    page_order: &[PageSlot],
+    dropped_annots: &HashSet<u32>,
+    redacted_image_originals: &HashSet<u32>,
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<PagePrune> {
     let mut p = Planner {
+        cancel,
         doc,
         staged,
         dropped_annots,
@@ -117,10 +140,12 @@ pub(crate) fn plan(
     p.out.redacted_image_originals = redacted_image_originals.clone();
     // ── end pdf_manipulator patch ──
     p.run(page_order);
-    p.out
+    cancel.check()?;
+    Ok(p.out)
 }
 
 struct Planner<'a> {
+    cancel: &'a crate::cancel::CancelCheck,
     doc: &'a PdfDocument,
     staged: &'a HashMap<u32, Object>,
     dropped_annots: &'a HashSet<u32>,
@@ -166,7 +191,10 @@ impl Planner<'_> {
         let Some(root) = catalog.get("Pages").and_then(|p| p.as_reference()) else {
             return;
         };
-        let leaves = self.doc.all_page_refs().unwrap_or_default();
+        let leaves = self.doc.all_page_refs_cancellable(self.cancel).unwrap_or_default();
+        if self.cancel.is_cancelled() {
+            return;
+        }
         let kept_idx: Vec<usize> = page_order
             .iter()
             .filter_map(|slot| match slot.key() {
@@ -190,6 +218,9 @@ impl Planner<'_> {
 
         let mut seen = HashSet::new();
         for r in &kept {
+            if self.cancel.is_cancelled() {
+                return;
+            }
             if seen.insert(r.id) {
                 self.reparent(*r, root, &inner);
             }

@@ -8,7 +8,7 @@ use crate::host::lane_state::LaneState;
 use crate::host::positioned_write::{CountingWriter, PositionedWrite};
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
-    authenticate_or_refuse, handle_with_editor, ok_flag, ok_response, open_source, page_of,
+    authenticate_or_refuse, handle_with_editor, ok_flag, ok_response, open_source_cancellable, page_of,
     page_set_of, pages_of, put_page_infos, read_all_from_reader, req_handle,
 };
 
@@ -16,7 +16,7 @@ use crate::editor::DocumentEditor;
 
 op_unit!(OPEN, "editorOpen", pdf_op_editor_open_anchor, |ctx| {
     let source = ctx.take_source(0);
-    handle_editor_open(ctx.state, ctx.req, ctx.source_bytes, source)
+    handle_editor_open(ctx.state, ctx.req, ctx.source_bytes, source, ctx.cancel)
 });
 
 op_unit!(DISPOSE, "editorDispose", pdf_op_editor_dispose_anchor, |ctx| {
@@ -140,7 +140,7 @@ op_unit!(
     pdf_op_editor_merge_from_anchor,
     |ctx| {
         let data = ctx.take_data_reader();
-        handle_editor_merge_from(ctx.state, ctx.req, data)
+        handle_editor_merge_from(ctx.state, ctx.req, data, ctx.cancel)
     }
 );
 
@@ -164,9 +164,10 @@ fn handle_editor_open(
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     let password = req.get_str("password");
-    let doc = match open_source(source_bytes, source_reader, "editorOpen") {
+    let doc = match open_source_cancellable(source_bytes, source_reader, "editorOpen", cancel) {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -188,6 +189,7 @@ fn handle_editor_merge_from(
     state: &mut LaneState,
     req: &Request<'_>,
     merge_reader: Option<BoxedReader>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     // An absent `pages` key means every page; an empty list would mean
     // "merge nothing", which no caller can express and none wants.
@@ -205,7 +207,7 @@ fn handle_editor_merge_from(
         if let Some(resp) = authenticate_or_refuse(&source, req.get_str("password")) {
             return resp;
         }
-        editor.merge_document(source, pages.as_deref())
+        editor.merge_document(source, pages.as_deref(), cancel)
     } else if let Some(other) = req.get_bytes("otherBytes") {
         editor.merge_from_bytes(other)
     } else {
@@ -480,13 +482,13 @@ fn do_editor_mutate(
             ok_response()
         }
         "applyRedactions" => {
-            let report = dispatch::edit_apply_redactions(editor)?;
+            let report = dispatch::edit_apply_redactions(editor, cancel)?;
             Ok(redaction_report(&report))
         }
         "redact" => {
             let page = page!();
             let rects = rects_of(req)?;
-            let report = dispatch::edit_redact(editor, page, &rects, overlay_fill_of(req)?)?;
+            let report = dispatch::edit_redact(editor, page, &rects, overlay_fill_of(req)?, cancel)?;
             Ok(redaction_report(&report))
         }
         "sanitize" => {

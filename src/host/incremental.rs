@@ -206,12 +206,13 @@ pub(crate) fn write(
         return Err(refused(why));
     }
     check_doc_mdp(editor)?;
-    let changes = editor.incremental_objects()?;
+    let changes = editor.incremental_objects(cancel)?;
 
     let doc = editor.source();
     let serializer = ObjectSerializer::compact();
     let mut objects: Vec<(u32, Vec<u8>)> = Vec::with_capacity(changes.objects.len());
     for (id, obj) in &changes.objects {
+        cancel.check()?;
         let gen = doc.object_generation(*id).unwrap_or(0);
         objects.push((*id, serializer.serialize_indirect(*id, gen, obj)));
     }

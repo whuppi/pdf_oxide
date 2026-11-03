@@ -123,14 +123,32 @@ pub fn validate_xmp_metadata(
 /// Validate font embedding requirements by walking all page resources.
 pub fn validate_fonts(
     document: &mut PdfDocument,
-    _level: PdfALevel,
+    level: PdfALevel,
     result: &mut ValidationResult,
 ) -> Result<()> {
+    // ── pdf_manipulator patch: the cancellable twin does the work ──
+    validate_fonts_cancellable(document, level, result, &crate::cancel::CancelCheck::none())
+    // ── end pdf_manipulator patch ──
+}
+
+// ── pdf_manipulator patch: a cancel stops the walk before the next page ──
+/// [`validate_fonts`] that stops with the cancelled error once `cancel`
+/// reports cancelled.
+pub fn validate_fonts_cancellable(
+    document: &mut PdfDocument,
+    _level: PdfALevel,
+    result: &mut ValidationResult,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<()> {
+    // ── end pdf_manipulator patch ──
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     // Single tree walk; per-index get_page_ref in a loop is O(n²).
     let page_refs = document.all_page_refs().unwrap_or_default();
     for page_ref in page_refs {
+        // ── pdf_manipulator patch: a cancel stops the walk before the next page ──
+        cancel.check()?;
+        // ── end pdf_manipulator patch ──
         let page_obj = match document.load_object(page_ref) {
             Ok(o) => o,
             Err(_) => continue,
@@ -260,9 +278,24 @@ fn check_font_embedding(
 /// Validate color space requirements.
 pub fn validate_colors(
     document: &mut PdfDocument,
-    _level: PdfALevel,
+    level: PdfALevel,
     result: &mut ValidationResult,
 ) -> Result<()> {
+    // ── pdf_manipulator patch: the cancellable twin does the work ──
+    validate_colors_cancellable(document, level, result, &crate::cancel::CancelCheck::none())
+    // ── end pdf_manipulator patch ──
+}
+
+// ── pdf_manipulator patch: a cancel stops the walk before the next page and polls its operators ──
+/// [`validate_colors`] that stops with the cancelled error once `cancel`
+/// reports cancelled.
+pub fn validate_colors_cancellable(
+    document: &mut PdfDocument,
+    _level: PdfALevel,
+    result: &mut ValidationResult,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<()> {
+    // ── end pdf_manipulator patch ──
     // Check for output intent
     let catalog_dict = match get_catalog_dict(document)? {
         Some(d) => d,
@@ -283,8 +316,9 @@ pub fn validate_colors(
     let page_count = document.page_count()?;
     for page_idx in 0..page_count {
         // ── pdf_manipulator patch: the page's operators are read as its content is decoded ──
+        cancel.check()?;
         let operators = match document.page_operators(page_idx) {
-            Ok(ops) => ops,
+            Ok(ops) => ops.with_cancel(cancel.clone()),
             Err(_) => continue,
         };
 

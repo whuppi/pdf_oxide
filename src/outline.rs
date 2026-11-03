@@ -57,6 +57,17 @@ impl PdfDocument {
     /// # Ok::<(), pdf_oxide::error::Error>(())
     /// ```
     pub fn get_outline(&self) -> Result<Option<Vec<OutlineItem>>> {
+        // ── pdf_manipulator patch: the cancellable twin does the work ──
+        self.get_outline_cancellable(&crate::cancel::CancelCheck::none())
+    }
+
+    /// [`get_outline`](Self::get_outline) that stops with the cancelled error
+    /// once `cancel` reports cancelled, polled before each bookmark.
+    pub fn get_outline_cancellable(
+        &self,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Option<Vec<OutlineItem>>> {
+        // ── end pdf_manipulator patch ──
         // Get catalog
         let catalog = self.catalog()?;
 
@@ -86,7 +97,10 @@ impl PdfDocument {
         let mut current_ref = Some(first_ref);
 
         while let Some(item_ref) = current_ref {
-            if let Ok(item) = self.parse_outline_item(item_ref) {
+            // ── pdf_manipulator patch: a cancel stops the walk before the next bookmark ──
+            cancel.check()?;
+            // ── end pdf_manipulator patch ──
+            if let Ok(item) = self.parse_outline_item(item_ref, cancel) {
                 items.push(item);
             }
 
@@ -101,6 +115,9 @@ impl PdfDocument {
             };
         }
 
+        // ── pdf_manipulator patch: a cancel inside the last bookmark is not an outline ──
+        cancel.check()?;
+        // ── end pdf_manipulator patch ──
         if items.is_empty() {
             Ok(None)
         } else {
@@ -109,7 +126,13 @@ impl PdfDocument {
     }
 
     /// Parse a single outline item and its children recursively.
-    fn parse_outline_item(&self, item_ref: crate::object::ObjectRef) -> Result<OutlineItem> {
+    fn parse_outline_item(
+        &self,
+        item_ref: crate::object::ObjectRef,
+        // ── pdf_manipulator patch: polled before each child bookmark ──
+        cancel: &crate::cancel::CancelCheck,
+        // ── end pdf_manipulator patch ──
+    ) -> Result<OutlineItem> {
         let item_obj = self.load_object(item_ref)?;
 
         // Extract title. `/Title` is a PDF text string (ISO 32000-1
@@ -140,7 +163,10 @@ impl PdfDocument {
                 let mut child_ref = Some(*first_child_ref);
 
                 while let Some(c_ref) = child_ref {
-                    if let Ok(child) = self.parse_outline_item(c_ref) {
+                    // ── pdf_manipulator patch: a cancel stops the walk before the next child ──
+                    cancel.check()?;
+                    // ── end pdf_manipulator patch ──
+                    if let Ok(child) = self.parse_outline_item(c_ref, cancel) {
                         children.push(child);
                     }
 

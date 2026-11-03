@@ -111,8 +111,19 @@ pub(crate) fn open_source(
     source_reader: Option<BoxedReader>,
     op: &str,
 ) -> Result<PdfDocument, Vec<u8>> {
+    open_source_cancellable(source_bytes, source_reader, op, &crate::cancel::CancelCheck::none())
+}
+
+/// [`open_source`] that stops once `cancel` reports cancelled, polled while a
+/// damaged file's cross-reference table is rebuilt.
+pub(crate) fn open_source_cancellable(
+    source_bytes: Option<&[u8]>,
+    source_reader: Option<BoxedReader>,
+    op: &str,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<PdfDocument, Vec<u8>> {
     if let Some(reader) = source_reader {
-        PdfDocument::from_external_reader(reader.0)
+        PdfDocument::from_external_reader_cancellable(reader.0, cancel)
             .map_err(|e| ResponseWriter::error_of(&e))
     } else if let Some(bytes) = source_bytes {
         PdfDocument::from_bytes(bytes.to_vec())

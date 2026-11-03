@@ -159,7 +159,7 @@ impl TextSearcher {
 
         for page in start_page..=end_page {
             cancel.check()?;
-            let page_results = Self::search_page(doc, page, &regex, options)?;
+            let page_results = Self::search_page_cancellable(doc, page, &regex, options, cancel)?;
             results.extend(page_results);
 
             // Check result limit
@@ -180,9 +180,27 @@ impl TextSearcher {
         regex: &Regex,
         options: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
+        // ── pdf_manipulator patch: the cancellable twin does the work ──
+        Self::search_page_cancellable(doc, page, regex, options, &crate::cancel::CancelCheck::none())
+        // ── end pdf_manipulator patch ──
+    }
+
+    // ── pdf_manipulator patch: a cancel stops the page's extraction ──
+    /// [`search_page`](Self::search_page) that stops with the cancelled error
+    /// once `cancel` reports cancelled.
+    pub fn search_page_cancellable(
+        doc: &PdfDocument,
+        page: usize,
+        regex: &Regex,
+        options: &SearchOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Vec<SearchResult>> {
+        // ── end pdf_manipulator patch ──
         // Reuse the page's cached search index (page text + span boxes) if a
         // prior search() built it, instead of re-extracting the page.
-        let index = doc.search_page_index(page)?;
+        // ── pdf_manipulator patch: the page's operators poll the cancel check ──
+        let index = doc.search_page_index_cancellable(page, cancel)?;
+        // ── end pdf_manipulator patch ──
 
         let mut results = Vec::new();
 

@@ -280,28 +280,31 @@ fn data_into(fetched: &Fetched<'_>, hasher: &mut Sha256) -> Result<bool> {
 }
 
 /// Whether stream `left_id` of `left` and stream `right_id` of `right` hold
-/// the same encoded data, decrypted and read in pieces side by side.
+/// the same encoded data, decrypted and read in pieces side by side. The
+/// cancel check is polled before each piece.
 pub(crate) fn same_stream_data(
     left: &Origin<'_>,
     left_id: u32,
     right: &Origin<'_>,
     right_id: u32,
+    cancel: &CancelCheck,
 ) -> Result<bool> {
     let Ok(left) = fetch(left, left_id) else { return Ok(false) };
     let Ok(right) = fetch(right, right_id) else { return Ok(false) };
-    same_data(&left, &right)
+    same_data(&left, &right, cancel)
 }
 
 /// Whether the encoded data of the two streams is the same, decrypted and
 /// read in pieces side by side. A stream that cannot be read in full is
 /// not the same as any other.
-fn same_data(a: &Fetched<'_>, b: &Fetched<'_>) -> Result<bool> {
+fn same_data(a: &Fetched<'_>, b: &Fetched<'_>, cancel: &CancelCheck) -> Result<bool> {
     let (Some(mut left), Some(mut right)) = (data_reader(a)?, data_reader(b)?) else {
         return Ok(false);
     };
     let mut left_buf = vec![0u8; CHUNK];
     let mut right_buf = vec![0u8; CHUNK];
     loop {
+        cancel.check()?;
         let (n, m) = match (fill(&mut left, &mut left_buf), fill(&mut right, &mut right_buf)) {
             (Ok(n), Ok(m)) => (n, m),
             (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -369,9 +372,9 @@ impl Hashing<'_, '_> {
     }
 
     /// Whether the encoded data of candidates `a` and `b` is the same.
-    fn same_data(&self, a: &Candidate, b: &Candidate) -> Result<bool> {
+    fn same_data(&self, a: &Candidate, b: &Candidate, cancel: &CancelCheck) -> Result<bool> {
         let (left, right) = (&self.origins[a.origin], &self.origins[b.origin]);
-        same_stream_data(left, fetch_id(left, a.out, a.src), right, fetch_id(right, b.out, b.src))
+        same_stream_data(left, fetch_id(left, a.out, a.src), right, fetch_id(right, b.out, b.src), cancel)
     }
 
     /// Feeds the canonical dictionary and then the data of a stream.
@@ -565,12 +568,13 @@ pub(crate) fn find(origins: &[Origin<'_>], cancel: &CancelCheck) -> Result<HashM
         }
         members.sort_unstable();
         for (out, digest, index) in members {
+            cancel.check()?;
             match kept.get(&digest) {
                 Some(&(canonical, _)) if canonical == out => {},
                 Some(&(canonical, kept_index)) => {
                     // Equal digests are not taken for equal data: the two are
                     // read side by side, decrypted, before one stands for both.
-                    if hashing.same_data(&candidates[kept_index], &candidates[index])? {
+                    if hashing.same_data(&candidates[kept_index], &candidates[index], cancel)? {
                         aliases.insert(out, canonical);
                     }
                 },

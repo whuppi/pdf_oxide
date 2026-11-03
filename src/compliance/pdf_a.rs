@@ -101,8 +101,12 @@ impl PdfAValidator {
 
         // Run all validators in order
         run_validator!(validators::validate_xmp_metadata);
-        run_validator!(validators::validate_fonts);
-        run_validator!(validators::validate_colors);
+        run_validator!(|d: &mut PdfDocument, l, r: &mut ValidationResult| {
+            validators::validate_fonts_cancellable(d, l, r, cancel)
+        });
+        run_validator!(|d: &mut PdfDocument, l, r: &mut ValidationResult| {
+            validators::validate_colors_cancellable(d, l, r, cancel)
+        });
         run_validator!(validators::validate_encryption);
         run_validator!(validators::validate_transparency);
         run_validator!(validators::validate_structure);
@@ -112,6 +116,8 @@ impl PdfAValidator {
         // Last validator doesn't need early return check
         cancel.check()?;
         validators::validate_annotations(document, level, &mut result)?;
+        // A validator a cancel cut short is not a verdict.
+        cancel.check()?;
 
         Ok(self.finalize_result(result))
     }

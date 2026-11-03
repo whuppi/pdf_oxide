@@ -521,24 +521,32 @@ pub fn classify_page(doc: &mut PdfDocument, page: usize) -> Result<Classificatio
 }
 
 /// Classify the overall document type.
-pub fn classify_document(doc: &mut PdfDocument) -> Result<ClassificationResult> {
+pub fn classify_document(
+    doc: &mut PdfDocument,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<ClassificationResult> {
     #[cfg(not(feature = "extract"))]
     {
-        let _ = doc;
+        let _ = (doc, cancel);
         return Err(Error::Unsupported("extract support not enabled in this build".into()));
     }
     #[cfg(feature = "extract")]
     {
-        let classification = doc.classify_document()?;
+        let classification = doc.classify_document_cancellable(cancel)?;
         Ok(ClassificationResult { type_name: format!("{:?}", classification.summary) })
     }
 }
 
 /// Plan bookmark-based page ranges for splitting the document.
-pub fn plan_split_by_bookmarks(doc: &mut PdfDocument) -> Result<Vec<BookmarkSplit>> {
-    use crate::split_bookmarks::{plan_split_by_bookmarks as do_plan, SplitByBookmarksOptions};
+pub fn plan_split_by_bookmarks(
+    doc: &mut PdfDocument,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<Vec<BookmarkSplit>> {
+    use crate::split_bookmarks::{
+        plan_split_by_bookmarks_cancellable as do_plan, SplitByBookmarksOptions,
+    };
     let opts = SplitByBookmarksOptions::default();
-    let splits = do_plan(doc, &opts)?;
+    let splits = do_plan(doc, &opts, cancel)?;
     Ok(splits.iter().map(|s| BookmarkSplit {
         title: s.title.clone(),
         start_page: s.start_page,
@@ -1636,8 +1644,9 @@ pub fn edit_redact(
     page: usize,
     rects: &[[f32; 4]],
     fill: Option<[f32; 3]>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Result<RedactionReportRow> {
-    let report = editor.redact_regions(page, rects, fill, &redaction_options())?;
+    let report = editor.redact_regions(page, rects, fill, &redaction_options(), cancel)?;
     Ok(report.into())
 }
 
@@ -1678,8 +1687,11 @@ impl From<crate::redaction::RedactionReport> for RedactionReportRow {
 }
 
 /// Apply all pending redactions, permanently removing redacted content.
-pub fn edit_apply_redactions(editor: &mut DocumentEditor) -> Result<RedactionReportRow> {
-    let report = editor.apply_redactions_destructive(redaction_options())?;
+pub fn edit_apply_redactions(
+    editor: &mut DocumentEditor,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<RedactionReportRow> {
+    let report = editor.apply_redactions_destructive_cancellable(redaction_options(), cancel)?;
     Ok(report.into())
 }
 

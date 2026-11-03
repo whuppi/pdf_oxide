@@ -249,7 +249,19 @@ pub fn plan_split_by_bookmarks(
     doc: &crate::document::PdfDocument,
     opts: &SplitByBookmarksOptions,
 ) -> Result<Vec<BookmarkSegment>> {
-    let outline = doc.get_outline()?.ok_or_else(|| {
+    // ── pdf_manipulator patch: the cancellable twin does the work ──
+    plan_split_by_bookmarks_cancellable(doc, opts, &crate::cancel::CancelCheck::none())
+}
+
+/// [`plan_split_by_bookmarks`] that stops with the cancelled error once
+/// `cancel` reports cancelled, polled before each bookmark is read.
+pub fn plan_split_by_bookmarks_cancellable(
+    doc: &crate::document::PdfDocument,
+    opts: &SplitByBookmarksOptions,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<Vec<BookmarkSegment>> {
+    // ── end pdf_manipulator patch ──
+    let outline = doc.get_outline_cancellable(cancel)?.ok_or_else(|| {
         Error::InvalidOperation(
             "document has no bookmarks/outline; use a plain per-page split instead".to_string(),
         )

@@ -7,13 +7,13 @@ use crate::host::dispatch;
 use crate::host::lane_state::LaneState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
-    authenticate_or_refuse, handle_with_doc, ok_flag, open_source, page_of, pages_of,
+    authenticate_or_refuse, handle_with_doc, ok_flag, open_source_cancellable, page_of, pages_of,
     put_page_infos, req_handle,
 };
 
 op_unit!(OPEN, "open", pdf_op_open_anchor, |ctx| {
     let source = ctx.take_source(0);
-    handle_open(ctx.state, ctx.req, ctx.source_bytes, source)
+    handle_open(ctx.state, ctx.req, ctx.source_bytes, source, ctx.cancel)
 });
 
 op_unit!(DISPOSE, "docDispose", pdf_op_doc_dispose_anchor, |ctx| {
@@ -98,8 +98,9 @@ op_unit!(
     "planSplitByBookmarks",
     pdf_op_plan_split_by_bookmarks_anchor,
     |ctx| {
+        let cancel = ctx.cancel;
         handle_with_doc(ctx.state, ctx.req, |doc, _| {
-            let result = dispatch::plan_split_by_bookmarks(doc)?;
+            let result = dispatch::plan_split_by_bookmarks(doc, cancel)?;
             let mut w = ResponseWriter::ok();
             w.put_map_list("splits", result.len(), |i, item| {
                 let s = &result[i];
@@ -132,8 +133,9 @@ op_unit!(
     "classifyDocument",
     pdf_op_classify_document_anchor,
     |ctx| {
+        let cancel = ctx.cancel;
         handle_with_doc(ctx.state, ctx.req, |doc, _| {
-            let result = dispatch::classify_document(doc)?;
+            let result = dispatch::classify_document(doc, cancel)?;
             let mut w = ResponseWriter::ok();
             w.put_str("type", &result.type_name);
             Ok(w.finish())
@@ -286,9 +288,10 @@ fn handle_open(
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
+    cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     let password = req.get_str("password");
-    let mut doc = match open_source(source_bytes, source_reader, "open") {
+    let mut doc = match open_source_cancellable(source_bytes, source_reader, "open", cancel) {
         Ok(d) => d,
         Err(resp) => return resp,
     };

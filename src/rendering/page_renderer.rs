@@ -755,7 +755,7 @@ impl PageRenderer {
 
             let band_transform = transform;
 
-            let mut stream = doc.page_operators(page_num)?;
+            let mut stream = doc.page_operators(page_num)?.with_cancel_every(cancel.clone(), 1);
             let mut operators = std::iter::from_fn(|| {
                 stream
                     .next()

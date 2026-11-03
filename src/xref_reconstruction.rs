@@ -60,6 +60,19 @@ use std::io::{Read, Seek, SeekFrom};
 pub fn reconstruct_xref<R: Read + Seek>(
     reader: &mut R,
 ) -> Result<(CrossRefTable, Object, Vec<(ObjectRef, Object)>)> {
+    // ── pdf_manipulator patch: the cancellable twin does the work ──
+    reconstruct_xref_cancellable(reader, &crate::cancel::CancelCheck::none())
+    // ── end pdf_manipulator patch ──
+}
+
+// ── pdf_manipulator patch: a cancel stops the scan at the next hit ──
+/// [`reconstruct_xref`] that stops with the cancelled error once `cancel`
+/// reports cancelled, polled every few thousand hits of the scan.
+pub fn reconstruct_xref_cancellable<R: Read + Seek>(
+    reader: &mut R,
+    cancel: &crate::cancel::CancelCheck,
+) -> Result<(CrossRefTable, Object, Vec<(ObjectRef, Object)>)> {
+    // ── end pdf_manipulator patch ──
     log::info!("Reconstructing xref table by scanning file...");
 
     let mut xref = CrossRefTable::new();
@@ -73,7 +86,9 @@ pub fn reconstruct_xref<R: Read + Seek>(
     // Pattern: one or more digits, whitespace, one or more digits, whitespace, "obj"
     let words: [&[u8]; 4] =
         [scan::pat::OBJ, scan::pat::TRAILER, scan::pat::STARTXREF, scan::pat::EOF_MARK];
+    let mut stride = crate::cancel::Stride::new(cancel);
     scan::scan(&mut input, 0, &words, |hit, r| {
+        stride.tick()?;
         if hit.pattern != 0 {
             trailers.hit(hit, r, hit.pattern == 1, &mut |start, parsed| fold.accept(start, parsed))?;
             return Ok(Flow::Continue);

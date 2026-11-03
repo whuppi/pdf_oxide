@@ -229,6 +229,8 @@ pub struct Operators<R: Read> {
     names_mark: usize,
     cancel: Option<CancelCheck>,
     since_check: u32,
+    /// Operators between two polls.
+    cancel_every: u32,
     done: bool,
     /// Counts the parts of a page's `/Contents` the source skipped.
     parts_unreadable: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
@@ -270,6 +272,7 @@ impl<R: Read> Operators<R> {
             names_mark: 0,
             cancel: None,
             since_check: 0,
+            cancel_every: CANCEL_EVERY,
             done: false,
             parts_unreadable: None,
             in_text: false,
@@ -299,6 +302,14 @@ impl<R: Read> Operators<R> {
     /// Polls `cancel` every 4,096 operators.
     pub fn with_cancel(mut self, cancel: CancelCheck) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Polls `cancel` every `every` operators, for a reader whose consumer
+    /// spends far more than a lex on each one (a renderer filling paths).
+    pub fn with_cancel_every(mut self, cancel: CancelCheck, every: u32) -> Self {
+        self.cancel = Some(cancel);
+        self.cancel_every = every.max(1);
         self
     }
 
@@ -562,7 +573,7 @@ impl<R: Read> Operators<R> {
     /// [`CANCEL_EVERY`] of them, those skipped unread included.
     fn poll_cancel(&mut self) -> Result<()> {
         self.since_check += 1;
-        if self.since_check >= CANCEL_EVERY {
+        if self.since_check >= self.cancel_every {
             self.since_check = 0;
             if let Some(cancel) = &self.cancel {
                 cancel.check()?;

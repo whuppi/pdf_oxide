@@ -2059,17 +2059,26 @@ impl DocumentEditor {
         &mut self,
         source_doc: PdfDocument,
         pages: Option<&[usize]>,
+        cancel: &crate::cancel::CancelCheck,
     ) -> Result<usize> {
         match pages {
-            Some(pages) => self.merge_pages_from_document(source_doc, pages),
-            None => self.merge_from_document(source_doc),
+            Some(pages) => self.merge_pages_from_document_cancellable(source_doc, pages, cancel),
+            None => self.merge_from_document_cancellable(source_doc, cancel),
         }
     }
 
     fn merge_from_document(&mut self, source_doc: PdfDocument) -> Result<usize> {
+        self.merge_from_document_cancellable(source_doc, &crate::cancel::CancelCheck::none())
+    }
+
+    fn merge_from_document_cancellable(
+        &mut self,
+        source_doc: PdfDocument,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<usize> {
         let source_page_count = source_doc.page_count()?;
         let pages: Vec<usize> = (0..source_page_count).collect();
-        self.merge_pages_from_document(source_doc, &pages)
+        self.merge_pages_from_document_cancellable(source_doc, &pages, cancel)
     }
 
     /// The page-selection core every merge entry point shares.
@@ -2086,7 +2095,20 @@ impl DocumentEditor {
         source_doc: PdfDocument,
         pages: &[usize],
     ) -> Result<usize> {
-        let page_refs = source_doc.all_page_refs()?;
+        self.merge_pages_from_document_cancellable(source_doc, pages, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`merge_pages_from_document`](Self::merge_pages_from_document) that
+    /// stops with the cancelled error once `cancel` reports cancelled. The
+    /// only state the import touches before its commit is the next object
+    /// id, which a cancel puts back.
+    fn merge_pages_from_document_cancellable(
+        &mut self,
+        source_doc: PdfDocument,
+        pages: &[usize],
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<usize> {
+        let page_refs = source_doc.all_page_refs_cancellable(cancel)?;
         for &page in pages {
             if page >= page_refs.len() {
                 return Err(Error::InvalidPdf(format!(
@@ -2111,11 +2133,16 @@ impl DocumentEditor {
         source_pages.sort_unstable();
         // Every imported page gets its id first, so a destination or /P
         // naming an imported page lands on the merged copy.
+        let first_free_id = self.next_object_id;
         let page_ids: Vec<u32> = pages.iter().map(|_| self.allocate_object_id()).collect();
         for (&page_idx, &page_id) in pages.iter().zip(&page_ids) {
             merged.id_map.entry(page_refs[page_idx].id).or_insert(page_id);
         }
         for (&page_idx, &page_id) in pages.iter().zip(&page_ids) {
+            if let Err(e) = cancel.check() {
+                self.next_object_id = first_free_id;
+                return Err(e);
+            }
             let page = self.import_page_from_document(
                 &mut merged,
                 page_refs[page_idx],
@@ -2647,6 +2674,7 @@ impl DocumentEditor {
     /// [`Self::incremental_refusal`] returned `None`.
     pub(crate) fn incremental_objects(
         &mut self,
+        cancel: &crate::cancel::CancelCheck,
     ) -> Result<crate::host::incremental::IncrementalChanges> {
         if self.acroform_modified {
             self.flush_form_fields_to_modified_objects()?;
@@ -2654,10 +2682,11 @@ impl DocumentEditor {
         let mut objects: std::collections::BTreeMap<u32, Object> =
             self.modified_objects.iter().map(|(&id, o)| (id, o.clone())).collect();
         if !self.modified_page_props.is_empty() {
-            let refs = self.source.all_page_refs()?;
+            let refs = self.source.all_page_refs_cancellable(cancel)?;
             let mut props: Vec<_> = self.modified_page_props.iter().collect();
             props.sort_by_key(|(i, _)| **i);
             for (&index, p) in props {
+                cancel.check()?;
                 let r = *refs.get(index).ok_or_else(|| {
                     Error::InvalidPdf(format!("page {index} is not in the source"))
                 })?;
@@ -3262,6 +3291,7 @@ impl DocumentEditor {
         prune: &crate::host::page_prune::PagePrune,
         written: Option<(&XrefEntries, &[(u32, u32)])>,
         aliases: &HashMap<u32, u32>,
+        cancel: &crate::cancel::CancelCheck,
     ) -> std::collections::HashSet<u32> {
         fn push_refs(obj: &Object, out: &mut Vec<u32>) {
             match obj {
@@ -3333,6 +3363,9 @@ impl DocumentEditor {
         route(&prune.kept_pages, &seen, &mut queue, &mut by_stream);
 
         loop {
+            if cancel.is_cancelled() {
+                break;
+            }
             // an object stream is drained before the walk leaves it
             let id = match queue.pop() {
                 Some(id) => id,
@@ -3464,8 +3497,8 @@ impl DocumentEditor {
     /// page loop of a full rewrite changes while writing: the page loop
     /// reads each of these fields, so the resource prune leaves the pages
     /// they name whole. Keep it in step with `incremental_refusal`.
-    fn pages_edited_while_writing(&self) -> HashSet<u32> {
-        let leaves = self.source.all_page_refs().unwrap_or_default();
+    fn pages_edited_while_writing(&self, cancel: &crate::cancel::CancelCheck) -> HashSet<u32> {
+        let leaves = self.source.all_page_refs_cancellable(cancel).unwrap_or_default();
         let mut indices: HashSet<usize> = HashSet::new();
         indices.extend(self.modified_content.keys());
         indices.extend(self.overlay_additions.keys());
@@ -3569,7 +3602,12 @@ impl DocumentEditor {
         if prune.excluded.is_empty() {
             return only;
         }
-        let kept = self.collect_reachable_ids(prune, None, &HashMap::new());
+        let kept = self.collect_reachable_ids(
+            prune,
+            None,
+            &HashMap::new(),
+            &crate::cancel::CancelCheck::none(),
+        );
         let mut queue: Vec<u32> = prune.excluded.iter().copied().collect();
         let mut refs_buf: Vec<u32> = Vec::with_capacity(32);
         while let Some(id) = queue.pop() {
@@ -4868,14 +4906,15 @@ impl DocumentEditor {
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: what the save drops with dropped pages (#261) ──
         let dropped_annots = self.redacted_annotation_ids();
-        let mut prune = crate::host::page_prune::plan(
+        let mut prune = crate::host::page_prune::plan_cancellable(
             &self.source,
             &self.modified_objects,
             &self.page_order,
             &dropped_annots,
             // the image sources destructive redaction replaced
             &self.redacted_image_originals,
-        );
+            cancel,
+        )?;
         // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: the font and structure scrub of the redacted pages ──
         let scrub = self.plan_scrub(&mut prune)?;
@@ -4895,7 +4934,7 @@ impl DocumentEditor {
         let merged_cuts = if options.prune_resources {
             use crate::host::resource_prune::{plan, Scope, ScopePage};
 
-            let held = self.pages_edited_while_writing();
+            let held = self.pages_edited_while_writing(cancel);
             plan(
                 Scope {
                     doc: &self.source,
@@ -5572,7 +5611,7 @@ impl DocumentEditor {
                     // page_order indices refer to leaf pages, not Kids array entries.
                     // Single tree walk — calling get_page_ref(i) in a loop is O(n²).
                     let original_page_refs: Vec<ObjectRef> =
-                        self.source.all_page_refs().unwrap_or_default();
+                        self.source.all_page_refs_cancellable(cancel).unwrap_or_default();
 
                     // ── pdf_manipulator patch: merged pages sit in /Kids in page order; their own block writes them, not the page loop ──
                     let mut kids: Vec<Object> = Vec::with_capacity(self.page_order.len());
@@ -7622,6 +7661,7 @@ impl DocumentEditor {
                 merged_index += 1;
 
                 for &(new_id, src_id) in &source.objects[page.objects.clone()] {
+                    cancel.check()?;
                     if xref_entries.contains_id(new_id) || merged_left_out.contains(&new_id) {
                         continue;
                     }
@@ -7673,6 +7713,7 @@ impl DocumentEditor {
         // dropped: an annotation names its page in /P and a widget belongs to
         // one form field, so a second page cannot list the same ones.
         for (copy_ids, page_obj) in page_copies {
+            cancel.check()?;
             let Object::Dictionary(mut dict) = page_obj else { continue };
             dict.remove("Annots");
             if let Some(pages_ref) = output_pages_ref {
@@ -7776,6 +7817,7 @@ impl DocumentEditor {
                 &prune,
                 Some((&xref_entries, &serializer.written_references())),
                 &aliases,
+                cancel,
             ))
         } else {
             None
@@ -7798,6 +7840,7 @@ impl DocumentEditor {
                 &prune,
                 Some((&xref_entries, &serializer.written_references())),
                 &aliases,
+                cancel,
             ))
         } else {
             None
@@ -7805,7 +7848,12 @@ impl DocumentEditor {
         // ── end pdf_manipulator patch ──
 
         let all_source_ids = self.source.all_object_ids();
+        // The walk above ends early on a cancel; what it found is not a set to write by.
+        cancel.check()?;
         for obj_id in all_source_ids.iter().copied() {
+            // ── pdf_manipulator patch: a cancel stops the write before the next object ──
+            cancel.check()?;
+            // ── end pdf_manipulator patch ──
             if obj_id == 0 || xref_entries.contains_id(obj_id) {
                 continue;
             }
@@ -7948,6 +7996,9 @@ impl DocumentEditor {
             new_objs.sort_by_key(|(id, _)| *id);
             // ── end pdf_manipulator patch ──
             for (obj_id, obj) in new_objs {
+                // ── pdf_manipulator patch: a cancel stops the write before the next object ──
+                cancel.check()?;
+                // ── end pdf_manipulator patch ──
                 // ── pdf_manipulator patch: full batches of queued objects become object streams ──
                 if packer.is_full() {
                     Self::write_object_streams(
@@ -8061,7 +8112,7 @@ impl DocumentEditor {
             } else if let Some(id) = source_file_id {
                 trailer.insert("ID".to_string(), id);
             }
-            let stream = xref_stream(rows, field_width(widest), deflate, trailer);
+            let stream = xref_stream(rows, field_width(widest), deflate, trailer, cancel)?;
             writer.write_all(&serializer.serialize_indirect(stream_id, 0, &stream))?;
             write!(writer, "startxref\n{}\n%%EOF\n", xref_offset)?;
 
@@ -11414,10 +11465,25 @@ impl DocumentEditor {
         &mut self,
         opts: crate::redaction::RedactionOptions,
     ) -> Result<crate::redaction::RedactionReport> {
+        // ── pdf_manipulator patch: the cancellable twin does the work ──
+        self.apply_redactions_destructive_cancellable(opts, &crate::cancel::CancelCheck::none())
+    }
+
+    /// [`apply_redactions_destructive`](Self::apply_redactions_destructive)
+    /// that stops with the cancelled error once `cancel` reports cancelled.
+    /// Every poll comes while pages are planned, before any is recorded, so a
+    /// cancel leaves the editor as it was.
+    pub fn apply_redactions_destructive_cancellable(
+        &mut self,
+        opts: crate::redaction::RedactionOptions,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<crate::redaction::RedactionReport> {
+        // ── end pdf_manipulator patch ──
         // ── pdf_manipulator patch: every page with a queued mark or a /Redact annotation ──
         // Every page with a queued mark or a /Redact annotation is applied.
         let mut pages: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for src in 0..self.source.page_count()? {
+            cancel.check()?;
             if self.redaction_regions.contains_key(&src) || !self.get_redaction_data(src)?.is_empty()
             {
                 pages.insert(src);
@@ -11428,8 +11494,9 @@ impl DocumentEditor {
         // leaves the pages before it as they were.
         let mut planned = Vec::with_capacity(pages.len());
         for src in pages {
+            cancel.check()?;
             let rs = self.page_redaction_regions(src, &[])?;
-            let plan = self.plan_destruction(src, &rs, &opts)?;
+            let plan = self.plan_destruction(src, &rs, &opts, cancel)?;
             planned.push((src, plan));
         }
 
@@ -11522,7 +11589,7 @@ impl DocumentEditor {
         rs: &crate::redaction::RegionSet,
         opts: &crate::redaction::RedactionOptions,
     ) -> Result<crate::redaction::RedactionReport> {
-        let plan = self.plan_destruction(src, rs, opts)?;
+        let plan = self.plan_destruction(src, rs, opts, &crate::cancel::CancelCheck::none())?;
         Ok(self.record_destruction(src, plan))
     }
 
@@ -11534,6 +11601,7 @@ impl DocumentEditor {
         src: usize,
         rs: &crate::redaction::RegionSet,
         opts: &crate::redaction::RedactionOptions,
+        cancel: &crate::cancel::CancelCheck,
     ) -> Result<Option<DestructionPlan>> {
         if rs.is_empty() {
             return Ok(None);
@@ -11579,7 +11647,7 @@ impl DocumentEditor {
             &fonts,
             &images,
             &forms,
-            self.source.page_operators(src)?,
+            self.source.page_operators(src)?.with_cancel_every(cancel.clone(), 256),
             &[],
             None,
             &mut std::io::sink(),
@@ -11687,6 +11755,7 @@ impl DocumentEditor {
         rects: &[[f32; 4]],
         fill: Option<[f32; 3]>,
         opts: &crate::redaction::RedactionOptions,
+        cancel: &crate::cancel::CancelCheck,
     ) -> Result<crate::redaction::RedactionReport> {
         use crate::redaction::{RedactionRegion, RegionSet};
 
@@ -11698,7 +11767,7 @@ impl DocumentEditor {
         for r in rects {
             rs.push(RedactionRegion::from_rect(r[0], r[1], r[2], r[3], fill));
         }
-        let plan = self.plan_destruction(src, &rs, opts)?;
+        let plan = self.plan_destruction(src, &rs, opts, cancel)?;
         let report = self.record_destruction(src, plan);
         self.is_modified = true;
         Ok(report)
@@ -11787,6 +11856,7 @@ impl DocumentEditor {
             ),
             None,
             &HashMap::new(),
+            &crate::cancel::CancelCheck::none(),
         );
         // ── end pdf_manipulator patch ──
 

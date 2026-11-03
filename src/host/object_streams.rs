@@ -205,8 +205,10 @@ pub(crate) fn xref_stream(
     width: usize,
     deflate: Option<u32>,
     mut trailer: HashMap<String, Object>,
-) -> Object {
+    cancel: &crate::cancel::CancelCheck,
+) -> crate::error::Result<Object> {
     let width = width.max(1);
+    let mut stride = crate::cancel::Stride::new(cancel);
     let row_len = 1 + width + 2;
     let compress = deflate.is_some();
     let mut out = match deflate {
@@ -217,6 +219,7 @@ pub(crate) fn xref_stream(
     let mut row = vec![0u8; row_len];
     let mut filtered = vec![0u8; row_len + 1];
     for entry in rows {
+        stride.tick()?;
         let (kind, second, third) = match entry {
             Row::Free { next, gen } => (0u8, next as u64, gen as u64),
             Row::Offset { offset, gen } => (1, offset, gen as u64),
@@ -257,7 +260,7 @@ pub(crate) fn xref_stream(
         parms.insert("Columns".to_string(), Object::Integer(row_len as i64));
         trailer.insert("DecodeParms".to_string(), Object::Dictionary(parms));
     }
-    Object::stream(trailer, data)
+    Ok(Object::stream(trailer, data))
 }
 
 /// The bytes of an xref stream as they are produced: raw, or deflated on
