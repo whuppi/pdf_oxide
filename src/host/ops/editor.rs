@@ -5,6 +5,7 @@ use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
 use crate::host::lane_state::LaneState;
+use crate::host::positioned_write::{CountingWriter, PositionedWrite};
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
     authenticate_or_refuse, handle_with_editor, ok_flag, ok_response, open_source, page_of,
@@ -908,24 +909,18 @@ fn handle_editor_save(
         ..Default::default()
     };
 
-    match (options.incremental, sink_writer) {
-        (true, Some(mut writer)) => {
-            use crate::host::incremental::{write, IncrementalError};
-            match write(editor, &mut writer, &options, cancel) {
-                Ok(()) => ok_flag("streamed"),
-                Err(IncrementalError::Refused(why)) => {
-                    ResponseWriter::error_kind(ErrorKind::IncrementalRefused, &why)
-                }
-                Err(IncrementalError::Failed(e)) => ResponseWriter::error_of(&e),
-            }
+    let measure = req.get_bool("measure").unwrap_or(false);
+    match (sink_writer, measure) {
+        (Some(mut writer), false) => stream_save(editor, &mut writer, &options, cancel),
+        (None, true) => {
+            let mut counter = CountingWriter::new(std::io::sink());
+            stream_save(editor, &mut counter, &options, cancel)
         },
-        (false, Some(mut writer)) => {
-            match dispatch::edit_save_with_options(editor, &mut writer, &options, cancel) {
-                Ok(()) => ok_flag("streamed"),
-                Err(e) => ResponseWriter::error_of(&e),
-            }
-        },
-        (_, None) => match editor.save_to_bytes_with_options(options) {
+        (Some(_), true) => ResponseWriter::error_kind(
+            ErrorKind::InvalidArgument,
+            "editorSave: a measuring save takes no sink",
+        ),
+        (None, false) => match editor.save_to_bytes_with_options(options) {
             Ok(bytes) => {
                 let mut w = ResponseWriter::ok();
                 w.put_bytes("data", &bytes);
@@ -934,6 +929,41 @@ fn handle_editor_save(
             Err(e) => ResponseWriter::error_of(&e),
         },
     }
+}
+
+/// Saves into `writer` and answers with the bytes it took, `written`: the
+/// count a caller reads instead of counting in a sink of its own. A refused
+/// incremental save keeps its own error kind.
+fn stream_save(
+    editor: &mut DocumentEditor,
+    writer: &mut impl PositionedWrite,
+    options: &crate::editor::SaveOptions,
+    cancel: &crate::cancel::CancelCheck,
+) -> Vec<u8> {
+    let saved = if options.incremental {
+        use crate::host::incremental::{write, IncrementalError};
+        match write(editor, writer, options, cancel) {
+            Ok(()) => Ok(()),
+            Err(IncrementalError::Refused(why)) => {
+                return ResponseWriter::error_kind(ErrorKind::IncrementalRefused, &why)
+            },
+            Err(IncrementalError::Failed(e)) => Err(e),
+        }
+    } else {
+        dispatch::edit_save_with_options(editor, writer, options, cancel)
+    };
+    match saved {
+        Ok(()) => written_response("streamed", writer.position()),
+        Err(e) => ResponseWriter::error_of(&e),
+    }
+}
+
+/// An ok response carrying `flag` and the count of bytes written.
+fn written_response(flag: &str, written: u64) -> Vec<u8> {
+    let mut w = ResponseWriter::ok();
+    w.put_bool(flag, true);
+    w.put_i64("written", i64::try_from(written).unwrap_or(i64::MAX));
+    w.finish()
 }
 
 /// Editor extract pages — select → save(sink) → restore page_order. The
@@ -970,24 +1000,29 @@ fn handle_editor_extract_pages(
 
     // Save with the page list cut down, then put it back — the editor is
     // unchanged after this call, merged pages included.
+    let measure = req.get_bool("measure").unwrap_or(false);
     let result = editor
         .with_pages_selected(&pages, |editor| {
-            if let Some(mut writer) = sink_writer {
-                dispatch::edit_save_with_options(
-                    editor, &mut writer, &crate::editor::SaveOptions::full_rewrite(), cancel,
-                )
-            } else {
-                Err(crate::error::Error::InvalidPdf(
-                    "editorExtractPages requires a sink".into(),
-                ))
+            let options = crate::editor::SaveOptions::full_rewrite();
+            match (sink_writer, measure) {
+                (Some(mut writer), false) => {
+                    dispatch::edit_save_with_options(editor, &mut writer, &options, cancel)
+                        .map(|()| writer.position())
+                },
+                (None, true) => {
+                    let mut counter = CountingWriter::new(std::io::sink());
+                    dispatch::edit_save_with_options(editor, &mut counter, &options, cancel)
+                        .map(|()| counter.position())
+                },
+                _ => Err(crate::error::Error::InvalidOperation(
+                    "editorExtractPages takes a sink, or measure and no sink".into(),
+                )),
             }
         })
         .and_then(|saved| saved);
 
     match result {
-        Ok(()) => {
-            ok_flag("streamed")
-        }
+        Ok(written) => written_response("streamed", written),
         Err(e) => ResponseWriter::error_of(&e),
     }
 }
