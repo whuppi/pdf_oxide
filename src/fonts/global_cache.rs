@@ -2,12 +2,15 @@
 //!
 //! When processing multiple PDFs in sequence or parallel, the same font programs
 //! (e.g., Helvetica, Times-Roman, Arial) appear repeatedly across documents.
-//! This module provides a global LRU cache keyed by font identity hash so that
+// ── pdf_manipulator patch: the cache is bounded by bytes, not an LRU of entries ──
+//! This module provides a global cache keyed by font identity hash so that
 //! already-parsed `FontInfo` instances can be reused across documents without
 //! re-parsing.
 //!
-//! The cache is safe for concurrent access from multiple threads and uses an
-//! LRU eviction policy to bound memory usage.
+//! The cache is safe for concurrent access from multiple threads and bounds
+//! memory by bytes: the fonts it holds are charged what they take, and the
+//! oldest are evicted when a new one would exceed the budget.
+// ── end pdf_manipulator patch ──
 //!
 //! # Usage
 //!
@@ -21,23 +24,24 @@
 //! // Process many PDFs... fonts are cached automatically
 //!
 //! // Check cache statistics
-//! let (size, capacity) = global_font_cache_stats();
-//! println!("Global font cache: {}/{} entries", size, capacity);
+// ── pdf_manipulator patch: the capacity is a number of bytes ──
+//! let (entries, capacity_bytes) = global_font_cache_stats();
+//! println!("Global font cache: {} fonts, budget {} bytes", entries, capacity_bytes);
+// ── end pdf_manipulator patch ──
 //!
 //! // Clear when done to free memory
 //! clear_global_font_cache();
 //! ```
 
 use super::FontInfo;
-use std::collections::{HashMap, VecDeque};
+// ── pdf_manipulator patch: the byte-bounded cache and its charge ──
+use crate::host::font_budget::{ByteCache, GLOBAL_FONT_BYTES};
+// ── end pdf_manipulator patch ──
 use std::sync::{Arc, OnceLock, RwLock};
 
-/// Default maximum number of entries in the global font cache.
-/// 1024 fonts covers typical batch processing workloads (most documents use
-/// 5-15 fonts, so this handles ~70-200 unique documents before eviction).
-const DEFAULT_MAX_ENTRIES: usize = 1024;
-
-/// A bounded font cache with FIFO eviction.
+// ── pdf_manipulator patch: the cache is bounded by the bytes its fonts take, not by their number ──
+/// A bounded font cache with FIFO eviction, charged by the bytes each font
+/// takes ([`font_bytes`]).
 ///
 /// Lookups are read-only (`&self`) so the cache can live behind an `RwLock`
 /// and serve concurrent readers without contention — font loading is read-heavy
@@ -45,74 +49,51 @@ const DEFAULT_MAX_ENTRIES: usize = 1024;
 /// rather than LRU; the cache is correctness-neutral (a miss just re-parses the
 /// same font to the same result), so the policy only affects memory/perf.
 struct FifoFontCache {
-    entries: HashMap<u64, Arc<FontInfo>>,
-    /// Keys in insertion order, for FIFO eviction.
-    order: VecDeque<u64>,
-    max_entries: usize,
+    fonts: ByteCache<u64, Arc<FontInfo>>,
 }
 
 impl FifoFontCache {
-    fn new(max_entries: usize) -> Self {
-        Self {
-            entries: HashMap::with_capacity(max_entries / 2),
-            order: VecDeque::new(),
-            max_entries,
-        }
+    fn new(max_bytes: usize) -> Self {
+        Self { fonts: ByteCache::fifo(max_bytes) }
     }
 
     fn get(&self, key: u64) -> Option<Arc<FontInfo>> {
-        self.entries.get(&key).map(Arc::clone)
+        self.fonts.peek(&key).map(Arc::clone)
     }
 
+    /// Keeps `font` under `key`, evicting the oldest fonts until it fits; a
+    /// font larger than the whole budget is not kept.
     fn insert(&mut self, key: u64, font: Arc<FontInfo>) {
-        // A present key is replaced in place, keeping its FIFO position; a new
-        // key gets an `order` entry and may evict the oldest if over capacity.
-        if self.entries.insert(key, font).is_some() {
-            return;
-        }
-        self.order.push_back(key);
-        while self.entries.len() > self.max_entries {
-            match self.order.pop_front() {
-                Some(old) => {
-                    self.entries.remove(&old);
-                },
-                None => break,
-            }
-        }
+        self.fonts.put(key, font);
     }
 
     fn len(&self) -> usize {
-        self.entries.len()
+        self.fonts.len()
     }
 
+    /// The budget, in bytes.
     fn capacity(&self) -> usize {
-        self.max_entries
+        self.fonts.budget()
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
+        self.fonts.clear();
     }
 
-    fn set_capacity(&mut self, new_max: usize) {
-        self.max_entries = new_max;
-        while self.entries.len() > self.max_entries {
-            match self.order.pop_front() {
-                Some(old) => {
-                    self.entries.remove(&old);
-                },
-                None => break,
-            }
-        }
+    fn set_capacity(&mut self, max_bytes: usize) {
+        self.fonts.set_budget(max_bytes);
     }
 }
+// ── end pdf_manipulator patch ──
 
 /// Global singleton font cache, initialized on first access.
 static GLOBAL_FONT_CACHE: OnceLock<RwLock<FifoFontCache>> = OnceLock::new();
 
 /// Get or initialize the global font cache.
 fn cache() -> &'static RwLock<FifoFontCache> {
-    GLOBAL_FONT_CACHE.get_or_init(|| RwLock::new(FifoFontCache::new(DEFAULT_MAX_ENTRIES)))
+    // ── pdf_manipulator patch: the cache is bounded by bytes ──
+    GLOBAL_FONT_CACHE.get_or_init(|| RwLock::new(FifoFontCache::new(GLOBAL_FONT_BYTES)))
+    // ── end pdf_manipulator patch ──
 }
 
 /// Look up a font in the global cross-document cache.
@@ -159,18 +140,20 @@ pub fn clear_global_font_cache() {
     }
 }
 
-/// Return the current size and capacity of the global font cache.
+// ── pdf_manipulator patch: the capacity is a number of bytes ──
+/// Return the number of fonts in the global font cache and its budget.
 ///
-/// Returns `(current_entries, max_capacity)`.
+/// Returns `(current_entries, max_capacity_bytes)`.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use pdf_oxide::fonts::global_cache::global_font_cache_stats;
 ///
-/// let (size, capacity) = global_font_cache_stats();
-/// println!("Global font cache: {}/{} entries", size, capacity);
+/// let (entries, capacity_bytes) = global_font_cache_stats();
+/// println!("Global font cache: {} fonts, budget {} bytes", entries, capacity_bytes);
 /// ```
+// ── end pdf_manipulator patch ──
 pub fn global_font_cache_stats() -> (usize, usize) {
     cache()
         .read()
@@ -178,25 +161,28 @@ pub fn global_font_cache_stats() -> (usize, usize) {
         .unwrap_or((0, 0))
 }
 
-/// Set the maximum number of entries in the global font cache.
+// ── pdf_manipulator patch: the capacity is a number of bytes ──
+/// Set the most bytes of fonts the global font cache holds.
 ///
-/// If `max_entries` is smaller than the current cache size, the least-recently-used
-/// entries are evicted immediately. Setting this to 0 effectively disables caching
-/// (all inserts are immediately evicted).
+/// A font is charged what it takes (its embedded program, its ToUnicode CMap
+/// and its tables). If `max_bytes` is smaller than what the cache holds, the
+/// oldest fonts are evicted immediately. Setting this to 0 disables caching
+/// (every insert is refused), and so does a budget smaller than one font.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use pdf_oxide::fonts::global_cache::set_global_font_cache_capacity;
 ///
-/// // Increase cache for large batch processing
-/// set_global_font_cache_capacity(4096);
+/// // Keep up to 64 MiB of fonts for large batch processing
+/// set_global_font_cache_capacity(64 * 1024 * 1024);
 /// ```
-pub fn set_global_font_cache_capacity(max_entries: usize) {
+pub fn set_global_font_cache_capacity(max_bytes: usize) {
     if let Ok(mut guard) = cache().write() {
-        guard.set_capacity(max_entries);
+        guard.set_capacity(max_bytes);
     }
 }
+// ── end pdf_manipulator patch ──
 
 #[cfg(test)]
 mod tests {
@@ -254,7 +240,9 @@ mod tests {
 
     #[test]
     fn test_fifo_cache_insert_and_get() {
-        let mut cache = FifoFontCache::new(16);
+        // ── pdf_manipulator patch: the budget is in bytes, and this one is room enough ──
+        let mut cache = FifoFontCache::new(ROOMY);
+        // ── end pdf_manipulator patch ──
         let font = Arc::new(make_test_font("Helvetica"));
 
         assert!(cache.get(100).is_none());
@@ -265,9 +253,18 @@ mod tests {
         assert_eq!(cached.unwrap().base_font, "Helvetica");
     }
 
+    // ── pdf_manipulator patch: the cache is bounded by bytes, so its tests count bytes ──
+    /// The bytes one test font is charged; every test font is named alike in length.
+    fn unit() -> usize {
+        crate::host::font_budget::font_bytes(&make_test_font("F1"))
+    }
+
+    /// A budget no test fills.
+    const ROOMY: usize = 1 << 30;
+
     #[test]
     fn test_fifo_cache_eviction() {
-        let mut cache = FifoFontCache::new(3);
+        let mut cache = FifoFontCache::new(3 * unit());
 
         cache.insert(10, Arc::new(make_test_font("F1")));
         cache.insert(20, Arc::new(make_test_font("F2")));
@@ -276,7 +273,7 @@ mod tests {
         // Reads do not affect eviction order (FIFO, not LRU).
         cache.get(10);
 
-        // Insert F4 — evicts F1 (first in).
+        // Insert F4 — the byte budget is exceeded, so F1 (first in) goes.
         cache.insert(40, Arc::new(make_test_font("F4")));
 
         assert!(cache.get(10).is_none(), "F1 (oldest) should have been evicted");
@@ -287,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_fifo_cache_clear() {
-        let mut cache = FifoFontCache::new(16);
+        let mut cache = FifoFontCache::new(ROOMY);
         cache.insert(1, Arc::new(make_test_font("A")));
         cache.insert(2, Arc::new(make_test_font("B")));
         assert_eq!(cache.len(), 2);
@@ -299,24 +296,29 @@ mod tests {
 
     #[test]
     fn test_fifo_cache_set_capacity() {
-        let mut cache = FifoFontCache::new(16);
+        let mut cache = FifoFontCache::new(ROOMY);
 
         for i in 0..5 {
             cache.insert(i, Arc::new(make_test_font(&format!("Font{}", i))));
         }
         assert_eq!(cache.len(), 5);
 
-        // Shrink to 2 — evicts the 3 oldest entries (0,1,2); 3,4 survive.
-        cache.set_capacity(2);
+        // Shrink to two fonts' bytes — evicts the 3 oldest entries (0,1,2); 3,4 survive.
+        cache.set_capacity(2 * unit_of("Font0"));
         assert_eq!(cache.len(), 2);
-        assert_eq!(cache.capacity(), 2);
+        assert_eq!(cache.capacity(), 2 * unit_of("Font0"));
         assert!(cache.get(3).is_some());
         assert!(cache.get(4).is_some());
     }
 
+    /// The bytes the test font called `name` is charged.
+    fn unit_of(name: &str) -> usize {
+        crate::host::font_budget::font_bytes(&make_test_font(name))
+    }
+
     #[test]
     fn test_fifo_cache_duplicate_key_update() {
-        let mut cache = FifoFontCache::new(16);
+        let mut cache = FifoFontCache::new(ROOMY);
 
         cache.insert(50, Arc::new(make_test_font("OldFont")));
         assert_eq!(cache.get(50).unwrap().base_font, "OldFont");
@@ -328,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_fifo_cache_eviction_order_is_insertion_order() {
-        let mut cache = FifoFontCache::new(3);
+        let mut cache = FifoFontCache::new(3 * unit());
         cache.insert(1, Arc::new(make_test_font("A")));
         cache.insert(2, Arc::new(make_test_font("B")));
         cache.insert(3, Arc::new(make_test_font("C")));
@@ -342,6 +344,7 @@ mod tests {
         assert!(cache.get(3).is_some());
         assert!(cache.get(4).is_some());
     }
+    // ── end pdf_manipulator patch ──
 
     // ---- Integration test for global API (single test to avoid parallel interference) ----
 
@@ -375,6 +378,8 @@ mod tests {
         assert_eq!(size_after, 0);
 
         // Restore capacity in case another test changed it
-        set_global_font_cache_capacity(DEFAULT_MAX_ENTRIES);
+        // ── pdf_manipulator patch: the default budget is in bytes ──
+        set_global_font_cache_capacity(crate::host::font_budget::GLOBAL_FONT_BYTES);
+        // ── end pdf_manipulator patch ──
     }
 }

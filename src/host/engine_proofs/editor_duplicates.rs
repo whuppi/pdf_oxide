@@ -339,12 +339,12 @@ fn merged_from_encrypted(len: usize) -> PdfDocument {
     PdfDocument::from_bytes(editor.save_to_bytes_with_options(options).unwrap()).unwrap()
 }
 
-/// No Dart battery sees it: the limit is the engine's memory bound on decrypting a stream to compare it, and a Dart read of the output shows the same pages either way.
+/// No Dart battery sees it: the claim is how many image objects the saved file holds, and a Dart read of the output shows the same pages whether it holds one or two. The memory the save takes on an encrypted source is held by `mem_encrypted_duplicates` and by the `compress encrypted` row of the memory probe.
 #[test]
-fn an_encrypted_source_merges_a_small_image_and_not_a_large_one() {
+fn an_encrypted_source_merges_a_small_image_and_a_large_one() {
     assert_eq!(image_count(&merged_from_encrypted(1000)), 1);
     let above = crate::host::deflate::MEMORY_STREAM as usize + 1000;
-    assert_eq!(image_count(&merged_from_encrypted(above)), 2);
+    assert_eq!(image_count(&merged_from_encrypted(above)), 1);
 }
 
 fn merge_source() -> Vec<u8> {

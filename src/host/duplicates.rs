@@ -15,14 +15,14 @@
 //! dictionary has its keys sorted, `/Length` removed and every reference
 //! replaced by what it names; a stream it names counts with its own
 //! dictionary and payload, so two images whose soft masks differ in data
-//! stay two. Payloads are read in pieces and never held whole, except for a
-//! stream of an encrypted source, which is decrypted to be hashed and so
-//! only when it is at most [`MEMORY_STREAM`].
+//! stay two. Payloads are read in pieces and never held whole: a stream of
+//! an encrypted source is decrypted through a reader into the hasher, and
+//! two streams whose digests agree are compared the same way, piece by
+//! piece, before one is replaced by the other.
 
 use crate::cancel::CancelCheck;
 use crate::document::{PdfDocument, StreamHead};
 use crate::error::{Error, Result};
-use crate::host::deflate::MEMORY_STREAM;
 use crate::object::{Object, ObjectRef, StreamBody};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -188,7 +188,7 @@ fn scan_streams(
             },
         };
         let Some((dict, len)) = fetched.stream() else { continue };
-        if is_blocked(dict) || is_container(dict) || !fits(origin.doc, len) {
+        if is_blocked(dict) || is_container(dict) {
             continue;
         }
         if is_image(dict) {
@@ -217,7 +217,7 @@ fn shared_plain(origins: &[Origin<'_>], plain: Vec<Plain>, cancel: &CancelCheck)
             let id = fetch_id(origin, p.out, p.src);
             let Ok(fetched) = fetch(origin, id) else { continue };
             let mut hasher = Sha256::new();
-            if data_into(origin.doc, &fetched, &mut hasher)? {
+            if data_into(&fetched, &mut hasher)? {
                 by_data.entry((p.len, hasher.finalize().into())).or_default().push(index);
             }
         }
@@ -258,20 +258,11 @@ fn fetch_id(origin: &Origin<'_>, out: u32, src: u32) -> u32 {
     }
 }
 
-/// A stream of an encrypted source is merged only when it is small enough
-/// to decrypt in memory.
-fn fits(doc: &PdfDocument, len: u64) -> bool {
-    !doc.is_encrypted() || len <= MEMORY_STREAM
-}
-
-/// Feeds the encoded data of stream `id`, read in pieces; `false` when it
-/// cannot be read in full or is too large to decrypt in memory.
-fn data_into(doc: &PdfDocument, fetched: &Fetched<'_>, hasher: &mut Sha256) -> Result<bool> {
+/// Feeds the encoded data of stream `id`, read in pieces and decrypted as it
+/// is read; `false` when it cannot be read in full.
+fn data_into(fetched: &Fetched<'_>, hasher: &mut Sha256) -> Result<bool> {
     match fetched {
         Fetched::Head(head) => {
-            if doc.is_encrypted() && head.data_len() > MEMORY_STREAM {
-                return Ok(false);
-            }
             match hash_body(&StreamBody::Extent(head.extent.clone()), hasher) {
                 Ok(()) => Ok(true),
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
@@ -280,15 +271,75 @@ fn data_into(doc: &PdfDocument, fetched: &Fetched<'_>, hasher: &mut Sha256) -> R
         },
         other => match other.object() {
             Some(Object::Stream { body, .. }) => {
-                if doc.is_encrypted() && body.len() > MEMORY_STREAM {
-                    return Ok(false);
-                }
                 hash_body(body, hasher)?;
                 Ok(true)
             },
             _ => Ok(false),
         },
     }
+}
+
+/// Whether stream `left_id` of `left` and stream `right_id` of `right` hold
+/// the same encoded data, decrypted and read in pieces side by side.
+pub(crate) fn same_stream_data(
+    left: &Origin<'_>,
+    left_id: u32,
+    right: &Origin<'_>,
+    right_id: u32,
+) -> Result<bool> {
+    let Ok(left) = fetch(left, left_id) else { return Ok(false) };
+    let Ok(right) = fetch(right, right_id) else { return Ok(false) };
+    same_data(&left, &right)
+}
+
+/// Whether the encoded data of the two streams is the same, decrypted and
+/// read in pieces side by side. A stream that cannot be read in full is
+/// not the same as any other.
+fn same_data(a: &Fetched<'_>, b: &Fetched<'_>) -> Result<bool> {
+    let (Some(mut left), Some(mut right)) = (data_reader(a)?, data_reader(b)?) else {
+        return Ok(false);
+    };
+    let mut left_buf = vec![0u8; CHUNK];
+    let mut right_buf = vec![0u8; CHUNK];
+    loop {
+        let (n, m) = match (fill(&mut left, &mut left_buf), fill(&mut right, &mut right_buf)) {
+            (Ok(n), Ok(m)) => (n, m),
+            (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(false)
+            },
+            (Err(e), _) | (_, Err(e)) => return Err(crate::encryption::stream::from_io(e)),
+        };
+        if n != m || left_buf[..n] != right_buf[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// The decrypted data of a stream as a reader; `None` for an object that is
+/// not a stream.
+fn data_reader<'a>(fetched: &'a Fetched<'_>) -> Result<Option<Box<dyn Read + 'a>>> {
+    match fetched {
+        Fetched::Head(head) => Ok(Some(StreamBody::Extent(head.extent.clone()).owned_reader()?)),
+        other => match other.object() {
+            Some(Object::Stream { body, .. }) => Ok(Some(body.raw_reader()?)),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// Reads until `buf` is full or the reader ends; the bytes read.
+fn fill(reader: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 struct Hashing<'a, 'b> {
@@ -317,6 +368,12 @@ impl Hashing<'_, '_> {
         Ok(Some(hasher.finalize().into()))
     }
 
+    /// Whether the encoded data of candidates `a` and `b` is the same.
+    fn same_data(&self, a: &Candidate, b: &Candidate) -> Result<bool> {
+        let (left, right) = (&self.origins[a.origin], &self.origins[b.origin]);
+        same_stream_data(left, fetch_id(left, a.out, a.src), right, fetch_id(right, b.out, b.src))
+    }
+
     /// Feeds the canonical dictionary and then the data of a stream.
     fn stream_into(
         &mut self,
@@ -330,7 +387,7 @@ impl Hashing<'_, '_> {
             return Ok(false);
         }
         hasher.update(len.to_le_bytes());
-        data_into(self.origins[o].doc, fetched, hasher)
+        data_into(fetched, hasher)
     }
 
     fn dict_into(
@@ -496,24 +553,29 @@ pub(crate) fn find(origins: &[Origin<'_>], cancel: &CancelCheck) -> Result<HashM
     let mut groups: Vec<Vec<usize>> = groups.into_values().filter(|g| g.len() > 1).collect();
     groups.sort_unstable();
     for group in groups {
-        let mut kept: HashMap<Digest32, u32> = HashMap::new();
-        let mut members: Vec<(u32, Digest32)> = Vec::new();
+        // The digest of each kept stream, with the candidate that holds it.
+        let mut kept: HashMap<Digest32, (u32, usize)> = HashMap::new();
+        let mut members: Vec<(u32, Digest32, usize)> = Vec::new();
         for index in group {
             cancel.check()?;
             let c = &candidates[index];
             if let Some(digest) = hashing.candidate(c)? {
-                members.push((c.out, digest));
+                members.push((c.out, digest, index));
             }
         }
         members.sort_unstable();
-        for (out, digest) in members {
+        for (out, digest, index) in members {
             match kept.get(&digest) {
-                Some(&canonical) if canonical != out => {
-                    aliases.insert(out, canonical);
+                Some(&(canonical, _)) if canonical == out => {},
+                Some(&(canonical, kept_index)) => {
+                    // Equal digests are not taken for equal data: the two are
+                    // read side by side, decrypted, before one stands for both.
+                    if hashing.same_data(&candidates[kept_index], &candidates[index])? {
+                        aliases.insert(out, canonical);
+                    }
                 },
-                Some(_) => {},
                 None => {
-                    kept.insert(digest, out);
+                    kept.insert(digest, (out, index));
                 },
             }
         }

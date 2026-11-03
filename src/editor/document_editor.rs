@@ -232,9 +232,8 @@ pub struct SaveOptions {
     /// when their dictionaries (without `/Length`, every reference replaced
     /// by the object it names) and their encoded bytes are equal; a stream
     /// with `/OC`, `/StructParent` or `/StructParents` is never merged. A
-    /// stream of an encrypted source is merged only when its data is at
-    /// most 256 KiB, since it is decrypted to be compared. An incremental
-    /// save ignores it.
+    /// stream of an encrypted source is decrypted through a reader as it is
+    /// hashed and compared, whatever its size. An incremental save ignores it.
     pub merge_duplicates: bool,
     // ── end pdf_manipulator patch ──
     // ── pdf_manipulator patch: unused resources dropped ──

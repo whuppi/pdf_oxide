@@ -2341,6 +2341,17 @@ pub struct TextExtractor<'doc> {
     state_stack: GraphicsStateStack,
     /// Loaded fonts (name -> FontInfo). Arc-wrapped to avoid deep cloning across pages.
     fonts: HashMap<String, Arc<FontInfo>>,
+    // ── pdf_manipulator patch: fonts the page names but reads only when its content selects them ──
+    /// Fonts the page's resources name that are read when its content selects
+    /// them (name -> font object), because loading them all would hold more
+    /// than `PAGE_FONT_BYTES` of fonts at once.
+    deferred_fonts: HashMap<String, ObjectRef>,
+    /// The deferred fonts read so far, the newest within `PAGE_FONT_BYTES`.
+    resident_fonts: std::sync::Mutex<crate::host::font_budget::ByteCache<ObjectRef, Arc<FontInfo>>>,
+    /// The `/BaseFont` of each deferred font read so far, which the spans are
+    /// named by at the end of the page without reading the fonts again.
+    deferred_base_fonts: std::sync::Mutex<HashMap<ObjectRef, String>>,
+    // ── end pdf_manipulator patch ──
     /// Extracted text spans (complete strings from Tj/TJ operators)
     spans: Vec<TextSpan>,
     /// Extracted characters (for backward compatibility)
@@ -2555,6 +2566,13 @@ impl<'doc> TextExtractor<'doc> {
         Self {
             state_stack: GraphicsStateStack::new(),
             fonts: HashMap::new(),
+            // ── pdf_manipulator patch: no font is deferred until a loader asks ──
+            deferred_fonts: HashMap::new(),
+            resident_fonts: std::sync::Mutex::new(crate::host::font_budget::ByteCache::lru(
+                crate::host::font_budget::PAGE_FONT_BYTES,
+            )),
+            deferred_base_fonts: std::sync::Mutex::new(HashMap::new()),
+            // ── end pdf_manipulator patch ──
             spans: Vec::new(),
             chars: Vec::new(),
             resources: None,
@@ -2767,7 +2785,9 @@ impl<'doc> TextExtractor<'doc> {
         let space_width_units = state
             .font_name
             .as_ref()
-            .and_then(|name| self.fonts.get(name))
+            // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+            .and_then(|name| self.font_named(name))
+            // ── end pdf_manipulator patch ──
             .map(|font| font.get_space_glyph_width())
             .unwrap_or(250.0); // Fallback: Times-Roman typical space width
 
@@ -3382,13 +3402,82 @@ impl<'doc> TextExtractor<'doc> {
     /// # }
     /// ```
     pub fn add_font(&mut self, name: String, font: FontInfo) {
+        // ── pdf_manipulator patch: a font added under a name replaces a deferred one ──
+        self.deferred_fonts.remove(&name);
+        // ── end pdf_manipulator patch ──
         self.fonts.insert(name, Arc::new(font));
     }
 
     /// Add a pre-shared font (Arc-wrapped) to the extractor. Avoids deep cloning.
     pub(crate) fn add_font_shared(&mut self, name: String, font: Arc<FontInfo>) {
+        // ── pdf_manipulator patch: a font added under a name replaces a deferred one ──
+        self.deferred_fonts.remove(&name);
+        // ── end pdf_manipulator patch ──
         self.fonts.insert(name, font);
     }
+
+    // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+    /// Whether a font past the page's byte budget may be left unread: only an
+    /// extractor with a document to read it from can read it later.
+    pub(crate) fn can_defer_fonts(&self) -> bool {
+        self.document.is_some()
+    }
+
+    /// Names font object `font_ref` as `name` without reading it: it is read
+    /// when the content selects `name`, and released when the page has read
+    /// more than `PAGE_FONT_BYTES` of other fonts since.
+    pub(crate) fn defer_font(&mut self, name: String, font_ref: ObjectRef) {
+        self.fonts.remove(&name);
+        self.deferred_fonts.insert(name, font_ref);
+    }
+
+    /// The font the resource `name` names: a loaded one, or a deferred one
+    /// read now (and read again if it was released since).
+    fn font_named(&self, name: &str) -> Option<Arc<FontInfo>> {
+        use crate::cache::MutexExt;
+        if let Some(font) = self.fonts.get(name) {
+            return Some(Arc::clone(font));
+        }
+        let font_ref = *self.deferred_fonts.get(name)?;
+        if let Some(font) = self.resident_fonts.lock_or_recover().get(&font_ref) {
+            return Some(Arc::clone(font));
+        }
+        let font = self.document?.deferred_font(name, font_ref)?;
+        self.deferred_base_fonts.lock_or_recover().insert(font_ref, font.base_font.clone());
+        self.resident_fonts.lock_or_recover().put(font_ref, Arc::clone(&font));
+        Some(font)
+    }
+
+    /// The `/BaseFont` of the font the resource `name` names, read without
+    /// reading a deferred font again once it has been read.
+    fn base_font_named(&self, name: &str) -> Option<String> {
+        use crate::cache::MutexExt;
+        if let Some(font) = self.fonts.get(name) {
+            return Some(font.base_font.clone());
+        }
+        let font_ref = *self.deferred_fonts.get(name)?;
+        if let Some(base_font) = self.deferred_base_fonts.lock_or_recover().get(&font_ref) {
+            return Some(base_font.clone());
+        }
+        self.font_named(name).map(|font| font.base_font.clone())
+    }
+
+    /// The fonts [`should_insert_space`] looks `name` up in: the loaded ones,
+    /// or, for a deferred font, a map of that one.
+    fn fonts_for_spacing<'a>(
+        &'a self,
+        name: &str,
+        scratch: &'a mut HashMap<String, Arc<FontInfo>>,
+    ) -> &'a HashMap<String, Arc<FontInfo>> {
+        if self.deferred_fonts.is_empty() || self.fonts.contains_key(name) {
+            return &self.fonts;
+        }
+        if let Some(font) = self.font_named(name) {
+            scratch.insert(name.to_string(), font);
+        }
+        scratch
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Return the current font set for caching purposes.
     pub fn get_font_set(&self) -> Vec<(String, Arc<FontInfo>)> {
@@ -3594,9 +3683,9 @@ impl<'doc> TextExtractor<'doc> {
             .spans
             .iter()
             .map(|s| {
-                self.fonts
-                    .get(&s.font_name)
-                    .map(|f| f.base_font.clone())
+                // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                self.base_font_named(&s.font_name)
+                    // ── end pdf_manipulator patch ──
                     .filter(|b| !b.is_empty())
             })
             .collect();
@@ -3610,12 +3699,16 @@ impl<'doc> TextExtractor<'doc> {
         // is finalized: the tier the span's font offered, or `Fallback` when it
         // carries no mapping resource (the text is then a fabricated glyph-index
         // echo, not read from the file). `None` when the font is unresolvable.
-        for span in self.spans.iter_mut() {
-            span.provenance = self
-                .fonts
-                .get(span.font_name.as_str())
-                .map(|f| f.best_mapping_provenance());
+        // ── pdf_manipulator patch: a font the page names is read when its content selects it, which needs the extractor while the spans are changed ──
+        let provenances: Vec<_> = self
+            .spans
+            .iter()
+            .map(|s| self.font_named(s.font_name.as_str()).map(|f| f.best_mapping_provenance()))
+            .collect();
+        for (span, provenance) in self.spans.iter_mut().zip(provenances) {
+            span.provenance = provenance;
         }
+        // ── end pdf_manipulator patch ──
 
         Ok(std::mem::take(&mut self.spans))
     }
@@ -4718,8 +4811,9 @@ impl<'doc> TextExtractor<'doc> {
             // merge branch we consult a more honest gap to decide whether
             // a space is warranted.
             let reliable_widths = self
-                .fonts
-                .get(&current.font_name)
+                // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                .font_named(&current.font_name)
+                // ── end pdf_manipulator patch ──
                 .map(|f| f.has_explicit_widths())
                 .unwrap_or(true);
             let space_gap = corrected_space_gap(
@@ -4987,13 +5081,20 @@ impl<'doc> TextExtractor<'doc> {
                     current.text.push_str(&span.text);
                 } else {
                     let tj_offset_triggered_override = has_split_boundary;
+                    // ── pdf_manipulator patch: a deferred font is looked up through a map of it ──
+                    let mut spacing_scratch = HashMap::new();
+                    let spacing_fonts =
+                        self.fonts_for_spacing(&current.font_name, &mut spacing_scratch);
+                    // ── end pdf_manipulator patch ──
                     let mut space_decision = should_insert_space(
                         &current.text,
                         &span.text,
                         space_gap,
                         current.font_size,
                         &current.font_name,
-                        &self.fonts,
+                        // ── pdf_manipulator patch: a deferred font is looked up through a map of it ──
+                        spacing_fonts,
+                        // ── end pdf_manipulator patch ──
                         tj_offset_triggered_override,
                         &self.merging_config,
                         Some(&current.bbox),
@@ -5501,7 +5602,9 @@ impl<'doc> TextExtractor<'doc> {
                     self.flush_tj_span_buffer()?;
 
                     // Cache font reference for advance_position_for_string
-                    self.cached_current_font = self.fonts.get(&font).cloned();
+                    // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                    self.cached_current_font = self.font_named(&font);
+                    // ── end pdf_manipulator patch ──
                     // Cache wmode on the graphics state so the advance hot
                     // path branches on a single primitive read instead of
                     // dereferencing the FontInfo every glyph.
@@ -5843,7 +5946,12 @@ impl<'doc> TextExtractor<'doc> {
                                         // Get font for determining weight
                                         let font = font_name
                                             .as_ref()
-                                            .and_then(|name| self.fonts.get(name));
+                                            // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                                            .and_then(|name| self.font_named(name));
+                                            // ── end pdf_manipulator patch ──
+                                        // ── pdf_manipulator patch: the font is an owned Arc ──
+                                        let font = font.as_deref();
+                                        // ── end pdf_manipulator patch ──
                                         let font_weight = if let Some(font) = font {
                                             if font.is_bold() {
                                                 FontWeight::Bold
@@ -5861,7 +5969,9 @@ impl<'doc> TextExtractor<'doc> {
                                         let (r, g, b) = fill_color_rgb;
                                         let is_italic_space = font_name
                                             .as_ref()
-                                            .and_then(|name| self.fonts.get(name))
+                                            // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                                            .and_then(|name| self.font_named(name))
+                                            // ── end pdf_manipulator patch ──
                                             .map(|font| font.is_italic())
                                             .unwrap_or(false);
                                         let font_name_str = font_name.unwrap_or_default();
@@ -6023,8 +6133,9 @@ impl<'doc> TextExtractor<'doc> {
                     .current()
                     .font_name
                     .as_ref()
-                    .and_then(|name| self.fonts.get(name))
-                    .cloned();
+                    // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                    .and_then(|name| self.font_named(name));
+                    // ── end pdf_manipulator patch ──
                 // Re-evaluate ink exclusion for the restored color space
                 if !self.excluded_inks.is_empty() {
                     let cs = self.state_stack.current().fill_color_space.clone();
@@ -7151,7 +7262,9 @@ impl<'doc> TextExtractor<'doc> {
                 let saved_xobj_cache;
 
                 if has_own_resources {
-                    saved_fonts = Some(self.fonts.clone());
+                    // ── pdf_manipulator patch: the deferred fonts are saved with the loaded ones ──
+                    saved_fonts = Some((self.fonts.clone(), self.deferred_fonts.clone()));
+                    // ── end pdf_manipulator patch ──
                     saved_resources = self.resources.clone();
                     saved_xobj_cache = Some(std::mem::take(&mut self.cached_xobject_refs));
 
@@ -7360,18 +7473,22 @@ impl<'doc> TextExtractor<'doc> {
                 // Restore graphics state (implicit Q per ISO 32000-1 §8.10.1)
                 self.state_stack.restore();
                 // Sync cached font with restored state
+                // ── pdf_manipulator patch: the font is read through the deferred fonts too ──
                 self.cached_current_font = self
                     .state_stack
                     .current()
                     .font_name
                     .as_ref()
-                    .and_then(|name| self.fonts.get(name))
-                    .cloned();
+                    .and_then(|name| self.font_named(name));
+                // ── end pdf_manipulator patch ──
 
                 // Restore fonts, resources, and XObject cache only if saved
-                if let Some(fonts) = saved_fonts {
+                // ── pdf_manipulator patch: the deferred fonts come back with the loaded ones ──
+                if let Some((fonts, deferred)) = saved_fonts {
                     self.fonts = fonts;
+                    self.deferred_fonts = deferred;
                 }
+                // ── end pdf_manipulator patch ──
                 if let Some(res) = saved_resources {
                     self.resources = Some(res);
                 }
@@ -7592,7 +7709,9 @@ impl<'doc> TextExtractor<'doc> {
                     // Collect character-level data before processing buffer
                     // Extract individual characters with their properties
                     if let Some(ref name) = font_name {
-                        if let Some(font) = self.fonts.get(name) {
+                        // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                        if let Some(font) = self.font_named(name) {
+                        // ── end pdf_manipulator patch ──
                             // Process each byte in the string
                             for &byte in s.iter() {
                                 // Normalize character code through encoding.
@@ -7912,7 +8031,9 @@ impl<'doc> TextExtractor<'doc> {
         // Step 3: Convert characters to Unicode string
         // Use same decoding as existing code
         let mut unicode_text = if let Some(font_name) = state.font_name.as_ref() {
-            if let Some(font) = self.fonts.get(font_name) {
+            // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+            if let Some(font) = self.font_named(font_name) {
+            // ── end pdf_manipulator patch ──
                 let mut text = String::new();
                 for char_info in cluster {
                     if let Some(decoded) = font.char_to_unicode(char_info.code) {
@@ -7958,10 +8079,15 @@ impl<'doc> TextExtractor<'doc> {
                 // string has more chars than the cluster (e.g. ligature
                 // expansion `fi` → "fi"), use the first decoded char as
                 // a representative since they share the same source x.
-                let font_for_cluster = state.font_name.as_ref().and_then(|n| self.fonts.get(n));
+                // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+                let font_for_cluster = state.font_name.as_ref().and_then(|n| self.font_named(n));
+                // ── end pdf_manipulator patch ──
                 let mut chars_with_x: Vec<(char, f32)> = Vec::with_capacity(cluster.len());
                 for ci in cluster {
                     let decoded_first = font_for_cluster
+                        // ── pdf_manipulator patch: the font is an owned Arc ──
+                        .as_deref()
+                        // ── end pdf_manipulator patch ──
                         .and_then(|f| f.char_to_unicode(ci.code))
                         .and_then(|s| s.chars().next());
                     if let Some(c) = decoded_first {
@@ -7995,7 +8121,9 @@ impl<'doc> TextExtractor<'doc> {
 
         // Step 4: Determine font weight
         let font_weight = if let Some(font_name) = state.font_name.as_ref() {
-            if let Some(font) = self.fonts.get(font_name) {
+            // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+            if let Some(font) = self.font_named(font_name) {
+            // ── end pdf_manipulator patch ──
                 if font.is_bold() {
                     FontWeight::Bold
                 } else {
@@ -8012,7 +8140,9 @@ impl<'doc> TextExtractor<'doc> {
         let is_italic = state
             .font_name
             .as_ref()
-            .and_then(|name| self.fonts.get(name))
+            // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+            .and_then(|name| self.font_named(name))
+            // ── end pdf_manipulator patch ──
             .map(|font| font.is_italic())
             .unwrap_or(false);
 
@@ -8759,7 +8889,9 @@ impl<'doc> TextExtractor<'doc> {
         let is_italic_space = state
             .font_name
             .as_ref()
-            .and_then(|name| self.fonts.get(name))
+            // ── pdf_manipulator patch: a font the page names is read when its content selects it ──
+            .and_then(|name| self.font_named(name))
+            // ── end pdf_manipulator patch ──
             .map(|font| font.is_italic())
             .unwrap_or(false);
         // Bbox geometry follows the writing axis: a horizontal gap is

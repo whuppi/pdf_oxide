@@ -187,6 +187,9 @@ const ARTIFACT_POS_TOL_Y: f32 = 24.0;
 
 // Re-export BoundedEntryCache from cache module for local use and backward compatibility
 pub(crate) use crate::cache::BoundedEntryCache;
+// ── pdf_manipulator patch: the font caches are bounded by bytes ──
+use crate::host::font_budget::{font_bytes, ByteCache, DOCUMENT_FONT_BYTES, PAGE_FONT_BYTES};
+// ── end pdf_manipulator patch ──
 
 /// Size-bounded object cache with FIFO eviction.
 ///
@@ -462,31 +465,33 @@ pub struct PdfDocument {
     /// the source's own xref does not describe it.
     xref_repaired: bool,
     // ── end pdf_manipulator patch ──
+    // ── pdf_manipulator patch: the font caches are bounded by the bytes their fonts take ──
     /// Font cache keyed by indirect ObjectRef to avoid re-parsing fonts across pages.
     /// Arc-wrapped to eliminate deep cloning when populating per-page TextExtractor.
-    /// Bounded at 512 entries — TeX PDFs can create unique font objects per page.
-    font_cache: Mutex<BoundedEntryCache<ObjectRef, Arc<crate::fonts::FontInfo>>>,
+    /// Bounded at `DOCUMENT_FONT_BYTES` — TeX PDFs can create unique font objects per page.
+    font_cache: Mutex<ByteCache<ObjectRef, Arc<crate::fonts::FontInfo>>>,
     /// Cached font sets keyed by /Font dictionary ObjectRef.
     /// Pages sharing the same /Font dict skip the entire load_fonts() loop.
-    /// Bounded at 256 entries.
-    font_set_cache: Mutex<BoundedEntryCache<ObjectRef, Vec<(String, Arc<crate::fonts::FontInfo>)>>>,
+    /// Bounded at `DOCUMENT_FONT_BYTES`; a set larger than that is not kept.
+    font_set_cache: Mutex<ByteCache<ObjectRef, Vec<(String, Arc<crate::fonts::FontInfo>)>>>,
     /// Fingerprint-based font set cache for direct /Font dictionaries.
     /// Keyed by sorted font ObjectRefs hash, catches pages with different
-    /// /Resources but same font references. Bounded at 256 entries.
-    font_fingerprint_cache:
-        Mutex<BoundedEntryCache<u64, Vec<(String, Arc<crate::fonts::FontInfo>)>>>,
+    /// /Resources but same font references. Bounded at `DOCUMENT_FONT_BYTES`.
+    font_fingerprint_cache: Mutex<ByteCache<u64, Vec<(String, Arc<crate::fonts::FontInfo>)>>>,
     /// Name-based font set cache keyed by hash of sorted font names.
     /// Catches pages with different font ObjectRefs but the same font name→base font
     /// mapping (common in PDFs that create new font objects per page).
     /// Stores the resolved font set (Arc-wrapped to avoid cloning) plus a combined
-    /// identity hash over ALL fonts for verification before reuse. Bounded at 256 entries.
+    /// identity hash over ALL fonts for verification before reuse. Bounded at
+    /// `DOCUMENT_FONT_BYTES`.
     font_name_set_cache:
-        Mutex<BoundedEntryCache<u64, (Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>, u64)>>,
+        Mutex<ByteCache<u64, (Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>, u64)>>,
     /// Per-font identity cache keyed by font_identity_hash (BaseFont + Subtype + Encoding +
     /// ToUnicode + FontDescriptor + DescendantFonts references). Skips expensive
     /// `FontInfo::from_dict()` when a structurally identical font was already parsed.
-    /// Bounded at 512 entries.
-    font_identity_cache: Mutex<BoundedEntryCache<u64, Arc<crate::fonts::FontInfo>>>,
+    /// Bounded at `DOCUMENT_FONT_BYTES`.
+    font_identity_cache: Mutex<ByteCache<u64, Arc<crate::fonts::FontInfo>>>,
+    // ── end pdf_manipulator patch ──
     /// Per-object `font_identity_hash_cheap`, memoized. An object's content is
     /// fixed within a document, so the Layer-4 cache guard (#408) need not
     /// re-load and re-hash each font's `/Widths` on every page.
@@ -1322,11 +1327,13 @@ impl PdfDocument {
             // ── pdf_manipulator patch: the incremental save refuses a repaired file ──
             xref_repaired: xref_reconstructed,
             // ── end pdf_manipulator patch ──
-            font_cache: Mutex::new(BoundedEntryCache::new(512)),
-            font_set_cache: Mutex::new(BoundedEntryCache::new(256)),
-            font_fingerprint_cache: Mutex::new(BoundedEntryCache::new(256)),
-            font_name_set_cache: Mutex::new(BoundedEntryCache::new(256)),
-            font_identity_cache: Mutex::new(BoundedEntryCache::new(512)),
+            // ── pdf_manipulator patch: the font caches are bounded by the bytes their fonts take ──
+            font_cache: Mutex::new(ByteCache::lru(DOCUMENT_FONT_BYTES)),
+            font_set_cache: Mutex::new(ByteCache::lru(DOCUMENT_FONT_BYTES)),
+            font_fingerprint_cache: Mutex::new(ByteCache::lru(DOCUMENT_FONT_BYTES)),
+            font_name_set_cache: Mutex::new(ByteCache::lru(DOCUMENT_FONT_BYTES)),
+            font_identity_cache: Mutex::new(ByteCache::lru(DOCUMENT_FONT_BYTES)),
+            // ── end pdf_manipulator patch ──
             font_id_hash_cache: Mutex::new(HashMap::new()),
             structure_tree_cache: Mutex::new(None),
             structure_content_cache: Mutex::new(None),
@@ -21359,7 +21366,9 @@ impl PdfDocument {
         if let Some(font_ref) = font_obj.as_reference() {
             self.font_cache
                 .lock_or_recover()
-                .insert(font_ref, Arc::clone(&arc));
+                // ── pdf_manipulator patch: the font caches are charged by bytes ──
+                .put(font_ref, Arc::clone(&arc));
+                // ── end pdf_manipulator patch ──
         }
         Ok(arc)
     }
@@ -21863,6 +21872,94 @@ impl PdfDocument {
         bytes.len() > 7 && bytes[6] == b'+' && bytes[..6].iter().all(|b| b.is_ascii_uppercase())
     }
 
+    // ── pdf_manipulator patch: the per-font layers of load_fonts, shared with the fonts a page reads when its content selects them ──
+    /// The font object `font_ref` names, as `name` in a page's resources, read
+    /// through the layers of font caches: this document's font and identity
+    /// caches, then the process-wide cache, then the font dictionary.
+    ///
+    /// The flag is whether the document's per-font cache already held it.
+    /// `Ok(None)` is a font dictionary that does not parse.
+    fn font_for_ref(
+        &self,
+        name: &str,
+        font_ref: ObjectRef,
+    ) -> Result<Option<(Arc<crate::fonts::FontInfo>, bool)>> {
+        use crate::fonts::FontInfo;
+        let cached_font_opt = self.font_cache.lock_or_recover().get(&font_ref).cloned();
+        if let Some(cached) = cached_font_opt {
+            return Ok(Some((cached, true)));
+        }
+        let font = self.load_object(font_ref)?;
+
+        // Compute identity hash. For Type0 fonts this also
+        // resolves the descendant CIDFont and folds its
+        // /DW, /DW2, /W, /W2 into the key — otherwise two
+        // Type0 fonts whose top-level dicts have identical
+        // inline shape but whose CIDFonts ship different
+        // horizontal or vertical metrics would collide on
+        // the Layer 5/6 caches.
+        let id_hash = self.font_identity_hash_with_descendants(&font);
+
+        // Type 3 fonts and subset fonts must not cross
+        // PdfDocument boundaries via the global cache — their
+        // glyph procs / glyph-subset + ToUnicode mappings are
+        // document-specific. The per-document Layer 4/5 caches
+        // below stay safe to use.
+        let is_document_local = Self::font_is_document_local(&font);
+
+        // Layer 5: Per-font identity cache — skip from_dict when a
+        // structurally identical font was already parsed elsewhere.
+        let cached_identity_opt = self.font_identity_cache.lock_or_recover().get(&id_hash).cloned();
+        if let Some(cached) = cached_identity_opt {
+            self.font_cache.lock_or_recover().put(font_ref, Arc::clone(&cached));
+            return Ok(Some((cached, false)));
+        }
+
+        // Layer 6: Global cross-document font cache — reuse fonts
+        // parsed by previous PdfDocument instances in this process.
+        // Skipped entirely for document-local fonts (#597).
+        if !is_document_local {
+            if let Some(cached) = crate::fonts::global_cache::global_font_cache_get(id_hash) {
+                self.font_identity_cache.lock_or_recover().put(id_hash, Arc::clone(&cached));
+                self.font_cache.lock_or_recover().put(font_ref, Arc::clone(&cached));
+                return Ok(Some((cached, false)));
+            }
+        }
+
+        match FontInfo::from_dict(&font, self) {
+            Ok(font_info) => {
+                let arc = Arc::new(font_info);
+                // Populate the document-level caches always; the
+                // global cross-document cache only for fonts that
+                // are safe to share across documents (#597).
+                if !is_document_local {
+                    crate::fonts::global_cache::global_font_cache_insert(id_hash, Arc::clone(&arc));
+                }
+                self.font_identity_cache.lock_or_recover().put(id_hash, Arc::clone(&arc));
+                self.font_cache.lock_or_recover().put(font_ref, Arc::clone(&arc));
+                Ok(Some((arc, false)))
+            },
+            Err(e) => {
+                log::error!(
+                    "Failed to load font '{}': {}. Text using this font will use fallback encoding.",
+                    name,
+                    e
+                );
+                Ok(None)
+            },
+        }
+    }
+
+    /// The font a page's resources name `name` and left unread, read now.
+    pub(crate) fn deferred_font(
+        &self,
+        name: &str,
+        font_ref: ObjectRef,
+    ) -> Option<Arc<crate::fonts::FontInfo>> {
+        self.font_for_ref(name, font_ref).ok().flatten().map(|(font, _)| font)
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Load fonts from a Resources dictionary into the extractor.
     pub(crate) fn load_fonts(
         &self,
@@ -22022,103 +22119,40 @@ impl PdfDocument {
                     .collect();
 
                 let mut all_from_cache = true;
+                // ── pdf_manipulator patch: a page past its font budget reads the rest of its fonts when its content selects them ──
+                let may_defer = extractor.can_defer_fonts();
+                let mut loaded_bytes = 0usize;
+                let mut deferred_any = false;
+                // ── end pdf_manipulator patch ──
 
                 for (name, font_obj) in &sorted_font_entries {
                     // If font is a reference, check per-font cache first
                     if let Some(font_ref) = font_obj.as_reference() {
-                        let cached_font_opt =
-                            self.font_cache.lock_or_recover().get(&font_ref).cloned();
-                        if let Some(cached) = cached_font_opt {
-                            extractor.add_font_shared((*name).clone(), cached);
+                        // ── pdf_manipulator patch: the per-font layers live in font_for_ref, and a font past the page budget waits for its first use ──
+                        if may_defer && loaded_bytes >= PAGE_FONT_BYTES {
+                            all_from_cache = false;
+                            deferred_any = true;
+                            extractor.defer_font((*name).clone(), font_ref);
                             continue;
                         }
-                        all_from_cache = false;
-                        let font = self.load_object(font_ref)?;
-
-                        // Compute identity hash. For Type0 fonts this also
-                        // resolves the descendant CIDFont and folds its
-                        // /DW, /DW2, /W, /W2 into the key — otherwise two
-                        // Type0 fonts whose top-level dicts have identical
-                        // inline shape but whose CIDFonts ship different
-                        // horizontal or vertical metrics would collide on
-                        // the Layer 5/6 caches.
-                        let id_hash = self.font_identity_hash_with_descendants(&font);
-
-                        // Type 3 fonts and subset fonts must not cross
-                        // PdfDocument boundaries via the global cache — their
-                        // glyph procs / glyph-subset + ToUnicode mappings are
-                        // document-specific. The per-document Layer 4/5 caches
-                        // below stay safe to use.
-                        let is_document_local = Self::font_is_document_local(&font);
-
-                        // Layer 5: Per-font identity cache — skip from_dict when a
-                        // structurally identical font was already parsed elsewhere.
-                        let cached_identity_opt = self
-                            .font_identity_cache
-                            .lock_or_recover()
-                            .get(&id_hash)
-                            .cloned();
-                        if let Some(cached) = cached_identity_opt {
-                            self.font_cache
-                                .lock_or_recover()
-                                .insert(font_ref, Arc::clone(&cached));
-                            extractor.add_font_shared((*name).clone(), cached);
-                            continue;
-                        }
-
-                        // Layer 6: Global cross-document font cache — reuse fonts
-                        // parsed by previous PdfDocument instances in this process.
-                        // Skipped entirely for document-local fonts (#597).
-                        if !is_document_local {
-                            if let Some(cached) =
-                                crate::fonts::global_cache::global_font_cache_get(id_hash)
-                            {
-                                self.font_identity_cache
-                                    .lock_or_recover()
-                                    .insert(id_hash, Arc::clone(&cached));
-                                self.font_cache
-                                    .lock_or_recover()
-                                    .insert(font_ref, Arc::clone(&cached));
-                                extractor.add_font_shared((*name).clone(), cached);
-                                continue;
-                            }
-                        }
-
-                        match FontInfo::from_dict(&font, self) {
-                            Ok(font_info) => {
-                                let arc = Arc::new(font_info);
-                                // Populate the document-level caches always; the
-                                // global cross-document cache only for fonts that
-                                // are safe to share across documents (#597).
-                                if !is_document_local {
-                                    crate::fonts::global_cache::global_font_cache_insert(
-                                        id_hash,
-                                        Arc::clone(&arc),
-                                    );
-                                }
-                                self.font_identity_cache
-                                    .lock_or_recover()
-                                    .insert(id_hash, Arc::clone(&arc));
-                                self.font_cache
-                                    .lock_or_recover()
-                                    .insert(font_ref, Arc::clone(&arc));
-                                extractor.add_font_shared((*name).clone(), arc);
+                        match self.font_for_ref(name, font_ref)? {
+                            Some((font, from_cache)) => {
+                                all_from_cache &= from_cache;
+                                loaded_bytes += font_bytes(&font);
+                                extractor.add_font_shared((*name).clone(), font);
                             },
-                            Err(e) => {
-                                log::error!(
-                                    "Failed to load font '{}': {}. Text using this font will use fallback encoding.",
-                                    name,
-                                    e
-                                );
-                                continue;
-                            },
+                            None => all_from_cache = false,
                         }
+                        // ── end pdf_manipulator patch ──
                     } else {
                         // Direct font object — parse without caching (no stable key)
                         all_from_cache = false;
                         let font = *font_obj;
                         match FontInfo::from_dict(font, self) {
                             Ok(font_info) => {
+                                // ── pdf_manipulator patch: a direct font counts against the page's font budget ──
+                                loaded_bytes += font_bytes(&font_info);
+                                // ── end pdf_manipulator patch ──
                                 extractor.add_font((*name).clone(), font_info);
                             },
                             Err(e) => {
@@ -22141,16 +22175,26 @@ impl PdfDocument {
                 // again even when all fonts came from cache.
                 extractor.share_truetype_cmaps();
 
+                // ── pdf_manipulator patch: a set with fonts left unread is not a set to cache ──
+                if deferred_any {
+                    return Ok(());
+                }
+                // ── end pdf_manipulator patch ──
+
                 // Cache font set by both ObjectRef and fingerprint
                 let font_set = extractor.get_font_set();
                 if let Some(fdr) = font_dict_ref {
                     self.font_set_cache
                         .lock_or_recover()
-                        .insert(fdr, font_set.clone());
+                        // ── pdf_manipulator patch: the font caches are charged by bytes ──
+                        .put(fdr, font_set.clone());
+                        // ── end pdf_manipulator patch ──
                 }
                 self.font_fingerprint_cache
                     .lock_or_recover()
-                    .insert(fingerprint, font_set.clone());
+                    // ── pdf_manipulator patch: the font caches are charged by bytes ──
+                    .put(fingerprint, font_set.clone());
+                    // ── end pdf_manipulator patch ──
 
                 // Cache by font names for Layer 4. Store only the delta — fonts
                 // added by THIS load_fonts call — so that a cache hit never pollutes
@@ -22180,7 +22224,9 @@ impl PdfDocument {
                         .collect();
                     self.font_name_set_cache
                         .lock_or_recover()
-                        .insert(name_hash, (Arc::new(l4_set), combined_check_hash));
+                        // ── pdf_manipulator patch: the font caches are charged by bytes ──
+                        .put(name_hash, (Arc::new(l4_set), combined_check_hash));
+                        // ── end pdf_manipulator patch ──
                 }
 
                 return Ok(());

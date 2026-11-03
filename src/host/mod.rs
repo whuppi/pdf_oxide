@@ -41,6 +41,7 @@ pub(crate) mod span_index;
 pub mod probe;
 pub mod positioned_write;
 pub mod font_optimizer;
+pub(crate) mod font_budget;
 pub(crate) mod font_subset;
 pub mod images;
 pub(crate) mod incremental;

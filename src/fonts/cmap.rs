@@ -89,6 +89,17 @@ pub struct CMap {
 }
 
 impl CMap {
+    // ── pdf_manipulator patch: the bytes a parsed CMap holds, for the byte-bounded CMap cache ──
+    /// The bytes this CMap holds: its map slots, their strings and its ranges.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.chars.capacity() * 32
+            + self.chars.values().map(|s| s.capacity().max(16)).sum::<usize>()
+            + (self.ranges.capacity() + self.notdef_ranges.capacity())
+                * std::mem::size_of::<RangeEntry>()
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Unicode string for a character code.
     ///
     /// 1. `chars` (bfchar + non-contiguous bfrange entries) — O(1), borrowed.
@@ -291,7 +302,9 @@ fn compute_stream_hash(data: &[u8]) -> CMapKey {
 // - Maps from stream hash to Arc<CMap> (reference-counted parsed CMap)
 // - Arc allows efficient sharing without cloning
 // - Mutex ensures thread-safe access
-// - Bounded at MAX_CMAP_CACHE_ENTRIES with LRU-style eviction (`get` promotes hot entries)
+// ── pdf_manipulator patch: the CMap cache is bounded by bytes ──
+// - Bounded at CMAP_CACHE_BYTES with LRU-style eviction (`get` promotes hot entries)
+// ── end pdf_manipulator patch ──
 //
 // Usage:
 // When a LazyCMap is first accessed, it checks this cache before parsing.
@@ -304,13 +317,14 @@ fn compute_stream_hash(data: &[u8]) -> CMapKey {
 // - Parse and insert new entries (Mutex serializes writes)
 // - Access shared CMaps concurrently (Arc is thread-safe)
 
-/// Maximum number of entries in the global CMap cache.
-const MAX_CMAP_CACHE_ENTRIES: usize = 1024;
-
-static CMAP_CACHE: std::sync::LazyLock<Mutex<crate::cache::BoundedEntryCache<CMapKey, Arc<CMap>>>> =
+// ── pdf_manipulator patch: the CMap cache is bounded by the bytes its CMaps take, not by their number ──
+static CMAP_CACHE: std::sync::LazyLock<Mutex<crate::host::font_budget::ByteCache<CMapKey, Arc<CMap>>>> =
     std::sync::LazyLock::new(|| {
-        Mutex::new(crate::cache::BoundedEntryCache::new(MAX_CMAP_CACHE_ENTRIES))
+        Mutex::new(crate::host::font_budget::ByteCache::lru(
+            crate::host::font_budget::CMAP_CACHE_BYTES,
+        ))
     });
+// ── end pdf_manipulator patch ──
 
 /// Clear the global CMap cache.
 ///
@@ -402,6 +416,19 @@ impl LazyCMap {
     ///
     /// # Returns
     /// `Some(Arc<CMap>)` if parsing succeeded, `None` if parsing failed or stream was empty
+    // ── pdf_manipulator patch: the bytes this CMap holds, for the byte budgets of the font caches ──
+    /// The bytes this CMap holds: its stream, and the parsed CMap when it has
+    /// been read (a CMap not yet read is charged what reading it will take).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let parsed = self.parsed.lock_or_recover();
+        let table = match parsed.as_ref() {
+            Some(cmap) => cmap.heap_bytes(),
+            None => self.raw_stream.len() * crate::host::font_budget::CMAP_GROWTH,
+        };
+        std::mem::size_of::<Self>() + self.raw_stream.capacity() + table
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Get the raw CMap stream bytes.
     pub fn raw_data(&self) -> &[u8] {
         &self.raw_stream
@@ -460,7 +487,9 @@ impl LazyCMap {
                 // Update global cache
                 {
                     let mut global = CMAP_CACHE.lock_or_recover();
-                    global.insert(self.cache_key, Arc::clone(&cmap_arc));
+                    // ── pdf_manipulator patch: charged by the bytes the CMap takes ──
+                    global.insert_charged(self.cache_key, Arc::clone(&cmap_arc), cmap_arc.heap_bytes());
+                    // ── end pdf_manipulator patch ──
                 }
 
                 log::debug!("CMap parsed and cached (stream hash {:?})", self.cache_key);

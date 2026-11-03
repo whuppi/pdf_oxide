@@ -50,9 +50,12 @@ mod lzw;
 mod mem_caps;
 mod mem_cmap;
 mod mem_declared;
+mod mem_encrypted_duplicates;
 mod mem_fixture;
+mod mem_fonts;
 mod mem_incremental;
 mod mem_xmp;
+mod own_process;
 mod page_operators;
 #[cfg(feature = "rendering")]
 mod pattern_paint;
