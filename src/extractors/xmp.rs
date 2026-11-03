@@ -71,6 +71,10 @@ pub struct XmpMetadata {
     pub custom: HashMap<String, String>,
 
     /// Raw XMP packet (the original XML)
+    // ── pdf_manipulator patch: a packet read from a document is parsed as events, not kept ──
+    /// Set by [`XmpExtractor::parse_xmp`], which is handed the packet whole;
+    /// `None` from [`XmpExtractor::extract`], which never holds it.
+    // ── end pdf_manipulator patch ──
     pub raw_xml: Option<String>,
 }
 
@@ -199,57 +203,44 @@ impl XmpExtractor {
         // Resolve the metadata stream
         let metadata_resolved = Self::resolve_object(doc, &metadata_obj)?;
 
-        // Get stream data
-        let xml_bytes = match &metadata_resolved {
-            Object::Stream { .. } => {
-                // XMP metadata streams are typically not filtered (or use FlateDecode)
-                // Try to decode the stream
-                let decoded = metadata_resolved.decode_stream_data()?;
-                decoded.to_vec()
-            },
-            _ => return Err(Error::InvalidPdf("Metadata is not a stream".to_string())),
+        // ── pdf_manipulator patch: the packet is parsed as XML events over the decoded reader, never held whole ──
+        // The decoded stream is read through a buffer and each event is
+        // taken as it arrives, so a packet of any size costs the buffer
+        // and the properties it names. `raw_xml` is not kept: it would be
+        // the whole packet.
+        let Object::Stream { dict, body } = &metadata_resolved else {
+            return Err(Error::InvalidPdf("Metadata is not a stream".to_string()));
         };
-
-        // Convert to string
-        let xml_str = String::from_utf8_lossy(&xml_bytes).to_string();
-
-        // Parse the XMP XML
-        Self::parse_xmp(&xml_str)
+        let decoded = crate::decoders::stream::reader_in(dict, body.origin(), || body.raw_reader())?;
+        let reader = Reader::from_reader(std::io::BufReader::with_capacity(64 * 1024, decoded));
+        let mut metadata = XmpMetadata::new();
+        if !Self::read_properties(reader, &mut metadata) {
+            return Ok(None);
+        }
+        Ok(Some(metadata))
+        // ── end pdf_manipulator patch ──
     }
 
-    /// Parse XMP XML content.
-    pub fn parse_xmp(xml: &str) -> Result<Option<XmpMetadata>> {
-        // Find the XMP packet boundaries
-        let start = xml.find("<x:xmpmeta").or_else(|| xml.find("<rdf:RDF"));
-        let end = xml
-            .rfind("</x:xmpmeta>")
-            .or_else(|| xml.rfind("</rdf:RDF>"));
-
-        let xmp_content = match (start, end) {
-            (Some(s), Some(e)) => {
-                let end_adjusted = if xml[e..].starts_with("</x:xmpmeta") {
-                    e + "</x:xmpmeta>".len()
-                } else {
-                    e + "</rdf:RDF>".len()
-                };
-                &xml[s..end_adjusted]
-            },
-            _ => return Ok(None),
-        };
-
-        let mut metadata = XmpMetadata::new();
-        metadata.raw_xml = Some(xml.to_string());
-
-        let mut reader = Reader::from_str(xmp_content);
+    // ── pdf_manipulator patch: one event loop serves the string and the reader ──
+    /// Reads the XMP properties of `reader` into `metadata`, one event at a
+    /// time. Returns whether an `x:xmpmeta` or `rdf:RDF` root was met; the
+    /// events stop where that root closes.
+    fn read_properties<R: std::io::BufRead>(mut reader: Reader<R>, metadata: &mut XmpMetadata) -> bool {
         reader.config_mut().trim_text(true);
 
         // Stack to track element hierarchy
         let mut element_stack: Vec<String> = Vec::new();
+        let mut root_seen = false;
+        let mut buf = Vec::new();
 
         loop {
-            match reader.read_event() {
+            buf.clear();
+            match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
                     let name = e.name().as_ref().to_string();
+                    if element_stack.is_empty() && (name == "x:xmpmeta" || name == "rdf:RDF") {
+                        root_seen = true;
+                    }
                     element_stack.push(name);
                 },
                 Ok(Event::Empty(_)) => {
@@ -330,6 +321,9 @@ impl XmpExtractor {
                 },
                 Ok(Event::End(_)) => {
                     element_stack.pop();
+                    if root_seen && element_stack.is_empty() {
+                        break;
+                    }
                 },
                 Ok(Event::Eof) => break,
                 Err(e) => {
@@ -339,6 +333,37 @@ impl XmpExtractor {
                 _ => {},
             }
         }
+
+        root_seen
+    }
+    // ── end pdf_manipulator patch ──
+
+    /// Parse XMP XML content.
+    pub fn parse_xmp(xml: &str) -> Result<Option<XmpMetadata>> {
+        // Find the XMP packet boundaries
+        let start = xml.find("<x:xmpmeta").or_else(|| xml.find("<rdf:RDF"));
+        let end = xml
+            .rfind("</x:xmpmeta>")
+            .or_else(|| xml.rfind("</rdf:RDF>"));
+
+        let xmp_content = match (start, end) {
+            (Some(s), Some(e)) => {
+                let end_adjusted = if xml[e..].starts_with("</x:xmpmeta") {
+                    e + "</x:xmpmeta>".len()
+                } else {
+                    e + "</rdf:RDF>".len()
+                };
+                &xml[s..end_adjusted]
+            },
+            _ => return Ok(None),
+        };
+
+        let mut metadata = XmpMetadata::new();
+        metadata.raw_xml = Some(xml.to_string());
+
+        // ── pdf_manipulator patch: one event loop serves the string and the reader ──
+        Self::read_properties(Reader::from_str(xmp_content), &mut metadata);
+        // ── end pdf_manipulator patch ──
 
         Ok(Some(metadata))
     }

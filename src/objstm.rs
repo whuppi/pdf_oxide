@@ -98,7 +98,19 @@ pub fn parse_object_stream(stream_obj: &Object) -> Result<HashMap<u32, Object>> 
 ///
 /// A vector of (object_number, offset) tuples.
 fn parse_object_number_pairs(data: &[u8], count: usize) -> Result<Vec<(u32, usize)>> {
-    let mut pairs = Vec::with_capacity(count);
+    // ── pdf_manipulator patch: the declared /N is checked against the table that holds it, and allocated fallibly ──
+    // A pair is two integers and a separator, at least 3 bytes.
+    if count > data.len() / 3 + 1 {
+        return Err(Error::InvalidPdf(format!(
+            "object stream declares {count} objects but its table holds {} bytes",
+            data.len()
+        )));
+    }
+    let mut pairs = Vec::new();
+    pairs.try_reserve_exact(count).map_err(|_| {
+        Error::InvalidPdf(format!("cannot allocate the table of {count} objects"))
+    })?;
+    // ── end pdf_manipulator patch ──
     let mut remaining = data;
 
     for i in 0..count {

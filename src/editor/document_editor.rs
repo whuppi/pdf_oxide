@@ -2525,166 +2525,42 @@ impl DocumentEditor {
 
     // === Internal save helpers ===
 
-    /// Read the original PDF file bytes.
-    fn read_source_bytes(&self) -> Result<Vec<u8>> {
-        let mut file = File::open(&self.source_path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    }
-
     /// Build the Info dictionary object for the trailer.
     fn build_info_object(&self) -> Option<Object> {
         self.modified_info.as_ref().map(|info| info.to_object())
     }
 
-    /// Write an incremental update to the PDF.
+    // ── pdf_manipulator patch: the public incremental save streams the source ──
+    /// Write an incremental update to the PDF: the source copied through a
+    /// read buffer, then the update section `host::incremental` builds. The
+    /// source is never read whole, and the edits an append cannot carry are
+    /// refused before the first byte is written.
     #[cfg(not(target_arch = "wasm32"))]
-    fn write_incremental(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        // Refuse rather than silently corrupt (#1032): an incremental
-        // update appends new/modified objects as plain, unencrypted bytes
-        // after the untouched original file (which keeps its own streams
-        // correctly encrypted and readable under the original password),
-        // but the trailer's /Prev chain still points back to the source's
-        // /Encrypt dictionary — a conforming reader would try to decrypt
-        // the newly-appended plaintext objects with the document's
-        // original key and corrupt them. Properly supporting this would
-        // mean re-encrypting the appended objects under the source's own
-        // key (EncryptionHandler already exposes what that needs), which
-        // is a real but separate feature; for now, direct callers to the
-        // full-rewrite path instead, which already decrypts-then-emits
-        // every copied stream plaintext.
-        if self.source.is_encrypted() {
-            return Err(Error::InvalidPdf(
-                "incremental save is not supported for encrypted documents; \
-                 use save_to_bytes()/save_with_options(SaveOptions::full_rewrite()) instead"
-                    .to_string(),
-            ));
+    fn write_incremental(&mut self, path: impl AsRef<Path>, options: &SaveOptions) -> Result<()> {
+        use crate::host::positioned_write::CountingWriter;
+        /// The file is created at the first byte, so a refusal, decided
+        /// before any is written, leaves the path as it was.
+        struct Lazy<'p> {
+            path: &'p Path,
+            file: Option<BufWriter<File>>,
         }
-
-        // Read original file
-        let original_bytes = self.read_source_bytes()?;
-
-        // Open output file
-        let file = File::create(path.as_ref())?;
-        // ── pdf_manipulator patch: positions are a byte count ──
-        // The count includes the original bytes written first, so it is
-        // the file offset of whatever is written next: every offset below
-        // is `writer.position()`, never a seek that can fail into a guess.
-        use crate::host::positioned_write::{CountingWriter, PositionedWrite};
-        let mut writer = CountingWriter::new(BufWriter::new(file));
-        // ── end pdf_manipulator patch ──
-        // Write original content
-        writer.write_all(&original_bytes)?;
-
-        // Sync form field changes into modified_objects before writing
-        if self.acroform_modified {
-            self.flush_form_fields_to_modified_objects()?;
-        }
-
-        // Track new xref entries
-        let mut xref_entries: Vec<(u32, u64, u16)> = Vec::new();
-        let serializer = ObjectSerializer::compact();
-
-        // ── pdf_manipulator patch: positions are a byte count ──
-        // Write modified objects, in id order: a HashMap's order differs per
-        // instance and the xref offsets follow it.
-        let mut modified: Vec<(&u32, &Object)> = self.modified_objects.iter().collect();
-        modified.sort_by_key(|(id, _)| **id);
-        for (&obj_id, obj) in modified {
-            let offset = writer.position();
-            let bytes = serializer.serialize_indirect(obj_id, 0, obj);
-            writer.write_all(&bytes)?;
-            xref_entries.push((obj_id, offset, 0));
-        }
-
-        // Write new Info object if metadata was modified
-        if let Some(info_obj) = self.build_info_object() {
-            let info_id = self.next_object_id;
-            let offset = writer.position();
-            let bytes = serializer.serialize_indirect(info_id, 0, &info_obj);
-            writer.write_all(&bytes)?;
-            xref_entries.push((info_id, offset, 0));
-        }
-
-        // Write new xref section
-        let xref_offset = writer.position();
-        // ── end pdf_manipulator patch ──
-        write!(writer, "xref\n")?;
-
-        // Sort entries by object ID
-        xref_entries.sort_by_key(|(id, _, _)| *id);
-
-        // Write xref subsections
-        // For simplicity, write each entry as its own subsection
-        for (obj_id, offset, gen) in &xref_entries {
-            write!(writer, "{} 1\n", obj_id)?;
-            write!(writer, "{:010} {:05} n \n", offset, gen)?;
-        }
-
-        // Write trailer
-        write!(writer, "trailer\n")?;
-        write!(writer, "<<\n")?;
-        write!(writer, "  /Size {}\n", self.next_object_id + 1)?;
-        write!(writer, "  /Prev {}\n", self.find_prev_xref_offset(&original_bytes)?)?;
-
-        // Add /Root reference (from original trailer)
-        if let Ok(catalog) = self.source.catalog() {
-            if let Some(dict) = self.source.trailer().as_dict() {
-                if let Some(root_ref) = dict.get("Root") {
-                    write!(writer, "  /Root ")?;
-                    writer.write_all(&serializer.serialize(root_ref))?;
-                    write!(writer, "\n")?;
+        impl std::io::Write for Lazy<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.file.is_none() {
+                    self.file = Some(BufWriter::new(File::create(self.path)?));
                 }
+                self.file.as_mut().map_or(Ok(0), |f| f.write(buf))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.as_mut().map_or(Ok(()), |f| f.flush())
             }
         }
-
-        // Add /Info reference if we created one
-        if self.modified_info.is_some() {
-            write!(writer, "  /Info {} 0 R\n", self.next_object_id)?;
-        }
-
-        // ISO 32000-1:2008 §7.5.6 (`docs/spec/pdf.md:3639`): "The added trailer
-        // shall contain all the entries except the Prev entry (if present) from
-        // the previous trailer, whether modified or not."
-        //
-        // Only /Size, /Prev, /Root and /Info were being written, so every other
-        // entry the original trailer carried was dropped — /ID most notably,
-        // whose absence "might prevent the file from functioning in some
-        // workflows that depend on files being uniquely identified" (Table 15
-        // NOTE 2). Carry the rest across verbatim.
-        //
-        // The four handled above are skipped: /Size and /Prev are recomputed
-        // for this update by definition, /Root is written from the source
-        // trailer just above, and /Info is either rewritten here or inherited
-        // through the /Prev chain. /Encrypt cannot appear — an encrypted source
-        // is refused at the top of this function, because appending plaintext
-        // objects under a document key would corrupt them.
-        if let Some(trailer) = self.source.trailer().as_dict() {
-            let mut carried: Vec<&String> = trailer
-                .keys()
-                .filter(|k| !matches!(k.as_str(), "Size" | "Prev" | "Root" | "Info" | "XRefStm"))
-                .collect();
-            // Deterministic output: a HashMap's order is not stable, and two
-            // saves of one document must produce the same bytes.
-            carried.sort();
-            for key in carried {
-                if let Some(value) = trailer.get(key) {
-                    write!(writer, "  /{key} ")?;
-                    writer.write_all(&serializer.serialize(value))?;
-                    write!(writer, "\n")?;
-                }
-            }
-        }
-
-        write!(writer, ">>\n")?;
-        write!(writer, "startxref\n")?;
-        write!(writer, "{}\n", xref_offset)?;
-        write!(writer, "%%EOF\n")?;
-
+        let mut writer = CountingWriter::new(Lazy { path: path.as_ref(), file: None });
+        crate::host::incremental::write(self, &mut writer, options, &crate::cancel::CancelCheck::none())?;
         writer.flush()?;
         Ok(())
     }
+    // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: what an incremental save appends ──
     /// Why an incremental save cannot carry the staged edits, or `None`.
@@ -3221,7 +3097,9 @@ impl DocumentEditor {
         Ok(())
     }
 
+    // ── pdf_manipulator patch: only its tests still call it; the host writer finds /Prev itself ──
     /// Find the offset of the previous xref table in the original PDF.
+    #[cfg(test)]
     fn find_prev_xref_offset(&self, bytes: &[u8]) -> Result<u64> {
         // Search backwards from the end for "startxref"
         let search = b"startxref";
@@ -3255,6 +3133,7 @@ impl DocumentEditor {
 
         Err(Error::InvalidPdf("Could not find startxref in original PDF".to_string()))
     }
+    // ── end pdf_manipulator patch ──
 
     /// Write a full rewrite of the PDF.
     #[cfg(not(target_arch = "wasm32"))]
@@ -12332,7 +12211,9 @@ impl EditableDocument for DocumentEditor {
     #[cfg(not(target_arch = "wasm32"))]
     fn save_with_options(&mut self, path: impl AsRef<Path>, options: SaveOptions) -> Result<()> {
         if options.incremental {
-            self.write_incremental(path)
+            // ── pdf_manipulator patch: the incremental save takes the options the host writer reads ──
+            self.write_incremental(path, &options)
+            // ── end pdf_manipulator patch ──
         } else {
             self.write_full(path, &options)
         }

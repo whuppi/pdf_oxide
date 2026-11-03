@@ -1505,10 +1505,8 @@ fn assign_spans_to_cells(
     }
 }
 
-/// Maximum number of detected columns the split-column detector can
-/// analyse. Grids wider than this skip the check; extremely wide
-/// candidates are rare and have other defences upstream.
-const MAX_MASK_COLUMNS: usize = 128;
+// ── pdf_manipulator patch: the split-column check has no column cap; a disjoint-set replaces the u128 masks ──
+// ── end pdf_manipulator patch ──
 
 /// Minimum share of modal rows a column-component must contain to
 /// count as "significant" for split-detection purposes. Chosen to
@@ -1591,117 +1589,97 @@ fn validate_table_structure_internal(grid: &GridStructure, config: &TableDetecti
 /// of the modal rows, the grid is rejected as split-flow.
 ///
 /// Heuristic, not corpus-calibrated.
+// ── pdf_manipulator patch: the split-column check has no column cap; a disjoint-set replaces the u128 masks ──
 fn has_split_modal_column_groups(grid: &GridStructure, most_common_count: usize) -> bool {
     let num_cols = grid.columns.len();
 
     // A meaningful split needs at least 4 columns (two groups of >=2)
     // and at least 2 populated cells per modal row.
-    if !(4..=MAX_MASK_COLUMNS).contains(&num_cols) || most_common_count < 2 {
+    if num_cols < 4 || most_common_count < 2 {
         return false;
     }
 
-    // Collect column-occupancy masks for the modal rows. Bounded by
-    // `num_cols` so `most_common_count` (computed over the same bounded
-    // slice upstream) and `populated` here share one column universe;
-    // also keeps every `1u128 << idx` shift in range of the u128 mask.
-    let modal_masks: Vec<u128> = grid
-        .cells
-        .iter()
-        .filter_map(|row| {
-            let populated = row
-                .iter()
-                .take(num_cols)
-                .filter(|cell| !cell.is_empty())
-                .count();
-
-            if populated != most_common_count {
-                return None;
-            }
-
-            let mut mask = 0u128;
-            for (idx, cell) in row.iter().take(num_cols).enumerate() {
-                if !cell.is_empty() {
-                    mask |= 1u128 << idx;
-                }
-            }
-
-            if mask.count_ones() >= 2 {
-                Some(mask)
-            } else {
-                None
-            }
+    // The modal rows: those whose populated-cell count (over the first
+    // `num_cols` cells, the slice `most_common_count` was counted on) is
+    // the most common one.
+    let modal_rows = || {
+        grid.cells.iter().filter(move |row| {
+            row.iter().take(num_cols).filter(|cell| !cell.is_empty()).count() == most_common_count
         })
-        .collect();
+    };
+    let populated = |row: &Vec<Vec<usize>>| {
+        row.iter()
+            .take(num_cols)
+            .enumerate()
+            .filter(|(_, cell)| !cell.is_empty())
+            .map(|(idx, _)| idx)
+            .collect::<Vec<usize>>()
+    };
 
     // Need enough modal rows to make the share threshold meaningful.
-    if modal_masks.len() < 4 {
+    let modal_count = modal_rows().count();
+    if modal_count < 4 {
         return false;
     }
 
     // Floor at 2 rows so a single-row outlier with a wide/narrow mask
     // can never be classified as its own "significant" component
-    // — when modal_masks.len() == 4 the share alone would round to 1.
+    // — when modal_count == 4 the share alone would round to 1.
     let min_component_rows =
-        (((modal_masks.len() as f32) * MIN_SPLIT_GROUP_ROW_SHARE).ceil() as usize).max(2);
+        (((modal_count as f32) * MIN_SPLIT_GROUP_ROW_SHARE).ceil() as usize).max(2);
 
-    // Build column adjacency: two columns are adjacent iff they ever
-    // co-occur in the same modal row.
-    let mut adjacency: Vec<u128> = vec![0u128; num_cols];
-    let mut active_columns: u128 = 0;
-
-    for &mask in &modal_masks {
-        active_columns |= mask;
-        let mut bits = mask;
-        while bits != 0 {
-            let bit = bits & bits.wrapping_neg();
-            let col = bit.trailing_zeros() as usize;
-            adjacency[col] |= mask;
-            bits &= !bit;
+    // Two columns are connected iff they ever co-occur in a modal row.
+    // A row joins all its columns, so it lies wholly in one component and
+    // the component's row support is the count of rows that join into it.
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut parent: Vec<usize> = (0..num_cols).collect();
+    let mut active = vec![false; num_cols];
+    for row in modal_rows() {
+        let cols = populated(row);
+        let first = find(&mut parent, cols[0]);
+        for &col in &cols {
+            active[col] = true;
+            let root = find(&mut parent, col);
+            parent[root] = first;
         }
     }
-
-    // Walk connected components by bitmask flood-fill. Count how many
-    // are "significant" (>=2 columns AND >=min_component_rows modal
-    // rows containing at least one of their columns).
-    let mut remaining = active_columns;
-    let mut significant_components = 0usize;
-
-    while remaining != 0 {
-        let seed_bit = remaining & remaining.wrapping_neg();
-        let mut component: u128 = 0;
-        let mut frontier: u128 = seed_bit;
-
-        while frontier != 0 {
-            let bit = frontier & frontier.wrapping_neg();
-            frontier &= !bit;
-
-            if component & bit != 0 {
-                continue;
-            }
-
-            component |= bit;
-            let col = bit.trailing_zeros() as usize;
-            frontier |= adjacency[col] & !component;
-        }
-
-        remaining &= !component;
-
-        let component_cols = component.count_ones() as usize;
-        let component_row_support = modal_masks
-            .iter()
-            .filter(|&&mask| mask & component != 0)
-            .count();
-
-        if component_cols >= 2 && component_row_support >= min_component_rows {
-            significant_components += 1;
-            if significant_components >= 2 {
-                return true;
-            }
-        }
+    let mut columns_of = vec![0usize; num_cols];
+    for col in (0..num_cols).filter(|&col| active[col]) {
+        columns_of[find(&mut parent, col)] += 1;
+    }
+    let mut rows_of = vec![0usize; num_cols];
+    for row in modal_rows() {
+        let first = populated(row)[0];
+        rows_of[find(&mut parent, first)] += 1;
     }
 
-    false
+    let significant = (0..num_cols)
+        .filter(|&root| columns_of[root] >= 2 && rows_of[root] >= min_component_rows)
+        .count();
+    significant >= 2
 }
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: the engine proofs reach the split-column check without a page of spans ──
+/// [`has_split_modal_column_groups`] over `cells` (rows of columns of span
+/// indices) read as a grid of `num_cols` columns.
+#[cfg(test)]
+pub(crate) fn split_flow_for_proof(
+    cells: Vec<Vec<Vec<usize>>>,
+    num_cols: usize,
+    most_common_count: usize,
+) -> bool {
+    let column = ColumnCluster { x_center: 0.0, x_min: 0.0, x_max: 0.0, span_indices: Vec::new() };
+    let grid = GridStructure { columns: vec![column; num_cols], rows: Vec::new(), cells };
+    has_split_modal_column_groups(&grid, most_common_count)
+}
+// ── end pdf_manipulator patch ──
 
 /// Backward compatibility: Indices of spans belonging to a table.
 #[derive(Debug, Clone)]

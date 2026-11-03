@@ -13,7 +13,6 @@ extractors::images::decode_jpx_image # the codestream is the codec's input, and 
 extractors::images::extract_image_from_xobject_at # a codec image's compressed bytes are the decoder's input (DCT, JPX, CCITT); a raw-sample image is read by the row cursor, not here
 extractors::images::resolve_icc_profile_from_obj
 extractors::images::resolve_indexed_palette
-extractors::xmp::extract
 fonts::font_dict::extract_embedded_font_from_descriptor
 fonts::font_dict::extract_truetype_cmap_from_descriptor
 fonts::font_dict::from_dict

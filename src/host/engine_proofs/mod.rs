@@ -43,6 +43,12 @@ mod editor_save;
 mod kept_encryption;
 mod legacy_decoders;
 mod lzw;
+mod mem_caps;
+mod mem_cmap;
+mod mem_declared;
+mod mem_fixture;
+mod mem_incremental;
+mod mem_xmp;
 mod page_operators;
 #[cfg(feature = "rendering")]
 mod pattern_paint;

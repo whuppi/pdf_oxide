@@ -23,7 +23,9 @@
 //!   - 20-40% faster parsing performance
 
 use crate::cache::MutexExt;
-use crate::error::Result;
+// ── pdf_manipulator patch: a CMap that cannot grow is a typed error ──
+use crate::error::{Error, Result};
+// ── end pdf_manipulator patch ──
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -234,11 +236,29 @@ impl CMap {
         }
     }
 
-    /// Insert individual character mapping.
-    fn insert(&mut self, code: u32, unicode: String) {
+    // ── pdf_manipulator patch: a mapping is stored with a fallible allocation ──
+    /// Insert individual character mapping; a table that cannot grow is a
+    /// typed error rather than an abort.
+    fn insert(&mut self, code: u32, unicode: String) -> Result<()> {
+        reserve_one(&mut self.chars)?;
         self.chars.insert(code, unicode);
+        Ok(())
     }
+    // ── end pdf_manipulator patch ──
 }
+
+// ── pdf_manipulator patch: a mapping is stored with a fallible allocation ──
+/// Room for `additional` more entries, or the typed error that names the size.
+pub(crate) fn reserve_entries(chars: &mut HashMap<u32, String>, additional: usize) -> Result<()> {
+    chars.try_reserve(additional).map_err(|_| {
+        Error::Font(format!("CMap cannot hold {additional} more mappings"))
+    })
+}
+
+fn reserve_one(chars: &mut HashMap<u32, String>) -> Result<()> {
+    reserve_entries(chars, 1)
+}
+// ── end pdf_manipulator patch ──
 
 /// Key for indexing into the global CMap cache.
 ///
@@ -615,7 +635,9 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
                 for line in section.lines() {
                     for (src, dst) in parse_bfchar_line(line) {
                         log::trace!("ToUnicode bfchar: 0x{:02X} -> {:?}", src, dst);
-                        cmap.insert(src, dst);
+                        // ── pdf_manipulator patch: a mapping that cannot be stored is a typed error ──
+                        cmap.insert(src, dst)?;
+                        // ── end pdf_manipulator patch ──
                     }
                 }
             },
@@ -626,7 +648,9 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
                     if let Some(mappings) = parse_bfrange_line(line) {
                         log::trace!("ToUnicode bfrange: {} mappings parsed", mappings.len());
                         for (src, dst) in mappings {
-                            cmap.insert(src, dst);
+                            // ── pdf_manipulator patch: a mapping that cannot be stored is a typed error ──
+                            cmap.insert(src, dst)?;
+                            // ── end pdf_manipulator patch ──
                         }
                     }
                 }
@@ -645,7 +669,9 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
                     // Only insert if not already mapped (normal mappings take precedence)
                     // For notdefrange, we need to check if source is already mapped
                     if !cmap.chars.contains_key(&src) {
-                        cmap.insert(src, dst);
+                        // ── pdf_manipulator patch: a mapping that cannot be stored is a typed error ──
+                        cmap.insert(src, dst)?;
+                        // ── end pdf_manipulator patch ──
                     }
                 }
             }
@@ -911,8 +937,16 @@ fn parse_bfrange_line(line: &str) -> Option<Vec<(u32, String)>> {
             })
             .collect();
 
+        // ── pdf_manipulator patch: a hostile range is refused, not computed with overflowing u32 arithmetic ──
+        // `end - start + 1` wraps (and panics in a debug build) for an end
+        // below the start or a range over the whole code space.
+        let range_size = match end.checked_sub(start) {
+            Some(span) => usize::try_from(u64::from(span) + 1).unwrap_or(usize::MAX),
+            None => return None,
+        };
         let mut result = Vec::new();
-        let range_size = (end - start + 1) as usize;
+        result.try_reserve(range_size.min(dst_hexes.len())).ok()?;
+        // ── end pdf_manipulator patch ──
 
         // SPEC VALIDATION: PDF Spec ISO 32000-1:2008, Section 9.10.3
         // The array must have exactly (end - start + 1) entries.

@@ -40,9 +40,8 @@ pub struct ArticleThread {
     pub beads: Vec<Bead>,
 }
 
-/// Upper bound on the bead chain length — a defence against malformed,
-/// non-circular `/N` chains produced by buggy generators.
-const MAX_BEADS_PER_THREAD: usize = 4096;
+// ── pdf_manipulator patch: a bead chain has no length cap; the visited set ends it ──
+// ── end pdf_manipulator patch ──
 
 /// Resolve `obj` to a concrete object, following a single indirect reference.
 fn resolve(doc: &PdfDocument, obj: &Object) -> Option<Object> {
@@ -70,8 +69,10 @@ fn parse_rect(arr: &[Object]) -> Option<Rect> {
 ///
 /// Best-effort and panic-free: malformed threads/beads are skipped, dangling
 /// references are tolerated, and non-circular `/N` chains are bounded by
-/// `MAX_BEADS_PER_THREAD`. Returns an empty vector when the document declares
-/// no threads.
+// ── pdf_manipulator patch: a bead chain has no length cap; the visited set ends it ──
+/// the objects the file holds: a chain ends where it revisits a bead.
+// ── end pdf_manipulator patch ──
+/// Returns an empty vector when the document declares no threads.
 pub fn parse_article_threads(doc: &PdfDocument) -> Vec<ArticleThread> {
     let Ok(catalog) = doc.catalog() else {
         return Vec::new();
@@ -129,9 +130,11 @@ fn parse_one_thread(
     let mut cur = Some(first_ref);
 
     while let Some(bead_ref) = cur {
-        if !seen.insert(bead_ref) || beads.len() >= MAX_BEADS_PER_THREAD {
-            break; // circular wrap (normal terminator) or runaway chain
+        // ── pdf_manipulator patch: a bead chain has no length cap; the visited set ends it ──
+        if !seen.insert(bead_ref) {
+            break; // circular wrap (normal terminator); each bead is read once
         }
+        // ── end pdf_manipulator patch ──
         let Ok(bead_obj) = doc.load_object(bead_ref) else {
             break;
         };

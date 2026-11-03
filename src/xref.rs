@@ -804,7 +804,9 @@ fn parse_xref_stream<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Cros
     // Check if we need more data based on /Length or endobj presence
     let needs_more = if let Some(length_val) = find_stream_length(&content) {
         let stream_kw_pos = content.windows(6).position(|w| w == b"stream").unwrap_or(0);
-        let needed = stream_kw_pos + 20 + length_val + 30;
+        // ── pdf_manipulator patch: a declared /Length is a claim, so its sum is saturating and is bounded by the file below ──
+        let needed = stream_kw_pos.saturating_add(20).saturating_add(length_val).saturating_add(30);
+        // ── end pdf_manipulator patch ──
         if needed > bytes_read {
             Some(needed)
         } else {
@@ -820,7 +822,14 @@ fn parse_xref_stream<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Cros
     if let Some(needed) = needs_more {
         let total = needed.min(remaining);
         reader.seek(SeekFrom::Start(offset))?;
-        content = vec![0u8; total];
+        // ── pdf_manipulator patch: the read is sized by the file, never past it, and allocated fallibly ──
+        let mut grown = Vec::new();
+        grown.try_reserve_exact(total).map_err(|_| {
+            Error::InvalidPdf(format!("cannot allocate {total} bytes for the cross-reference stream"))
+        })?;
+        grown.resize(total, 0);
+        content = grown;
+        // ── end pdf_manipulator patch ──
         let mut total_read = 0;
         while total_read < total {
             let n = reader.read(&mut content[total_read..])?;
@@ -889,15 +898,18 @@ fn parse_xref_stream<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Cros
         return Err(Error::InvalidPdf("invalid /W array length".to_string()));
     }
 
-    let w1 = w_array[0]
-        .as_integer()
-        .ok_or_else(|| Error::InvalidPdf("invalid /W[0]".to_string()))? as usize;
-    let w2 = w_array[1]
-        .as_integer()
-        .ok_or_else(|| Error::InvalidPdf("invalid /W[1]".to_string()))? as usize;
-    let w3 = w_array[2]
-        .as_integer()
-        .ok_or_else(|| Error::InvalidPdf("invalid /W[2]".to_string()))? as usize;
+    // ── pdf_manipulator patch: a field width is 0 to 8 bytes, so the entry size is a sum that cannot overflow ──
+    let width = |index: usize| -> Result<usize> {
+        let declared = w_array[index]
+            .as_integer()
+            .ok_or_else(|| Error::InvalidPdf(format!("invalid /W[{index}]")))?;
+        match usize::try_from(declared) {
+            Ok(w) if w <= 8 => Ok(w),
+            _ => Err(Error::InvalidPdf(format!("/W[{index}] of {declared} is not 0 to 8 bytes"))),
+        }
+    };
+    let (w1, w2, w3) = (width(0)?, width(1)?, width(2)?);
+    // ── end pdf_manipulator patch ──
 
     let entry_size = w1 + w2 + w3;
     if entry_size == 0 {
