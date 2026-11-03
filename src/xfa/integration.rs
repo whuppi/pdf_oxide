@@ -5,7 +5,6 @@
 
 use super::converter::{ConvertedField, ConvertedPage, XfaConversionOptions, XfaConverter};
 use super::extractor::XfaExtractor;
-use super::parser::XfaParser;
 use crate::document::PdfDocument;
 use crate::error::Result;
 use crate::writer::{PageBuilder, PdfWriter, PdfWriterConfig};
@@ -136,12 +135,9 @@ pub fn convert_xfa_document(
         ));
     }
 
-    // Extract XFA data
-    let xfa_data = XfaExtractor::extract_xfa(doc)?;
-
-    // Parse XFA
-    let mut parser = XfaParser::new();
-    let xfa_form = parser.parse(&xfa_data)?;
+    // ── pdf_manipulator patch: the packets are parsed as events over their streams ──
+    let xfa_form = XfaExtractor::parse_form(doc)?;
+    // ── end pdf_manipulator patch ──
 
     // Convert to AcroForm
     let converter = if let Some(opts) = options {
@@ -213,10 +209,9 @@ pub fn analyze_xfa_document(doc: &mut PdfDocument) -> Result<XfaAnalysis> {
         });
     }
 
-    // Extract and parse
-    let xfa_data = XfaExtractor::extract_xfa(doc)?;
-    let mut parser = XfaParser::new();
-    let xfa_form = parser.parse(&xfa_data)?;
+    // ── pdf_manipulator patch: the packets are parsed as events over their streams ──
+    let xfa_form = XfaExtractor::parse_form(doc)?;
+    // ── end pdf_manipulator patch ──
 
     // Collect field types
     let mut field_types: Vec<String> = xfa_form

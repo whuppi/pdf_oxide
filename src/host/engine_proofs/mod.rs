@@ -8,6 +8,7 @@
 mod band_proof;
 #[cfg(feature = "rendering")]
 mod cancel_at_every_poll;
+mod alone;
 mod content_inline;
 mod content_stream;
 mod determinism;
@@ -54,6 +55,8 @@ mod mem_encrypted_duplicates;
 mod mem_fixture;
 mod mem_fonts;
 mod mem_incremental;
+mod mem_structure;
+mod mem_xfa;
 mod mem_xmp;
 mod own_process;
 mod page_operators;

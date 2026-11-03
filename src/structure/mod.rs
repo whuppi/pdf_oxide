@@ -50,6 +50,10 @@ pub mod types;
 pub use article_threads::{parse_article_threads, ArticleThread, Bead};
 pub use converter::StructureConverter;
 pub use parser::{parse_structure_tree, parse_structure_tree_with_budget};
+// ── pdf_manipulator patch: the walk's head and a page's structure are the engine's, not the public API's ──
+pub(crate) use parser::{open_structure_tree, StructHeader};
+pub(crate) use traversal::PageStructure;
+// ── end pdf_manipulator patch ──
 pub use spatial_table_detector::{
     detect_tables_from_spans, DetectedTable, SpatialTableDetector, TableDetectionConfig,
 };

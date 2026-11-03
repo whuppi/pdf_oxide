@@ -25,18 +25,15 @@
 //! # Example
 //!
 //! ```ignore
-//! use pdf_oxide::xfa::{XfaExtractor, XfaParser, XfaConverter};
+//! use pdf_oxide::xfa::{XfaExtractor, XfaConverter};
 //! use pdf_oxide::PdfDocument;
 //!
 //! let mut doc = PdfDocument::open("form.pdf")?;
 //!
 //! // Check if document has XFA form
 //! if XfaExtractor::has_xfa(&mut doc)? {
-//!     // Extract and parse XFA data
-//!     let xfa_data = XfaExtractor::extract_xfa(&mut doc)?;
-//!
-//!     let mut parser = XfaParser::new();
-//!     let form = parser.parse(&xfa_data)?;
+//!     // Parse the XFA packets as XML events
+//!     let form = XfaExtractor::parse_form(&mut doc)?;
 //!
 //!     // Convert to AcroForm
 //!     let converter = XfaConverter::new();

@@ -22,6 +22,9 @@ use crate::error::{Error, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::collections::HashMap;
+// ── pdf_manipulator patch: packets are read from a reader ──
+use std::io::BufRead;
+// ── end pdf_manipulator patch ──
 
 /// US Letter page width in points (8.5 inches × 72 points/inch).
 const LETTER_WIDTH: f32 = 612.0;
@@ -177,10 +180,8 @@ pub struct XfaForm {
     pub fields: Vec<XfaField>,
     /// Field values from datasets (binding -> value)
     pub dataset_values: HashMap<String, String>,
-    /// Raw template XML (for debugging)
-    pub template_xml: Option<String>,
-    /// Raw datasets XML (for debugging)
-    pub datasets_xml: Option<String>,
+    // ── pdf_manipulator patch: the packets are read as events, so the form keeps no raw XML ──
+    // ── end pdf_manipulator patch ──
 }
 
 impl XfaForm {
@@ -199,6 +200,32 @@ impl XfaForm {
         self.fields.len()
     }
 }
+
+// ── pdf_manipulator patch: the state a packet's events carry, and which section they are in ──
+/// The part of an XDP an event belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Template,
+    Datasets,
+}
+
+/// What reading a template carries from one event to the next.
+#[derive(Default)]
+struct TemplateState {
+    current_field: Option<XfaField>,
+    current_page: Option<XfaPage>,
+    in_items: bool,
+    option_text: String,
+    option_value: String,
+}
+
+/// What reading datasets carries from one event to the next.
+#[derive(Default)]
+struct DatasetsState {
+    path_stack: Vec<String>,
+    current_text: String,
+}
+// ── end pdf_manipulator patch ──
 
 /// XFA parser.
 pub struct XfaParser {
@@ -226,29 +253,32 @@ impl XfaParser {
         }
     }
 
+    // ── pdf_manipulator patch: XFA packets are read as XML events, from a reader, never held as one string ──
     /// Parse XFA data from raw bytes.
     ///
     /// The XFA data may be a single XML stream or an array of packets.
     pub fn parse(&mut self, xfa_data: &[u8]) -> Result<XfaForm> {
-        // Try to parse as XML
-        let xml_str = String::from_utf8_lossy(xfa_data);
-        self.form.template_xml = Some(xml_str.to_string());
+        self.parse_reader(xfa_data)
+    }
 
-        // Check if this is a complete XDP (XFA Data Package)
-        if xml_str.contains("<xdp:xdp") || xml_str.contains("<xfa:datasets") {
-            self.parse_xdp(&xml_str)?;
-        } else if xml_str.contains("<template") {
-            // Just a template packet
-            self.parse_template(&xml_str)?;
-        } else if xml_str.contains("<xfa:data") || xml_str.contains("<data>") {
-            // Just a datasets packet
-            self.parse_datasets(&xml_str)?;
-        }
+    /// Parse XFA data read from `reader`, one XML event at a time.
+    pub fn parse_reader<R: BufRead>(&mut self, reader: R) -> Result<XfaForm> {
+        self.feed(reader)?;
+        Ok(self.finish())
+    }
 
-        // Apply dataset values to fields
+    /// Feed one packet of XFA data (a complete XDP, or a `template` or
+    /// `datasets` packet) to the parser. Call [`Self::finish`] once every
+    /// packet is fed.
+    pub fn feed<R: BufRead>(&mut self, reader: R) -> Result<()> {
+        self.drive(reader, None)
+    }
+
+    /// Take the form the packets fed so far describe, with the dataset values
+    /// applied to its fields.
+    pub fn finish(&mut self) -> XfaForm {
         self.apply_dataset_values();
-
-        Ok(std::mem::take(&mut self.form))
+        std::mem::take(&mut self.form)
     }
 
     /// Parse XFA packets from a PDF XFA array.
@@ -256,260 +286,269 @@ impl XfaParser {
     /// XFA in PDFs can be an array: [name1, stream1, name2, stream2, ...]
     pub fn parse_packets(&mut self, packets: &[(String, Vec<u8>)]) -> Result<XfaForm> {
         for (name, data) in packets {
-            let xml_str = String::from_utf8_lossy(data);
-
             match name.as_str() {
-                "template" => {
-                    self.form.template_xml = Some(xml_str.to_string());
-                    self.parse_template(&xml_str)?;
-                },
-                "datasets" => {
-                    self.form.datasets_xml = Some(xml_str.to_string());
-                    self.parse_datasets(&xml_str)?;
-                },
+                "template" => self.drive(data.as_slice(), Some(Section::Template))?,
+                "datasets" => self.drive(data.as_slice(), Some(Section::Datasets))?,
                 // Other packets (config, form, etc.) are not needed for static conversion
                 _ => {},
             }
         }
-
-        // Apply dataset values to fields
-        self.apply_dataset_values();
-
-        Ok(std::mem::take(&mut self.form))
-    }
-
-    /// Parse a complete XDP document.
-    fn parse_xdp(&mut self, xml: &str) -> Result<()> {
-        // Extract template section
-        if let Some(template_start) = xml.find("<template") {
-            if let Some(template_end) = xml.find("</template>") {
-                let template_xml = &xml[template_start..template_end + 11];
-                self.parse_template(template_xml)?;
-            }
-        }
-
-        // Extract datasets section
-        if let Some(data_start) = xml.find("<xfa:datasets") {
-            if let Some(data_end) = xml.find("</xfa:datasets>") {
-                let datasets_xml = &xml[data_start..data_end + 15];
-                self.form.datasets_xml = Some(datasets_xml.to_string());
-                self.parse_datasets(datasets_xml)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Parse the template packet.
-    fn parse_template(&mut self, xml: &str) -> Result<()> {
-        let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
-
-        let mut current_field: Option<XfaField> = None;
-        let mut current_page: Option<XfaPage> = None;
-        let mut in_items = false;
-        let mut current_option_text = String::new();
-        let mut current_option_value = String::new();
-
-        loop {
-            match reader.read_event() {
-                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                    let local_name = e.local_name().as_ref().to_string();
-
-                    match local_name.as_str() {
-                        "subform" => {
-                            // Check if this is a page-level subform
-                            let name = self.get_attribute(e, "name");
-                            if let Some(name) = name {
-                                self.binding_parts.push(format!("{}[0]", name));
-
-                                // Check for page-like subforms
-                                if name.contains("Page") || current_page.is_none() {
-                                    current_page = Some(XfaPage {
-                                        name,
-                                        ..Default::default()
-                                    });
-                                }
-                            }
-                        },
-                        "field" => {
-                            let name = self.get_attribute(e, "name").unwrap_or_default();
-                            let mut binding = self.binding_parts.join(".");
-                            if !binding.is_empty() {
-                                binding.push('.');
-                            }
-                            binding.push_str(&format!("{}[0]", name));
-
-                            let mut field = XfaField::new(&name, binding);
-
-                            // Get dimensions from attributes
-                            if let Some(w) = self.get_attribute(e, "w") {
-                                field.width = self.parse_dimension(&w);
-                            }
-                            if let Some(h) = self.get_attribute(e, "h") {
-                                field.height = self.parse_dimension(&h);
-                            }
-                            if let Some(x) = self.get_attribute(e, "x") {
-                                field.x = self.parse_dimension(&x);
-                            }
-                            if let Some(y) = self.get_attribute(e, "y") {
-                                field.y = self.parse_dimension(&y);
-                            }
-
-                            current_field = Some(field);
-                        },
-                        "textEdit" | "numericEdit" | "dateTimeEdit" | "checkButton"
-                        | "choiceList" | "button" | "signature" | "imageEdit" | "barcode" => {
-                            if let Some(ref mut field) = current_field {
-                                field.field_type = XfaFieldType::from_xfa_name(&local_name);
-                            }
-                        },
-                        "items" => {
-                            in_items = true;
-                        },
-                        "text" => {
-                            // Will capture text content
-                        },
-                        "caption" => {
-                            // Caption element
-                        },
-                        "toolTip" => {
-                            // Tooltip element
-                        },
-                        _ => {},
-                    }
-
-                    self.context_stack.push(local_name);
-                },
-                Ok(Event::Text(e)) => {
-                    let text = e.xml11_content().to_string();
-
-                    if let Some(parent) = self.context_stack.last() {
-                        if in_items && parent == "text" {
-                            current_option_text = text.clone();
-                            current_option_value = text;
-                        } else if let Some(ref mut field) = current_field {
-                            match parent.as_str() {
-                                "caption" | "text" => {
-                                    if field.caption.is_none()
-                                        && !in_items
-                                        && self.context_stack.iter().any(|s| s == "caption")
-                                    {
-                                        field.caption = Some(text);
-                                    }
-                                },
-                                "toolTip" => {
-                                    field.tooltip = Some(text);
-                                },
-                                "value" => {
-                                    if field.default_value.is_none() {
-                                        field.default_value = Some(text);
-                                    }
-                                },
-                                _ => {},
-                            }
-                        }
-                    }
-                },
-                Ok(Event::End(ref e)) => {
-                    let local_name = e.local_name().as_ref().to_string();
-
-                    match local_name.as_str() {
-                        "subform" => {
-                            self.binding_parts.pop();
-                        },
-                        "field" => {
-                            if let Some(field) = current_field.take() {
-                                self.form.fields.push(field.clone());
-                                if let Some(ref mut page) = current_page {
-                                    page.fields.push(field);
-                                }
-                            }
-                        },
-                        "items" => {
-                            in_items = false;
-                        },
-                        "text" => {
-                            if in_items {
-                                if let Some(ref mut field) = current_field {
-                                    field.options.push(XfaOption {
-                                        text: current_option_text.clone(),
-                                        value: current_option_value.clone(),
-                                    });
-                                }
-                                current_option_text.clear();
-                                current_option_value.clear();
-                            }
-                        },
-                        _ => {},
-                    }
-
-                    self.context_stack.pop();
-                },
-                Ok(Event::Eof) => break,
-                Err(e) => {
-                    return Err(Error::InvalidPdf(format!("XFA template parse error: {}", e)));
-                },
-                _ => {},
-            }
-        }
-
-        // Add the last page if any
-        if let Some(page) = current_page {
-            if !page.fields.is_empty() {
-                self.form.pages.push(page);
-            }
-        }
-
-        Ok(())
+        Ok(self.finish())
     }
 
     /// Parse the datasets packet.
     fn parse_datasets(&mut self, xml: &str) -> Result<()> {
-        let mut reader = Reader::from_str(xml);
+        self.drive(xml.as_bytes(), Some(Section::Datasets))
+    }
+
+    /// Reads `reader` as XML events. With `forced` the whole input is that
+    /// section; without it a `template` element opens the template section and
+    /// a `datasets` or `data` element the datasets section, each until its
+    /// element closes. An XML error inside a section is an error; one outside
+    /// any section ends the packet.
+    fn drive<R: BufRead>(&mut self, reader: R, forced: Option<Section>) -> Result<()> {
+        let mut reader = Reader::from_reader(reader);
         reader.config_mut().trim_text(true);
-
-        let mut path_stack: Vec<String> = Vec::new();
-        let mut current_text = String::new();
-
+        let mut buf = Vec::new();
+        let mut section = forced;
+        let mut depth = 0usize;
+        let mut template = TemplateState::default();
+        let mut datasets = DatasetsState::default();
         loop {
-            match reader.read_event() {
-                Ok(Event::Start(ref e)) => {
-                    let local_name = e.local_name().as_ref().to_string();
-
-                    // Skip XFA namespace elements
-                    if local_name != "xfa" && local_name != "datasets" && local_name != "data" {
-                        path_stack.push(format!("{}[0]", local_name));
-                    }
-                },
-                Ok(Event::Text(e)) => {
-                    current_text = e.xml11_content().to_string();
-                },
-                Ok(Event::End(ref e)) => {
-                    let local_name = e.local_name().as_ref().to_string();
-
-                    if local_name != "xfa" && local_name != "datasets" && local_name != "data" {
-                        // Store value if we have text
-                        if !current_text.is_empty() && !path_stack.is_empty() {
-                            let binding = path_stack.join(".");
-                            self.form
-                                .dataset_values
-                                .insert(binding, current_text.clone());
-                        }
-                        current_text.clear();
-                        path_stack.pop();
-                    }
-                },
+            buf.clear();
+            let event = match reader.read_event_into(&mut buf) {
                 Ok(Event::Eof) => break,
+                Ok(event) => event,
                 Err(e) => {
-                    return Err(Error::InvalidPdf(format!("XFA datasets parse error: {}", e)));
+                    return match section {
+                        Some(Section::Template) => {
+                            Err(Error::InvalidPdf(format!("XFA template parse error: {}", e)))
+                        },
+                        Some(Section::Datasets) => {
+                            Err(Error::InvalidPdf(format!("XFA datasets parse error: {}", e)))
+                        },
+                        None => Ok(()),
+                    };
                 },
-                _ => {},
+            };
+            if section.is_none() {
+                if let Event::Start(ref e) | Event::Empty(ref e) = event {
+                    section = match e.local_name().as_ref().to_string().as_str() {
+                        "template" => Some(Section::Template),
+                        "datasets" | "data" => Some(Section::Datasets),
+                        _ => None,
+                    };
+                }
+                if section.is_none() {
+                    continue;
+                }
+                depth = 0;
+            }
+            match section {
+                Some(Section::Template) => self.template_event(&event, &mut template),
+                Some(Section::Datasets) => self.datasets_event(&event, &mut datasets),
+                None => {},
+            }
+            if forced.is_none() {
+                match event {
+                    Event::Start(_) => depth += 1,
+                    Event::End(_) => depth = depth.saturating_sub(1),
+                    _ => {},
+                }
+                let closed = match event {
+                    Event::Empty(_) => depth == 0,
+                    Event::End(_) => depth == 0,
+                    _ => false,
+                };
+                if closed {
+                    if section == Some(Section::Template) {
+                        self.close_template(&mut template);
+                    }
+                    section = None;
+                    template = TemplateState::default();
+                    datasets = DatasetsState::default();
+                }
             }
         }
-
+        if section == Some(Section::Template) {
+            self.close_template(&mut template);
+        }
         Ok(())
     }
+
+    /// The last page of a template, if it has fields.
+    fn close_template(&mut self, state: &mut TemplateState) {
+        if let Some(page) = state.current_page.take() {
+            if !page.fields.is_empty() {
+                self.form.pages.push(page);
+            }
+        }
+    }
+
+    /// One event of the template packet.
+    fn template_event(&mut self, event: &Event, st: &mut TemplateState) {
+        match event {
+            Event::Start(e) | Event::Empty(e) => {
+                let local_name = e.local_name().as_ref().to_string();
+
+                match local_name.as_str() {
+                    "subform" => {
+                        // Check if this is a page-level subform
+                        let name = self.get_attribute(e, "name");
+                        if let Some(name) = name {
+                            self.binding_parts.push(format!("{}[0]", name));
+
+                            // Check for page-like subforms
+                            if name.contains("Page") || st.current_page.is_none() {
+                                st.current_page = Some(XfaPage {
+                                    name,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    },
+                    "field" => {
+                        let name = self.get_attribute(e, "name").unwrap_or_default();
+                        let mut binding = self.binding_parts.join(".");
+                        if !binding.is_empty() {
+                            binding.push('.');
+                        }
+                        binding.push_str(&format!("{}[0]", name));
+
+                        let mut field = XfaField::new(&name, binding);
+
+                        // Get dimensions from attributes
+                        if let Some(w) = self.get_attribute(e, "w") {
+                            field.width = self.parse_dimension(&w);
+                        }
+                        if let Some(h) = self.get_attribute(e, "h") {
+                            field.height = self.parse_dimension(&h);
+                        }
+                        if let Some(x) = self.get_attribute(e, "x") {
+                            field.x = self.parse_dimension(&x);
+                        }
+                        if let Some(y) = self.get_attribute(e, "y") {
+                            field.y = self.parse_dimension(&y);
+                        }
+
+                        st.current_field = Some(field);
+                    },
+                    "textEdit" | "numericEdit" | "dateTimeEdit" | "checkButton" | "choiceList"
+                    | "button" | "signature" | "imageEdit" | "barcode" => {
+                        if let Some(ref mut field) = st.current_field {
+                            field.field_type = XfaFieldType::from_xfa_name(&local_name);
+                        }
+                    },
+                    "items" => {
+                        st.in_items = true;
+                    },
+                    _ => {},
+                }
+
+                self.context_stack.push(local_name);
+            },
+            Event::Text(e) => {
+                let text = e.xml11_content().to_string();
+
+                if let Some(parent) = self.context_stack.last() {
+                    if st.in_items && parent == "text" {
+                        st.option_text = text.clone();
+                        st.option_value = text;
+                    } else if let Some(ref mut field) = st.current_field {
+                        match parent.as_str() {
+                            "caption" | "text" => {
+                                if field.caption.is_none()
+                                    && !st.in_items
+                                    && self.context_stack.iter().any(|s| s == "caption")
+                                {
+                                    field.caption = Some(text);
+                                }
+                            },
+                            "toolTip" => {
+                                field.tooltip = Some(text);
+                            },
+                            "value" => {
+                                if field.default_value.is_none() {
+                                    field.default_value = Some(text);
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                }
+            },
+            Event::End(e) => {
+                let local_name = e.local_name().as_ref().to_string();
+
+                match local_name.as_str() {
+                    "subform" => {
+                        self.binding_parts.pop();
+                    },
+                    "field" => {
+                        if let Some(field) = st.current_field.take() {
+                            self.form.fields.push(field.clone());
+                            if let Some(ref mut page) = st.current_page {
+                                page.fields.push(field);
+                            }
+                        }
+                    },
+                    "items" => {
+                        st.in_items = false;
+                    },
+                    "text" => {
+                        if st.in_items {
+                            if let Some(ref mut field) = st.current_field {
+                                field.options.push(XfaOption {
+                                    text: st.option_text.clone(),
+                                    value: st.option_value.clone(),
+                                });
+                            }
+                            st.option_text.clear();
+                            st.option_value.clear();
+                        }
+                    },
+                    _ => {},
+                }
+
+                self.context_stack.pop();
+            },
+            _ => {},
+        }
+    }
+
+    /// One event of the datasets packet.
+    fn datasets_event(&mut self, event: &Event, st: &mut DatasetsState) {
+        match event {
+            Event::Start(e) => {
+                let local_name = e.local_name().as_ref().to_string();
+
+                // Skip XFA namespace elements
+                if local_name != "xfa" && local_name != "datasets" && local_name != "data" {
+                    st.path_stack.push(format!("{}[0]", local_name));
+                }
+            },
+            Event::Text(e) => {
+                st.current_text = e.xml11_content().to_string();
+            },
+            Event::End(e) => {
+                let local_name = e.local_name().as_ref().to_string();
+
+                if local_name != "xfa" && local_name != "datasets" && local_name != "data" {
+                    // Store value if we have text
+                    if !st.current_text.is_empty() && !st.path_stack.is_empty() {
+                        let binding = st.path_stack.join(".");
+                        self.form
+                            .dataset_values
+                            .insert(binding, st.current_text.clone());
+                    }
+                    st.current_text.clear();
+                    st.path_stack.pop();
+                }
+            },
+            _ => {},
+        }
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Apply dataset values to fields.
     fn apply_dataset_values(&mut self) {

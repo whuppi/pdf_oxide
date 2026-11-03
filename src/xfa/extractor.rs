@@ -3,7 +3,10 @@
 //! This module provides utilities to detect and extract XFA form data
 //! from PDF documents.
 
+// ── pdf_manipulator patch: the whole-slice decoder is test-only now ──
+#[cfg(test)]
 use crate::decoders::decode_stream;
+// ── end pdf_manipulator patch ──
 use crate::document::PdfDocument;
 use crate::error::{Error, Result};
 use crate::object::Object;
@@ -50,101 +53,86 @@ impl XfaExtractor {
         Ok(acroform_dict.contains_key("XFA"))
     }
 
-    /// Extract XFA data from a PDF document.
-    ///
-    /// XFA data in PDFs can be stored as:
-    /// 1. A single stream containing the complete XDP document
-    /// 2. An array of alternating name/stream pairs for different XFA packets
-    ///
-    /// This method returns the raw XFA data bytes.
+    // ── pdf_manipulator patch: XFA packets are handed out as readers over their decoded streams, never as whole buffers ──
+    /// The document's `/XFA` entry: a stream holding the complete XDP, or an
+    /// array of alternating name and stream packets.
+    fn xfa_entry(doc: &mut PdfDocument) -> Result<Object> {
+        let catalog = doc.catalog()?;
+        let catalog_dict = catalog
+            .as_dict()
+            .ok_or_else(|| Error::InvalidPdf("Catalog is not a dictionary".to_string()))?;
+
+        let acroform_obj = catalog_dict
+            .get("AcroForm")
+            .ok_or_else(|| Error::InvalidPdf("No AcroForm in document".to_string()))?;
+        let acroform_obj = Self::resolve_object(doc, acroform_obj)?;
+
+        let acroform_dict = acroform_obj
+            .as_dict()
+            .ok_or_else(|| Error::InvalidPdf("AcroForm is not a dictionary".to_string()))?;
+
+        let xfa_obj = acroform_dict
+            .get("XFA")
+            .ok_or_else(|| Error::InvalidPdf("No XFA entry in AcroForm".to_string()))?;
+        Self::resolve_object(doc, xfa_obj)
+    }
+
+    /// Hands each XFA packet to `each` as a reader over its decoded stream:
+    /// `("xdp", ..)` for a single stream, the packet's name for an array.
+    /// The decoded data is read through a buffer and never held whole.
+    pub fn read_packets(
+        doc: &mut PdfDocument,
+        mut each: impl FnMut(&str, &mut dyn std::io::BufRead) -> Result<()>,
+    ) -> Result<()> {
+        let mut packet = |name: &str, stream: &Object| -> Result<()> {
+            let Object::Stream { dict, body } = stream else {
+                return Ok(());
+            };
+            let decoded =
+                crate::decoders::stream::reader_in(dict, body.origin(), || body.raw_reader())?;
+            let mut reader = std::io::BufReader::with_capacity(64 * 1024, decoded);
+            each(name, &mut reader)
+        };
+        match Self::xfa_entry(doc)? {
+            stream @ Object::Stream { .. } => packet("xdp", &stream),
+            Object::Array(arr) => {
+                // Array is [name1, stream1, name2, stream2, ...]
+                let mut i = 0;
+                while i + 1 < arr.len() {
+                    let name = match &arr[i] {
+                        Object::Name(n) => n.clone(),
+                        Object::String(s) => String::from_utf8_lossy(s).to_string(),
+                        _ => format!("packet_{}", i / 2),
+                    };
+                    let stream = Self::resolve_object(doc, &arr[i + 1])?;
+                    packet(&name, &stream)?;
+                    i += 2;
+                }
+                Ok(())
+            },
+            _ => Err(Error::InvalidPdf("XFA entry is neither stream nor array".to_string())),
+        }
+    }
+
+    /// The form the document's XFA packets describe, parsed as XML events
+    /// over each packet's decoded stream.
     ///
     /// # Example
     ///
     /// ```ignore
     /// use pdf_oxide::PdfDocument;
-    /// use pdf_oxide::xfa::{XfaExtractor, XfaParser};
+    /// use pdf_oxide::xfa::XfaExtractor;
     ///
     /// let mut doc = PdfDocument::open("form.pdf")?;
-    /// if let Ok(xfa_data) = XfaExtractor::extract_xfa(&mut doc) {
-    ///     let mut parser = XfaParser::new();
-    ///     let form = parser.parse(&xfa_data)?;
-    ///     println!("Found {} fields", form.field_count());
-    /// }
+    /// let form = XfaExtractor::parse_form(&mut doc)?;
+    /// println!("Found {} fields", form.field_count());
     /// ```
-    pub fn extract_xfa(doc: &mut PdfDocument) -> Result<Vec<u8>> {
-        let catalog = doc.catalog()?;
-        let catalog_dict = catalog
-            .as_dict()
-            .ok_or_else(|| Error::InvalidPdf("Catalog is not a dictionary".to_string()))?;
-
-        let acroform_obj = catalog_dict
-            .get("AcroForm")
-            .ok_or_else(|| Error::InvalidPdf("No AcroForm in document".to_string()))?;
-        let acroform_obj = Self::resolve_object(doc, acroform_obj)?;
-
-        let acroform_dict = acroform_obj
-            .as_dict()
-            .ok_or_else(|| Error::InvalidPdf("AcroForm is not a dictionary".to_string()))?;
-
-        let xfa_obj = acroform_dict
-            .get("XFA")
-            .ok_or_else(|| Error::InvalidPdf("No XFA entry in AcroForm".to_string()))?;
-        let xfa_obj = Self::resolve_object(doc, xfa_obj)?;
-
-        match &xfa_obj {
-            // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            Object::Stream { dict, body } => {
-                // Single stream containing complete XDP
-                Self::decode_stream_data(dict, &body.read_whole_raw()?)
-            },
-            // ── end pdf_manipulator patch ──
-            Object::Array(arr) => {
-                // Array of name/stream pairs
-                // Combine all streams into single XFA document
-                Self::extract_xfa_array(doc, arr)
-            },
-            _ => Err(Error::InvalidPdf("XFA entry is neither stream nor array".to_string())),
-        }
+    pub fn parse_form(doc: &mut PdfDocument) -> Result<crate::xfa::XfaForm> {
+        let mut parser = crate::xfa::XfaParser::new();
+        Self::read_packets(doc, |_name, reader| parser.feed(reader))?;
+        Ok(parser.finish())
     }
-
-    /// Extract XFA packets from an array format.
-    ///
-    /// Returns a vector of (name, data) pairs for each XFA packet.
-    pub fn extract_xfa_packets(doc: &mut PdfDocument) -> Result<Vec<(String, Vec<u8>)>> {
-        let catalog = doc.catalog()?;
-        let catalog_dict = catalog
-            .as_dict()
-            .ok_or_else(|| Error::InvalidPdf("Catalog is not a dictionary".to_string()))?;
-
-        let acroform_obj = catalog_dict
-            .get("AcroForm")
-            .ok_or_else(|| Error::InvalidPdf("No AcroForm in document".to_string()))?;
-        let acroform_obj = Self::resolve_object(doc, acroform_obj)?;
-
-        let acroform_dict = acroform_obj
-            .as_dict()
-            .ok_or_else(|| Error::InvalidPdf("AcroForm is not a dictionary".to_string()))?;
-
-        let xfa_obj = acroform_dict
-            .get("XFA")
-            .ok_or_else(|| Error::InvalidPdf("No XFA entry in AcroForm".to_string()))?;
-        let xfa_obj = Self::resolve_object(doc, xfa_obj)?;
-
-        match &xfa_obj {
-            // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            Object::Stream { dict, body } => {
-                // Single stream - return as single "xdp" packet
-                let decoded = Self::decode_stream_data(dict, &body.read_whole_raw()?)?;
-                Ok(vec![("xdp".to_string(), decoded)])
-            },
-            // ── end pdf_manipulator patch ──
-            Object::Array(arr) => {
-                // Array of name/stream pairs
-                Self::extract_xfa_packets_from_array(doc, arr)
-            },
-            _ => Err(Error::InvalidPdf("XFA entry is neither stream nor array".to_string())),
-        }
-    }
+    // ── end pdf_manipulator patch ──
 
     /// Resolve an indirect reference to its object.
     fn resolve_object(doc: &mut PdfDocument, obj: &Object) -> Result<Object> {
@@ -155,6 +143,9 @@ impl XfaExtractor {
         }
     }
 
+    // ── pdf_manipulator patch: only the tests decode a stream from a slice now ──
+    #[cfg(test)]
+    // ── end pdf_manipulator patch ──
     /// Decode a stream's data using its filter chain.
     fn decode_stream_data(
         dict: &std::collections::HashMap<String, Object>,
@@ -170,6 +161,9 @@ impl XfaExtractor {
         }
     }
 
+    // ── pdf_manipulator patch: only the tests read the filter names from a dictionary now ──
+    #[cfg(test)]
+    // ── end pdf_manipulator patch ──
     /// Extract filter names from stream dictionary.
     fn get_filters(dict: &std::collections::HashMap<String, Object>) -> Vec<String> {
         let filter_obj = dict.get("Filter");
@@ -187,62 +181,6 @@ impl XfaExtractor {
                 .collect(),
             _ => Vec::new(),
         }
-    }
-
-    /// Extract and combine XFA data from an array of packets.
-    fn extract_xfa_array(doc: &mut PdfDocument, arr: &[Object]) -> Result<Vec<u8>> {
-        let mut combined = Vec::new();
-
-        // Array is [name1, stream1, name2, stream2, ...]
-        let mut i = 0;
-        while i < arr.len() {
-            // Skip the name, get the stream
-            if i + 1 < arr.len() {
-                let stream_obj = Self::resolve_object(doc, &arr[i + 1])?;
-                // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                if let Object::Stream { dict, body } = &stream_obj {
-                    let decoded = Self::decode_stream_data(dict, &body.read_whole_raw()?)?;
-                    // ── end pdf_manipulator patch ──
-                    combined.extend_from_slice(&decoded);
-                }
-            }
-            i += 2;
-        }
-
-        Ok(combined)
-    }
-
-    /// Extract packets from XFA array with names preserved.
-    fn extract_xfa_packets_from_array(
-        doc: &mut PdfDocument,
-        arr: &[Object],
-    ) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut packets = Vec::new();
-
-        // Array is [name1, stream1, name2, stream2, ...]
-        let mut i = 0;
-        while i < arr.len() {
-            if i + 1 < arr.len() {
-                // Get the name
-                let name = match &arr[i] {
-                    Object::Name(n) => n.clone(),
-                    Object::String(s) => String::from_utf8_lossy(s).to_string(),
-                    _ => format!("packet_{}", i / 2),
-                };
-
-                // Get the stream data
-                let stream_obj = Self::resolve_object(doc, &arr[i + 1])?;
-                // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                if let Object::Stream { dict, body } = &stream_obj {
-                    let decoded = Self::decode_stream_data(dict, &body.read_whole_raw()?)?;
-                    // ── end pdf_manipulator patch ──
-                    packets.push((name, decoded));
-                }
-            }
-            i += 2;
-        }
-
-        Ok(packets)
     }
 }
 

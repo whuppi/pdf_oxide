@@ -10,54 +10,51 @@ use std::collections::{HashMap, HashSet};
 
 use std::time::Duration;
 
+// ── pdf_manipulator patch: the budget is a wall-clock bound only; the element cap is gone ──
 /// An optional bound on structure-tree parsing.
 ///
 /// A parsing library returns the *complete* tree by default, so the unbounded
-/// guard (`ParseBudget::unbounded`) applies no time limit and no element cap.
-/// Callers that deliberately want to bound the work — e.g. the extraction
-/// reading-order strategy, which can fall back to content-stream order — build a
-/// bounded guard from a wall-clock `Duration`, which also caps the element count
-/// at [`MAX_STRUCT_ELEMENTS`]. On `wasm32-unknown-unknown` `std::time::Instant`
-/// panics, so the time limit is a no-op there and only the element cap applies.
+/// guard (`ParseBudget::unbounded`) applies no limit. Callers that deliberately
+/// want to bound the work — e.g. the extraction reading-order strategy, which
+/// can fall back to content-stream order — build a bounded guard from a
+/// wall-clock `Duration`. On `wasm32-unknown-unknown` `std::time::Instant`
+/// panics, so the limit is a no-op there.
 #[derive(Clone, Copy, Default)]
-struct ParseBudget {
+pub(crate) struct ParseBudget {
     #[cfg(not(target_arch = "wasm32"))]
     deadline: Option<std::time::Instant>,
-    max_elements: Option<usize>,
 }
 
 impl ParseBudget {
     /// No limit — parse the entire tree (the default for a general-purpose API).
-    fn unbounded() -> Self {
+    pub(crate) fn unbounded() -> Self {
         Self::default()
     }
 
-    /// Bound parsing by `budget` wall-clock time, and cap the element count at
-    /// [`MAX_STRUCT_ELEMENTS`] as a companion guard against pathological trees.
+    /// Bound parsing by `budget` wall-clock time.
     fn from_option(budget: Option<Duration>) -> Self {
         match budget {
             None => Self::unbounded(),
             Some(_budget) => Self {
                 #[cfg(not(target_arch = "wasm32"))]
                 deadline: Some(std::time::Instant::now() + _budget),
-                max_elements: Some(MAX_STRUCT_ELEMENTS),
             },
         }
     }
 
-    /// Whether either bound has been exceeded at the current element count.
-    /// Always `false` for an unbounded guard.
+    /// Whether the deadline has passed. The element count is not a bound; the
+    /// parameter keeps upstream's signature, so its callers and tests merge
+    /// unchanged.
     #[inline]
-    fn exceeded(&self, element_count: usize) -> bool {
+    fn exceeded(&self, _element_count: usize) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(deadline) = self.deadline {
-            if std::time::Instant::now() > deadline {
-                return true;
-            }
+            return std::time::Instant::now() > deadline;
         }
-        self.max_elements.is_some_and(|max| element_count > max)
+        false
     }
 }
+// ── end pdf_manipulator patch ──
 
 /// A timer for measuring elapsed time, WASM-safe.
 #[derive(Clone, Copy)]
@@ -92,11 +89,8 @@ impl Timer {
     }
 }
 
-/// Maximum number of structure elements to parse.
-/// Trees larger than this cause expensive traversal (seconds for 50K+ elements).
-/// 10K elements is sufficient for any normal document; larger trees indicate
-/// deeply structured books where content-stream order works equally well.
-const MAX_STRUCT_ELEMENTS: usize = 10_000;
+// ── pdf_manipulator patch: MAX_STRUCT_ELEMENTS is removed; the tree is walked, not capped ──
+// ── end pdf_manipulator patch ──
 
 /// Decode a PDF text string (UTF-16BE/LE with BOM, or PDFDocEncoding).
 fn decode_pdf_text_string(bytes: &[u8]) -> String {
@@ -226,33 +220,84 @@ pub fn parse_structure_tree_with_budget(
     parse_structure_tree_inner(document, ParseBudget::from_option(budget))
 }
 
-fn parse_structure_tree_inner(
-    document: &PdfDocument,
-    deadline: ParseBudget,
-) -> Result<Option<StructTreeRoot>, Error> {
-    let parse_start = Timer::now();
+// ── pdf_manipulator patch: the structure tree is walked with an explicit stack, not parsed recursively and held whole ──
+/// What the walk needs before it visits the first element: the root's
+/// `/RoleMap`, its `/K` and the page-object → page-index map.
+pub(crate) struct StructHeader {
+    pub(crate) role_map: HashMap<String, String>,
+    k: Option<Object>,
+    page_map: HashMap<u32, u32>,
+}
 
-    // Get catalog
+/// An element as the walk meets it, before its children.
+pub(crate) struct ElemHead {
+    pub(crate) struct_type: StructType,
+    pub(crate) source_role: Option<String>,
+    pub(crate) page: Option<u32>,
+    pub(crate) actual_text: Option<String>,
+}
+
+/// What a walk reports: an element opens, marked content it names, the element
+/// closes. Nothing of an element outlives its `leave` unless the visitor keeps it.
+pub(crate) trait StructVisitor {
+    fn enter(&mut self, head: ElemHead);
+    fn marked_content(&mut self, mcid: u32, page: u32, scope: crate::structure::McidScope);
+    fn leave(&mut self);
+}
+
+/// Builds elements from the events of a walk: `leave` returns an element
+/// once the stack is empty again, that is, when it was a top-level one.
+#[derive(Default)]
+pub(crate) struct Builder {
+    stack: Vec<StructElem>,
+}
+
+impl Builder {
+    pub(crate) fn enter(&mut self, head: ElemHead) {
+        let mut elem = StructElem::new(head.struct_type);
+        elem.source_role = head.source_role;
+        elem.page = head.page;
+        elem.actual_text = head.actual_text;
+        self.stack.push(elem);
+    }
+
+    pub(crate) fn marked_content(
+        &mut self,
+        mcid: u32,
+        page: u32,
+        scope: crate::structure::McidScope,
+    ) {
+        if let Some(top) = self.stack.last_mut() {
+            top.add_child(StructChild::MarkedContentRef { mcid, page, scope });
+        }
+    }
+
+    /// Closes the open element; returns it when it was a top-level one.
+    pub(crate) fn leave(&mut self) -> Option<StructElem> {
+        let done = self.stack.pop()?;
+        match self.stack.last_mut() {
+            Some(parent) => {
+                parent.add_child(StructChild::StructElem(Box::new(done)));
+                None
+            },
+            None => Some(done),
+        }
+    }
+}
+
+/// Reads the head of the structure tree: `Ok(None)` when the document is not
+/// tagged (no `/StructTreeRoot`, or one that is not a dictionary).
+pub(crate) fn open_structure_tree(document: &PdfDocument) -> Result<Option<StructHeader>, Error> {
     let catalog = document.catalog()?;
-
-    // Check for StructTreeRoot in catalog dictionary
     let catalog_dict = catalog
         .as_dict()
         .ok_or_else(|| Error::InvalidPdf("Catalog is not a dictionary".into()))?;
-
     let struct_tree_root_ref = match catalog_dict.get("StructTreeRoot") {
         Some(obj) => obj,
-        None => return Ok(None), // Not a tagged PDF
+        None => return Ok(None),
     };
-
-    // Build page map for resolving /Pg references
     let page_map = build_page_map(document);
-
-    // Resolve the StructTreeRoot object
     let struct_tree_root_obj = resolve_object(document, struct_tree_root_ref)?;
-
-    // Parse StructTreeRoot dictionary — treat non-dict (e.g. Null from a
-    // corrupted parse) as "no structure tree" rather than a hard error.
     let struct_tree_dict = match struct_tree_root_obj.as_dict() {
         Some(d) => d,
         None => {
@@ -263,148 +308,79 @@ fn parse_structure_tree_inner(
             return Ok(None);
         },
     };
-
-    let mut struct_tree = StructTreeRoot::new();
-
-    // Parse RoleMap (optional)
+    let mut role_map = HashMap::new();
     if let Some(role_map_obj) = struct_tree_dict.get("RoleMap") {
         let role_map_obj = resolve_object(document, role_map_obj)?;
         if let Some(role_map_dict) = role_map_obj.as_dict() {
             for (key, value) in role_map_dict.iter() {
                 if let Some(name) = value.as_name() {
-                    struct_tree.role_map.insert(key.clone(), name.to_string());
+                    role_map.insert(key.clone(), name.to_string());
                 }
             }
         }
     }
-
-    // Skip ParentTree parsing — it's expensive (recursively loads/parses objects)
-    // and not needed for text extraction. The forward traversal of /K children
-    // provides reading order. ParentTree is only needed for reverse lookups
-    // (MCID → StructElem), which are not used in the extraction pipeline.
-
-    // Parse K (children) - can be a single element or array of elements
-    let mut element_count: usize = 0;
-    let mut visited: HashSet<u32> = HashSet::new();
-
-    if let Some(k_obj) = struct_tree_dict.get("K") {
-        let k_obj = resolve_object(document, k_obj)?;
-
-        match k_obj {
-            Object::Array(arr) => {
-                // Multiple root elements
-                for elem_obj in arr {
-                    if deadline.exceeded(element_count) {
-                        log::debug!(
-                            "Structure tree parse budget exceeded, falling back to content order"
-                        );
-                        return Ok(None);
-                    }
-                    // Record root element IDs before descending so that a back-reference
-                    // from any descendant to this root is detectable as a cycle.
-                    if let Object::Reference(obj_ref) = &elem_obj {
-                        if !visited.insert(obj_ref.id) {
-                            log::warn!(
-                                "Cycle in structure tree: root object {} already visited, skipping",
-                                obj_ref.id
-                            );
-                            continue;
-                        }
-                    }
-                    if let Some(elem) = parse_struct_elem(
-                        document,
-                        &elem_obj,
-                        &struct_tree.role_map,
-                        &page_map,
-                        deadline,
-                        &mut element_count,
-                        &mut visited,
-                    )? {
-                        struct_tree.add_root_element(elem);
-                    }
-                }
-            },
-            _ => {
-                // Single root element
-                if let Some(elem) = parse_struct_elem(
-                    document,
-                    &k_obj,
-                    &struct_tree.role_map,
-                    &page_map,
-                    deadline,
-                    &mut element_count,
-                    &mut visited,
-                )? {
-                    struct_tree.add_root_element(elem);
-                }
-            },
-        }
-    }
-
-    log::debug!(
-        "Structure tree parsed: {} elements, {} root elements in {}",
-        element_count,
-        struct_tree.root_elements.len(),
-        parse_start.elapsed_debug()
-    );
-
-    Ok(Some(struct_tree))
+    let k = match struct_tree_dict.get("K") {
+        Some(k_obj) => Some(resolve_object(document, k_obj)?),
+        None => None,
+    };
+    Ok(Some(StructHeader {
+        role_map,
+        k,
+        page_map,
+    }))
 }
 
-/// Parse a structure element (StructElem) from a PDF object.
-///
-/// Returns `Ok(None)` if the deadline is exceeded, causing the caller to
-/// abandon the tree and fall back to content-stream order.
-fn parse_struct_elem(
-    document: &PdfDocument,
-    obj: &Object,
-    role_map: &HashMap<String, String>,
-    page_map: &HashMap<u32, u32>,
-    deadline: ParseBudget,
-    element_count: &mut usize,
-    visited: &mut HashSet<u32>,
-) -> Result<Option<StructElem>, Error> {
-    // Check the (optional) budget before doing work.
-    if deadline.exceeded(*element_count) {
-        return Ok(None);
+/// The children of one open element still to visit. `single` is a `/K` that
+/// was not an array; `root` the children of the `/StructTreeRoot`.
+struct Frame {
+    kids: Vec<Object>,
+    next: usize,
+    single: bool,
+    root: bool,
+    page: Option<u32>,
+}
+
+struct Opened {
+    head: ElemHead,
+    kids: Option<(Vec<Object>, bool)>,
+}
+
+struct Walk<'a> {
+    document: &'a PdfDocument,
+    header: &'a StructHeader,
+    /// Object ids already met, so a cycle ends. Two integers per element met.
+    visited: HashSet<(u32, u16)>,
+}
+
+impl Walk<'_> {
+    fn first_visit(&mut self, r: &crate::object::ObjectRef) -> bool {
+        self.visited.insert((r.id, r.gen))
     }
-    *element_count += 1;
 
-    let obj = resolve_object(document, obj)?;
-
-    let dict = match obj.as_dict() {
-        Some(d) => d,
-        None => return Ok(None), // Not a dictionary, skip
-    };
-
-    // Check /Type (should be /StructElem, but optional)
-    if let Some(type_obj) = dict.get("Type") {
-        if let Some(type_name) = type_obj.as_name() {
-            if type_name == "OBJR" {
-                // Per PDF spec §14.7.4 Table 323, an OBJR (Object Reference) dictionary
-                // references a StructElem (or other PDF object) via its /Obj entry.
-                // Transparently dereference it so the caller gets the real StructElem.
-                if let Some(obj_ref_obj) = dict.get("Obj") {
-                    if let Some(obj_ref) = obj_ref_obj.as_reference() {
-                        if !visited.insert(obj_ref.id) {
+    /// Reads the element `obj` names, or `None` when it is not one (the caller
+    /// may still read it as a marked-content reference).
+    fn open_element(&mut self, obj: &Object) -> Result<Option<Opened>, Error> {
+        let mut obj = resolve_object(self.document, obj)?;
+        loop {
+            // An OBJR dictionary is followed to the object it names (§14.7.4).
+            let followed: Option<Object> = {
+                let Some(dict) = obj.as_dict() else {
+                    return Ok(None);
+                };
+                match dict.get("Type").and_then(|t| t.as_name()) {
+                    Some("OBJR") => {
+                        let Some(obj_ref) = dict.get("Obj").and_then(|o| o.as_reference()) else {
+                            return Ok(None);
+                        };
+                        if !self.first_visit(&obj_ref) {
                             log::debug!(
                                 "OBJR: cycle detected — object {} already visited, skipping",
                                 obj_ref.id
                             );
                             return Ok(None);
                         }
-                        match document.load_object(obj_ref) {
-                            Ok(resolved) => {
-                                return parse_struct_elem(
-                                    document,
-                                    &resolved,
-                                    role_map,
-                                    page_map,
-                                    deadline,
-                                    element_count,
-                                    visited,
-                                );
-                            },
+                        match self.document.load_object(obj_ref) {
+                            Ok(resolved) => Some(resolve_object(self.document, &resolved)?),
                             Err(e) => {
                                 log::warn!(
                                     "OBJR: failed to load /Obj {} {}: {}",
@@ -415,300 +391,282 @@ fn parse_struct_elem(
                                 return Ok(None);
                             },
                         }
-                    }
+                    },
+                    Some(name) if name != "StructElem" => return Ok(None),
+                    _ => None,
                 }
-                return Ok(None);
-            }
-            if type_name != "StructElem" {
-                return Ok(None); // Not a StructElem
-            }
-        }
-    }
-
-    // Get /S (structure type) - REQUIRED
-    let s_obj = match dict.get("S") {
-        Some(obj) => obj,
-        None => return Ok(None), // Missing /S, skip gracefully
-    };
-    let s_name = match s_obj.as_name() {
-        Some(name) => name,
-        None => return Ok(None), // /S not a name, skip
-    };
-
-    // Map custom types to standard types using RoleMap
-    // Preserve the original role name when mapping occurs
-    let mapped = role_map.get(s_name);
-    let struct_type_str = mapped.map(|s| s.as_str()).unwrap_or(s_name);
-    let struct_type = StructType::from_str(struct_type_str);
-
-    let mut struct_elem = StructElem::new(struct_type);
-    if mapped.is_some() {
-        struct_elem.source_role = Some(s_name.to_string());
-    }
-
-    // Get /Pg (page) - optional, resolve to page number
-    if let Some(Object::Reference(pg_ref)) = dict.get("Pg") {
-        if let Some(&page_num) = page_map.get(&pg_ref.id) {
-            struct_elem.page = Some(page_num);
-        }
-    }
-
-    // Skip /A (attributes) during text extraction — not needed for reading order.
-    // Skip /Alt (alternate description) — not needed for text extraction.
-
-    // Get /ActualText (replacement text) - optional, per PDF spec Section 14.9.4
-    // When present, this text replaces all descendant content for the element.
-    if let Some(at_obj) = dict.get("ActualText") {
-        let at_obj = resolve_object(document, at_obj)?;
-        if let Some(at_bytes) = at_obj.as_string() {
-            let text = decode_pdf_text_string(at_bytes);
-            if !text.is_empty() {
-                struct_elem.actual_text = Some(text);
+            };
+            match followed {
+                Some(next) => obj = next,
+                None => break,
             }
         }
-    }
+        let dict = obj.as_dict().expect("checked above");
 
-    // Parse /K (children)
-    if let Some(k_obj_raw) = dict.get("K") {
-        // When /K is an indirect reference that resolves to a struct elem dictionary
-        // (as opposed to an array), we lose the object ID after resolve_object and
-        // the Dictionary arm of parse_k_children cannot check for cycles.
-        // Load it here while we still have the reference ID, insert into visited,
-        // and short-circuit if it has already been visited.
-        if let Object::Reference(r) = k_obj_raw {
-            let k_resolved = match document.load_object(*r) {
-                Ok(obj) => obj,
+        let Some(s_name) = dict.get("S").and_then(|s| s.as_name()) else {
+            return Ok(None);
+        };
+        let mapped = self.header.role_map.get(s_name);
+        let struct_type = StructType::from_str(mapped.map(|s| s.as_str()).unwrap_or(s_name));
+        let source_role = mapped.is_some().then(|| s_name.to_string());
+        let page = match dict.get("Pg") {
+            Some(Object::Reference(pg_ref)) => self.header.page_map.get(&pg_ref.id).copied(),
+            _ => None,
+        };
+        let mut actual_text = None;
+        if let Some(at_obj) = dict.get("ActualText") {
+            let at_obj = resolve_object(self.document, at_obj)?;
+            if let Some(at_bytes) = at_obj.as_string() {
+                let text = decode_pdf_text_string(at_bytes);
+                if !text.is_empty() {
+                    actual_text = Some(text);
+                }
+            }
+        }
+
+        let kids = match dict.get("K") {
+            None => None,
+            // A /K that is an indirect dictionary keeps its id for the cycle check.
+            Some(Object::Reference(r)) => match self.document.load_object(*r) {
                 Err(e) => {
                     log::warn!("Failed to load /K reference {}: {}", r.id, e);
-                    return Ok(Some(struct_elem));
+                    None
                 },
-            };
-            if k_resolved.as_dict().is_some() {
-                // /K points directly at a struct elem — guard against cycles.
-                if !visited.insert(r.id) {
-                    log::warn!(
-                        "Cycle in structure tree: /K object {} already visited, skipping children",
-                        r.id
-                    );
-                    return Ok(Some(struct_elem));
-                }
-            }
-            parse_k_children(
-                document,
-                &k_resolved,
-                &mut struct_elem,
-                role_map,
-                page_map,
-                deadline,
-                element_count,
-                visited,
-            )?;
-        } else {
-            let k_obj = resolve_object(document, k_obj_raw)?;
-            parse_k_children(
-                document,
-                &k_obj,
-                &mut struct_elem,
-                role_map,
-                page_map,
-                deadline,
-                element_count,
-                visited,
-            )?;
-        }
+                Ok(k) => {
+                    if k.as_dict().is_some() && !self.first_visit(r) {
+                        log::warn!(
+                            "Cycle in structure tree: /K object {} already visited, skipping children",
+                            r.id
+                        );
+                        None
+                    } else {
+                        kids_of(k)
+                    }
+                },
+            },
+            Some(raw) => kids_of(resolve_object(self.document, raw)?),
+        };
+        Ok(Some(Opened {
+            head: ElemHead {
+                struct_type,
+                source_role,
+                page,
+                actual_text,
+            },
+            kids,
+        }))
     }
-
-    Ok(Some(struct_elem))
 }
 
-/// Parse the /K entry (children) of a structure element.
-fn parse_k_children(
+/// The children a resolved `/K` holds: an array's items, or the one object.
+fn kids_of(k: Object) -> Option<(Vec<Object>, bool)> {
+    match k {
+        Object::Array(arr) => Some((arr, false)),
+        Object::Integer(_) | Object::Dictionary(_) | Object::Reference(_) => Some((vec![k], true)),
+        _ => None,
+    }
+}
+
+/// Visits the structure tree depth-first, in document order. The stack holds
+/// the children still to visit of each open element, never the elements.
+/// Returns `false` when the budget ran out before the walk finished.
+pub(crate) fn walk_structure_tree(
     document: &PdfDocument,
-    k_obj: &Object,
-    parent: &mut StructElem,
-    role_map: &HashMap<String, String>,
-    page_map: &HashMap<u32, u32>,
+    header: &StructHeader,
     deadline: ParseBudget,
-    element_count: &mut usize,
-    visited: &mut HashSet<u32>,
-) -> Result<(), Error> {
-    match k_obj {
-        Object::Integer(mcid) => {
-            // Single MCID — bare integer child references the page's
-            // own content stream (ISO 32000-1:2008 §14.7.5.4.2 "MCR"
-            // form is reserved for cross-stream refs).
-            let page = parent.page.unwrap_or(0);
-            parent.add_child(StructChild::MarkedContentRef {
-                mcid: *mcid as u32,
-                page,
-                scope: crate::structure::McidScope::Page(page),
+    visitor: &mut dyn StructVisitor,
+) -> Result<bool, Error> {
+    let mut walk = Walk {
+        document,
+        header,
+        visited: HashSet::new(),
+    };
+    let mut stack: Vec<Frame> = Vec::new();
+    if let Some(k) = &header.k {
+        if let Some((kids, single)) = kids_of(k.clone()) {
+            stack.push(Frame {
+                kids,
+                next: 0,
+                single,
+                root: true,
+                page: None,
             });
-        },
+        }
+    }
+    while let Some(frame) = stack.last_mut() {
+        if deadline.exceeded(0) {
+            log::debug!("Structure tree parse budget exceeded, falling back to content order");
+            return Ok(false);
+        }
+        if frame.next >= frame.kids.len() {
+            let done = stack.pop().expect("a frame was open");
+            if !done.root {
+                visitor.leave();
+            }
+            continue;
+        }
+        let item = std::mem::replace(&mut frame.kids[frame.next], Object::Null);
+        frame.next += 1;
+        let (single, root, parent_page) = (frame.single, frame.root, frame.page);
 
-        Object::Array(arr) => {
-            // Array of children
-            for child_obj in arr {
-                // Check the (optional) budget before descending.
-                if deadline.exceeded(*element_count) {
-                    return Ok(());
-                }
-
-                // Guard against cycles before resolving: an indirect reference that has
-                // already been visited would resolve to a dictionary and slip through to
-                // parse_struct_elem without any ID to check. Capture the ID now, while we
-                // still have the unresolved Reference, so the check happens before loading.
-                if let Object::Reference(obj_ref) = child_obj {
-                    if !visited.insert(obj_ref.id) {
+        // What the item is, once the cycle guard and the indirection are past.
+        let candidate: Option<Object> = if root {
+            if !single {
+                if let Object::Reference(r) = &item {
+                    if !walk.first_visit(r) {
                         log::warn!(
-                            "Cycle in structure tree: object {} already visited, skipping",
-                            obj_ref.id
+                            "Cycle in structure tree: root object {} already visited, skipping",
+                            r.id
                         );
                         continue;
                     }
                 }
-
-                let child_obj = resolve_object(document, child_obj)?;
-
-                match &child_obj {
-                    Object::Integer(mcid) => {
-                        // Bare integer MCID — page's own content stream.
-                        let page = parent.page.unwrap_or(0);
-                        parent.add_child(StructChild::MarkedContentRef {
-                            mcid: *mcid as u32,
-                            page,
-                            scope: crate::structure::McidScope::Page(page),
-                        });
-                    },
-
-                    Object::Dictionary(_) => {
-                        // Could be a StructElem or marked content reference
-                        if let Some(child_elem) = parse_struct_elem(
-                            document,
-                            &child_obj,
-                            role_map,
-                            page_map,
-                            deadline,
-                            element_count,
-                            visited,
-                        )? {
-                            parent.add_child(StructChild::StructElem(Box::new(child_elem)));
-                        } else {
-                            // Try parsing as marked content reference
-                            if let Some(mcr) =
-                                parse_marked_content_ref(document, &child_obj, page_map)?
-                            {
-                                parent.add_child(mcr);
-                            }
+            }
+            Some(item)
+        } else {
+            match item {
+                Object::Integer(mcid) => {
+                    let page = parent_page.unwrap_or(0);
+                    visitor.marked_content(
+                        mcid as u32,
+                        page,
+                        crate::structure::McidScope::Page(page),
+                    );
+                    None
+                },
+                Object::Dictionary(_) => Some(item),
+                Object::Reference(r) => {
+                    if !walk.first_visit(&r) {
+                        log::warn!(
+                            "Cycle in structure tree: object {} already visited, skipping",
+                            r.id
+                        );
+                        continue;
+                    }
+                    if single {
+                        match document.load_object(r) {
+                            Ok(resolved) => Some(resolved),
+                            Err(e) => {
+                                log::warn!("Failed to resolve ObjectRef {} {}: {}", r.id, r.gen, e);
+                                None
+                            },
                         }
-                    },
-
-                    Object::Reference(obj_ref) => {
-                        // Double-indirect reference — guard against cycles here too.
-                        if !visited.insert(obj_ref.id) {
-                            log::warn!(
-                                "Cycle in structure tree: object {} already visited, skipping",
-                                obj_ref.id
-                            );
-                            continue;
-                        }
-                        // Resolve indirect reference and try to parse as StructElem
-                        match document.load_object(*obj_ref) {
-                            Ok(resolved) => {
-                                if let Some(child_elem) = parse_struct_elem(
-                                    document,
-                                    &resolved,
-                                    role_map,
-                                    page_map,
-                                    deadline,
-                                    element_count,
-                                    visited,
-                                )? {
-                                    parent.add_child(StructChild::StructElem(Box::new(child_elem)));
-                                } else if let Some(mcr) =
-                                    parse_marked_content_ref(document, &resolved, page_map)?
-                                {
-                                    parent.add_child(mcr);
+                    } else {
+                        match resolve_object(document, &Object::Reference(r))? {
+                            Object::Integer(mcid) => {
+                                let page = parent_page.unwrap_or(0);
+                                visitor.marked_content(
+                                    mcid as u32,
+                                    page,
+                                    crate::structure::McidScope::Page(page),
+                                );
+                                None
+                            },
+                            Object::Dictionary(d) => Some(Object::Dictionary(d)),
+                            Object::Reference(r2) => {
+                                if !walk.first_visit(&r2) {
+                                    log::warn!(
+                                        "Cycle in structure tree: object {} already visited, skipping",
+                                        r2.id
+                                    );
+                                    continue;
+                                }
+                                match document.load_object(r2) {
+                                    Ok(resolved) => Some(resolved),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to resolve ObjectRef {} {}: {}",
+                                            r2.id,
+                                            r2.gen,
+                                            e
+                                        );
+                                        None
+                                    },
                                 }
                             },
-                            Err(e) => {
-                                log::warn!(
-                                    "Failed to resolve ObjectRef {} {}: {}",
-                                    obj_ref.id,
-                                    obj_ref.gen,
-                                    e
-                                );
-                            },
+                            _ => None,
                         }
-                    },
-
-                    _ => {
-                        // Unknown child type, skip
-                    },
-                }
-            }
-        },
-
-        Object::Dictionary(_) => {
-            // Single dictionary child
-            if let Some(child_elem) = parse_struct_elem(
-                document,
-                k_obj,
-                role_map,
-                page_map,
-                deadline,
-                element_count,
-                visited,
-            )? {
-                parent.add_child(StructChild::StructElem(Box::new(child_elem)));
-            } else {
-                // Try parsing as marked content reference
-                if let Some(mcr) = parse_marked_content_ref(document, k_obj, page_map)? {
-                    parent.add_child(mcr);
-                }
-            }
-        },
-
-        Object::Reference(obj_ref) => {
-            // Guard against cycles: skip if this object has already been visited.
-            if !visited.insert(obj_ref.id) {
-                log::warn!(
-                    "Cycle in structure tree: object {} already visited, skipping",
-                    obj_ref.id
-                );
-                return Ok(());
-            }
-            // Resolve indirect reference and try to parse as StructElem
-            match document.load_object(*obj_ref) {
-                Ok(resolved) => {
-                    if let Some(child_elem) = parse_struct_elem(
-                        document,
-                        &resolved,
-                        role_map,
-                        page_map,
-                        deadline,
-                        element_count,
-                        visited,
-                    )? {
-                        parent.add_child(StructChild::StructElem(Box::new(child_elem)));
-                    } else if let Some(mcr) =
-                        parse_marked_content_ref(document, &resolved, page_map)?
-                    {
-                        parent.add_child(mcr);
                     }
                 },
-                Err(e) => {
-                    log::warn!("Failed to resolve ObjectRef {} {}: {}", obj_ref.id, obj_ref.gen, e);
-                },
+                _ => None,
             }
-        },
+        };
+        let Some(candidate) = candidate else { continue };
 
-        _ => {
-            // Unknown K type
-        },
+        match walk.open_element(&candidate)? {
+            Some(opened) => {
+                let page = opened.head.page;
+                visitor.enter(opened.head);
+                let (kids, single) = opened.kids.unwrap_or_default();
+                stack.push(Frame {
+                    kids,
+                    next: 0,
+                    single,
+                    root: false,
+                    page,
+                });
+            },
+            // A root item that is not an element is dropped; elsewhere it may be an MCR.
+            None if root => {},
+            None => {
+                if let Some(StructChild::MarkedContentRef { mcid, page, scope }) =
+                    parse_marked_content_ref(document, &candidate, &header.page_map)?
+                {
+                    visitor.marked_content(mcid, page, scope);
+                }
+            },
+        }
     }
-
-    Ok(())
+    Ok(true)
 }
+
+struct TreeBuilder {
+    builder: Builder,
+    roots: Vec<StructElem>,
+}
+
+impl StructVisitor for TreeBuilder {
+    fn enter(&mut self, head: ElemHead) {
+        self.builder.enter(head);
+    }
+    fn marked_content(&mut self, mcid: u32, page: u32, scope: crate::structure::McidScope) {
+        self.builder.marked_content(mcid, page, scope);
+    }
+    fn leave(&mut self) {
+        if let Some(done) = self.builder.leave() {
+            self.roots.push(done);
+        }
+    }
+}
+
+fn parse_structure_tree_inner(
+    document: &PdfDocument,
+    deadline: ParseBudget,
+) -> Result<Option<StructTreeRoot>, Error> {
+    let parse_start = Timer::now();
+    let Some(header) = open_structure_tree(document)? else {
+        return Ok(None);
+    };
+    let mut tree = TreeBuilder {
+        builder: Builder::default(),
+        roots: Vec::new(),
+    };
+    if !walk_structure_tree(document, &header, deadline, &mut tree)? {
+        return Ok(None);
+    }
+    let mut struct_tree = StructTreeRoot::new();
+    struct_tree.role_map = header.role_map;
+    for root in tree.roots {
+        struct_tree.add_root_element(root);
+    }
+    log::debug!(
+        "Structure tree parsed: {} root elements in {}",
+        struct_tree.root_elements.len(),
+        parse_start.elapsed_debug()
+    );
+    Ok(Some(struct_tree))
+}
+// ── end pdf_manipulator patch ──
 
 /// Parse a marked content reference dictionary.
 ///
@@ -870,20 +828,16 @@ mod tests {
         // count must not trip it, so `parse_structure_tree` returns the whole tree.
         let guard = ParseBudget::unbounded();
         assert!(!guard.exceeded(0));
-        assert!(!guard.exceeded(MAX_STRUCT_ELEMENTS + 1));
+        // ── pdf_manipulator patch: MAX_STRUCT_ELEMENTS is removed; 10_000 was its value ──
+        assert!(!guard.exceeded(10_000 + 1));
+        // ── end pdf_manipulator patch ──
         assert!(!guard.exceeded(usize::MAX));
         // `None` budget is the unbounded guard.
         assert!(!ParseBudget::from_option(None).exceeded(usize::MAX));
     }
 
-    #[test]
-    fn parse_budget_bounded_caps_element_count() {
-        // A bounded guard (Some(duration)) still applies the companion element
-        // cap, deterministically, independent of wall-clock timing.
-        let guard = ParseBudget::from_option(Some(Duration::from_secs(3600)));
-        assert!(!guard.exceeded(MAX_STRUCT_ELEMENTS));
-        assert!(guard.exceeded(MAX_STRUCT_ELEMENTS + 1));
-    }
+    // ── pdf_manipulator patch: the element cap is gone, and its test with it; host/engine_proofs/mem_structure.rs parses past the old cap ──
+    // ── end pdf_manipulator patch ──
 
     #[test]
     fn test_struct_type_mapping() {

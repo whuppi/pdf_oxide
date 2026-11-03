@@ -726,6 +726,205 @@ pub fn extract_reading_order(
         .collect())
 }
 
+// ── pdf_manipulator patch: a page's structure and the ActualText index are produced while the tree is walked ──
+use super::parser::{
+    walk_structure_tree, Builder, ElemHead, ParseBudget, StructHeader, StructVisitor,
+};
+
+/// What extracting one page needs of the structure tree: its marked content
+/// in reading order, and the `Table` elements that have content on it.
+pub(crate) struct PageStructure {
+    pub(crate) content: Vec<OrderedContent>,
+    pub(crate) tables: Vec<StructElem>,
+}
+
+struct PageFrame {
+    /// The context this element's children inherit.
+    ctx: InheritedContext,
+    type_str: String,
+    parsed_type: StructType,
+    is_heading: bool,
+    is_block: bool,
+}
+
+/// An element whose subtree the page walk needs whole: a word break (its
+/// markers name the pages of each child) or a table (it is returned whole).
+struct PageCapture {
+    builder: Builder,
+    depth: usize,
+    /// The context the captured element inherits.
+    ctx: InheritedContext,
+}
+
+struct PageWalk {
+    target: u32,
+    counter: u32,
+    frames: Vec<PageFrame>,
+    capture: Option<PageCapture>,
+    content: Vec<OrderedContent>,
+    tables: Vec<StructElem>,
+}
+
+impl StructVisitor for PageWalk {
+    fn enter(&mut self, head: ElemHead) {
+        if let Some(cap) = &mut self.capture {
+            cap.builder.enter(head);
+            cap.depth += 1;
+            return;
+        }
+        let ctx = self.frames.last().map(|f| f.ctx).unwrap_or_default();
+        if head.struct_type.is_word_break() || head.struct_type == StructType::Table {
+            let mut builder = Builder::default();
+            builder.enter(head);
+            self.capture = Some(PageCapture {
+                builder,
+                depth: 1,
+                ctx,
+            });
+            return;
+        }
+        let descended = ctx.descend(&head.struct_type, &mut self.counter);
+        self.frames.push(PageFrame {
+            ctx: descended,
+            type_str: format!("{:?}", head.struct_type),
+            is_heading: descended.heading_level.is_some(),
+            is_block: head.struct_type.is_block(),
+            parsed_type: head.struct_type,
+        });
+    }
+
+    fn marked_content(&mut self, mcid: u32, page: u32, scope: McidScope) {
+        if let Some(cap) = &mut self.capture {
+            cap.builder.marked_content(mcid, page, scope);
+            return;
+        }
+        if page != self.target {
+            return;
+        }
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+        self.content.push(OrderedContent {
+            page,
+            mcid: Some(mcid),
+            struct_type: frame.type_str.clone(),
+            parsed_type: frame.parsed_type.clone(),
+            is_heading: frame.is_heading,
+            heading_level: frame.ctx.heading_level,
+            list_role: frame.ctx.list_role,
+            is_block: frame.is_block,
+            is_word_break: false,
+            block_id: frame.ctx.block_id,
+            section_id: frame.ctx.section_id,
+            in_table: frame.ctx.in_table,
+            preformatted: frame.ctx.preformatted,
+            actual_text: None,
+            mcid_scope: Some(scope),
+        });
+    }
+
+    fn leave(&mut self) {
+        let Some(cap) = &mut self.capture else {
+            self.frames.pop();
+            return;
+        };
+        let finished = cap.builder.leave();
+        cap.depth -= 1;
+        if cap.depth > 0 {
+            return;
+        }
+        let ctx = cap.ctx;
+        self.capture = None;
+        let Some(elem) = finished else { return };
+        let mut by_page = std::collections::HashMap::new();
+        traverse_element_all_pages(&elem, ctx, &mut self.counter, &mut by_page);
+        if let Some(found) = by_page.remove(&self.target) {
+            self.content.extend(found);
+        }
+        super::table_extractor::collect_tables_on_page(&elem, self.target, &mut self.tables);
+    }
+}
+
+/// The structure of one page, produced by one walk of the tree. The result
+/// equals `traverse_structure_tree_all_pages(tree)[page]` and the page's
+/// bucket of `find_table_elements_all_pages(tree)`; the tree is never held.
+pub(crate) fn page_structure(
+    document: &crate::document::PdfDocument,
+    header: &StructHeader,
+    page: u32,
+) -> Result<PageStructure, Error> {
+    let mut walk = PageWalk {
+        target: page,
+        counter: 0,
+        frames: Vec::new(),
+        capture: None,
+        content: Vec::new(),
+        tables: Vec::new(),
+    };
+    walk_structure_tree(document, header, ParseBudget::unbounded(), &mut walk)?;
+    Ok(PageStructure {
+        content: walk.content,
+        tables: walk.tables,
+    })
+}
+
+/// Holds an element that bears `/ActualText` whole, since its scope needs to
+/// look ahead into its subtree, and hands it to [`walk_actualtext`].
+struct ActualTextWalk {
+    builder: Builder,
+    /// Open elements of the captured subtree; 0 while none is captured.
+    depth: usize,
+    /// Open elements outside any captured subtree.
+    outside: usize,
+    index: ActualTextIndex,
+}
+
+impl StructVisitor for ActualTextWalk {
+    fn enter(&mut self, head: ElemHead) {
+        if self.depth > 0 || head.actual_text.is_some() {
+            self.builder.enter(head);
+            self.depth += 1;
+        } else {
+            self.outside += 1;
+        }
+    }
+
+    fn marked_content(&mut self, mcid: u32, page: u32, scope: McidScope) {
+        if self.depth > 0 {
+            self.builder.marked_content(mcid, page, scope);
+        }
+    }
+
+    fn leave(&mut self) {
+        if self.depth == 0 {
+            self.outside -= 1;
+            return;
+        }
+        let finished = self.builder.leave();
+        self.depth -= 1;
+        if let Some(elem) = finished {
+            walk_actualtext(&elem, None, &mut self.index);
+        }
+    }
+}
+
+/// [`build_actualtext_index`] over a walk of the tree: only the subtrees that
+/// bear `/ActualText` are held, each until its scope is read.
+pub(crate) fn streamed_actualtext_index(
+    document: &crate::document::PdfDocument,
+    header: &StructHeader,
+) -> Result<ActualTextIndex, Error> {
+    let mut walk = ActualTextWalk {
+        builder: Builder::default(),
+        depth: 0,
+        outside: 0,
+        index: ActualTextIndex::new(),
+    };
+    walk_structure_tree(document, header, ParseBudget::unbounded(), &mut walk)?;
+    Ok(walk.index)
+}
+// ── end pdf_manipulator patch ──
+
 #[cfg(test)]
 mod tests {
     use super::*;

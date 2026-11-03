@@ -425,6 +425,18 @@ fn collect_table_elements_all_pages(
     }
 }
 
+// ── pdf_manipulator patch: the Table elements of a subtree that have content on one page ──
+/// What [`find_table_elements_all_pages`] puts in `page`'s bucket, for the
+/// subtree `elem` alone.
+pub(crate) fn collect_tables_on_page(elem: &StructElem, page: u32, out: &mut Vec<StructElem>) {
+    let mut by_page = std::collections::HashMap::new();
+    collect_table_elements_all_pages(elem, &mut by_page);
+    if let Some(found) = by_page.remove(&page) {
+        out.extend(found);
+    }
+}
+// ── end pdf_manipulator patch ──
+
 /// Collect the set of pages on which `elem` (or any descendant) has content.
 /// Mirrors the truth set of [`element_has_page_content`] across all pages.
 fn collect_content_pages(elem: &StructElem, pages: &mut std::collections::BTreeSet<u32>) {

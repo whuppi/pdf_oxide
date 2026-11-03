@@ -20,6 +20,34 @@ struct Tracking;
 pub(super) static HELD: AtomicUsize = AtomicUsize::new(0);
 pub(super) static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+std::thread_local! {
+    /// What the current thread holds, and the most it held since [`thread_growth`] began.
+    /// Plain cells without a destructor, so the allocator may touch them.
+    static MINE: std::cell::Cell<(isize, isize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn mine_add(bytes: isize) {
+    MINE.with(|m| {
+        let (held, peak) = m.get();
+        let held = held + bytes;
+        m.set((held, peak.max(held)));
+    });
+}
+
+/// Runs `f` and returns what it returned with the most bytes this thread held
+/// above where it began. Unlike `HELD` and `PEAK` it is blind to every other test
+/// thread, so a bound on it is tight.
+pub(super) fn thread_growth<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let base = MINE.with(|m| {
+        let (held, _) = m.get();
+        m.set((held, held));
+        held
+    });
+    let out = f();
+    let peak = MINE.with(|m| m.get().1);
+    (out, (peak - base).max(0) as usize)
+}
+
 // SAFETY: every call is forwarded to the system allocator unchanged; only counters are added.
 unsafe impl GlobalAlloc for Tracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -27,6 +55,7 @@ unsafe impl GlobalAlloc for Tracking {
         if !p.is_null() {
             let now = HELD.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             PEAK.fetch_max(now, Ordering::Relaxed);
+            mine_add(layout.size() as isize);
         }
         p
     }
@@ -34,6 +63,7 @@ unsafe impl GlobalAlloc for Tracking {
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         System.dealloc(p, layout);
         HELD.fetch_sub(layout.size(), Ordering::Relaxed);
+        mine_add(-(layout.size() as isize));
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -46,6 +76,7 @@ unsafe impl GlobalAlloc for Tracking {
             } else {
                 HELD.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
             }
+            mine_add(new_size as isize - layout.size() as isize);
         }
         q
     }

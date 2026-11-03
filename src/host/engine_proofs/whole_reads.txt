@@ -39,8 +39,4 @@ rendering::separation_renderer::paint_image_mask_to_plates
 rendering::separation_renderer::scan_operators_for_inks
 rendering::sidecar::try_retarget_cmyk_via_embedded_profile
 signatures::pades::dss_read::stream_array
-xfa::extractor::extract_xfa
-xfa::extractor::extract_xfa_array
-xfa::extractor::extract_xfa_packets
-xfa::extractor::extract_xfa_packets_from_array
 xref::parse_xref_stream

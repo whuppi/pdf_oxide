@@ -499,11 +499,13 @@ pub struct PdfDocument {
     /// Cached structure tree (None = not yet checked, Some(None) = untagged, Some(Some) = tagged).
     /// Uses Arc to avoid expensive deep clones on every page extraction.
     /// Mutex provides interior mutability for `&self` read-path methods (#398).
-    structure_tree_cache: Mutex<Option<Option<Arc<crate::structure::StructTreeRoot>>>>,
-    /// Cached per-page structure tree traversal results.
-    /// Built once from the structure tree, then O(1) lookup per page.
-    /// Mutex provides interior mutability for `&self` read-path methods (#398).
-    structure_content_cache: Mutex<Option<HashMap<u32, Vec<crate::structure::OrderedContent>>>>,
+    structure_tree_cache: Mutex<Option<Option<Arc<crate::structure::StructHeader>>>>,
+    // ── pdf_manipulator patch: the structure of the last page asked for, not of every page ──
+    /// The structure of the page last asked for (marked content in reading
+    /// order, the `Table` elements on it): one walk of the tree produces it,
+    /// and the next page replaces it.
+    structure_page_cache: Mutex<Option<(u32, Arc<crate::structure::PageStructure>)>>,
+    // ── end pdf_manipulator patch ──
     /// Cached resolved structure-tree `/ActualText` scopes.
     ///
     /// `None` = not yet built, `Some(None)` = built and the document has
@@ -531,11 +533,6 @@ pub struct PdfDocument {
     /// it covers, so a struct-tree-scope `/ActualText` on an ancestor
     /// element must NOT override it.
     pub(crate) mc_actualtext_mcids: Mutex<HashMap<usize, HashSet<u32>>>,
-    /// `Table` structure elements bucketed by page, built once via
-    /// `find_table_elements_all_pages` (one tree walk) so the converter table
-    /// path does an O(1) lookup instead of walking the tree per page.
-    /// `None` = not yet built.
-    table_elements_cache: Mutex<Option<HashMap<u32, Vec<crate::structure::StructElem>>>>,
     /// Page object cache keyed by page index to avoid re-traversing the page tree.
     /// The page tree structure is static (§7.7.3.2), so pages can be safely cached.
     /// Mutex provides interior mutability for `&self` read-path methods (#398).
@@ -1336,10 +1333,9 @@ impl PdfDocument {
             // ── end pdf_manipulator patch ──
             font_id_hash_cache: Mutex::new(HashMap::new()),
             structure_tree_cache: Mutex::new(None),
-            structure_content_cache: Mutex::new(None),
+            structure_page_cache: Mutex::new(None),
             actualtext_index_cache: Mutex::new(None),
             mc_actualtext_mcids: Mutex::new(HashMap::new()),
-            table_elements_cache: Mutex::new(None),
             page_cache: Mutex::new(BoundedEntryCache::new(PAGE_WINDOW)),
             page_tree_index: Mutex::new(None),
             page_walks: AtomicUsize::new(0),
@@ -4491,6 +4487,43 @@ impl PdfDocument {
         crate::structure::parse_structure_tree_with_budget(self, budget)
     }
 
+    // ── pdf_manipulator patch: the structure tree is opened and walked per page, never held whole ──
+    /// Reads the head of the structure tree: `None` when the document is not
+    /// tagged.
+    fn open_structure_header(&self) -> Option<Arc<crate::structure::StructHeader>> {
+        crate::structure::open_structure_tree(self).ok().flatten().map(Arc::new)
+    }
+
+    /// The structure of `page_index`: its marked content in reading order and
+    /// its `Table` elements. One walk of the tree produces it; the page last
+    /// asked for stays cached. A tree that cannot be walked yields an empty
+    /// structure.
+    pub(crate) fn page_structure(
+        &self,
+        header: &crate::structure::StructHeader,
+        page_index: u32,
+    ) -> Arc<crate::structure::PageStructure> {
+        if let Some((cached, structure)) = self.structure_page_cache.lock_or_recover().as_ref() {
+            if *cached == page_index {
+                return Arc::clone(structure);
+            }
+        }
+        let structure = Arc::new(
+            crate::structure::traversal::page_structure(self, header, page_index).unwrap_or_else(
+                |e| {
+                    log::warn!("Structure tree of page {} could not be walked: {}", page_index, e);
+                    crate::structure::PageStructure {
+                        content: Vec::new(),
+                        tables: Vec::new(),
+                    }
+                },
+            ),
+        );
+        *self.structure_page_cache.lock_or_recover() = Some((page_index, Arc::clone(&structure)));
+        structure
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Returns the document's structure tree **only when it is trustworthy for
     /// reading-order purposes**, per ISO 32000-1:2008 §14.8.2.3.1 and §14.7.1.
     ///
@@ -4507,7 +4540,7 @@ impl PdfDocument {
     /// order, so the tree is rejected and callers fall back to geometric order.
     ///
     /// Shares `structure_tree_cache`, so this costs a single cached parse.
-    pub(crate) fn struct_tree_trustworthy(&self) -> Option<Arc<crate::structure::StructTreeRoot>> {
+    pub(crate) fn struct_tree_trustworthy(&self) -> Option<Arc<crate::structure::StructHeader>> {
         let mark = self.mark_info().unwrap_or_default();
         // Suspect documents: geometric reading order is spec-correct
         // (§14.8.2.3.1). This is the only behavioural change versus the legacy
@@ -4525,7 +4558,11 @@ impl PdfDocument {
                     .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
                     .unwrap_or(false);
                 let tree = if mark.marked || has_struct_tree_root {
-                    self.structure_tree().ok().flatten().map(Arc::new)
+                    {
+                        // ── pdf_manipulator patch: the head of the tree is read; pages walk it ──
+                        self.open_structure_header()
+                        // ── end pdf_manipulator patch ──
+                    }
                 } else {
                     None
                 };
@@ -4551,7 +4588,7 @@ impl PdfDocument {
     ///
     /// Shares `structure_tree_cache` with `struct_tree_trustworthy`, so
     /// both predicates cost a single cached parse.
-    pub(crate) fn struct_tree_marked(&self) -> Option<Arc<crate::structure::StructTreeRoot>> {
+    pub(crate) fn struct_tree_marked(&self) -> Option<Arc<crate::structure::StructHeader>> {
         let cached = self.structure_tree_cache.lock_or_recover().clone();
         match cached {
             Some(tree) => tree,
@@ -4563,7 +4600,11 @@ impl PdfDocument {
                     .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
                     .unwrap_or(false);
                 let tree = if mark.marked || has_struct_tree_root {
-                    self.structure_tree().ok().flatten().map(Arc::new)
+                    {
+                        // ── pdf_manipulator patch: the head of the tree is read; pages walk it ──
+                        self.open_structure_header()
+                        // ── end pdf_manipulator patch ──
+                    }
                 } else {
                     None
                 };
@@ -4586,7 +4627,10 @@ impl PdfDocument {
         }
         let tree = self.struct_tree_marked();
         let built = tree.and_then(|t| {
-            let idx = crate::structure::traversal::build_actualtext_index(&t);
+            // ── pdf_manipulator patch: the index is built while the tree is walked ──
+            let idx = crate::structure::traversal::streamed_actualtext_index(self, &t)
+                .unwrap_or_else(|_| crate::structure::ActualTextIndex::new());
+            // ── end pdf_manipulator patch ──
             if idx.is_empty() {
                 None
             } else {
@@ -6656,16 +6700,14 @@ impl PdfDocument {
         }
 
         let text = if let Some(ref struct_tree) = cached_tree {
-            // Build per-page traversal cache once, then O(1) lookup per page.
-            if self.structure_content_cache.lock_or_recover().is_none() {
-                let all_content = crate::structure::traverse_structure_tree_all_pages(struct_tree);
-                *self.structure_content_cache.lock_or_recover() = Some(all_content);
-            }
+            // ── pdf_manipulator patch: the page's structure is walked for, not looked up in a whole-document cache ──
             self.extract_text_structure_order_cached_with_spans(
                 page_index,
+                struct_tree,
                 all_spans,
                 options.include_artifacts,
             )?
+            // ── end pdf_manipulator patch ──
         } else {
             // Untagged or Suspects=true PDF: use page content
             // (geometric) order. Apply struct-tree-scope `/ActualText`
@@ -12738,52 +12780,45 @@ impl PdfDocument {
         out
     }
 
-    /// Page's MCID reading order from the all-pages traversal cache
-    /// (`structure_content_cache`, populated once). `build_context` previously
-    /// re-walked the whole tree per page (≈ O(pages²) on a tagged document);
-    /// the cached all-pages walk (#608) yields the same per-page order.
+    /// Page's MCID reading order, from the page's structure
+    /// (`structure_page_cache`).
     pub(crate) fn cached_mcid_order_for_page(
         &self,
-        struct_tree: &crate::structure::StructTreeRoot,
+        struct_tree: &crate::structure::StructHeader,
         page_index: u32,
     ) -> Vec<(crate::structure::McidScope, u32)> {
-        if self.structure_content_cache.lock_or_recover().is_none() {
-            let all_content = crate::structure::traverse_structure_tree_all_pages(struct_tree);
-            *self.structure_content_cache.lock_or_recover() = Some(all_content);
-        }
-        self.structure_content_cache
-            .lock_or_recover()
-            .as_ref()
-            .and_then(|c| c.get(&page_index))
-            .map(|content| {
-                content
-                    .iter()
-                    .filter_map(|c| {
-                        // Word break markers have mcid=None; skip.
-                        let m = c.mcid?;
-                        // Page-scoped MCIDs default to Page(c.page) when
-                        // the parser didn't capture a scope. New parses
-                        // always populate `mcid_scope`; the unwrap_or
-                        // is for legacy traversals only.
-                        let scope = c
-                            .mcid_scope
-                            .clone()
-                            .unwrap_or(crate::structure::McidScope::Page(c.page));
-                        Some((scope, m))
-                    })
-                    .collect()
+        // ── pdf_manipulator patch: the order comes from the page's own walk ──
+        self.page_structure(struct_tree, page_index)
+            .content
+            .iter()
+            .filter_map(|c| {
+                // Word break markers have mcid=None; skip.
+                let m = c.mcid?;
+                // Page-scoped MCIDs default to Page(c.page) when
+                // the parser didn't capture a scope. New parses
+                // always populate `mcid_scope`; the unwrap_or
+                // is for legacy traversals only.
+                let scope = c
+                    .mcid_scope
+                    .clone()
+                    .unwrap_or(crate::structure::McidScope::Page(c.page));
+                Some((scope, m))
             })
-            .unwrap_or_default()
+            .collect()
+        // ── end pdf_manipulator patch ──
     }
 
     /// Extract text from a Tagged PDF page using pre-computed structure traversal cache.
     ///
     /// This is the optimized version of `extract_text_structure_order` that uses
-    /// the pre-built `structure_content_cache` for O(1) page content lookup instead
-    /// of re-traversing the entire structure tree for each page.
+    /// the page's structure from `structure_page_cache` instead of re-traversing
+    /// the entire structure tree for each use.
     fn extract_text_structure_order_cached_with_spans(
         &self,
         page_index: usize,
+        // ── pdf_manipulator patch: the structure tree's head is passed so the page's structure can be walked ──
+        struct_tree: &crate::structure::StructHeader,
+        // ── end pdf_manipulator patch ──
         all_spans: Vec<TextSpan>,
         include_artifacts: bool,
     ) -> Result<String> {
@@ -12837,16 +12872,10 @@ impl PdfDocument {
         }
 
         // Step 3: Get pre-computed ordered content for this page (O(1) lookup)
-        let ordered_content_owned: Vec<crate::structure::OrderedContent>;
-        let ordered_content = {
-            let cache = self.structure_content_cache.lock_or_recover();
-            ordered_content_owned = cache
-                .as_ref()
-                .and_then(|c| c.get(&(page_index as u32)))
-                .cloned()
-                .unwrap_or_default();
-            &ordered_content_owned as &[crate::structure::OrderedContent]
-        };
+        // ── pdf_manipulator patch: the page's content comes from its own walk ──
+        let page_structure = self.page_structure(struct_tree, page_index as u32);
+        let ordered_content: &[crate::structure::OrderedContent] = &page_structure.content;
+        // ── end pdf_manipulator patch ──
 
         // Resolve struct-tree-scope `/ActualText` via the mcid-driven
         // action map (see `actualtext_actions_for_page`). The index is
@@ -18021,16 +18050,12 @@ impl PdfDocument {
                 // span keeps its geometric position.
                 let mut ordered = self.order_spans_column_aware(spans, page_index)?;
                 if let Some(tree) = self.struct_tree_trustworthy() {
-                    // Populate the structure-content cache, then read it (it carries the
-                    // per-MCID `in_table` flag the mcid-order list does not).
-                    let _ = self.cached_mcid_order_for_page(&tree, page_index as u32);
-                    let content: Vec<crate::structure::OrderedContent> = self
-                        .structure_content_cache
-                        .lock_or_recover()
-                        .as_ref()
-                        .and_then(|c| c.get(&(page_index as u32)))
-                        .cloned()
-                        .unwrap_or_default();
+                    // Read the page's structure (it carries the per-MCID `in_table` flag
+                    // the mcid-order list does not).
+                    // ── pdf_manipulator patch: the page's content comes from its own walk ──
+                    let content: Vec<crate::structure::OrderedContent> =
+                        self.page_structure(&tree, page_index as u32).content.clone();
+                    // ── end pdf_manipulator patch ──
 
                     let page_scope = crate::structure::McidScope::Page(page_index as u32);
                     // Structure rank for TABLE MCIDs only.
@@ -18206,23 +18231,19 @@ impl PdfDocument {
         let Some(ref struct_tree) = self.struct_tree_trustworthy() else {
             return info;
         };
-        if self.structure_content_cache.lock_or_recover().is_none() {
-            let all = crate::structure::traverse_structure_tree_all_pages(struct_tree);
-            *self.structure_content_cache.lock_or_recover() = Some(all);
-        }
-        let cache = self.structure_content_cache.lock_or_recover();
-        if let Some(content) = cache.as_ref().and_then(|c| c.get(&(page_index as u32))) {
-            for item in content {
-                if let Some(mcid) = item.mcid {
-                    if matches!(item.list_role, Some(crate::structure::ListRole::Lbl)) {
-                        info.lbl.insert(mcid);
-                    }
-                    if let Some(sid) = item.section_id {
-                        info.section.insert(mcid, sid as usize);
-                    }
+        // ── pdf_manipulator patch: the page's content comes from its own walk ──
+        let page_structure = self.page_structure(struct_tree, page_index as u32);
+        for item in &page_structure.content {
+            if let Some(mcid) = item.mcid {
+                if matches!(item.list_role, Some(crate::structure::ListRole::Lbl)) {
+                    info.lbl.insert(mcid);
+                }
+                if let Some(sid) = item.section_id {
+                    info.section.insert(mcid, sid as usize);
                 }
             }
         }
+        // ── end pdf_manipulator patch ──
         info
     }
 
@@ -22269,7 +22290,11 @@ impl PdfDocument {
                             .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
                             .unwrap_or(false);
                     let tree = if is_marked || has_struct_tree_root {
-                        self.structure_tree().ok().flatten().map(Arc::new)
+                        {
+                        // ── pdf_manipulator patch: the head of the tree is read; pages walk it ──
+                        self.open_structure_header()
+                        // ── end pdf_manipulator patch ──
+                    }
                     } else {
                         None
                     };
@@ -22279,18 +22304,10 @@ impl PdfDocument {
             }
         };
         if let Some(ref struct_tree) = struct_tree_opt {
-            // Build the per-page Table-element buckets once, then look up.
-            if self.table_elements_cache.lock_or_recover().is_none() {
-                let all = crate::structure::find_table_elements_all_pages(struct_tree);
-                *self.table_elements_cache.lock_or_recover() = Some(all);
-            }
-            let table_elems: Vec<crate::structure::StructElem> = self
-                .table_elements_cache
-                .lock_or_recover()
-                .as_ref()
-                .and_then(|c| c.get(&(page_index as u32)))
-                .cloned()
-                .unwrap_or_default();
+            // ── pdf_manipulator patch: the page's Table elements come from its own walk ──
+            let table_elems: Vec<crate::structure::StructElem> =
+                self.page_structure(struct_tree, page_index as u32).tables.clone();
+            // ── end pdf_manipulator patch ──
             if !table_elems.is_empty() {
                 let mut tables = Vec::new();
                 for table_elem in &table_elems {
@@ -22869,21 +22886,12 @@ impl PdfDocument {
             let cached_tree = self.struct_tree_trustworthy();
 
             if let Some(ref struct_tree) = cached_tree {
-                // Build per-page traversal cache once, then O(1) lookup per page
-                if self.structure_content_cache.lock_or_recover().is_none() {
-                    let all_content =
-                        crate::structure::traverse_structure_tree_all_pages(struct_tree);
-                    *self.structure_content_cache.lock_or_recover() = Some(all_content);
-                }
-
                 // Extract MCID order AND per-MCID structural role for this page.
-                let cached_page_owned = self
-                    .structure_content_cache
-                    .lock_or_recover()
-                    .as_ref()
-                    .and_then(|cache| cache.get(&(page_index as u32)))
-                    .cloned();
-                let cached_page = cached_page_owned.as_deref();
+                // ── pdf_manipulator patch: the page's content comes from its own walk ──
+                let page_structure = self.page_structure(struct_tree, page_index as u32);
+                let cached_page: Option<&[crate::structure::OrderedContent]> =
+                    Some(&page_structure.content);
+                // ── end pdf_manipulator patch ──
 
                 // The scope travels with the id — §14.7.4.2 scopes an /MCID
                 // to its content stream, so a form's 0 and the page's 0 are
