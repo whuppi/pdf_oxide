@@ -246,7 +246,9 @@ pub struct SaveOptions {
     /// dictionary whose content cannot be read, or that an object outside
     /// the pages' own resources also points at, stays whole, and so do the
     /// resources of a page the save edits. The AcroForm's `/DR` is never
-    /// touched. An incremental save ignores it.
+    /// touched. The embedded TrueType and CID CFF font programs are cut down
+    /// to the glyphs the kept pages show, every glyph id kept (see
+    /// `host::font_subset`). An incremental save ignores it.
     pub prune_resources: bool,
     // ── end pdf_manipulator patch ──
 }
@@ -4959,6 +4961,27 @@ impl DocumentEditor {
             cancel,
         )?);
         // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: embedded font programs cut down to the glyphs shown, ids kept ──
+        if options.prune_resources {
+            let held = self.pages_edited_while_writing();
+            let fonts = crate::host::font_subset::plan(
+                crate::host::font_subset::Scope {
+                    doc: &self.source,
+                    staged: &self.modified_objects,
+                    overrides: &prune.overrides,
+                    aliases: &aliases,
+                    pages: prune
+                        .kept_pages
+                        .iter()
+                        .map(|&id| (id, held.contains(&id)))
+                        .collect(),
+                    level: options.deflate_level,
+                },
+                cancel,
+            )?;
+            prune.overrides.extend(fonts);
+        }
+        // ── end pdf_manipulator patch ──
 
         // ── pdf_manipulator patch: a loaded stream is deflated or re-deflated, kept only if smaller ──
         /// Deflate a stream object with no filter, or re-deflate one with a
@@ -7882,8 +7905,9 @@ impl DocumentEditor {
                     continue;
                 }
             }
-            // ── pdf_manipulator patch: an unchanged source stream is copied, not loaded ──
+            // ── pdf_manipulator patch: an unchanged source stream the plan does not replace is copied, not loaded ──
             if !self.modified_objects.contains_key(&obj_id)
+                && !prune.overrides.contains_key(&obj_id)
                 && Self::write_source_stream(
                     &self.source,
                     &mut self.next_object_id,
