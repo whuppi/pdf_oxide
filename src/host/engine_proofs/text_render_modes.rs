@@ -4,9 +4,9 @@
 //! A 160 pt Helvetica "H" is shown in each mode with a red fill, a blue
 //! stroke and `4 w`, then a green rectangle is filled after `ET`. The oracle
 //! for each page is the same page with the glyph drawn as a path: the
-//! outline is read with `ttf_parser` from the face `fontdb` returns for the
-//! first query the rasteriser makes for an unembedded "Helvetica" (family
-//! "Helvetica", then the generic serif and sans-serif families), scaled by
+//! outline is read with `ttf_parser` from the exact face the rasteriser draws
+//! an unembedded "Helvetica" with (`TextRasterizer::unembedded_face`, the
+//! rasteriser's own resolution over its own font database), scaled by
 //! 160/units-per-em and placed at the text origin, then painted with
 //! `f`, `S` or `B` and, for the clipping modes, clipped with `W n`. The pages
 //! are rendered at 72 dpi on a transparent background and must be the same
@@ -18,7 +18,7 @@
 
 use super::band_proof::{Fixture, HELVETICA};
 use crate::document::PdfDocument;
-use crate::rendering::{render_page, RenderOptions};
+use crate::rendering::{render_page, RenderOptions, TextRasterizer};
 use std::fmt::Write;
 
 const SIZE: f32 = 160.0;
@@ -72,25 +72,13 @@ impl ttf_parser::OutlineBuilder for Ops {
 
 /// The "H" outline as path operators in page space.
 fn outline() -> String {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-    let families = [fontdb::Family::Name("Helvetica"), fontdb::Family::Serif, fontdb::Family::SansSerif];
-    let id = db
-        .query(&fontdb::Query {
-            families: &families,
-            weight: fontdb::Weight::NORMAL,
-            stretch: fontdb::Stretch::Normal,
-            style: fontdb::Style::Normal,
-        })
-        .expect("a system face answers the Helvetica query");
-    db.with_face_data(id, |data, index| {
-        let face = ttf_parser::Face::parse(data, index).expect("face parses");
-        let glyph = face.glyph_index('H').expect("face has an H");
-        let mut ops = Ops { text: String::new(), scale: SIZE / face.units_per_em() as f32, at: (0.0, 0.0) };
-        face.outline_glyph(glyph, &mut ops).expect("H has an outline");
-        ops.text
-    })
-    .expect("face data")
+    let (data, index) = TextRasterizer::unembedded_face("Helvetica")
+        .expect("the rasteriser has a face for an unembedded Helvetica; without one it draws nothing");
+    let face = ttf_parser::Face::parse(&data, index).expect("face parses");
+    let glyph = face.glyph_index('H').expect("face has an H");
+    let mut ops = Ops { text: String::new(), scale: SIZE / face.units_per_em() as f32, at: (0.0, 0.0) };
+    face.outline_glyph(glyph, &mut ops).expect("H has an outline");
+    ops.text
 }
 
 /// The eight pages the band identity proof renders too.

@@ -1169,6 +1169,14 @@ impl TextRasterizer {
         None
     }
 
+    // ── pdf_manipulator patch: expose the face an unembedded font is drawn with, so the text-mode oracle uses the rasteriser's own resolution ──
+    #[cfg(test)]
+    pub(crate) fn unembedded_face(pdf_font_name: &str) -> Option<(Arc<Vec<u8>>, u32)> {
+        let (_, data, index) = Self::new().load_font_data(pdf_font_name)?;
+        Some((data, index))
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Access the font database.
     fn font_db(&self) -> &fontdb::Database {
         &self.fontdb

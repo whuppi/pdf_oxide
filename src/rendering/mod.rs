@@ -49,6 +49,10 @@ pub(crate) mod separation_renderer;
 /// (`CmykSidecar`) remain `pub(crate)`.
 pub mod sidecar;
 mod text_rasterizer;
+// ── pdf_manipulator patch: the text-mode oracle reads the rasteriser's face ──
+#[cfg(test)]
+pub(crate) use text_rasterizer::TextRasterizer;
+// ── end pdf_manipulator patch ──
 
 // ── pdf_manipulator patch: pages are rastered in bands ──
 pub use band::{render_page_rows, BandPlan, RowSink};

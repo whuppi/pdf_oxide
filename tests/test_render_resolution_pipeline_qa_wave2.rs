@@ -607,28 +607,43 @@ fn qa_text_tr7_clip_only_renders_without_panic() {
     assert_eq!(on.len(), 100 * 100 * 4, "Tr=7 must produce a full pixmap");
 }
 
-/// Probe 6 — Tr changes mid-stream. Sequence: Tr=0 Tj, `Tr 2`, Tr=2 Tj.
-/// Each call gets its own pipeline-resolve; the previous call's spliced
-/// GS clone must not leak into the next call's borrowed `gs`.
+// ── pdf_manipulator patch: per-glyph proof that a Tr change does not leak; the page-average red test depended on how thin the system face is ──
+/// Probe 6 — Tr changes mid-stream. Sequence: Tr=0 Tj, `Tr 2`, Tr=2 Tj,
+/// `Tr 0`, Tr=0 Tj. Each call gets its own pipeline-resolve; the previous
+/// call's spliced GS clone must not leak into the next call's borrowed `gs`.
+/// The glyphs sit in three disjoint column bands of the 100x100 page, so
+/// each band holds one glyph: A (Tr 0) and C (Tr 0) are red with no blue
+/// stroke, B (Tr 2) is red and blue.
 #[test]
 fn qa_text_tr_change_mid_stream_no_leak_paints_red() {
     let content = "BT 1 0 0 rg 0 0 1 RG /F1 20 Tf 5 60 Td \
                    0 Tr (A) Tj \
-                   2 Tr (B) Tj \
-                   0 Tr (C) Tj ET\n";
+                   35 0 Td 2 Tr (B) Tj \
+                   35 0 Td 0 Tr (C) Tj ET\n";
     let bytes = build_pdf_text(content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
     let on = render_with_pipeline(&doc, true);
-    // Tr changes don't leak GS state between Tj calls — every Tj
-    // resolves cleanly. Painted ink must be the fill (red), not the
-    // stroke (blue), across all three glyphs.
-    let avg = average_ink_rgb(&on, 0, 0, 100, 100);
-    let (r, g, b) = avg.expect("Tr change mid-stream must paint glyph ink");
-    assert!(
-        r > 180.0 && r > g + 60.0 && r > b + 60.0,
-        "Tr change mid-stream must paint red fill across all glyphs, got ({r:.1}, {g:.1}, {b:.1})"
-    );
+    let bands = [("A (Tr 0)", 0usize, 33usize), ("B (Tr 2)", 33, 66), ("C (Tr 0)", 66, 100)];
+    let band_counts = |x0: usize, x1: usize| {
+        let mut band = Vec::new();
+        for row in on.chunks_exact(100 * 4) {
+            band.extend_from_slice(&row[x0 * 4..x1 * 4]);
+        }
+        let red = count_rgb(&band, |r, g, b| r > 180 && g < 80 && b < 80);
+        let blue = count_rgb(&band, |r, g, b| b > 180 && r < 80 && g < 80);
+        (red, blue)
+    };
+    for (name, x0, x1) in bands {
+        let (red, blue) = band_counts(x0, x1);
+        assert!(red > 0, "glyph {name} (columns {x0}..{x1}) must be filled red, red pixels {red}");
+        if name.contains("Tr 2") {
+            assert!(blue > 0, "glyph {name} (columns {x0}..{x1}) must be stroked blue, blue pixels {blue}");
+        } else {
+            assert_eq!(blue, 0, "glyph {name} (columns {x0}..{x1}) must not take B's stroke, blue pixels {blue}");
+        }
+    }
 }
+// ── end pdf_manipulator patch ──
 
 // ============================================================================
 // Spot-colour text probes — Separation / DeviceN / All / None on text fill.
