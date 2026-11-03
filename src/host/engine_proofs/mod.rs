@@ -39,6 +39,8 @@ mod font_subset_walk;
 mod group_proof;
 #[cfg(feature = "rendering")]
 mod reduce_proof;
+#[cfg(feature = "rendering")]
+mod render_named_glyphs;
 mod editor_pages;
 mod editor_resource_prune;
 mod editor_save;

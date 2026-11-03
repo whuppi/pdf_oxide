@@ -6064,8 +6064,10 @@ fn builtin_encoding_looks_like_cipher(prog_enc: &HashMap<u8, char>, std_name: &s
     overlap > 0 && (agree as f32 / overlap as f32) < 0.5
 }
 
+// ── pdf_manipulator patch: the host's named-glyph mapping reads a predefined encoding's code → Unicode ──
 /// The Unicode string for this character, or None if not in the encoding.
-fn standard_encoding_lookup(encoding: &str, code: u8) -> Option<String> {
+pub(crate) fn standard_encoding_lookup(encoding: &str, code: u8) -> Option<String> {
+// ── end pdf_manipulator patch ──
     match encoding {
         "PDFDocEncoding" => {
             // PDFDocEncoding: superset of ISO Latin-1 with special 128-159 range

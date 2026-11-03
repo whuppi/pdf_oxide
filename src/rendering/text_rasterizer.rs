@@ -8,7 +8,9 @@
 //!
 //! This module provides a text rendering implementation that:
 //! - Uses system fonts as fallback when embedded fonts aren't available
-//! - Renders text using harfrust for shaping and tiny-skia for drawing glyph paths
+// ── pdf_manipulator patch: the glyphs a PDF names are drawn as named, never shaped ──
+//! - Renders text using tiny-skia for drawing glyph paths, one glyph per character code
+// ── end pdf_manipulator patch ──
 
 use super::{create_fill_paint, guarded_fill_path};
 // ── pdf_manipulator patch: a stroke-coverage render strokes the outline ──
@@ -186,50 +188,48 @@ fn cached_font_bytes(id: fontdb::ID, db: &fontdb::Database) -> Option<(Arc<Vec<u
 
 /// Parsed font faces cached by fontdb ID.
 ///
-/// harfrust's `FontRef` and `ttf_parser::Face` both borrow the backing bytes.
+// ── pdf_manipulator patch: the text names its glyphs, so no shaper is built or kept ──
+/// `ttf_parser::Face` borrows the backing bytes.
 /// We use a self-referential pattern (backed Arc keeps bytes alive) with
-/// unsafe 'static transmute so we can store them in a process-wide cache
-/// and reuse them across hundreds of render_text calls for the same font.
-/// `ShaperData` caches the shaping tables derived from the font (owned, no
-/// borrow) so each render only has to build a cheap `Shaper` from it.
+/// unsafe 'static transmute so we can store it in a process-wide cache
+/// and reuse it across hundreds of render_text calls for the same font.
+// ── end pdf_manipulator patch ──
 ///
 /// # Safety
-/// The `font` and `ttf_face` fields borrow `_data`'s heap allocation (not the
+// ── pdf_manipulator patch: the text names its glyphs, so no shaper is built or kept ──
+/// The `ttf_face` field borrows `_data`'s heap allocation (not the
+// ── end pdf_manipulator patch ──
 /// Arc pointer itself, so no double-free on Arc drop). They are only ever
 /// accessed while `_data` is alive — i.e., while this struct exists.
 /// Because the struct is behind `Arc`, it lives at least as long as any
 /// caller that holds a clone of that Arc.
 struct CachedFace {
     _data: Arc<Vec<u8>>,
-    font: harfrust::FontRef<'static>,
-    shaper_data: harfrust::ShaperData,
+    // ── pdf_manipulator patch: the text names its glyphs, so no shaper is built or kept ──
     ttf_face: ttf_parser::Face<'static>,
+    // ── end pdf_manipulator patch ──
     pub units_per_em: f32,
 }
 
-// SAFETY: harfrust::FontRef and ttf_parser::Face only borrow immutable bytes;
-// harfrust::ShaperData owns the cached tables it derives from the font.
+// ── pdf_manipulator patch: the text names its glyphs, so no shaper is built or kept ──
+// SAFETY: ttf_parser::Face only borrows immutable bytes.
+// ── end pdf_manipulator patch ──
 unsafe impl Send for CachedFace {}
 unsafe impl Sync for CachedFace {}
 
 impl CachedFace {
     fn new(data: Arc<Vec<u8>>, index: u32) -> Option<Self> {
-        let font: harfrust::FontRef<'_> = harfrust::FontRef::from_index(&data, index).ok()?;
+        // ── pdf_manipulator patch: the text names its glyphs, so no shaper is built or kept ──
         let ttf_face: ttf_parser::Face<'_> = ttf_parser::Face::parse(&data, index).ok()?;
         let units_per_em = ttf_face.units_per_em() as f32;
-        // SAFETY: both the font and ttf_face borrow the data slice. We store an
-        // Arc to that data in `_data`, ensuring the bytes stay alive for this
-        // struct's lifetime.
-        let font: harfrust::FontRef<'static> = unsafe { std::mem::transmute(font) };
+        // SAFETY: ttf_face borrows the data slice. We store an Arc to that
+        // data in `_data`, ensuring the bytes stay alive for this struct's
+        // lifetime.
         let ttf_face: ttf_parser::Face<'static> = unsafe { std::mem::transmute(ttf_face) };
-        // ShaperData owns its derived tables (no borrow of `font`), so it is
-        // safe to build from the now-'static font and store it alongside.
-        let shaper_data = harfrust::ShaperData::new(&font);
         Some(CachedFace {
             _data: data,
-            font,
-            shaper_data,
             ttf_face,
+        // ── end pdf_manipulator patch ──
             units_per_em,
         })
     }
@@ -653,6 +653,21 @@ impl TextRasterizer {
                     // probe; the process-wide memoisation was removed as
                     // unsound under concurrency (issue #505).
                     let (is_byte_indexed, has_unicode_cmap) = classify_embedded_font(embedded);
+                    // ── pdf_manipulator patch: an embedded simple TrueType font draws the glyph ids its codes name (ISO 32000-2, 9.6.5.4), whatever cmap it carries ──
+                    if info.subtype == "TrueType" && info.is_truetype_font {
+                        return self.render_cid_direct(
+                            pixmap,
+                            text,
+                            info,
+                            embedded,
+                            0,
+                            &paint,
+                            base_transform,
+                            gs,
+                            clip_mask,
+                        );
+                    }
+                    // ── end pdf_manipulator patch ──
                     if info.subtype != "Type0" && is_byte_indexed {
                         log::debug!(
                         "Using embedded font '{}' with byte-indexed cmap (simple TrueType subset)",
@@ -692,13 +707,16 @@ impl TextRasterizer {
                     // `GrpOne` ordering for which no predefined table exists.
                     let cid_keyed_cff = info.subtype == "Type0"
                         && info.cid_font_type.as_deref() == Some("CIDFontType0");
-                    if has_unicode_cmap && !cid_keyed_cff {
+                    // ── pdf_manipulator patch: every embedded CIDFontType2 takes the direct path, whatever cmap its font carries ──
+                    let cid_truetype = info.subtype == "Type0"
+                        && info.cid_font_type.as_deref() == Some("CIDFontType2");
+                    if has_unicode_cmap && !cid_keyed_cff && !cid_truetype {
+                    // ── end pdf_manipulator patch ──
                         log::debug!("Using embedded font data for '{}'", info.base_font);
                         Some((None, Arc::clone(embedded), 0, false))
-                    } else if info.subtype == "Type0"
-                        && info.cid_to_gid_map.is_some()
-                        && info.cid_font_type.as_deref() == Some("CIDFontType2")
-                    {
+                    // ── pdf_manipulator patch: every embedded CIDFontType2 takes the direct path, whatever cmap its font carries ──
+                    } else if cid_truetype {
+                    // ── end pdf_manipulator patch ──
                         // CIDFontType2 (TrueType) with CIDToGIDMap — use direct GID rendering.
                         log::debug!(
                             "Using embedded font '{}' with CIDToGIDMap (CIDFontType2)",
@@ -724,14 +742,13 @@ impl TextRasterizer {
                         //
                         // Type0 + CIDFontType0 (CFF / OpenType-CFF): Identity-H
                         // emission means the content-stream's 2-byte codes ARE
-                        // the GIDs in the CFF charset; bypass harfrust Unicode
-                        // shaping (which round-trips CID→Unicode→GID through
-                        // the patched cmap and can drift on CFF charset
-                        // positions) and feed the raw codes to
+                        // ── pdf_manipulator patch: the raw codes are the glyph ids; no Unicode round trip ──
+                        // the GIDs in the CFF charset; the raw codes go to
                         // render_cid_direct (G3-h). ttf-parser handles CFF
                         // outlines for sfnt-wrapped OpenType-CFF (OTTO); raw
                         // CFF streams were already wrapped by
                         // `font_dict::wrap_cff_in_opentype` at load time.
+                        // ── end pdf_manipulator patch ──
                         log::debug!(
                             "Using embedded CFF font '{}' with direct GID mapping",
                             info.base_font
@@ -756,7 +773,9 @@ impl TextRasterizer {
 
         if let Some((font_id, font_data, index, use_cid_to_gid)) = font_data_and_index {
             if use_cid_to_gid {
-                // Direct CIDToGIDMap/CFF rendering — bypass harfrust, use ttf-parser for glyph outlines
+                // ── pdf_manipulator patch: no shaper exists to bypass ──
+                // Direct CIDToGIDMap/CFF rendering — use ttf-parser for glyph outlines
+                // ── end pdf_manipulator patch ──
                 match self.render_cid_direct(
                     pixmap,
                     text,
@@ -1182,30 +1201,24 @@ impl TextRasterizer {
         let cached_arc: Option<Arc<CachedFace>> =
             font_id.and_then(|id| cached_face(id, Arc::clone(&font_data), index));
 
+        // ── pdf_manipulator patch: the face is parsed once for outlines and cmap; no shaper is built ──
         // Storage for locally-created faces when there is no cache entry
         // (embedded fonts, first-ever render of a system font).
-        let _local_font: Option<harfrust::FontRef<'_>>;
         let _local_ttf: Option<ttf_parser::Face<'_>>;
-        let _local_shaper_data: Option<harfrust::ShaperData>;
 
-        let font_ref: &harfrust::FontRef<'_>;
-        let shaper_data_ref: &harfrust::ShaperData;
         let ttf_face_ref: &ttf_parser::Face<'_>;
         let units_per_em: f32;
 
         if let Some(ref c) = cached_arc {
-            _local_font = None;
             _local_ttf = None;
-            _local_shaper_data = None;
-            font_ref = &c.font;
-            shaper_data_ref = &c.shaper_data;
             ttf_face_ref = &c.ttf_face;
             units_per_em = c.units_per_em;
         } else {
-            let font_opt = harfrust::FontRef::from_index(&font_data, index).ok();
-            if font_opt.is_none() {
+            _local_ttf = ttf_parser::Face::parse(&font_data, index).ok();
+            if _local_ttf.is_none() {
                 if allow_fallback {
-                    log::warn!("Failed to create harfrust font from embedded data for '{}', falling back to system font", pdf_font_name);
+                    log::warn!("Failed to parse font data for '{}', falling back to system font", pdf_font_name);
+        // ── end pdf_manipulator patch ──
                     if let Some((fb_id, fallback_data, fallback_index)) =
                         self.load_font_data(pdf_font_name)
                     {
@@ -1235,44 +1248,14 @@ impl TextRasterizer {
                     clip_mask,
                 );
             }
-            _local_font = font_opt;
-            _local_ttf = ttf_parser::Face::parse(&font_data, index).ok();
-            if _local_ttf.is_none() {
-                return Err(Error::InvalidPdf(format!("Failed to parse font: {}", pdf_font_name)));
-            }
-            font_ref = _local_font.as_ref().unwrap();
+            // ── pdf_manipulator patch: the face is parsed once for outlines and cmap; no shaper is built ──
             ttf_face_ref = _local_ttf.as_ref().unwrap();
             units_per_em = ttf_face_ref.units_per_em() as f32;
-            // ShaperData owns its derived tables (no borrow of `font_ref`).
-            _local_shaper_data = Some(harfrust::ShaperData::new(font_ref));
-            shaper_data_ref = _local_shaper_data.as_ref().unwrap();
+            // ── end pdf_manipulator patch ──
         }
 
-        // 2. Buffer setup
-        let mut buffer = harfrust::UnicodeBuffer::new();
-        buffer.push_str(text);
-
-        // Explicitly set script and direction for better CJK shaping
-        if text
-            .chars()
-            .any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF)
-        {
-            if let Some(script) = harfrust::Script::from_iso15924_tag(harfrust::Tag::new(b"Hani")) {
-                buffer.set_script(script);
-            }
-        }
-        buffer.set_direction(harfrust::Direction::LeftToRight);
-        // Fill in any still-unset segment properties (script for non-CJK,
-        // language) so the shaper picks the right GSUB/GPOS rules. The
-        // explicit direction and CJK script set above are preserved.
-        buffer.guess_segment_properties();
-
-        // 3. Shape the text
-        let shaper = shaper_data_ref.shaper(font_ref).instance(None).build();
-        let glyphs = shaper.shape(buffer, harfrust::ShapeOptions::new());
-        let info = glyphs.glyph_infos();
-        let pos = glyphs.glyph_positions();
-
+// ── pdf_manipulator patch: nothing is shaped; each code's glyphs are placed below, one nominal cmap glyph per character ──
+// ── end pdf_manipulator patch ──
         let scale = font_size / units_per_em;
         log::debug!(
             "render_unicode_text: pdf_font={}, units_per_em={}, font_size={}, scale={}",
@@ -1335,68 +1318,139 @@ impl TextRasterizer {
             .map(|(char_idx, (byte_offset, _))| (byte_offset, char_idx))
             .collect();
 
-        // 5. Iterate through shaped glyphs
-        for i in 0..info.len() {
-            let glyph_id = info[i].glyph_id;
-            let cluster = info[i].cluster as usize;
-
-            // Get character at this cluster (byte offset)
-            let char_at_pos = text[cluster..].chars().next().unwrap_or(' ');
-
-            // Map cluster (Unicode byte offset) to character index
-            let char_idx = cluster_to_char_idx.get(&cluster).copied().unwrap_or(0);
-
-            // Determine how many *source* characters this glyph represents.
-            // For normal 1:1 glyphs, cluster_chars == 1. For shaped
-            // ligatures like the "ffi" glyph (#331 R2), one glyph covers
-            // multiple characters and harfrust reports them with the
-            // same cluster index on every glyph of the cluster. Since we
-            // advance the output cursor by the sum of the PDF-declared
-            // widths of the *source* characters (per PDF §9.2.4 text-
-            // showing advance), we must add the widths of every source
-            // character in the ligature cluster to the cursor, not just
-            // the first character's width. Otherwise a ligature glyph
-            // draws wide but only advances by one character's worth, and
-            // subsequent glyphs overwrite the tail of the ligature —
-            // exactly the `Efficient` → `Effi ert` symptom reported in
-            // #331 on arxiv-style LaTeX-embedded fonts.
-            let next_cluster_byte: usize = info
-                .get(i + 1)
-                .map(|n| n.cluster as usize)
-                .unwrap_or(text.len());
-            let cluster_chars: usize = text[cluster..next_cluster_byte.min(text.len())]
-                .chars()
-                .count()
-                .max(1);
+        // 5. Iterate through the placed glyphs
+        // ── pdf_manipulator patch: a code keeps its own advance however many characters it decodes to ──
+        struct Placed {
+            /// Index in the run; unique per glyph.
+            cluster: usize,
+            ch: char,
+            gid: u16,
+            /// The code whose width and vertical metrics this glyph takes.
+            code: Option<u16>,
+            /// The part of the code's advance this glyph takes.
+            share: f32,
+            /// The code's last glyph: Tc and Tw apply once per code.
+            last: bool,
+        }
+        let nominal = |c: char| -> u16 { ttf_face_ref.glyph_index(c).map_or(0, |g| g.0) };
+        let nominal_advance = |gid: u16| -> f32 {
+            ttf_face_ref
+                .glyph_hor_advance(ttf_parser::GlyphId(gid))
+                .unwrap_or(0) as f32
+        };
+        let decode_code = |code_bytes: &[u8], info: &crate::fonts::FontInfo, decompose: bool| {
+            crate::fonts::unicode_decode::decode_text_to_unicode(
+                code_bytes,
+                Some(info),
+                DecodePolicy {
+                    preserve_unmapped: false,
+                    decompose_ligatures: decompose,
+                    question_mark_for_invalid: false,
+                },
+            )
+        };
+        // Each code decoded on its own; usable only when the codes together
+        // decode to `text`, so a font whose codes are segmented differently
+        // keeps the character-indexed reading below.
+        let per_code: Option<Vec<(u16, String, String)>> = font_info.and_then(|info| {
+            let mut at = 0usize;
+            let mut units = Vec::new();
+            for (code, used) in TextCharIter::new(bytes, Some(info)) {
+                let code_bytes = bytes.get(at..at + used)?;
+                at += used;
+                units.push((
+                    code,
+                    decode_code(code_bytes, info, true),
+                    decode_code(code_bytes, info, false),
+                ));
+            }
+            (units.iter().map(|u| u.1.as_str()).collect::<String>() == text).then_some(units)
+        });
+        let mut placed: Vec<Placed> = Vec::new();
+        if let Some(units) = per_code {
+            for (code, drawn, original) in units {
+                let mut original_chars = original.chars();
+                // A ligature code whose precomposed character the face has a
+                // nominal glyph for is that one glyph at the code's width.
+                if let (Some(c), None) = (original_chars.next(), original_chars.next()) {
+                    if ('\u{FB00}'..='\u{FB06}').contains(&c) && nominal(c) != 0 {
+                        placed.push(Placed {
+                            cluster: placed.len(),
+                            ch: c,
+                            gid: nominal(c),
+                            code: Some(code),
+                            share: 1.0,
+                            last: true,
+                        });
+                        continue;
+                    }
+                }
+                // Otherwise its characters one after another, their advances
+                // scaled so that they sum to the code's width.
+                let chars: Vec<(char, u16)> = drawn.chars().map(|c| (c, nominal(c))).collect();
+                let total: f32 = chars.iter().map(|&(_, g)| nominal_advance(g)).sum();
+                for (k, &(c, g)) in chars.iter().enumerate() {
+                    let share = if chars.len() == 1 {
+                        1.0
+                    } else if total > 0.0 {
+                        nominal_advance(g) / total
+                    } else {
+                        1.0 / chars.len() as f32
+                    };
+                    placed.push(Placed {
+                        cluster: placed.len(),
+                        ch: c,
+                        gid: g,
+                        code: Some(code),
+                        share,
+                        last: k + 1 == chars.len(),
+                    });
+                }
+            }
+        } else {
+            for (char_idx, c) in text.chars().enumerate() {
+                let code = font_info.map(|info| {
+                    if info.subtype == "Type0" {
+                        *cids.get(char_idx).unwrap_or(&0)
+                    } else {
+                        *bytes.get(char_idx).unwrap_or(&0) as u16
+                    }
+                });
+                placed.push(Placed {
+                    cluster: char_idx,
+                    ch: c,
+                    gid: nominal(c),
+                    code,
+                    share: 1.0,
+                    last: true,
+                });
+            }
+        }
+        for g in &placed {
+            let (cluster, glyph_id, char_at_pos) = (g.cluster, g.gid, g.ch);
+        // ── end pdf_manipulator patch ──
 
             // PDF Spec: tx = ((w0 * Tfs) + Tc + Tw) * Th
             // Priority:
             // 1. Explicit /W or /DW from FontInfo (in 1000ths of em),
             //    summed across every source character in the cluster
             //    so ligatures advance by the full cluster's width.
-            // 2. Shaped advance from harfrust (fallback, already
-            //    reflects the ligature's real width because it comes
-            //    from the font's horizontal metrics table).
-            let pdf_width = if let Some(font_info_ref) = font_info {
-                let mut sum = 0.0_f32;
-                for k in 0..cluster_chars {
-                    let idx = char_idx + k;
-                    let char_code = if font_info_ref.subtype == "Type0" {
-                        *cids.get(idx).unwrap_or(&0)
-                    } else {
-                        *bytes.get(idx).unwrap_or(&0) as u16
-                    };
-                    sum += font_info_ref.get_glyph_width(char_code);
-                }
-                sum
+            // ── pdf_manipulator patch: no shaper reports an advance ──
+            // 2. The glyph's nominal advance from the font's horizontal metrics.
+            // ── end pdf_manipulator patch ──
+            // ── pdf_manipulator patch: the glyph takes its share of its own code's width ──
+            let pdf_width = if let (Some(font_info_ref), Some(code)) = (font_info, g.code) {
+                font_info_ref.get_glyph_width(code) * g.share
             } else {
-                // No FontInfo, use shaped advance
-                pos[i].x_advance as f32 / font_size * 1000.0
+                // No FontInfo, use the glyph's nominal advance
+                nominal_advance(glyph_id) / units_per_em * 1000.0
             };
+            // ── end pdf_manipulator patch ──
 
             let x_advance = pdf_width * font_size / 1000.0;
-            let x_offset = pos[i].x_offset as f32 / units_per_em * font_size;
-            let y_offset = pos[i].y_offset as f32 / units_per_em * font_size;
+            // ── pdf_manipulator patch: no GPOS offset moves a glyph off the PDF's own position ──
+            // No GPOS offset: the PDF's own position is the glyph's position.
+            // ── end pdf_manipulator patch ──
 
             let mut x_advance_override: Option<f32> = None;
 
@@ -1412,32 +1466,14 @@ impl TextRasterizer {
             // a real-world case but the helper still produces spec-default
             // metrics, keeping the math safe.
             let (y_step, paint_origin_dx, paint_origin_dy) = if wmode == 1 {
-                if let Some(font_info_ref) = font_info {
-                    // Sum w1y across the source-character cluster, matching the
-                    // horizontal path's `pdf_width` accumulation. Use the
-                    // primary glyph's vertical-origin offset (v_x, v_y) for
-                    // painting — clusters share a single origin per spec.
-                    let mut w1y_sum = 0.0_f32;
-                    let mut head_v_x = 0.0_f32;
-                    let mut head_v_y = 0.0_f32;
-                    for k in 0..cluster_chars {
-                        let idx = char_idx + k;
-                        let cid = if font_info_ref.subtype == "Type0" {
-                            *cids.get(idx).unwrap_or(&0)
-                        } else {
-                            *bytes.get(idx).unwrap_or(&0) as u16
-                        };
-                        let m = font_info_ref.get_vertical_metrics(cid);
-                        w1y_sum += m.w1y;
-                        if k == 0 {
-                            head_v_x = m.v_x;
-                            head_v_y = m.v_y;
-                        }
-                    }
-                    let y_advance_v = w1y_sum * font_size / 1000.0;
-                    let dx = -head_v_x * font_size / 1000.0;
-                    let dy = -head_v_y * font_size / 1000.0;
+                // ── pdf_manipulator patch: the glyph takes its share of its own code's vertical advance ──
+                if let (Some(font_info_ref), Some(code)) = (font_info, g.code) {
+                    let m = font_info_ref.get_vertical_metrics(code);
+                    let y_advance_v = m.w1y * g.share * font_size / 1000.0;
+                    let dx = -m.v_x * font_size / 1000.0;
+                    let dy = -m.v_y * font_size / 1000.0;
                     (y_advance_v, dx, dy)
+                // ── end pdf_manipulator patch ──
                 } else {
                     // No FontInfo + vertical mode: spec defaults (-1000, 500, 880).
                     let m = crate::fonts::VerticalMetrics::SPEC_DEFAULT;
@@ -1470,8 +1506,10 @@ impl TextRasterizer {
                     } else {
                         (gs.text_rise, 0.0)
                     };
-                    let px = (x_cursor + x_offset + paint_origin_dx) * h_scale + rise_x;
-                    let py = y_cursor + y_offset + paint_origin_dy + rise_y;
+                    // ── pdf_manipulator patch: no GPOS offset moves a glyph off the PDF's own position ──
+                    let px = (x_cursor + paint_origin_dx) * h_scale + rise_x;
+                    let py = y_cursor + paint_origin_dy + rise_y;
+                    // ── end pdf_manipulator patch ──
                     let glyph_transform =
                         combined_base.pre_translate(px, py).pre_scale(scale, scale);
 
@@ -1532,9 +1570,10 @@ impl TextRasterizer {
                                     } else {
                                         (gs.text_rise, 0.0)
                                     };
-                                    let px =
-                                        (x_cursor + x_offset + paint_origin_dx) * h_scale + rise_x;
-                                    let py = y_cursor + y_offset + paint_origin_dy + rise_y;
+                                    // ── pdf_manipulator patch: no GPOS offset moves a glyph off the PDF's own position ──
+                                    let px = (x_cursor + paint_origin_dx) * h_scale + rise_x;
+                                    let py = y_cursor + paint_origin_dy + rise_y;
+                                    // ── end pdf_manipulator patch ──
                                     // No y reflection here. ISO 32000-1:2008 9.4.4 makes
                                     // the rendering matrix Tfs/Th/Trise x Tm x CTM the whole
                                     // glyph-space-to-device transform, and the page's single
@@ -1588,16 +1627,24 @@ impl TextRasterizer {
             // x_advance / y_step already include w0*Tfs / w1y*Tfs.
             if wmode == 0 {
                 x_cursor += x_advance_override.unwrap_or(x_advance);
-                x_cursor += gs.char_space;
-                if char_at_pos == ' ' && word_space_eligible {
-                    x_cursor += gs.word_space;
+                // ── pdf_manipulator patch: Tc and Tw apply once per code ──
+                if g.last {
+                    x_cursor += gs.char_space;
+                    if char_at_pos == ' ' && word_space_eligible {
+                        x_cursor += gs.word_space;
+                    }
                 }
+                // ── end pdf_manipulator patch ──
             } else {
                 y_cursor += y_step;
-                y_cursor += gs.char_space;
-                if char_at_pos == ' ' && word_space_eligible {
-                    y_cursor += gs.word_space;
+                // ── pdf_manipulator patch: Tc and Tw apply once per code ──
+                if g.last {
+                    y_cursor += gs.char_space;
+                    if char_at_pos == ' ' && word_space_eligible {
+                        y_cursor += gs.word_space;
+                    }
                 }
+                // ── end pdf_manipulator patch ──
             }
         }
 
@@ -1617,7 +1664,9 @@ impl TextRasterizer {
         // helper (which itself handles the axis swap).
         Ok(if wmode == 0 { x_cursor } else { y_cursor })
     }
-    /// Render text using direct CID-to-GID mapping, bypassing harfrust shaping.
+    // ── pdf_manipulator patch: no shaper exists to bypass ──
+    /// Render text using direct CID-to-GID mapping.
+    // ── end pdf_manipulator patch ──
     /// Used for CID subset fonts that have embedded data but no usable Unicode cmap.
     /// Per PDF spec section 9.7.4, CIDToGIDMap maps CIDs to glyph indices in the TrueType font.
     fn render_cid_direct(
@@ -1703,6 +1752,10 @@ impl TextRasterizer {
                 }
             } else if let Some(cff_map) = &font_info.cff_gid_map {
                 *cff_map.get(&(char_code as u8)).unwrap_or(&0)
+            // ── pdf_manipulator patch: a simple TrueType code reaches its glyph through the tables ISO 32000-2, 9.6.5.4 names ──
+            } else if font_info.subtype == "TrueType" {
+                crate::host::named_glyphs::simple_truetype_gid(font_info, &ttf_face, char_code as u8)
+            // ── end pdf_manipulator patch ──
             } else if font_info.cid_to_gid_map.is_none() {
                 cmap_byte_to_gid(&ttf_face, char_code as u8).unwrap_or(0)
             } else {

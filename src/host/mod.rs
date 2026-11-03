@@ -44,6 +44,8 @@ pub mod font_optimizer;
 pub(crate) mod font_subset;
 pub mod images;
 pub(crate) mod incremental;
+#[cfg(feature = "rendering")]
+pub(crate) mod named_glyphs;
 pub(crate) mod ink_index;
 pub(crate) mod object_streams;
 #[cfg(feature = "signatures")]
