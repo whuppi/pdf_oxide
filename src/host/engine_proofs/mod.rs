@@ -112,3 +112,11 @@ mod watermark_positions;
 mod whole_reads;
 #[cfg(feature = "rendering")]
 mod redact_extra_type3;
+#[cfg(feature = "rendering")]
+mod editor_choice_values;
+#[cfg(feature = "rendering")]
+mod editor_content_sets;
+#[cfg(feature = "rendering")]
+mod editor_field_removals;
+#[cfg(feature = "rendering")]
+mod editor_redact_overlay;

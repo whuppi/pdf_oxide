@@ -2640,6 +2640,7 @@ impl DocumentEditor {
                     && w.modified_background_color.is_none()
                     && w.modified_border_color.is_none()
                     && w.modified_border_width.is_none()
+                    && w.removed_properties.is_empty()
             })
     }
 
@@ -2799,7 +2800,7 @@ impl DocumentEditor {
     /// kid cannot see: `"on"` names no state in a `/Red` + `/Blue` group, but
     /// each kid alone has exactly one state, so every kid would light while the
     /// save path — which sees both — wrote `/Off`.
-    fn field_on_states(&mut self, field: &HashMap<String, Object>) -> Vec<String> {
+    pub(crate) fn field_on_states(&mut self, field: &HashMap<String, Object>) -> Vec<String> {
         let widget_refs = self.field_widget_refs(field);
         if widget_refs.is_empty() {
             return self.widget_on_states(field);
@@ -2856,6 +2857,7 @@ impl DocumentEditor {
             obj_ref: ObjectRef,
             value: Option<FormFieldValue>,
             is_button: bool,
+            is_choice: bool,
             tooltip: Option<String>,
             rect: Option<Rect>,
             max_length: Option<u32>,
@@ -2865,6 +2867,7 @@ impl DocumentEditor {
             border_color: Option<[f32; 3]>,
             border_width: Option<f32>,
             default_appearance: Option<String>,
+            removed: Vec<&'static str>,
         }
 
         let fields_to_flush: Vec<FieldFlush> = {
@@ -2884,10 +2887,15 @@ impl DocumentEditor {
                     .field_type()
                     .map(|ft| *ft == FieldType::Button)
                     .unwrap_or(false);
+                let is_choice = wrapper
+                    .field_type()
+                    .map(|ft| *ft == FieldType::Choice)
+                    .unwrap_or(false);
                 result.push(FieldFlush {
                     obj_ref,
                     value: wrapper.modified_value.clone(),
                     is_button,
+                    is_choice,
                     tooltip: wrapper.modified_tooltip.clone(),
                     rect: wrapper.modified_rect,
                     max_length: wrapper.modified_max_length,
@@ -2897,6 +2905,7 @@ impl DocumentEditor {
                     border_color: wrapper.modified_border_color,
                     border_width: wrapper.modified_border_width,
                     default_appearance: wrapper.modified_default_appearance.clone(),
+                    removed: wrapper.removed_properties.clone(),
                 });
             }
             result
@@ -2963,7 +2972,31 @@ impl DocumentEditor {
                         }
                     }
                 } else {
-                    new_dict.insert("V".to_string(), Object::from(new_value));
+                    // A value that is no value leaves no /V (and no /I) behind;
+                    // a list box's /I names the selected options by index.
+                    match new_value {
+                        FormFieldValue::None => {
+                            new_dict.remove("V");
+                            new_dict.remove("I");
+                        },
+                        _ => {
+                            new_dict.insert("V".to_string(), Object::from(new_value));
+                            match crate::host::form_choice::selected_indexes(
+                                &self.source,
+                                &new_dict,
+                                new_value,
+                            ) {
+                                Some(indexes) if flush.is_choice => {
+                                    new_dict.insert("I".to_string(), indexes);
+                                },
+                                _ => {
+                                    if flush.is_choice {
+                                        new_dict.remove("I");
+                                    }
+                                },
+                            }
+                        },
+                    }
                 }
             }
             // ── end pdf_manipulator patch ──
@@ -3051,6 +3084,55 @@ impl DocumentEditor {
             }
             if let Some(ref da) = flush.default_appearance {
                 new_dict.insert("DA".to_string(), Object::text_string(da));
+            }
+            // Removed properties: the key is deleted, and an /MK left with no
+            // entry is dropped, from the field and from every kid widget.
+            if flush.removed.contains(&"TU") {
+                new_dict.remove("TU");
+            }
+            if flush.removed.contains(&"MaxLen") {
+                new_dict.remove("MaxLen");
+            }
+            let drop_colors: Vec<&str> = ["BG", "BC"]
+                .into_iter()
+                .filter(|key| flush.removed.contains(key))
+                .collect();
+            if !drop_colors.is_empty() {
+                let without = |mk: Option<&Object>, source: &PdfDocument| -> Option<Object> {
+                    let mut mk = mk
+                        .and_then(|o| source.resolve_object(o).ok())
+                        .and_then(|o| o.as_dict().cloned())?;
+                    for key in &drop_colors {
+                        mk.remove(*key);
+                    }
+                    (!mk.is_empty()).then_some(Object::Dictionary(mk))
+                };
+                match without(new_dict.get("MK"), &self.source) {
+                    Some(mk) => {
+                        new_dict.insert("MK".to_string(), mk);
+                    },
+                    None => {
+                        new_dict.remove("MK");
+                    },
+                }
+                for &wref in &widget_refs {
+                    let kid = match self.modified_objects.get(&wref.id) {
+                        Some(staged) => Some(staged.clone()),
+                        None => self.source.load_object(wref).ok(),
+                    };
+                    if let Some(kd) = kid.as_ref().and_then(|k| k.as_dict()) {
+                        let mut new_kid = kd.clone();
+                        match without(kd.get("MK"), &self.source) {
+                            Some(mk) => {
+                                new_kid.insert("MK".to_string(), mk);
+                            },
+                            None => {
+                                new_kid.remove("MK");
+                            },
+                        }
+                        self.modified_objects.insert(wref.id, Object::Dictionary(new_kid));
+                    }
+                }
             }
             // ── end pdf_manipulator patch ──
 
@@ -8836,9 +8918,17 @@ impl DocumentEditor {
     /// into the page content and removed.
     pub fn flatten_all_annotations(&mut self) -> Result<()> {
         let page_count = self.current_page_count();
+        // ── pdf_manipulator patch: every page, named by the source page it shows ──
+        // The set holds source page indices, so a document with pages removed
+        // or reordered must not insert the output indices.
         for page in 0..page_count {
-            self.flatten_annotations_pages.insert(page);
+            let key = match self.page_key(page) {
+                PageKey::Source(source_page) => source_page,
+                PageKey::Merged(_) => page,
+            };
+            self.flatten_annotations_pages.insert(key);
         }
+        // ── end pdf_manipulator patch ──
         self.is_modified = true;
         Ok(())
     }
@@ -8900,9 +8990,15 @@ impl DocumentEditor {
     /// ```
     pub fn flatten_forms(&mut self) -> Result<()> {
         let page_count = self.current_page_count();
+        // ── pdf_manipulator patch: every page, named by the source page it shows ──
         for page in 0..page_count {
-            self.flatten_forms_pages.insert(page);
+            let key = match self.page_key(page) {
+                PageKey::Source(source_page) => source_page,
+                PageKey::Merged(_) => page,
+            };
+            self.flatten_forms_pages.insert(key);
         }
+        // ── end pdf_manipulator patch ──
         self.remove_acroform = true;
         self.is_modified = true;
         Ok(())
@@ -9983,6 +10079,28 @@ impl DocumentEditor {
         })
     }
 
+    // ── pdf_manipulator patch: properties removed, not changed ──
+    /// Remove a form field's tooltip (`/TU`).
+    pub fn remove_form_field_tooltip(&mut self, name: &str) -> Result<()> {
+        self.modify_form_field(name, |wrapper| wrapper.remove_tooltip())
+    }
+
+    /// Remove a form field's maximum text length (`/MaxLen`).
+    pub fn remove_form_field_max_length(&mut self, name: &str) -> Result<()> {
+        self.modify_form_field(name, |wrapper| wrapper.remove_max_length())
+    }
+
+    /// Remove a form field's background color (`/MK /BG`).
+    pub fn remove_form_field_background_color(&mut self, name: &str) -> Result<()> {
+        self.modify_form_field(name, |wrapper| wrapper.remove_background_color())
+    }
+
+    /// Remove a form field's border color (`/MK /BC`).
+    pub fn remove_form_field_border_color(&mut self, name: &str) -> Result<()> {
+        self.modify_form_field(name, |wrapper| wrapper.remove_border_color())
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Set a form field's border width.
     ///
     /// # Arguments
@@ -10193,6 +10311,55 @@ impl DocumentEditor {
             }
             // ── end pdf_manipulator patch ──
 
+            // ── pdf_manipulator patch: a choice widget whose value is a list ──
+            // A multi-select list box's value is an array, which the text
+            // branch below cannot carry, and a cleared one has no value to
+            // read. Both regenerate from the dictionary the appearance reads,
+            // with this session's value written into it; a document saved
+            // earlier with /NeedAppearances regenerates from its stored array.
+            if matches!(
+                annotation.field_type,
+                Some(crate::annotation_types::WidgetFieldType::Choice { .. })
+            ) {
+                use crate::editor::form_fields::FormFieldValue;
+                let modified = self.modified_choice_value(&annotation);
+                let stored_list = self.source.acroform_needs_appearances()
+                    && matches!(
+                        crate::host::form_choice::inherited(&self.source, &raw_dict.clone(), "V"),
+                        Some(Object::Array(_))
+                    );
+                if matches!(modified, Some(FormFieldValue::MultiChoice(_) | FormFieldValue::None))
+                    || (modified.is_none() && stored_list)
+                {
+                    let mut updated = annotation.clone();
+                    if let (Some(value), Some(dict)) = (&modified, updated.raw_dict.as_mut()) {
+                        match value {
+                            FormFieldValue::None => {
+                                dict.remove("V");
+                            },
+                            other => {
+                                dict.insert("V".to_string(), Object::from(other));
+                            },
+                        }
+                    }
+                    if let Some(crate::annotation_types::WidgetFieldType::Choice {
+                        options, ..
+                    }) = &updated.field_type
+                    {
+                        updated.field_type =
+                            Some(crate::annotation_types::WidgetFieldType::Choice {
+                                options: options.clone(),
+                                selected: None,
+                            });
+                    }
+                    if let Some(generated) = self.generate_widget_appearance(&updated)? {
+                        appearances.push(generated);
+                        continue;
+                    }
+                }
+            }
+            // ── end pdf_manipulator patch ──
+
             // If this widget's value was changed via set_form_field_value, the
             // document's stored /AP is stale — it still renders the original
             // value or the empty placeholder the form writer never refreshed.
@@ -10246,6 +10413,13 @@ impl DocumentEditor {
                         ref options, ..
                     }) => {
                         let options = options.clone();
+                        // ── pdf_manipulator patch: the stored value is replaced too ──
+                        // The appearance reads a list-valued /V from the dictionary
+                        // first, so a stale array there would win over `text`.
+                        if let Some(dict) = updated.raw_dict.as_mut() {
+                            dict.insert("V".to_string(), Object::text_string(&text));
+                        }
+                        // ── end pdf_manipulator patch ──
                         updated.field_type =
                             Some(crate::annotation_types::WidgetFieldType::Choice {
                                 options,
@@ -10319,6 +10493,24 @@ impl DocumentEditor {
             _ => None,
         }
     }
+
+    // ── pdf_manipulator patch: the value set on a choice widget's field this session ──
+    /// The value this session set on the field that owns `annotation`, when it
+    /// set one; unlike [`Self::modified_widget_text`] it keeps every shape.
+    fn modified_choice_value(
+        &self,
+        annotation: &crate::annotations::Annotation,
+    ) -> Option<crate::editor::form_fields::FormFieldValue> {
+        let field_name = annotation.field_name.as_deref()?;
+        let wrapper = self.modified_form_fields.get(field_name).or_else(|| {
+            self.modified_form_fields
+                .iter()
+                .find(|(full, _)| full.rsplit('.').next() == Some(field_name))
+                .map(|(_, w)| w)
+        })?;
+        wrapper.modified_value.clone()
+    }
+    // ── end pdf_manipulator patch ──
 
     // ── pdf_manipulator patch: modified-button state for flattening (#215) ──
 
@@ -11353,6 +11545,24 @@ impl DocumentEditor {
         if !has_contents {
             return Ok(None);
         }
+        // The pass reads the source's content, so a page redacted before must
+        // be redacted again over its earlier regions too, or the new record
+        // replaces the old one and the earlier removals come back. The report
+        // counts only what this call adds.
+        let earlier = self
+            .redacted_pages
+            .get(&src)
+            .map(|p| (p.regions.clone(), p.report, p.dropped_annots.len()));
+        let combined;
+        let rs = match &earlier {
+            Some((regions, _, _)) => {
+                let mut all = regions.clone();
+                all.regions.extend(rs.regions.iter().copied());
+                combined = all;
+                &combined
+            },
+            None => rs,
+        };
         // The pass runs over the whole content now, so a refusal (a damaged
         // stream, a font whose glyphs cannot be pruned) is raised here, before
         // anything is recorded. The save runs the same pass and must agree.
@@ -11391,10 +11601,23 @@ impl DocumentEditor {
             originals.extend(mask_originals);
         }
         let dropped_annots = self.redacted_annotations(src, rs, opts)?;
-        let report = crate::redaction::RedactionReport {
+        let mut report = crate::redaction::RedactionReport {
             annotations_removed: dropped_annots.len(),
             ..outcome.report.clone()
         };
+        if let Some((_, before, annotations_before)) = &earlier {
+            report.regions = report.regions.saturating_sub(before.regions);
+            report.glyphs_removed = report.glyphs_removed.saturating_sub(before.glyphs_removed);
+            report.images_modified = report.images_modified.saturating_sub(before.images_modified);
+            report.images_removed = report.images_removed.saturating_sub(before.images_removed);
+            report.paths_pruned = report.paths_pruned.saturating_sub(before.paths_pruned);
+            report.xobjects_specialized =
+                report.xobjects_specialized.saturating_sub(before.xobjects_specialized);
+            report.fonts_scrubbed = report.fonts_scrubbed.saturating_sub(before.fonts_scrubbed);
+            report.bytes_removed = report.bytes_removed.saturating_sub(before.bytes_removed);
+            report.annotations_removed =
+                report.annotations_removed.saturating_sub(*annotations_before);
+        }
         // The original /Contents object ids, which the save path hard-drops:
         // the removed content must not survive even as an orphaned, GC-missed
         // object.
@@ -11446,42 +11669,47 @@ impl DocumentEditor {
         plan.report
     }
 
-    /// Destructively erase rectangular regions on a page.
+    /// Destructively redacts the rectangles `rects` on `page` and only them:
+    /// covered glyphs are rewritten out of the content stream and the original
+    /// stream objects are hard-dropped at save, with the opaque overlay in
+    /// `fill` drawn over each (no overlay at all when `fill` is `None` and
+    /// `opts` does not draw one). Unlike [`Self::apply_redactions_destructive`]
+    /// this fires only the given rectangles: the marks queued with
+    /// [`Self::add_redaction`] and the document's `/Redact` annotations stay
+    /// pending, and a later apply of them keeps what this call removed. The
+    /// call plans before it records, so an error leaves the editor as it was.
     ///
-    /// The contract is removal, not concealment: covered glyphs are
-    /// rewritten out of the content stream and the original stream
-    /// objects are hard-dropped at save. Unlike
-    /// [`Self::apply_redactions_destructive`] this fires ONLY the
-    /// given regions — the document's pending redaction marks (queued
-    /// via [`Self::add_redaction`] or present as /Redact annotations)
-    /// stay pending — and none of redaction's document-wide side
-    /// effects run: no metadata scrub, no JavaScript removal, no
-    /// opaque overlay drawn over the region.
-    pub fn erase_regions_destructive(
+    /// # Errors
+    /// [`Error::InvalidPdf`] if `page` is out of range, [`Error::Unsupported`]
+    /// for a merged page or a font whose glyphs cannot be pruned.
+    pub fn redact_regions(
         &mut self,
         page: usize,
         rects: &[[f32; 4]],
-    ) -> Result<()> {
-        use crate::redaction::{RedactionOptions, RedactionRegion, RegionSet};
+        fill: Option<[f32; 3]>,
+        opts: &crate::redaction::RedactionOptions,
+    ) -> Result<crate::redaction::RedactionReport> {
+        use crate::redaction::{RedactionRegion, RegionSet};
 
         if page >= self.current_page_count() {
             return Err(Error::InvalidPdf(format!("Page index {} out of range", page)));
         }
-        let src = self.source_page_for(page, "erasing regions")?;
+        let src = self.source_page_for(page, "redacting regions")?;
         let mut rs = RegionSet::new(src);
         for r in rects {
-            rs.push(RedactionRegion::from_rect(r[0], r[1], r[2], r[3], None));
+            rs.push(RedactionRegion::from_rect(r[0], r[1], r[2], r[3], fill));
         }
-        let opts = RedactionOptions {
-            scrub_metadata: false,
-            remove_javascript: false,
-            remove_embedded_files: false,
-            draw_overlay_when_no_ic: false,
-            ..Default::default()
-        };
-        self.destroy_regions_on_page(src, &rs, &opts)?;
+        let plan = self.plan_destruction(src, &rs, opts)?;
+        let report = self.record_destruction(src, plan);
         self.is_modified = true;
-        Ok(())
+        Ok(report)
+    }
+
+    /// Drops every mark queued with [`Self::add_redaction`], on every page. A
+    /// `/Redact` annotation the document carries is not a queued mark and
+    /// stays.
+    pub fn clear_redactions(&mut self) {
+        self.redaction_regions.clear();
     }
     // ── end pdf_manipulator patch ──
 

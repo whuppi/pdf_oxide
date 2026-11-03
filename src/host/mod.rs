@@ -15,6 +15,7 @@ pub mod content;
 pub(crate) mod deflate;
 pub mod dispatch;
 pub(crate) mod duplicates;
+pub(crate) mod form_choice;
 #[cfg(test)]
 mod engine_proofs;
 #[cfg(test)]

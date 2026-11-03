@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use crate::annotations::Annotation;
 use crate::document::PdfDocument;
 use crate::error::Result;
-use crate::object::Object;
+use crate::host::form_choice::{self, ChoiceOption};
+use crate::object::{decode_pdf_text_string, Object};
 
 /// A regenerated widget appearance: the content-stream bytes, its bounding box
 /// (`[0 0 w h]`), and the `/Resources` needed to draw it. Both the flattener
@@ -236,9 +237,36 @@ impl PdfDocument {
                 text_generator.button_appearance(geom_rect, caption, &da_font, font_size, da_color)
             },
             Some(WidgetFieldType::Choice { selected, .. }) => {
-                let text = selected.as_deref().unwrap_or("");
                 text_resources = Some(self.build_text_appearance_resources(&da_font));
-                text_generator.text_field_appearance(geom_rect, text, &da_font, font_size, da_color)
+                let view = self.choice_view(annotation, selected.as_deref());
+                if view.combo || view.options.is_empty() {
+                    // The one line a combo box shows: the selected option's
+                    // display text, or the value itself when it is no listed option.
+                    let text = view
+                        .selected
+                        .first()
+                        .map(|value| {
+                            view.options
+                                .iter()
+                                .find(|o| &o.export == value)
+                                .map_or(value.as_str(), |o| o.display.as_str())
+                        })
+                        .unwrap_or("");
+                    text_generator.text_field_appearance(
+                        geom_rect, text, &da_font, font_size, da_color,
+                    )
+                } else {
+                    let display: Vec<String> =
+                        view.options.iter().map(|o| o.display.clone()).collect();
+                    let chosen: Vec<bool> = view
+                        .options
+                        .iter()
+                        .map(|o| view.selected.contains(&o.export))
+                        .collect();
+                    text_generator.list_box_appearance(
+                        geom_rect, &display, &chosen, view.first, &da_font, font_size, da_color,
+                    )
+                }
             },
             Some(WidgetFieldType::Signature) | Some(WidgetFieldType::Unknown) | None => {
                 return Ok(None);
@@ -250,5 +278,45 @@ impl PdfDocument {
             bbox: [0.0, 0.0, width, height],
             resources: text_resources,
         }))
+    }
+}
+
+/// What a choice widget shows: the field's options, the export values its
+/// value selects, whether it is a combo box and the first row a list box draws.
+struct ChoiceView {
+    options: Vec<ChoiceOption>,
+    selected: Vec<String>,
+    combo: bool,
+    first: usize,
+}
+
+impl PdfDocument {
+    /// Reads what a choice widget shows from its own dictionary and its
+    /// `/Parent` chain. `selected` is the widget's parsed single value; a `/V`
+    /// array (a multi-select list box) takes precedence over it.
+    fn choice_view(&self, annotation: &Annotation, selected: Option<&str>) -> ChoiceView {
+        let empty = HashMap::new();
+        let field = annotation.raw_dict.as_ref().unwrap_or(&empty);
+        let selected = match form_choice::inherited(self, field, "V") {
+            Some(Object::Array(items)) => items
+                .iter()
+                .filter_map(|item| match item {
+                    Object::String(bytes) => Some(decode_pdf_text_string(bytes)),
+                    Object::Name(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => selected.map(str::to_string).into_iter().collect(),
+        };
+        let first = match form_choice::inherited(self, field, "TI") {
+            Some(Object::Integer(n)) if n > 0 => n as usize,
+            _ => 0,
+        };
+        ChoiceView {
+            options: form_choice::options_of(self, field),
+            selected,
+            combo: form_choice::is_combo(form_choice::flags_of(self, field)),
+            first,
+        }
     }
 }

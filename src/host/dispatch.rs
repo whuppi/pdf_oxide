@@ -657,6 +657,11 @@ pub fn doc_form_fields(doc: &mut PdfDocument) -> Result<Vec<FormFieldRow>> {
             };
             let (value_kind, text, checked, choices): (&'static str, String, bool, Vec<String>) =
                 match (&f.field_type, &f.value) {
+                    // A choice field's /V is the selected option's export
+                    // value, a text string on disk; it is a choice, not text.
+                    (FieldType::Choice, FieldValue::Text(s)) => {
+                        ("choice", s.clone(), false, Vec::new())
+                    }
                     (_, FieldValue::Text(s)) => ("text", s.clone(), false, Vec::new()),
                     // A radio group's /V is the selected option's export
                     // name; "Off" means none, like an unset choice field.
@@ -983,28 +988,41 @@ pub fn edit_merge(editor: &mut DocumentEditor, secondary_bytes: &[Vec<u8>]) -> R
 
 // ── Content operations ──
 
-/// Flatten interactive form fields into page content. `page == None`
-/// flattens every page; `Some(page)` flattens only that page's widgets.
-pub fn edit_flatten_forms(editor: &mut DocumentEditor, page: Option<usize>) -> Result<()> {
-    match page {
+/// Refuses a page set that names a page the editor cannot edit, before any
+/// page is changed: an empty or repeating list, a page the document does not
+/// have, and a page merged in, whose content is copied at save.
+fn check_editable_pages(editor: &DocumentEditor, pages: &[usize]) -> Result<()> {
+    check_pages(editor, pages)?;
+    for &page in pages {
+        editor.source_page_index(page)?;
+    }
+    Ok(())
+}
+
+/// Flatten interactive form fields into page content. `pages == None`
+/// flattens every page; `Some(pages)` flattens only those pages' widgets.
+/// A page set is checked before the first page is marked.
+pub fn edit_flatten_forms(editor: &mut DocumentEditor, pages: Option<&[usize]>) -> Result<()> {
+    match pages {
         None => editor.flatten_forms(),
-        Some(p) => editor.flatten_forms_on_page(p),
+        Some(pages) => {
+            check_editable_pages(editor, pages)?;
+            pages.iter().try_for_each(|&p| editor.flatten_forms_on_page(p))
+        },
     }
 }
 
-/// Flatten annotations into page content. `page == None` flattens every
-/// page; `Some(page)` flattens only that page's annotations.
-pub fn edit_flatten_annotations(editor: &mut DocumentEditor, page: Option<usize>) -> Result<()> {
-    match page {
+/// Flatten annotations into page content. `pages == None` flattens every
+/// page; `Some(pages)` flattens only those pages' annotations. A page set is
+/// checked before the first page is marked.
+pub fn edit_flatten_annotations(editor: &mut DocumentEditor, pages: Option<&[usize]>) -> Result<()> {
+    match pages {
         None => editor.flatten_all_annotations(),
-        Some(p) => editor.flatten_page_annotations(p),
+        Some(pages) => {
+            check_editable_pages(editor, pages)?;
+            pages.iter().try_for_each(|&p| editor.flatten_page_annotations(p))
+        },
     }
-}
-
-/// Clear the queued destructive-erase regions on a page without applying
-/// them.
-pub fn edit_clear_erase_regions(editor: &mut DocumentEditor, page: usize) {
-    editor.clear_erase_regions(page);
 }
 
 /// The `reduceImages` knobs as they arrive on the wire (`PdfImagePolicy`);
@@ -1243,13 +1261,6 @@ pub fn doc_extract_attachment<W: std::io::Write>(
     Ok(())
 }
 
-/// Erase rectangular regions from a page's content.
-pub fn edit_erase_regions(editor: &mut DocumentEditor, page: usize, rects: &[[f32; 4]]) -> Result<()> {
-    // Destructive by contract: the public op promises the covered
-    // content is GONE from the file, not painted over. The cosmetic
-    // overlay (`erase_regions`) leaves every glyph extractable.
-    editor.erase_regions_destructive(page, rects)
-}
 
 /// Crop all pages by the given margin insets (in points).
 pub fn edit_crop_margins(editor: &mut DocumentEditor, left: f32, right: f32, top: f32, bottom: f32) -> Result<()> {
@@ -1273,6 +1284,133 @@ pub fn edit_set_checkbox_field_value(editor: &mut DocumentEditor, name: &str, ch
     editor.set_form_field_value(name, FormFieldValue::Boolean(checked))
 }
 
+/// The form field `name`, as the form reader finds it in the source, with
+/// the field's own dictionary.
+fn form_field_of(
+    editor: &DocumentEditor,
+    name: &str,
+) -> Result<(
+    crate::extractors::forms::FormField,
+    std::collections::HashMap<String, crate::object::Object>,
+)> {
+    use crate::extractors::forms::FormExtractor;
+
+    let field = FormExtractor::extract_fields(editor.source())?
+        .into_iter()
+        .find(|f| f.full_name == name)
+        .ok_or_else(|| Error::InvalidOperation(format!("form field not found: {name}")))?;
+    let object_ref = field
+        .object_ref
+        .ok_or_else(|| Error::InvalidOperation(format!("form field has no object: {name}")))?;
+    let dict = editor
+        .source()
+        .load_object(object_ref)?
+        .as_dict()
+        .cloned()
+        .ok_or_else(|| Error::InvalidPdf(format!("form field {name} is not a dictionary")))?;
+    Ok((field, dict))
+}
+
+/// Set a choice field's value to one option, named by its export value.
+///
+/// A combo box takes any of its options; one with the edit flag takes any
+/// text. A list box takes one of its options, and a multi-select list box
+/// selects just that one. A radio group or checkbox takes one of its states.
+/// A value the field does not offer, and a field that is no choice, radio or
+/// checkbox, are refused before anything changes.
+pub fn edit_set_form_field_choice(editor: &mut DocumentEditor, name: &str, value: &str) -> Result<()> {
+    use crate::editor::form_fields::FormFieldValue;
+    use crate::extractors::forms::{field_flags, FieldType};
+    use crate::host::form_choice::{flags_of, options_of};
+
+    let (field, dict) = form_field_of(editor, name)?;
+    match field.field_type {
+        FieldType::Button => {
+            if field.flags.unwrap_or(0) & field_flags::PUSH_BUTTON != 0 {
+                return Err(Error::InvalidOperation(format!(
+                    "form field {name} is a push button and has no value"
+                )));
+            }
+            let states = editor.field_on_states(&dict);
+            if value != "Off" && !states.iter().any(|s| s == value) {
+                return Err(Error::InvalidOperation(format!(
+                    "{value:?} is not a state of form field {name}"
+                )));
+            }
+            editor.set_form_field_value(name, FormFieldValue::Choice(value.to_string()))
+        },
+        FieldType::Choice => {
+            let flags = flags_of(editor.source(), &dict);
+            let listed = options_of(editor.source(), &dict).iter().any(|o| o.export == value);
+            let editable_combo = flags & field_flags::COMBO != 0 && flags & field_flags::EDIT != 0;
+            if !listed && !editable_combo {
+                return Err(Error::InvalidOperation(format!(
+                    "{value:?} is not an option of form field {name}"
+                )));
+            }
+            let multiple = flags & field_flags::COMBO == 0 && flags & field_flags::MULTI_SELECT != 0;
+            let new_value = if multiple {
+                FormFieldValue::MultiChoice(vec![value.to_string()])
+            } else {
+                FormFieldValue::Choice(value.to_string())
+            };
+            editor.set_form_field_value(name, new_value)
+        },
+        _ => Err(Error::InvalidOperation(format!(
+            "form field {name} is not a choice, radio or checkbox field"
+        ))),
+    }
+}
+
+/// Set a multi-select list box's value to the options named by `values`, by
+/// export value. No value clears the selection. A field that is no
+/// multi-select list box, a value the field does not offer and a value listed
+/// twice are refused before anything changes.
+pub fn edit_set_form_field_choices(editor: &mut DocumentEditor, name: &str, values: &[String]) -> Result<()> {
+    use crate::editor::form_fields::FormFieldValue;
+    use crate::extractors::forms::{field_flags, FieldType};
+    use crate::host::form_choice::{flags_of, options_of};
+
+    let (field, dict) = form_field_of(editor, name)?;
+    let flags = flags_of(editor.source(), &dict);
+    if field.field_type != FieldType::Choice
+        || flags & field_flags::COMBO != 0
+        || flags & field_flags::MULTI_SELECT == 0
+    {
+        return Err(Error::InvalidOperation(format!(
+            "form field {name} is not a multi-select list box"
+        )));
+    }
+    let options = options_of(editor.source(), &dict);
+    for (at, value) in values.iter().enumerate() {
+        if !options.iter().any(|o| &o.export == value) {
+            return Err(Error::InvalidOperation(format!(
+                "{value:?} is not an option of form field {name}"
+            )));
+        }
+        if values[..at].contains(value) {
+            return Err(Error::InvalidOperation(format!(
+                "{value:?} is listed twice for form field {name}"
+            )));
+        }
+    }
+    let new_value = if values.is_empty() {
+        FormFieldValue::None
+    } else {
+        FormFieldValue::MultiChoice(values.to_vec())
+    };
+    editor.set_form_field_value(name, new_value)
+}
+
+/// Clear a form field's value: a text or choice field loses its `/V`, a
+/// checkbox turns off, a radio group selects nothing.
+pub fn edit_clear_form_field_value(editor: &mut DocumentEditor, name: &str) -> Result<()> {
+    use crate::editor::form_fields::FormFieldValue;
+
+    form_field_of(editor, name)?;
+    editor.set_form_field_value(name, FormFieldValue::None)
+}
+
 // ── Form field property mutations ──
 
 /// Remove a form field (and its widget) from the document.
@@ -1290,9 +1428,12 @@ pub fn edit_set_form_field_required(editor: &mut DocumentEditor, name: &str, req
     editor.set_form_field_required(name, required)
 }
 
-/// Set a form field's tooltip (`/TU`).
-pub fn edit_set_form_field_tooltip(editor: &mut DocumentEditor, name: &str, tooltip: &str) -> Result<()> {
-    editor.set_form_field_tooltip(name, tooltip)
+/// Set a form field's tooltip (`/TU`); `None` removes it.
+pub fn edit_set_form_field_tooltip(editor: &mut DocumentEditor, name: &str, tooltip: Option<&str>) -> Result<()> {
+    match tooltip {
+        Some(tooltip) => editor.set_form_field_tooltip(name, tooltip),
+        None => editor.remove_form_field_tooltip(name),
+    }
 }
 
 /// Set a form field's bounding rectangle (`/Rect` of its first widget).
@@ -1307,9 +1448,16 @@ pub fn edit_set_form_field_bounds(
     editor.set_form_field_rect(name, crate::geometry::Rect::new(x, y, width, height))
 }
 
-/// Set a form field's maximum text length (`/MaxLen`).
-pub fn edit_set_form_field_max_length(editor: &mut DocumentEditor, name: &str, max_length: u32) -> Result<()> {
-    editor.set_form_field_max_length(name, max_length)
+/// Set a form field's maximum text length (`/MaxLen`); `None` removes it.
+pub fn edit_set_form_field_max_length(
+    editor: &mut DocumentEditor,
+    name: &str,
+    max_length: Option<u32>,
+) -> Result<()> {
+    match max_length {
+        Some(max_length) => editor.set_form_field_max_length(name, max_length),
+        None => editor.remove_form_field_max_length(name),
+    }
 }
 
 /// Set a form field's text alignment (`/Q`) from its wire name: `left`,
@@ -1340,18 +1488,28 @@ pub fn alignment_name_from_q(q: i32) -> Option<&'static str> {
     }
 }
 
-/// Set a form field's background color (`/MK /BG`).
+/// Set a form field's background color (`/MK /BG`); `None` removes it.
 pub fn edit_set_form_field_background_color(
     editor: &mut DocumentEditor,
     name: &str,
-    color: [f32; 3],
+    color: Option<[f32; 3]>,
 ) -> Result<()> {
-    editor.set_form_field_background_color(name, color)
+    match color {
+        Some(color) => editor.set_form_field_background_color(name, color),
+        None => editor.remove_form_field_background_color(name),
+    }
 }
 
-/// Set a form field's border color (`/MK /BC`).
-pub fn edit_set_form_field_border_color(editor: &mut DocumentEditor, name: &str, color: [f32; 3]) -> Result<()> {
-    editor.set_form_field_border_color(name, color)
+/// Set a form field's border color (`/MK /BC`); `None` removes it.
+pub fn edit_set_form_field_border_color(
+    editor: &mut DocumentEditor,
+    name: &str,
+    color: Option<[f32; 3]>,
+) -> Result<()> {
+    match color {
+        Some(color) => editor.set_form_field_border_color(name, color),
+        None => editor.remove_form_field_border_color(name),
+    }
 }
 
 /// Set a form field's border width (`/BS /W`).
@@ -1445,9 +1603,42 @@ pub fn edit_convert_to_pdf_a(
 
 // ── Redaction ──
 
-/// Mark a rectangular region on a page for redaction.
-pub fn edit_add_redaction(editor: &mut DocumentEditor, page: usize, rect: [f32; 4]) -> Result<()> {
-    editor.add_redaction(page, rect, None)
+/// Mark a rectangular region on a page for redaction. `fill` is the overlay
+/// colour drawn over it when it is applied; `None` draws no overlay.
+pub fn edit_add_redaction(
+    editor: &mut DocumentEditor,
+    page: usize,
+    rect: [f32; 4],
+    fill: Option<[f32; 3]>,
+) -> Result<()> {
+    editor.add_redaction(page, rect, fill)
+}
+
+/// Drop every mark queued by `edit_add_redaction`.
+pub fn edit_clear_redactions(editor: &mut DocumentEditor) {
+    editor.clear_redactions();
+}
+
+/// The options every host redaction runs under: a region draws an overlay
+/// only when it carries a fill colour, so a mark with none draws no box.
+fn redaction_options() -> crate::redaction::RedactionOptions {
+    crate::redaction::RedactionOptions {
+        draw_overlay_when_no_ic: false,
+        ..Default::default()
+    }
+}
+
+/// Mark `rects` on `page` and apply them, and only them, in one step: the
+/// marks queued earlier stay queued and are not applied. A failure leaves
+/// nothing marked and nothing applied.
+pub fn edit_redact(
+    editor: &mut DocumentEditor,
+    page: usize,
+    rects: &[[f32; 4]],
+    fill: Option<[f32; 3]>,
+) -> Result<RedactionReportRow> {
+    let report = editor.redact_regions(page, rects, fill, &redaction_options())?;
+    Ok(report.into())
 }
 
 /// Count pending redaction annotations on a page.
@@ -1457,6 +1648,7 @@ pub fn edit_redaction_count(editor: &mut DocumentEditor, page: usize) -> Result<
 
 /// One `applyRedactions` report in wire vocabulary; the field meanings are
 /// documented on `crate::redaction::RedactionReport`.
+#[derive(Debug)]
 pub struct RedactionReportRow {
     /// Number of regions applied.
     pub regions: usize,
@@ -1487,7 +1679,7 @@ impl From<crate::redaction::RedactionReport> for RedactionReportRow {
 
 /// Apply all pending redactions, permanently removing redacted content.
 pub fn edit_apply_redactions(editor: &mut DocumentEditor) -> Result<RedactionReportRow> {
-    let report = editor.apply_redactions_destructive(crate::redaction::RedactionOptions::default())?;
+    let report = editor.apply_redactions_destructive(redaction_options())?;
     Ok(report.into())
 }
 
@@ -2087,10 +2279,12 @@ fn prepend_to_page_content(
     Ok(())
 }
 
-/// Add a standard stamp annotation to a page. `stamp_type` is the wire name
-/// (`Approved`, `Draft`, ...).
+/// Add a standard stamp annotation to every page of `pages`. `stamp_type` is
+/// the wire name (`Approved`, `Draft`, ...). The stamp type and every page are
+/// checked, and every page's stamp is built, before the first page is saved,
+/// so an error leaves no page stamped.
 pub fn edit_add_stamp(
-    editor: &mut DocumentEditor, page: usize, stamp_type: &str,
+    editor: &mut DocumentEditor, pages: &[usize], stamp_type: &str,
     x: f32, y: f32, w: f32, h: f32, opacity: f32,
 ) -> Result<()> {
     use crate::geometry::Rect;
@@ -2100,27 +2294,46 @@ pub fn edit_add_stamp(
     let rect = Rect::new(x, y, w, h);
     let st = stamp_type_from_name(stamp_type)
         .ok_or_else(|| Error::InvalidOperation(format!("unknown stamp type: {stamp_type}")))?;
-    let mut annot = crate::writer::StampAnnotation::new(rect, st);
-    if opacity > 0.0 && opacity < 1.0 {
-        annot.opacity = Some(opacity);
+    check_editable_pages(editor, pages)?;
+    let mut built = Vec::with_capacity(pages.len());
+    for &page in pages {
+        let mut annot = crate::writer::StampAnnotation::new(rect, st.clone());
+        if opacity > 0.0 && opacity < 1.0 {
+            annot.opacity = Some(opacity);
+        }
+        let mut pg = editor.get_page(page)?;
+        pg.add_annotation(annot);
+        built.push(pg);
     }
-    let mut pg = editor.get_page(page)?;
-    pg.add_annotation(annot);
-    editor.save_page(pg)?;
+    for pg in built {
+        editor.save_page(pg)?;
+    }
     Ok(())
 }
 
-/// Add an image stamp — builds appearance stream directly from image bytes.
-/// Uses editor's pub(crate) alloc_id + insert_modified to place objects.
+/// Add an image stamp to every page of `pages` — builds the appearance stream
+/// directly from image bytes, once: the pages share one image and one
+/// appearance, each with an annotation of its own. All or nothing: the image is
+/// decoded and every page checked before anything is staged, and an error
+/// after that puts the editor back as it was.
 pub fn edit_add_image_stamp(
-    editor: &mut DocumentEditor, page: usize, image_bytes: Vec<u8>,
+    editor: &mut DocumentEditor, pages: &[usize], image_bytes: Vec<u8>,
     x: f32, y: f32, w: f32, h: f32, opacity: f32,
 ) -> Result<()> {
-    use crate::object::Object;
     use crate::writer::ImageData;
 
     let img = ImageData::from_bytes(&image_bytes)
         .map_err(|e| Error::InvalidPdf(format!("invalid image: {e}")))?;
+    check_editable_pages(editor, pages)?;
+    editor.undoable(|editor| stage_image_stamps(editor, pages, img, x, y, w, h, opacity))
+}
+
+/// The staging of [`edit_add_image_stamp`].
+fn stage_image_stamps(
+    editor: &mut DocumentEditor, pages: &[usize], img: crate::writer::ImageData,
+    x: f32, y: f32, w: f32, h: f32, opacity: f32,
+) -> Result<()> {
+    use crate::object::Object;
 
     // build_xobject_dict() carries the PNG DecodeParms/Predictor=15 that
     // from_png()'s per-row filter bytes require; a hand-rolled FlateDecode
@@ -2200,37 +2413,45 @@ pub fn edit_add_image_stamp(
         annot.insert("CA".into(), Object::Real(opacity as f64));
     }
 
-    let annot_id = editor.alloc_id();
-    editor.insert_modified(annot_id, Object::Dictionary(annot));
+    for &page in pages {
+        let annot_id = editor.alloc_id();
+        editor.insert_modified(annot_id, Object::Dictionary(annot.clone()));
 
-    // Add annotation ref to page's /Annots array
-    let page_ref = editor.source_mut().get_page_ref(page)?;
-    let page_obj = editor.source_mut().load_object(page_ref)?;
-    let mut page_dict = page_obj.as_dict()
-        .ok_or_else(|| Error::InvalidPdf("page not a dict".into()))?
-        .clone();
-    // /Annots may be a direct array OR an indirect reference to one (ISO
-    // 32000-1 §7.3.10 — any object may be indirect). Resolve both: `as_array`
-    // alone returns None for the indirect form, so a naive read drops every
-    // existing widget/link on the page and leaves only the new stamp.
-    // Detach the object from page_dict first so load_object's &mut borrow of
-    // the editor doesn't overlap the page_dict borrow.
-    let annots_obj = page_dict.get("Annots").cloned();
-    let mut annots = match annots_obj {
-        Some(Object::Array(items)) => items,
-        Some(Object::Reference(reference)) => editor
-            .source_mut()
-            .load_object(reference)
-            .ok()
-            .and_then(|o| o.as_array().cloned())
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    annots.push(Object::Reference(crate::object::ObjectRef::new(annot_id, 0)));
-    // Write the resolved list back inline; the old indirect array object is
-    // orphaned harmlessly (the page no longer references it).
-    page_dict.insert("Annots".into(), Object::Array(annots));
-    editor.insert_modified(page_ref.id, Object::Dictionary(page_dict));
+        // Add annotation ref to the page's /Annots array. The page is the
+        // source page the output index names, and its dictionary is the one
+        // an earlier edit staged, if any.
+        let source_page = editor.source_page_index(page)?;
+        let page_ref = editor.source_mut().get_page_ref(source_page)?;
+        let page_obj = match editor.modified_objects_mut().get(&page_ref.id) {
+            Some(staged) => staged.clone(),
+            None => editor.source_mut().load_object(page_ref)?,
+        };
+        let mut page_dict = page_obj.as_dict()
+            .ok_or_else(|| Error::InvalidPdf("page not a dict".into()))?
+            .clone();
+        // /Annots may be a direct array OR an indirect reference to one (ISO
+        // 32000-1 §7.3.10 — any object may be indirect). Resolve both: `as_array`
+        // alone returns None for the indirect form, so a naive read drops every
+        // existing widget/link on the page and leaves only the new stamp.
+        // Detach the object from page_dict first so load_object's &mut borrow of
+        // the editor doesn't overlap the page_dict borrow.
+        let annots_obj = page_dict.get("Annots").cloned();
+        let mut annots = match annots_obj {
+            Some(Object::Array(items)) => items,
+            Some(Object::Reference(reference)) => editor
+                .source_mut()
+                .load_object(reference)
+                .ok()
+                .and_then(|o| o.as_array().cloned())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        annots.push(Object::Reference(crate::object::ObjectRef::new(annot_id, 0)));
+        // Write the resolved list back inline; the old indirect array object is
+        // orphaned harmlessly (the page no longer references it).
+        page_dict.insert("Annots".into(), Object::Array(annots));
+        editor.insert_modified(page_ref.id, Object::Dictionary(page_dict));
+    }
 
     Ok(())
 }

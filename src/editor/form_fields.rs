@@ -223,6 +223,12 @@ pub struct FormFieldWrapper {
 
     /// Modified border width (from /BS/W)
     pub(crate) modified_border_width: Option<f32>,
+
+    // ── pdf_manipulator patch: properties removed, not changed ──
+    /// The keys the save deletes: `TU`, `MaxLen`, and `BG` and `BC` of `/MK`.
+    /// A setter of the same property takes its key back out.
+    pub(crate) removed_properties: Vec<&'static str>,
+    // ── end pdf_manipulator patch ──
 }
 
 /// Field type for new fields.
@@ -411,6 +417,9 @@ impl FormFieldWrapper {
             modified_background_color: None,
             modified_border_color: None,
             modified_border_width: None,
+            // ── pdf_manipulator patch: properties removed, not changed ──
+            removed_properties: Vec::new(),
+            // ── end pdf_manipulator patch ──
         }
     }
 
@@ -460,6 +469,9 @@ impl FormFieldWrapper {
             modified_background_color: None,
             modified_border_color: None,
             modified_border_width: None,
+            // ── pdf_manipulator patch: properties removed, not changed ──
+            removed_properties: Vec::new(),
+            // ── end pdf_manipulator patch ──
         }
     }
 
@@ -492,6 +504,9 @@ impl FormFieldWrapper {
             modified_background_color: None,
             modified_border_color: None,
             modified_border_width: None,
+            // ── pdf_manipulator patch: properties removed, not changed ──
+            removed_properties: Vec::new(),
+            // ── end pdf_manipulator patch ──
         }
     }
 
@@ -853,7 +868,44 @@ impl FormFieldWrapper {
     pub fn set_tooltip(&mut self, tooltip: impl Into<String>) {
         self.modified_tooltip = Some(tooltip.into());
         self.modified = true;
+        // ── pdf_manipulator patch: properties removed, not changed ──
+        self.removed_properties.retain(|key| *key != "TU");
+        // ── end pdf_manipulator patch ──
     }
+
+    // ── pdf_manipulator patch: properties removed, not changed ──
+    /// Marks `key` for deletion at save and drops a value set before it.
+    fn remove_property(&mut self, key: &'static str) {
+        if !self.removed_properties.contains(&key) {
+            self.removed_properties.push(key);
+        }
+        self.modified = true;
+    }
+
+    /// Remove the tooltip (`/TU`).
+    pub fn remove_tooltip(&mut self) {
+        self.modified_tooltip = None;
+        self.remove_property("TU");
+    }
+
+    /// Remove the maximum text length (`/MaxLen`).
+    pub fn remove_max_length(&mut self) {
+        self.modified_max_length = None;
+        self.remove_property("MaxLen");
+    }
+
+    /// Remove the background color (`/MK /BG`).
+    pub fn remove_background_color(&mut self) {
+        self.modified_background_color = None;
+        self.remove_property("BG");
+    }
+
+    /// Remove the border color (`/MK /BC`).
+    pub fn remove_border_color(&mut self) {
+        self.modified_border_color = None;
+        self.remove_property("BC");
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Get the current tooltip, preferring modified over original.
     pub fn get_tooltip(&self) -> Option<&str> {
@@ -901,6 +953,9 @@ impl FormFieldWrapper {
     pub fn set_max_length(&mut self, max_len: u32) {
         self.modified_max_length = Some(max_len);
         self.modified = true;
+        // ── pdf_manipulator patch: properties removed, not changed ──
+        self.removed_properties.retain(|key| *key != "MaxLen");
+        // ── end pdf_manipulator patch ──
     }
 
     /// Get the maximum text length.
@@ -952,6 +1007,9 @@ impl FormFieldWrapper {
     pub fn set_background_color(&mut self, color: [f32; 3]) {
         self.modified_background_color = Some(color);
         self.modified = true;
+        // ── pdf_manipulator patch: properties removed, not changed ──
+        self.removed_properties.retain(|key| *key != "BG");
+        // ── end pdf_manipulator patch ──
     }
 
     /// Get the current background color.
@@ -969,6 +1027,9 @@ impl FormFieldWrapper {
     pub fn set_border_color(&mut self, color: [f32; 3]) {
         self.modified_border_color = Some(color);
         self.modified = true;
+        // ── pdf_manipulator patch: properties removed, not changed ──
+        self.removed_properties.retain(|key| *key != "BC");
+        // ── end pdf_manipulator patch ──
     }
 
     /// Get the current border color.

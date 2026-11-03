@@ -246,6 +246,82 @@ fn rotation_of(req: &Request<'_>) -> crate::error::Result<i32> {
         .ok_or_else(|| crate::error::Error::InvalidOperation(format!("unknown rotation: {name}")))
 }
 
+/// The overlay a redaction draws: the fill colour of `overlay` `fill`
+/// (`r`, `g`, `b`), or `None` for `overlay` `none`, which draws no box.
+fn overlay_fill_of(req: &Request<'_>) -> crate::error::Result<Option<[f32; 3]>> {
+    use crate::error::Error;
+    match req.get_str("overlay") {
+        Some("fill") => {
+            let channel = |key: &str| {
+                req.get_f64(key)
+                    .map(|v| v as f32)
+                    .ok_or_else(|| Error::InvalidOperation(format!("a fill overlay needs {key}")))
+            };
+            Ok(Some([channel("r")?, channel("g")?, channel("b")?]))
+        },
+        Some("none") => Ok(None),
+        Some(other) => Err(Error::InvalidOperation(format!("unknown redaction overlay: {other}"))),
+        None => Err(Error::InvalidOperation("a redaction needs an overlay".into())),
+    }
+}
+
+/// The colour of the request's `r`, `g` and `b`, or `None` when it carries
+/// none: an edit that takes an optional colour removes the colour then. A
+/// request with only some of the three is refused.
+fn optional_color_of(req: &Request<'_>) -> crate::error::Result<Option<[f32; 3]>> {
+    let channels = [req.get_f64("r"), req.get_f64("g"), req.get_f64("b")];
+    match channels {
+        [None, None, None] => Ok(None),
+        [Some(r), Some(g), Some(b)] => Ok(Some([r as f32, g as f32, b as f32])),
+        _ => Err(crate::error::Error::InvalidOperation(
+            "a colour needs r, g and b together".into(),
+        )),
+    }
+}
+
+/// The request's `maxLength`, or `None` when it carries none: the edit
+/// removes the limit then. A negative length is refused.
+fn max_length_of(req: &Request<'_>) -> crate::error::Result<Option<u32>> {
+    req.get_i32("maxLength")
+        .map(|n| {
+            u32::try_from(n).map_err(|_| {
+                crate::error::Error::InvalidOperation(format!("maxLength {n} is negative"))
+            })
+        })
+        .transpose()
+}
+
+/// The rectangles of the request's `regions`, as two corners each. The wire
+/// carries origin + size per region; `RedactionRegion::from_rect` takes two
+/// corners. A list that is empty or ends in a partial region is refused.
+fn rects_of(req: &Request<'_>) -> crate::error::Result<Vec<[f32; 4]>> {
+    let coords = req.get_f64_list("regions").unwrap_or(&[]);
+    if coords.is_empty() || coords.len() % 4 != 0 {
+        return Err(crate::error::Error::InvalidOperation(
+            "regions must hold at least one region of four numbers".into(),
+        ));
+    }
+    Ok(coords
+        .chunks_exact(4)
+        .map(|c| {
+            let (x, y) = (c[0] as f32, c[1] as f32);
+            [x, y, x + c[2] as f32, y + c[3] as f32]
+        })
+        .collect())
+}
+
+/// The response of an op that applied redactions: what it removed.
+fn redaction_report(report: &dispatch::RedactionReportRow) -> Vec<u8> {
+    let mut w = ResponseWriter::ok();
+    w.put_i32("regions", report.regions as i32);
+    w.put_i32("glyphsRemoved", report.glyphs_removed as i32);
+    w.put_i32("imagesModified", report.images_modified as i32);
+    w.put_i32("imagesRemoved", report.images_removed as i32);
+    w.put_i32("pathsPruned", report.paths_pruned as i32);
+    w.put_i32("xobjectsSpecialized", report.xobjects_specialized as i32);
+    w.finish()
+}
+
 /// The watermark position the request's `posType` and its fields name. Dart
 /// always sends every field of the position it encodes, so a missing or
 /// unknown one is refused.
@@ -375,36 +451,42 @@ fn do_editor_mutate(
             ok_response()
         }
         "flattenForms" => {
-            let page = match req.get_i32("page").map(|p| page_of(p, count)).transpose() {
-                Ok(p) => p,
-                Err(resp) => return Ok(resp),
+            let pages = if req.get_bool("pagesAll").unwrap_or(false) {
+                None
+            } else {
+                match page_set_of(req, count) {
+                    Ok(p) => Some(p),
+                    Err(resp) => return Ok(resp),
+                }
             };
-            dispatch::edit_flatten_forms(editor, page)?;
+            dispatch::edit_flatten_forms(editor, pages.as_deref())?;
             ok_response()
         }
         "flattenAnnotations" => {
-            let page = match req.get_i32("page").map(|p| page_of(p, count)).transpose() {
-                Ok(p) => p,
-                Err(resp) => return Ok(resp),
+            let pages = if req.get_bool("pagesAll").unwrap_or(false) {
+                None
+            } else {
+                match page_set_of(req, count) {
+                    Ok(p) => Some(p),
+                    Err(resp) => return Ok(resp),
+                }
             };
-            dispatch::edit_flatten_annotations(editor, page)?;
+            dispatch::edit_flatten_annotations(editor, pages.as_deref())?;
             ok_response()
         }
-        "clearEraseRegions" => {
-            let page = page!();
-            dispatch::edit_clear_erase_regions(editor, page);
+        "clearRedactions" => {
+            dispatch::edit_clear_redactions(editor);
             ok_response()
         }
         "applyRedactions" => {
             let report = dispatch::edit_apply_redactions(editor)?;
-            let mut w = ResponseWriter::ok();
-            w.put_i32("regions", report.regions as i32);
-            w.put_i32("glyphsRemoved", report.glyphs_removed as i32);
-            w.put_i32("imagesModified", report.images_modified as i32);
-            w.put_i32("imagesRemoved", report.images_removed as i32);
-            w.put_i32("pathsPruned", report.paths_pruned as i32);
-            w.put_i32("xobjectsSpecialized", report.xobjects_specialized as i32);
-            Ok(w.finish())
+            Ok(redaction_report(&report))
+        }
+        "redact" => {
+            let page = page!();
+            let rects = rects_of(req)?;
+            let report = dispatch::edit_redact(editor, page, &rects, overlay_fill_of(req)?)?;
+            Ok(redaction_report(&report))
         }
         "sanitize" => {
             dispatch::edit_sanitize(
@@ -497,21 +579,6 @@ fn do_editor_mutate(
             )?;
             ok_response()
         }
-        "eraseRegions" => {
-            let page = page!();
-            let coords = req.get_f64_list("regions").unwrap_or(&[]);
-            // The wire carries origin + size per region; the engine's
-            // region set takes two corners (`RedactionRegion::from_rect`).
-            let rects: Vec<[f32; 4]> = coords.chunks(4)
-                .filter(|c| c.len() == 4)
-                .map(|c| {
-                    let (x, y) = (c[0] as f32, c[1] as f32);
-                    [x, y, x + c[2] as f32, y + c[3] as f32]
-                })
-                .collect();
-            dispatch::edit_erase_regions(editor, page, &rects)?;
-            ok_response()
-        }
         "watermark" => {
             let position = watermark_position_of(req)?;
             let pages = if req.get_bool("pagesAll").unwrap_or(false) {
@@ -538,9 +605,13 @@ fn do_editor_mutate(
             ok_response()
         }
         "addStamp" => {
+            let pages = match page_set_of(req, count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
             dispatch::edit_add_stamp(
                 editor,
-                page!(),
+                &pages,
                 req.get_str("stampType").unwrap_or("Draft"),
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
@@ -557,9 +628,13 @@ fn do_editor_mutate(
             } else {
                 req.get_bytes("imageData").unwrap_or(&[]).to_vec()
             };
+            let pages = match page_set_of(req, count) {
+                Ok(p) => p,
+                Err(resp) => return Ok(resp),
+            };
             dispatch::edit_add_image_stamp(
                 editor,
-                page!(),
+                &pages,
                 image_bytes,
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
@@ -581,6 +656,32 @@ fn do_editor_mutate(
                 req.get_str("fieldName").unwrap_or(""),
                 req.get_str("value").unwrap_or(""),
             )?;
+            ok_response()
+        }
+        "setFormFieldChoice" => {
+            dispatch::edit_set_form_field_choice(
+                editor,
+                req.get_str("fieldName").unwrap_or(""),
+                req.get_str("value").unwrap_or(""),
+            )?;
+            ok_response()
+        }
+        "setFormFieldChoices" => {
+            let values: Vec<String> = req
+                .get_string_list("values")
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            dispatch::edit_set_form_field_choices(
+                editor,
+                req.get_str("fieldName").unwrap_or(""),
+                &values,
+            )?;
+            ok_response()
+        }
+        "clearFormFieldValue" => {
+            dispatch::edit_clear_form_field_value(editor, req.get_str("fieldName").unwrap_or(""))?;
             ok_response()
         }
         "setCheckboxFieldValue" => {
@@ -631,6 +732,7 @@ fn do_editor_mutate(
                 editor,
                 page!(),
                 [x, y, x + width, y + height],
+                overlay_fill_of(req)?,
             )?;
             ok_response()
         }
@@ -662,7 +764,7 @@ fn do_editor_mutate(
             dispatch::edit_set_form_field_tooltip(
                 editor,
                 req.get_str("name").unwrap_or(""),
-                req.get_str("tooltip").unwrap_or(""),
+                req.get_str("tooltip"),
             )?;
             ok_response()
         }
@@ -681,7 +783,7 @@ fn do_editor_mutate(
             dispatch::edit_set_form_field_max_length(
                 editor,
                 req.get_str("name").unwrap_or(""),
-                req.get_i32("maxLength").unwrap_or(0) as u32,
+                max_length_of(req)?,
             )?;
             ok_response()
         }
@@ -697,11 +799,7 @@ fn do_editor_mutate(
             dispatch::edit_set_form_field_background_color(
                 editor,
                 req.get_str("name").unwrap_or(""),
-                [
-                    req.get_f64("r").unwrap_or(0.0) as f32,
-                    req.get_f64("g").unwrap_or(0.0) as f32,
-                    req.get_f64("b").unwrap_or(0.0) as f32,
-                ],
+                optional_color_of(req)?,
             )?;
             ok_response()
         }
@@ -709,11 +807,7 @@ fn do_editor_mutate(
             dispatch::edit_set_form_field_border_color(
                 editor,
                 req.get_str("name").unwrap_or(""),
-                [
-                    req.get_f64("r").unwrap_or(0.0) as f32,
-                    req.get_f64("g").unwrap_or(0.0) as f32,
-                    req.get_f64("b").unwrap_or(0.0) as f32,
-                ],
+                optional_color_of(req)?,
             )?;
             ok_response()
         }

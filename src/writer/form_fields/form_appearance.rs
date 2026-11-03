@@ -102,6 +102,54 @@ impl FormAppearanceGenerator {
         stream
     }
 
+    // ── pdf_manipulator patch: a list box draws its options, the selected ones highlighted ──
+    /// Generate the appearance stream of a list box: one row per option from
+    /// `first` on, as many as the rectangle holds, the rows in `selected`
+    /// drawn over a highlight. `options` holds each option's display text.
+    pub fn list_box_appearance(
+        &self,
+        rect: Rect,
+        options: &[String],
+        selected: &[bool],
+        first: usize,
+        font_name: &str,
+        font_size: f32,
+        text_color: (f32, f32, f32),
+    ) -> String {
+        const PADDING: f32 = 2.0;
+        const HIGHLIGHT: (f32, f32, f32) = (0.6, 0.75, 0.85);
+        let mut stream = String::new();
+        let row = font_size * 1.15;
+        let rows = (((rect.height - 2.0 * PADDING) / row).floor().max(0.0)) as usize;
+        let (r, g, b) = text_color;
+        for (at, option) in options.iter().enumerate().skip(first).take(rows) {
+            let top = rect.height - PADDING - (at - first) as f32 * row;
+            if selected.get(at).copied().unwrap_or(false) {
+                let (hr, hg, hb) = HIGHLIGHT;
+                stream.push_str(&format!("{} {} {} rg\n", hr, hg, hb));
+                stream.push_str(&format!(
+                    "{} {} {} {} re f\n",
+                    PADDING,
+                    top - row,
+                    rect.width - 2.0 * PADDING,
+                    row
+                ));
+            }
+            stream.push_str("BT\n");
+            stream.push_str(&format!("{} {} {} rg\n", r, g, b));
+            stream.push_str(&format!("{} {} Tf\n", font_name, font_size));
+            stream.push_str(&format!(
+                "{} {} Td\n",
+                2.0 * PADDING,
+                top - row + (row - font_size) / 2.0 + font_size * 0.2
+            ));
+            stream.push_str(&format!("({}) Tj\n", escape_pdf_string(option)));
+            stream.push_str("ET\n");
+        }
+        stream
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Generate appearance stream for a checkbox (checked state).
     ///
     /// # Arguments
