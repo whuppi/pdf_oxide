@@ -8,82 +8,19 @@ use super::legacy_decoders as legacy;
 use crate::decoders::stream::{chain, read_whole, Pieces, TEST_ALLOCATION_LIMIT};
 use crate::decoders::DecodeParams;
 use crate::error::{Error, Result};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 const PIECES: [usize; 7] = [1, 2, 3, 7, 64, 1024, 65536];
 
-/// Counts the bytes the process holds and the most it ever held, so a test can say how far a read grew it.
-struct Tracking;
-
-pub(super) static HELD: AtomicUsize = AtomicUsize::new(0);
-pub(super) static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-std::thread_local! {
-    /// What the current thread holds, and the most it held since [`thread_growth`] began.
-    /// Plain cells without a destructor, so the allocator may touch them.
-    static MINE: std::cell::Cell<(isize, isize)> = const { std::cell::Cell::new((0, 0)) };
-}
-
-fn mine_add(bytes: isize) {
-    MINE.with(|m| {
-        let (held, peak) = m.get();
-        let held = held + bytes;
-        m.set((held, peak.max(held)));
-    });
-}
+pub(super) use crate::host::heap::{PROCESS_LIVE as HELD, PROCESS_PEAK as PEAK};
 
 /// Runs `f` and returns what it returned with the most bytes this thread held
 /// above where it began. Unlike `HELD` and `PEAK` it is blind to every other test
 /// thread, so a bound on it is tight.
 pub(super) fn thread_growth<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let base = MINE.with(|m| {
-        let (held, _) = m.get();
-        m.set((held, held));
-        held
-    });
-    let out = f();
-    let peak = MINE.with(|m| m.get().1);
-    (out, (peak - base).max(0) as usize)
+    crate::host::heap::growth(f)
 }
-
-// SAFETY: every call is forwarded to the system allocator unchanged; only counters are added.
-unsafe impl GlobalAlloc for Tracking {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if !p.is_null() {
-            let now = HELD.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(now, Ordering::Relaxed);
-            mine_add(layout.size() as isize);
-        }
-        p
-    }
-
-    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        System.dealloc(p, layout);
-        HELD.fetch_sub(layout.size(), Ordering::Relaxed);
-        mine_add(-(layout.size() as isize));
-    }
-
-    unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let q = System.realloc(p, layout, new_size);
-        if !q.is_null() {
-            if new_size >= layout.size() {
-                let now = HELD.fetch_add(new_size - layout.size(), Ordering::Relaxed)
-                    + (new_size - layout.size());
-                PEAK.fetch_max(now, Ordering::Relaxed);
-            } else {
-                HELD.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-            }
-            mine_add(new_size as isize - layout.size() as isize);
-        }
-        q
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Tracking = Tracking;
 
 fn run(filters: &[&str], params: Option<&DecodeParams>, input: &[u8], piece: usize) -> Result<Vec<u8>> {
     let names: Vec<String> = filters.iter().map(|f| f.to_string()).collect();

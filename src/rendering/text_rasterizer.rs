@@ -162,26 +162,31 @@ fn system_fontdb() -> std::sync::Arc<fontdb::Database> {
 /// or Times New Roman) on every `render_text` call. A two-page text PDF can
 /// trigger hundreds of such clones per render pass. This cache reduces each
 /// subsequent access to a cheap `Arc::clone`.
+// ── pdf_manipulator patch: the cache holds a byte budget of the machine's fonts, evicting the least recently used ──
 static FONT_BYTES_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<fontdb::ID, (Arc<Vec<u8>>, u32)>>,
+    std::sync::Mutex<crate::host::font_budget::ByteCache<fontdb::ID, (Arc<Vec<u8>>, u32)>>,
 > = std::sync::OnceLock::new();
 
 fn cached_font_bytes(id: fontdb::ID, db: &fontdb::Database) -> Option<(Arc<Vec<u8>>, u32)> {
-    let cache =
-        FONT_BYTES_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    use crate::host::font_budget::{ByteCache, MACHINE_FONT_BYTES};
+    let cache = FONT_BYTES_CACHE
+        .get_or_init(|| std::sync::Mutex::new(ByteCache::lru(MACHINE_FONT_BYTES)));
     {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.get(&id) {
             return Some(entry.clone());
         }
     }
+    // ── end pdf_manipulator patch ──
     let mut result: Option<(Arc<Vec<u8>>, u32)> = None;
     db.with_face_data(id, |data, index| {
         result = Some((Arc::new(data.to_vec()), index));
     });
     if let Some(ref entry) = result {
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(id, entry.clone());
+        // ── pdf_manipulator patch: charged the font program it holds ──
+        guard.insert_charged(id, entry.clone(), entry.0.len());
+        // ── end pdf_manipulator patch ──
     }
     result
 }
@@ -235,22 +240,28 @@ impl CachedFace {
     }
 }
 
+// ── pdf_manipulator patch: the cache holds a byte budget of faces, evicting the least recently used ──
 static FACE_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(fontdb::ID, u32), Arc<CachedFace>>>,
+    std::sync::Mutex<crate::host::font_budget::ByteCache<(fontdb::ID, u32), Arc<CachedFace>>>,
 > = std::sync::OnceLock::new();
 
 fn cached_face(id: fontdb::ID, data: Arc<Vec<u8>>, index: u32) -> Option<Arc<CachedFace>> {
-    let cache = FACE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    use crate::host::font_budget::{ByteCache, MACHINE_FACE_BYTES};
+    let cache = FACE_CACHE.get_or_init(|| std::sync::Mutex::new(ByteCache::lru(MACHINE_FACE_BYTES)));
     {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.get(&(id, index)) {
             return Some(entry.clone());
         }
     }
+    let charge = data.len() + std::mem::size_of::<CachedFace>();
+    // ── end pdf_manipulator patch ──
     let face = CachedFace::new(data, index)?;
     let arc = Arc::new(face);
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    guard.insert((id, index), arc.clone());
+    // ── pdf_manipulator patch: a face above the budget is returned but not kept ──
+    guard.insert_charged((id, index), arc.clone(), charge);
+    // ── end pdf_manipulator patch ──
     Some(arc)
 }
 
@@ -1317,17 +1328,9 @@ impl TextRasterizer {
             Vec::new()
         };
 
-        // Build mapping from Unicode byte offset → character index for correct CID lookup.
-        // Rustybuzz clusters are byte offsets into the Unicode string, but we need
-        // the character index to map to the corresponding CID.
-        let cluster_to_char_idx: HashMap<usize, usize> = text
-            .char_indices()
-            .enumerate()
-            .map(|(char_idx, (byte_offset, _))| (byte_offset, char_idx))
-            .collect();
-
-        // 5. Iterate through the placed glyphs
         // ── pdf_manipulator patch: a code keeps its own advance however many characters it decodes to ──
+        // (upstream's cluster-to-character map is gone: the placement below keys each glyph by its cluster)
+        // 5. Iterate through the placed glyphs
         struct Placed {
             /// Index in the run; unique per glyph.
             cluster: usize,

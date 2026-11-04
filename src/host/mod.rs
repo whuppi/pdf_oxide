@@ -20,7 +20,8 @@ pub(crate) mod form_choice;
 mod engine_proofs;
 #[cfg(test)]
 pub(crate) mod flat_extras_seam;
-pub mod fallback_fonts;
+pub mod executor;
+pub mod heap;
 pub mod lane_state;
 /// Per-op dispatch units (entry + handler + linker anchor).
 pub mod ops;

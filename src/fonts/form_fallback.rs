@@ -72,17 +72,38 @@ pub fn split_runs(text: &str) -> Vec<Run> {
 }
 
 // ── pdf_manipulator patch ──
-/// Fallback bytes for the form-flatten path: a runtime-registered font
-/// (see `crate::host::fallback_fonts`) wins over the compiled-in asset, so
+/// The bytes of a fallback font: the compiled-in asset, or the font the
+/// executor holds for the lane (shared, so a later registration does not
+/// pull it from under a reader).
+pub enum FallbackBytes {
+    /// The bundled asset.
+    Bundled(&'static [u8]),
+    /// The font registered on the lane's executor.
+    Registered(std::sync::Arc<[u8]>),
+}
+
+impl std::ops::Deref for FallbackBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Bundled(bytes) => bytes,
+            Self::Registered(bytes) => bytes,
+        }
+    }
+}
+
+/// Fallback bytes for the form-flatten path: a font registered on the lane's
+/// executor (see `crate::host::executor`) wins over the compiled-in asset, so
 /// builds without `cjk-form-fonts` keep full CJK/emoji form fill when the
 /// app supplies the font. `None` = no fallback available; the caller keeps
 /// its no-font behavior.
-pub fn resolve_font_bytes(kind: Fallback) -> Option<&'static [u8]> {
-    if let Some(bytes) = crate::host::fallback_fonts::registered(kind) {
-        return Some(bytes);
+pub fn resolve_font_bytes(kind: Fallback) -> Option<FallbackBytes> {
+    if let Some(bytes) = crate::host::executor::with(|e| e.registered(kind)) {
+        return Some(FallbackBytes::Registered(bytes));
     }
     #[cfg(any(feature = "cjk-form-fonts", feature = "cjk-render-fallback"))]
-    return Some(font_bytes(kind));
+    return Some(FallbackBytes::Bundled(font_bytes(kind)));
     #[cfg(not(any(feature = "cjk-form-fonts", feature = "cjk-render-fallback")))]
     None
 }

@@ -382,6 +382,14 @@ thread_local! {
     static RECURSION_DEPTH: RefCell<u32> = const { RefCell::new(0) };
 }
 
+// ── pdf_manipulator patch: a lane starts on a clean thread (host::executor::install) ──
+/// Forgets the objects this thread was resolving and its recursion depth.
+pub(crate) fn reset_resolving() {
+    RESOLVING_STACK.with(|s| s.borrow_mut().clear());
+    RECURSION_DEPTH.with(|d| *d.borrow_mut() = 0);
+}
+// ── end pdf_manipulator patch ──
+
 /// One registered running-header/footer signature: the earliest page it was
 /// observed on (kept intact — often a cover-page title echoed by later
 /// pages), and every `(page, bbox)` it was recorded at. The latter backs

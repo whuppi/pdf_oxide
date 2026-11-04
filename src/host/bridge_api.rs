@@ -85,6 +85,11 @@ pub(crate) fn handle_request(
     mut sinks: Vec<BoxedWriter>,
     cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
+    debug_assert_eq!(
+        state.executor().owner(),
+        std::thread::current().id(),
+        "a lane's state is used on the thread that made it"
+    );
     let req = match Request::parse(bytes) {
         Ok(r) => r,
         Err(e) => return ResponseWriter::error(&format!("parse error: {e}")),

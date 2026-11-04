@@ -14,6 +14,12 @@ mod content_inline;
 mod content_stream;
 mod determinism;
 mod encrypted_streams;
+mod executor_state;
+#[cfg(feature = "native-bridge")]
+mod executor_lanes;
+mod heap_counts;
+#[cfg(feature = "native-bridge")]
+mod lane_boundary;
 mod document_pages;
 mod editor_deflate;
 mod editor_duplicates;

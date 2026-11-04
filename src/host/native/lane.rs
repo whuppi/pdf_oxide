@@ -31,6 +31,7 @@
 
 use crate::host::bridge_api::{handle_request, BoxedReader, BoxedWriter};
 use crate::host::binary_codec::ResponseWriter;
+use crate::host::heap;
 use crate::host::lane_state::LaneState;
 use crate::host::native::callback_reader::CallbackReader;
 use crate::host::native::callback_writer::CallbackWriter;
@@ -415,15 +416,18 @@ pub fn lane_main(mailbox: Receiver<Mail>, controller: Arc<LaneController>) {
 
     while let Ok(mail) = mailbox.recv() {
         match mail {
-            Mail::Job(job) => match state.as_mut() {
-                Some(live) => {
-                    if !run_job(live, &controller, job) {
-                        state = None;
-                        *controller.mailbox.lock().unwrap() = None;
+            Mail::Job(job) => {
+                heap::adopt(submitted_bytes(&job));
+                match state.as_mut() {
+                    Some(live) => {
+                        if !run_job(live, &controller, job) {
+                            state = None;
+                            *controller.mailbox.lock().unwrap() = None;
+                        }
                     }
+                    None => fail_job(&controller, job),
                 }
-                None => fail_job(&controller, job),
-            },
+            }
             Mail::Reset { result_port } => {
                 let answer = match state.as_mut() {
                     // Dequeued after a kill: the lane is going away, and
@@ -451,9 +455,22 @@ pub fn lane_main(mailbox: Receiver<Mail>, controller: Arc<LaneController>) {
 /// channels that belonged to it. Runs between jobs on the lane thread, so
 /// no reader is parked on a channel and no other thread touches the state.
 /// Dart frees the held buffers after the reset's answer, never before.
-fn reset_lane(state: &mut LaneState, controller: &LaneController) {
+pub(crate) fn reset_lane(state: &mut LaneState, controller: &LaneController) {
     *state = LaneState::new();
     controller.channels.release_held();
+}
+
+/// What the Arc of a job's cancel flag takes: two counts and the flag, padded
+/// to a word.
+const CANCEL_ARC_BYTES: usize = 3 * std::mem::size_of::<usize>();
+
+/// What `lane_submit` allocated for `job` on the caller's thread and this
+/// thread frees: the request, the two channel lists and the cancel flag's Arc.
+fn submitted_bytes(job: &Job) -> usize {
+    job.request.capacity()
+        + job.sources.capacity() * std::mem::size_of::<SourceChannel>()
+        + job.sinks.capacity() * std::mem::size_of::<SinkChannel>()
+        + CANCEL_ARC_BYTES
 }
 
 /// Post the lane-dead error for a job that arrives after a panic.
@@ -567,9 +584,19 @@ fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) -> bool
 
 /// Post result bytes to the job's Dart port. A closed port (job
 /// cancelled, instance disposed) makes this a safe no-op.
+///
+/// A posted, non-empty response is shrunk to its length and boxed (a `Vec`
+/// header) by allo-isolate on this thread, and freed by Dart's finalizer on a
+/// Dart thread, so this thread stops counting those bytes before the post. A
+/// post that fails frees them here, inside the call: they are counted again
+/// afterwards, so the free nets to nothing.
 pub(crate) fn post_result(port: i64, bytes: Vec<u8>) {
+    let handed = if bytes.is_empty() { 0 } else { bytes.len() + std::mem::size_of::<Vec<u8>>() };
+    heap::release(handed);
     let isolate = allo_isolate::Isolate::new(port);
-    isolate.post(allo_isolate::ZeroCopyBuffer(bytes));
+    if !isolate.post(allo_isolate::ZeroCopyBuffer(bytes)) {
+        heap::adopt(handed);
+    }
 }
 
 #[cfg(test)]
@@ -597,6 +624,33 @@ mod tests {
             sinks: vec![],
             result_port: 0,
             cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// What `lane_submit` builds on the caller's thread is what the lane
+    /// adopts: the caller's heap grows by exactly `submitted_bytes`.
+    #[test]
+    fn a_submitted_job_is_adopted_at_the_size_the_caller_allocated() {
+        let (mut buf, mut other) = (read_buf(), read_buf());
+        let before = heap::live();
+        let request = vec![7u8; 1000];
+        let sources = vec![
+            SourceChannel { buf: buf.as_mut_ptr() as usize, notify: None, length: 1, keep: false },
+            SourceChannel { buf: other.as_mut_ptr() as usize, notify: None, length: 1, keep: false },
+        ];
+        let sinks = vec![SinkChannel { buf: 0, notify: None }];
+        let job = Job {
+            job_id: 1,
+            request,
+            sources,
+            sinks,
+            result_port: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(heap::live() - before, submitted_bytes(&job));
+        unsafe {
+            sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR);
+            sb::destroy_sync(other.as_mut_ptr(), rc::OFFSET_SYNC_PTR);
         }
     }
 

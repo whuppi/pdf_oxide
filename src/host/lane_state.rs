@@ -14,6 +14,7 @@
 
 use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;
+use crate::host::executor::{self, Executor};
 use crate::writer::DocumentBuilder;
 use std::collections::HashMap;
 
@@ -28,18 +29,31 @@ pub struct LaneState {
     pub builders: HashMap<u32, DocumentBuilder>,
     /// Next handle id. Plain u32 — single-threaded owner, no atomics.
     next_handle: u32,
+    /// The lane's font and CMap caches and fallback fonts, installed for the
+    /// thread that made this state until it drops. Boxed so the installed
+    /// address survives a move of the state; last, so the handles above drop
+    /// before the caches they may have filled.
+    executor: Box<Executor>,
 }
 
 impl LaneState {
     /// Create an empty lane state. Handle ids start at 1 (0 means
     /// "no handle" on the wire).
     pub fn new() -> Self {
+        let executor = Box::new(Executor::new());
+        executor::install(&executor);
         Self {
             documents: HashMap::new(),
             editors: HashMap::new(),
             builders: HashMap::new(),
             next_handle: 1,
+            executor,
         }
+    }
+
+    /// The executor this state owns.
+    pub fn executor(&self) -> &Executor {
+        &self.executor
     }
 
     /// Allocate the next handle id.
@@ -47,6 +61,12 @@ impl LaneState {
         let id = self.next_handle;
         self.next_handle += 1;
         id
+    }
+}
+
+impl Drop for LaneState {
+    fn drop(&mut self) {
+        executor::uninstall(&self.executor);
     }
 }
 

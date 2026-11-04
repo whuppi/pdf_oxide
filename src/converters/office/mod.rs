@@ -1356,6 +1356,15 @@ thread_local! {
         = const { std::cell::RefCell::new(None) };
 }
 
+// ── pdf_manipulator patch: a lane starts on a clean thread (host::executor::install) ──
+/// Forgets the font-resolution context a conversion that never finished left.
+pub(crate) fn reset_conversion_context() {
+    REGISTERED_FONTS.with(|cell| cell.replace(None));
+    UNICODE_FALLBACK_FONT.with(|cell| cell.replace(None));
+    UNICODE_FALLBACK_CJK_FONT.with(|cell| cell.replace(None));
+}
+// ── end pdf_manipulator patch ──
+
 /// Run `body` with the full font-resolution context: registered
 /// embedded faces, plus optional Unicode + CJK fallback names. Used
 /// to scope `resolve_font_name` / `resolve_font_for_text` answers to

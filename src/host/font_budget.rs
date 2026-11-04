@@ -25,6 +25,19 @@ pub(crate) const GLOBAL_FONT_BYTES: usize = 2 * MIB;
 /// What the process-wide ToUnicode CMap cache may hold.
 pub(crate) const CMAP_CACHE_BYTES: usize = MIB;
 
+/// What the process-wide cache of the machine's font files may hold (the
+/// renderer's `FONT_BYTES_CACHE`), and what its cache of faces parsed from
+/// them may be charged. One render of any PDF committed in the tree needed at
+/// most 6.9 MiB of them (three fonts of 3.7 MiB at most), so 8 MiB holds a
+/// whole document's fonts and about two of the largest. A font above the
+/// budget (a CJK face of 10 to 20 MiB) is read again for each use, except the
+/// CJK fallback, which the renderer keeps for the process.
+pub(crate) const MACHINE_FONT_BYTES: usize = 8 * MIB;
+
+/// See [`MACHINE_FONT_BYTES`]; a face is charged its font program again,
+/// though the two caches share one allocation.
+pub(crate) const MACHINE_FACE_BYTES: usize = 8 * MIB;
+
 /// The fonts a page's text extraction loads when it starts, and the fonts it
 /// keeps resident beside them while it reads the rest by name.
 pub(crate) const PAGE_FONT_BYTES: usize = 512 * KIB;

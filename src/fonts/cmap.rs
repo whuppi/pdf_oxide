@@ -317,13 +317,9 @@ fn compute_stream_hash(data: &[u8]) -> CMapKey {
 // - Parse and insert new entries (Mutex serializes writes)
 // - Access shared CMaps concurrently (Arc is thread-safe)
 
-// ── pdf_manipulator patch: the CMap cache is bounded by the bytes its CMaps take, not by their number ──
-static CMAP_CACHE: std::sync::LazyLock<Mutex<crate::host::font_budget::ByteCache<CMapKey, Arc<CMap>>>> =
-    std::sync::LazyLock::new(|| {
-        Mutex::new(crate::host::font_budget::ByteCache::lru(
-            crate::host::font_budget::CMAP_CACHE_BYTES,
-        ))
-    });
+// ── pdf_manipulator patch: the CMap cache belongs to the lane's executor and is bounded by the bytes its CMaps take ──
+// It is an LRU of `CMAP_CACHE_BYTES` on `crate::host::executor::Executor`;
+// each access below is one get or one put.
 // ── end pdf_manipulator patch ──
 
 /// Clear the global CMap cache.
@@ -331,12 +327,16 @@ static CMAP_CACHE: std::sync::LazyLock<Mutex<crate::host::font_budget::ByteCache
 /// Call this to reclaim memory in long-lived processes (MCP servers,
 /// Python REPLs, Node.js services) that process many different PDFs.
 pub fn clear_cmap_cache() {
-    CMAP_CACHE.lock_or_recover().clear();
+    // ── pdf_manipulator patch: the executor's cache ──
+    crate::host::executor::with(|e| e.clear_cmaps());
+    // ── end pdf_manipulator patch ──
 }
 
 /// Returns the current number of entries in the global CMap cache.
 pub fn cmap_cache_size() -> usize {
-    CMAP_CACHE.lock_or_recover().len()
+    // ── pdf_manipulator patch: the executor's cache ──
+    crate::host::executor::with(|e| e.cmap_count())
+    // ── end pdf_manipulator patch ──
 }
 
 /// Lazy-loaded ToUnicode CMap wrapper.
@@ -465,15 +465,13 @@ impl LazyCMap {
         }
 
         // Step 2: Check global cache
-        {
-            let mut global = CMAP_CACHE.lock_or_recover();
-            if let Some(cached) = global.get(&self.cache_key) {
-                let arc = Arc::clone(cached);
-                // Update local cache for next access
-                *parsed_guard = Some(Arc::clone(&arc));
-                log::debug!("CMap cache hit (global) for stream hash {:?}", self.cache_key);
-                return Some(arc);
-            }
+        // ── pdf_manipulator patch: the executor's cache, one get ──
+        if let Some(arc) = crate::host::executor::with(|e| e.cmap(&self.cache_key)) {
+            // ── end pdf_manipulator patch ──
+            // Update local cache for next access
+            *parsed_guard = Some(Arc::clone(&arc));
+            log::debug!("CMap cache hit (global) for stream hash {:?}", self.cache_key);
+            return Some(arc);
         }
 
         // Step 3: Parse on miss
@@ -485,12 +483,11 @@ impl LazyCMap {
                 *parsed_guard = Some(Arc::clone(&cmap_arc));
 
                 // Update global cache
-                {
-                    let mut global = CMAP_CACHE.lock_or_recover();
-                    // ── pdf_manipulator patch: charged by the bytes the CMap takes ──
-                    global.insert_charged(self.cache_key, Arc::clone(&cmap_arc), cmap_arc.heap_bytes());
-                    // ── end pdf_manipulator patch ──
-                }
+                // ── pdf_manipulator patch: the executor's cache, one put, charged by the bytes the CMap takes ──
+                crate::host::executor::with(|e| {
+                    e.put_cmap(self.cache_key, Arc::clone(&cmap_arc), cmap_arc.heap_bytes())
+                });
+                // ── end pdf_manipulator patch ──
 
                 log::debug!("CMap parsed and cached (stream hash {:?})", self.cache_key);
                 Some(cmap_arc)
