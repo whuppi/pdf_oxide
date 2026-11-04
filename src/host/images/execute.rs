@@ -554,6 +554,7 @@ impl<'a> Pipe<'a> {
         let mut encoder = FlateRows::new(self.width, channels)?;
         let mut row = vec![0u8; self.width as usize * channels as usize];
         for _ in 0..self.height {
+            crate::cancel::poll()?;
             self.pull(&mut row)?;
             encoder.push(&row)?;
         }
@@ -565,6 +566,7 @@ impl<'a> Pipe<'a> {
         let mut encoder = CcittRows::new(self.width)?;
         let mut row = vec![0u8; self.width as usize];
         for _ in 0..self.height {
+            crate::cancel::poll()?;
             self.pull(&mut row)?;
             encoder.push(&row)?;
         }

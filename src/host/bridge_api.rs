@@ -90,6 +90,7 @@ pub(crate) fn handle_request(
         std::thread::current().id(),
         "a lane's state is used on the thread that made it"
     );
+    let _job = crate::cancel::enter(cancel);
     let req = match Request::parse(bytes) {
         Ok(r) => r,
         Err(e) => return ResponseWriter::error(&format!("parse error: {e}")),

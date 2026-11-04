@@ -161,6 +161,7 @@ impl<'a, W: Write> ImageModStage<'a, W> {
     fn push_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
         let mut ops = Operators::new(chunk, Mode::Full).with_inline_images(InlineImages::Collect);
         for item in ops.by_ref() {
+            crate::cancel::poll_io()?;
             let op = item.map_err(io::Error::other)?;
             self.push(&op)?;
         }

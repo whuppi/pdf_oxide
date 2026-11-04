@@ -910,6 +910,7 @@ pub fn edit_select_pages(editor: &mut DocumentEditor, pages: &[usize]) -> Result
 pub(crate) fn refuse_repeated_pages(pages: impl IntoIterator<Item = usize>) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for p in pages {
+        crate::cancel::poll()?;
         if !seen.insert(p) {
             return Err(Error::InvalidOperation(format!("page {p} is listed twice")));
         }
@@ -1002,6 +1003,7 @@ pub fn edit_merge(editor: &mut DocumentEditor, secondary_bytes: &[Vec<u8>]) -> R
 fn check_editable_pages(editor: &DocumentEditor, pages: &[usize]) -> Result<()> {
     check_pages(editor, pages)?;
     for &page in pages {
+        crate::cancel::poll()?;
         editor.source_page_index(page)?;
     }
     Ok(())
@@ -2006,6 +2008,7 @@ pub fn edit_watermark(
             check_pages(editor, pages)?;
             let mut targets = Vec::with_capacity(pages.len());
             for &page in pages {
+                crate::cancel::poll()?;
                 let mb = editor.get_page_media_box(page)?;
                 check_page(editor, page)?;
                 targets.push((page, mb));
@@ -2020,10 +2023,12 @@ pub fn edit_watermark(
             editor.all_media_boxes().into_iter().enumerate().collect()
         },
     };
-    for (page, mb) in targets {
-        add_to_page(editor, page, mb)?;
-    }
-    Ok(())
+    editor.undoable(|editor| {
+        for (page, mb) in targets {
+            add_to_page(editor, page, mb)?;
+        }
+        Ok(())
+    })
 }
 
 /// Generate PDF content stream operators for a text watermark.
@@ -2144,6 +2149,7 @@ fn plan_page_font(
 
     // Reuse an existing registration of the same standard font.
     for (name, value) in fonts.clone() {
+        crate::cancel::poll()?;
         let font_obj = match value {
             Object::Dictionary(d) => Object::Dictionary(d),
             Object::Reference(r) => {
@@ -2309,6 +2315,7 @@ pub fn edit_add_stamp(
     check_editable_pages(editor, pages)?;
     let mut built = Vec::with_capacity(pages.len());
     for &page in pages {
+        crate::cancel::poll()?;
         let mut annot = crate::writer::StampAnnotation::new(rect, st.clone());
         if opacity > 0.0 && opacity < 1.0 {
             annot.opacity = Some(opacity);
@@ -2426,6 +2433,7 @@ fn stage_image_stamps(
     }
 
     for &page in pages {
+        crate::cancel::poll()?;
         let annot_id = editor.alloc_id();
         editor.insert_modified(annot_id, Object::Dictionary(annot.clone()));
 

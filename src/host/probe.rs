@@ -37,6 +37,7 @@ pub fn render_streamed(
     cancel: &CancelCheck,
 ) -> Result<usize> {
     use crate::host::render_stream::{render_pages_streamed, RenderFormat, RenderSize};
+    let _job = crate::cancel::enter(cancel);
     render_pages_streamed(doc, pages, RenderSize::Dpi(dpi), RenderFormat::Png, writer, cancel)
 }
 
@@ -48,6 +49,7 @@ pub fn extract_images_streamed(
     writer: &mut impl std::io::Write,
     cancel: &CancelCheck,
 ) -> Result<usize> {
+    let _job = crate::cancel::enter(cancel);
     crate::host::extract_stream::extract_images_streamed(doc, pages, writer, cancel)
 }
 
@@ -58,6 +60,7 @@ pub fn save_incremental(
     options: &SaveOptions,
     cancel: &CancelCheck,
 ) -> Result<()> {
+    let _job = crate::cancel::enter(cancel);
     crate::host::incremental::write(editor, writer, options, cancel).map_err(|e| match e {
         crate::host::incremental::IncrementalError::Refused(why) => {
             crate::error::Error::InvalidOperation(why)
@@ -73,6 +76,7 @@ pub fn merge_pages(
     pages: Option<&[usize]>,
     cancel: &CancelCheck,
 ) -> Result<()> {
+    let _job = crate::cancel::enter(cancel);
     let source = DocumentEditor::open_merge_source(Box::new(std::io::Cursor::new(bytes)))?;
     editor.merge_document(source, pages, cancel).map(|_| ())
 }
@@ -84,6 +88,7 @@ pub fn extract_pages(
     writer: &mut impl crate::host::positioned_write::PositionedWrite,
     cancel: &CancelCheck,
 ) -> Result<()> {
+    let _job = crate::cancel::enter(cancel);
     editor
         .with_pages_selected(pages, |editor| {
             crate::host::dispatch::edit_save_with_options(
@@ -99,5 +104,6 @@ pub fn extract_pages(
 /// `open` / `editorOpen`'s source: the PDF in `bytes`, read through the
 /// external-reader path the lanes use, not the in-memory one.
 pub fn open_source(bytes: Vec<u8>, cancel: &CancelCheck) -> Result<PdfDocument> {
+    let _job = crate::cancel::enter(cancel);
     PdfDocument::from_external_reader_cancellable(Box::new(std::io::Cursor::new(bytes)), cancel)
 }

@@ -232,7 +232,9 @@ impl Counter<'_> {
         let mut scratch = Vec::new();
         let mut ops = ops.with_inline_images(InlineImages::Skip);
         let mut intact = true;
+        let mut stride = crate::cancel::Stride::job();
         for item in ops.by_ref() {
+            stride.tick()?;
             let Ok(op) = item else {
                 intact = false;
                 break;
@@ -251,6 +253,7 @@ impl Counter<'_> {
             return self.give_up(resources);
         }
         for (name, codes) in &pass.result().fonts {
+            crate::cancel::poll()?;
             let Some(FontEntry::Reference(font)) = entries.get(name) else {
                 continue;
             };
@@ -302,6 +305,7 @@ impl Counter<'_> {
         };
         let annots = self.source.resolve_object(annots)?;
         for annot in annots.as_array().into_iter().flatten() {
+            crate::cancel::poll()?;
             let Some(r) = annot.as_reference() else { continue };
             if dropped.contains(&r.id) {
                 continue;
@@ -846,6 +850,7 @@ impl DocumentEditor {
         let mut pages: Vec<&usize> = self.redacted_pages.keys().collect();
         pages.sort();
         for src in pages {
+            crate::cancel::poll()?;
             let page = &self.redacted_pages[src];
             let page_ref = self.source.get_page_ref(*src)?;
             let page_dict = self.source.load_object(page_ref)?.as_dict().cloned().unwrap_or_default();
@@ -885,6 +890,7 @@ impl DocumentEditor {
     ) -> Result<()> {
         let entries = font_entries(&self.source, resources)?;
         for (name, codes) in &scope.fonts {
+            crate::cancel::poll()?;
             match entries.get(name) {
                 Some(FontEntry::Reference(r)) => {
                     let state = states.entry(r.id).or_default();
@@ -917,6 +923,7 @@ impl DocumentEditor {
         let mut pages: Vec<usize> = self.redacted_pages.keys().copied().collect();
         pages.sort();
         for src in pages {
+            crate::cancel::poll()?;
             let annots = self.flatten_annotations_pages.contains(&src);
             let widgets = self.flatten_forms_pages.contains(&src);
             let had = self.redacted_pages[&src].flat.is_some();
@@ -1247,6 +1254,7 @@ impl DocumentEditor {
         let dropped = self.redacted_annotation_ids();
         let mut counter = Counter { source: &self.source, states, visited: HashSet::new() };
         for index in 0..self.source.page_count()? {
+            crate::cancel::poll()?;
             let page_ref = self.source.get_page_ref(index)?;
             let page = self.source.load_object(page_ref)?;
             let resources = Self::inherited_resources(&self.source, index)?;

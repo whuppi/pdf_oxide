@@ -73,6 +73,7 @@ pub fn page_image_xobject_names(
         return Ok(names);
     };
     for (name, target) in xobjects {
+        crate::cancel::poll()?;
         let Ok(obj) = source.resolve_object(&target) else {
             continue;
         };

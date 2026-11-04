@@ -463,3 +463,97 @@ fn render_cancelled_between_the_operators_of_a_band() {
     }
     assert!(render(&CancelCheck::none()).is_ok(), "the document renders after the cancels");
 }
+
+/// No Dart battery sees it: these edits take no check, so their loops poll
+/// the check the job entered, and only a check that cancels at an exact poll
+/// proves each page of the list is a safe place to stop with the editor as it
+/// was.
+#[test]
+fn page_list_edits_cancelled_at_any_poll_change_nothing() {
+    let bytes = text_pdf(6, 2);
+    let all = [0usize, 1, 2, 3, 4, 5];
+    editor_at_every_poll(
+        || editor_of(&bytes),
+        |editor, cancel| {
+            let _job = crate::cancel::enter(cancel);
+            crate::host::dispatch::edit_select_pages(editor, &[5, 3, 1])
+        },
+        true,
+        // one poll for each of the three pages of the list's repeat check
+        3,
+    );
+    editor_at_every_poll(
+        || editor_of(&bytes),
+        |editor, cancel| {
+            let _job = crate::cancel::enter(cancel);
+            crate::host::dispatch::edit_add_stamp(editor, &all, "Approved", 10.0, 10.0, 60.0, 20.0, 1.0)
+        },
+        true,
+        // the repeat check and the editable check of six pages, then the build of six stamps
+        18,
+    );
+    editor_at_every_poll(
+        || editor_of(&bytes),
+        |editor, cancel| {
+            let _job = crate::cancel::enter(cancel);
+            crate::host::dispatch::edit_watermark(
+                editor,
+                Some(&all),
+                "DRAFT",
+                24.0,
+                45.0,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                "background",
+                crate::host::dispatch::WatermarkPosition::Centre,
+            )
+        },
+        true,
+        // the repeat check of six pages and the font plan of six pages
+        12,
+    );
+}
+
+/// One page of `n` save, transform and restore triples: the operators an image
+/// walk reads, since it skips the text ones.
+fn graphics_pdf(n: usize) -> Vec<u8> {
+    let content = "q 1 0 0 1 5 5 cm Q\n".repeat(n);
+    let objects = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n".to_vec(),
+        stream_object(4, "", content.as_bytes()),
+    ];
+    pdf_from_objects(&objects)
+}
+
+/// No Dart battery sees it: a long page's operators are read for its images
+/// by a loop that takes no check, and a cancel in it must leave neither a
+/// half-read page in the document's caches nor a different result for the
+/// next read.
+#[test]
+fn page_images_of_a_long_page_cancelled_at_any_poll_caches_nothing() {
+    let bytes = graphics_pdf(3000);
+    read_at_every_poll(
+        || open(&bytes),
+        |doc, cancel| {
+            let _job = crate::cancel::enter(cancel);
+            doc.page_image_handles(0).map(|handles| handles.len())
+        },
+        // two strides of 4,096 operators in 9,000 (3,000 triples)
+        2,
+    );
+    let mut editor_polls = 0;
+    editor_polls += editor_at_every_poll(
+        || editor_of(&bytes),
+        |editor, cancel| {
+            let _job = crate::cancel::enter(cancel);
+            editor.get_page_images(0).map(|_| ())
+        },
+        false,
+        2,
+    );
+    assert!(editor_polls >= 2);
+}

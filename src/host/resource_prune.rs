@@ -358,6 +358,7 @@ pub(crate) fn plan(scope: Scope<'_, '_>, cancel: &CancelCheck) -> Result<()> {
     pruner.finish_unnamed(cancel)?;
     pruner.close_color_spaces();
     pruner.pin_shared(cancel)?;
+    cancel.check()?;
     pruner.cut_shared();
     Ok(())
 }
@@ -776,6 +777,9 @@ impl Pruner<'_, '_> {
         let Object::Array(annots) = &*annots else { return Vec::new() };
         let mut forms = Vec::new();
         for annot in annots {
+            if crate::cancel::poll().is_err() {
+                break;
+            }
             let (names, annot) = match annot {
                 Object::Reference(r) => {
                     let names = !self.excluded.contains(&r.id);

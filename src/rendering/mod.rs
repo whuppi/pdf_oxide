@@ -687,6 +687,12 @@ pub fn flatten_to_images(doc: &crate::document::PdfDocument, dpi: u32) -> Result
 
     let mut paths: Vec<String> = Vec::new();
     for page_idx in 0..page_count {
+        // ── pdf_manipulator patch: a cancel stops the page renders within one page and removes the pages written so far ──
+        if let Err(e) = crate::cancel::poll() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+        // ── end pdf_manipulator patch ──
         let mut renderer = PageRenderer::new(options.clone());
         let rendered = renderer.render_page(doc, page_idx)?;
         let path = tmp_dir.join(format!("page_{}.png", page_idx));

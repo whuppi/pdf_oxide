@@ -9332,6 +9332,9 @@ impl PageRenderer {
         let needs_appearances = doc.acroform_needs_appearances();
         // ── end pdf_manipulator patch ──
         for annot in annotations {
+            // ── pdf_manipulator patch: a cancel stops the annotations within one annotation ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             // Per ISO 32000-1 §12.5.2, an annotation dict may carry an /OC
             // entry referencing the OCG/OCMD the annotation belongs to. Skip
             // the annotation entirely if its layer is excluded.

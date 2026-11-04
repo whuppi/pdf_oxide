@@ -9,6 +9,7 @@ mod band_proof;
 #[cfg(feature = "rendering")]
 mod cancel_at_every_poll;
 mod alone;
+mod cancel_job;
 mod cancel_polls;
 mod content_inline;
 mod content_stream;

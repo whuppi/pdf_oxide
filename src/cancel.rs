@@ -11,8 +11,13 @@
 //!   wasm32 — reads the job's cancel word through the `host_cancelled`
 //!            import (a SharedArrayBuffer word the main thread stores to).
 //!   none   — never cancelled: every caller outside a lane, and tests.
+//!
+//! Upstream code has no `CancelCheck` in scope, so the running job's check is
+//! installed in a thread-local for the job's life ([`enter`]) and a loop in
+//! such code polls it with [`poll`].
 
 use crate::error::{Error, Result};
+use std::cell::RefCell;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,22 +150,73 @@ pub(crate) const STRIDE: u32 = 4096;
 
 /// Polls a [`CancelCheck`] once per [`STRIDE`] iterations of an inner loop.
 pub(crate) struct Stride<'a> {
-    cancel: &'a CancelCheck,
+    cancel: Option<&'a CancelCheck>,
     count: u32,
 }
 
 impl<'a> Stride<'a> {
     pub(crate) fn new(cancel: &'a CancelCheck) -> Self {
-        Self { cancel, count: 0 }
+        Self { cancel: Some(cancel), count: 0 }
+    }
+
+    /// A stride over the check installed by [`enter`], for a loop with no
+    /// `CancelCheck` in scope.
+    pub(crate) fn job() -> Self {
+        Self { cancel: None, count: 0 }
     }
 
     /// Counts one iteration; every [`STRIDE`]th one checks for a cancel.
     pub(crate) fn tick(&mut self) -> Result<()> {
         self.count = self.count.wrapping_add(1);
-        if self.count % STRIDE == 0 {
-            self.cancel.check()
-        } else {
-            Ok(())
+        if self.count % STRIDE != 0 {
+            return Ok(());
+        }
+        match self.cancel {
+            Some(cancel) => cancel.check(),
+            None => poll(),
         }
     }
+}
+
+thread_local! {
+    static CURRENT: RefCell<Option<CancelCheck>> = const { RefCell::new(None) };
+}
+
+/// Keeps a job's check installed for [`poll`]; dropping it restores the check
+/// that was installed before.
+#[must_use = "the check is installed only while the guard lives"]
+pub struct JobGuard {
+    previous: Option<CancelCheck>,
+}
+
+/// Installs `check` as the running job's check on this thread until the
+/// returned guard drops.
+pub fn enter(check: &CancelCheck) -> JobGuard {
+    let previous = CURRENT.with(|current| current.borrow_mut().replace(check.clone()));
+    JobGuard { previous }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CURRENT.with(|current| *current.borrow_mut() = previous);
+    }
+}
+
+/// Polls the check installed by [`enter`]: the cancelled error once the job
+/// is cancelled, `Ok` when nothing is installed.
+pub fn poll() -> Result<()> {
+    CURRENT.with(|current| match current.borrow().as_ref() {
+        Some(check) => check.check(),
+        None => Ok(()),
+    })
+}
+
+/// [`poll`] for a loop that returns `io::Result`: the cancelled error is the
+/// one the readers and writers return.
+pub fn poll_io() -> std::io::Result<()> {
+    poll().map_err(|error| match error {
+        Error::Io(error) => error,
+        other => std::io::Error::other(other),
+    })
 }

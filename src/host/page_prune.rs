@@ -288,6 +288,9 @@ impl Planner<'_> {
         let mut nums = Vec::new();
         let mut prev: Option<(Option<usize>, usize)> = None;
         for (j, slot) in page_order.iter().enumerate() {
+            if self.cancel.is_cancelled() {
+                return;
+            }
             let PageKey::Source(i) = slot.key() else {
                 prev = None;
                 continue;
@@ -450,6 +453,9 @@ impl Planner<'_> {
             .collect();
         for page in dropped {
             for a in self.annot_refs(page) {
+                if self.cancel.is_cancelled() {
+                    return;
+                }
                 if !on_kept.contains(&a.id) {
                     self.out.excluded.insert(a.id);
                 }
@@ -671,6 +677,9 @@ impl Planner<'_> {
     fn prune_links(&mut self, kept: &[ObjectRef]) {
         let annots: HashSet<ObjectRef> = kept.iter().flat_map(|r| self.annot_refs(*r)).collect();
         for a in annots {
+            if self.cancel.is_cancelled() {
+                return;
+            }
             let Some(Object::Dictionary(mut d)) = self.load(a) else {
                 continue;
             };

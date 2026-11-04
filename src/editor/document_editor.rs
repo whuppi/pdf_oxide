@@ -1595,6 +1595,7 @@ impl DocumentEditor {
     ) -> Result<R> {
         let mut selected = Vec::with_capacity(pages.len());
         for &page in pages {
+            crate::cancel::poll()?;
             selected.push(*self.page_order.get(page).ok_or_else(|| {
                 Error::InvalidPdf(format!(
                     "Page index {} out of range (document has {} pages)",
@@ -1891,6 +1892,9 @@ impl DocumentEditor {
 
         let page_count = self.page_count()?;
         for &page in pages {
+            // ── pdf_manipulator patch: a cancel stops the page list within one page ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             if page >= page_count {
                 return Err(Error::InvalidPdf(format!(
                     "Page index {} out of range (document has {} pages)",
@@ -1952,6 +1956,9 @@ impl DocumentEditor {
         }
         let page_count = self.page_count()?;
         for &p in pages {
+            // ── pdf_manipulator patch: a cancel stops the page list within one page ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             if p >= page_count {
                 return Err(Error::InvalidPdf(format!(
                     "Page index {} out of range (document has {} pages)",
@@ -2110,6 +2117,7 @@ impl DocumentEditor {
     ) -> Result<usize> {
         let page_refs = source_doc.all_page_refs_cancellable(cancel)?;
         for &page in pages {
+            cancel.check()?;
             if page >= page_refs.len() {
                 return Err(Error::InvalidPdf(format!(
                     "Page index {} out of range (source has {} pages)",
@@ -2136,6 +2144,10 @@ impl DocumentEditor {
         let first_free_id = self.next_object_id;
         let page_ids: Vec<u32> = pages.iter().map(|_| self.allocate_object_id()).collect();
         for (&page_idx, &page_id) in pages.iter().zip(&page_ids) {
+            if let Err(e) = cancel.check() {
+                self.next_object_id = first_free_id;
+                return Err(e);
+            }
             merged.id_map.entry(page_refs[page_idx].id).or_insert(page_id);
         }
         for (&page_idx, &page_id) in pages.iter().zip(&page_ids) {
@@ -2407,6 +2419,7 @@ impl DocumentEditor {
 
         let mut kept = vec![false; self.merged_page_total()];
         for slot in &self.page_order {
+            crate::cancel::poll()?;
             if let PageKey::Merged(index) = slot.key() {
                 kept[index] = true;
             }
@@ -2425,6 +2438,7 @@ impl DocumentEditor {
             let mut reached: HashSet<u32> = HashSet::new();
             let mut pending: Vec<ObjectRef> = Vec::new();
             for (page, _) in source.pages.iter().zip(&kept[pages.clone()]).filter(|(_, &k)| k) {
+                crate::cancel::poll()?;
                 let mut page_object = Self::merged_page_object(source, page.page_ref)?;
                 if let Some(cuts) = cuts.get(&page.page_id) {
                     page_object = apply(page_object, cuts);
@@ -2449,6 +2463,7 @@ impl DocumentEditor {
             }
             source.doc.clear_object_cache();
             for page in &source.pages {
+                crate::cancel::poll()?;
                 for &(new_id, _) in &source.objects[page.objects.clone()] {
                     if !reached.contains(&new_id) {
                         left_out.insert(new_id);
@@ -2481,6 +2496,7 @@ impl DocumentEditor {
             let mut pages = Vec::new();
             let mut writers: Vec<u32> = Vec::new();
             for (page, _) in source.pages.iter().zip(&merged_kept[range]).filter(|(_, &kept)| kept) {
+                cancel.check()?;
                 pages.push(ScopePage { id: page.page_ref.id, held: false });
                 writers.push(page.page_ref.id);
             }
@@ -4153,6 +4169,7 @@ impl DocumentEditor {
         };
         for set in &flat.sets {
             for (id, name) in &set.xobjects {
+                crate::cancel::poll()?;
                 xobjects.insert(name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
             }
         }
@@ -4485,6 +4502,7 @@ impl DocumentEditor {
         let mut xobjects = dict.get("XObject").and_then(Object::as_dict).cloned().unwrap_or_default();
         for set in &flat.sets {
             for (id, name) in &set.xobjects {
+                crate::cancel::poll()?;
                 if page.scope.kept_xobject_names.contains(name) {
                     xobjects.insert(name.clone(), Object::Reference(ObjectRef::new(*id, 0)));
                 }
@@ -4517,6 +4535,7 @@ impl DocumentEditor {
         xobject_dict.retain(|name, _| scope.kept_xobject_names.contains(name));
         // The copies, under the names the pass wrote.
         for (placement, ids) in scope.placements.iter().zip(&ids.images) {
+            crate::cancel::poll()?;
             xobject_dict.insert(
                 placement.name.clone(),
                 Object::Reference(ObjectRef::new(ids.image.0, 0)),
@@ -4552,6 +4571,7 @@ impl DocumentEditor {
         if !ids.fonts.is_empty() {
             let mut font_dict = entries("Font")?;
             for (name, entry) in &ids.fonts {
+                crate::cancel::poll()?;
                 font_dict.insert(name.clone(), entry.clone());
             }
             resources_dict.insert("Font".to_string(), Object::Dictionary(font_dict));
@@ -5579,6 +5599,7 @@ impl DocumentEditor {
             let mut seen_source = vec![false; leaves.len()];
             let mut seen_merged = vec![false; merged_page_ids.len()];
             for position in 0..self.page_order.len() {
+                cancel.check()?;
                 let (seen, original_id) = match self.page_order[position].key() {
                     PageKey::Source(index) if index < leaves.len() => {
                         (&mut seen_source[index], leaves[index].id)
@@ -5616,6 +5637,7 @@ impl DocumentEditor {
                     // ── pdf_manipulator patch: merged pages sit in /Kids in page order; their own block writes them, not the page loop ──
                     let mut kids: Vec<Object> = Vec::with_capacity(self.page_order.len());
                     for (position, slot) in self.page_order.iter().enumerate() {
+                        cancel.check()?;
                         if let Some(&copy_id) = repeat_at.get(&position) {
                             kids.push(Object::Reference(ObjectRef::new(copy_id, 0)));
                             continue;
@@ -8971,13 +8993,15 @@ impl DocumentEditor {
         // ── pdf_manipulator patch: every page, named by the source page it shows ──
         // The set holds source page indices, so a document with pages removed
         // or reordered must not insert the output indices.
+        let mut keys = Vec::with_capacity(page_count);
         for page in 0..page_count {
-            let key = match self.page_key(page) {
+            crate::cancel::poll()?;
+            keys.push(match self.page_key(page) {
                 PageKey::Source(source_page) => source_page,
                 PageKey::Merged(_) => page,
-            };
-            self.flatten_annotations_pages.insert(key);
+            });
         }
+        self.flatten_annotations_pages.extend(keys);
         // ── end pdf_manipulator patch ──
         self.is_modified = true;
         Ok(())
@@ -9041,13 +9065,15 @@ impl DocumentEditor {
     pub fn flatten_forms(&mut self) -> Result<()> {
         let page_count = self.current_page_count();
         // ── pdf_manipulator patch: every page, named by the source page it shows ──
+        let mut keys = Vec::with_capacity(page_count);
         for page in 0..page_count {
-            let key = match self.page_key(page) {
+            crate::cancel::poll()?;
+            keys.push(match self.page_key(page) {
                 PageKey::Source(source_page) => source_page,
                 PageKey::Merged(_) => page,
-            };
-            self.flatten_forms_pages.insert(key);
+            });
         }
+        self.flatten_forms_pages.extend(keys);
         // ── end pdf_manipulator patch ──
         self.remove_acroform = true;
         self.is_modified = true;
@@ -11976,6 +12002,9 @@ impl DocumentEditor {
         let mut redactions = Vec::new();
 
         for annotation in annotations {
+            // ── pdf_manipulator patch: a cancel stops the annotations within one annotation ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             // Only process Redact annotations
             if annotation.subtype_enum != AnnotationSubtype::Redact {
                 continue;
@@ -12100,7 +12129,13 @@ impl DocumentEditor {
         let mut ctm_stack: Vec<[f32; 6]> = vec![[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]]; // Identity
         let mut current_ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
 
+        // ── pdf_manipulator patch: a cancel stops the page's operators within a stride ──
+        let mut stride = crate::cancel::Stride::job();
+        // ── end pdf_manipulator patch ──
         for op in operators {
+            // ── pdf_manipulator patch: a cancel stops the page's operators within a stride ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             match op {
                 crate::content::operators::Operator::SaveState => {
                     ctm_stack.push(current_ctm);

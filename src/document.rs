@@ -2003,6 +2003,9 @@ impl PdfDocument {
         let mut img_area = 0.0f32;
         let mut codec = ImageCodecClass::None;
         for im in &images {
+            // ── pdf_manipulator patch: a cancel stops the image walk within one image ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             if let Some(b) = im.bbox() {
                 img_area += Self::rect_isect_area(b, px0, py0, px1, py1);
             }
@@ -2029,7 +2032,9 @@ impl PdfDocument {
         if let Ok(ops) = self.page_operators(page) {
             let mut rm: u8 = 0;
             let mut stack: Vec<u8> = Vec::new();
+            let mut stride = crate::cancel::Stride::job();
             for op in ops.with_mode(crate::host::content::Mode::Text).flatten() {
+                stride.tick()?;
                 match op {
                     Operator::SaveState => stack.push(rm),
                     Operator::RestoreState => {
@@ -3400,6 +3405,11 @@ impl PdfDocument {
             for col in &top {
                 let bands: HashSet<i32> = col.iter().map(|&i| band_of(spans[i].bbox.y)).collect();
                 for b in bands {
+                    // ── pdf_manipulator patch: a cancel ends the band count early; the callers poll right after ──
+                    if crate::cancel::poll().is_err() {
+                        break;
+                    }
+                    // ── end pdf_manipulator patch ──
                     *support.entry(b).or_insert(0) += 1;
                 }
             }
@@ -5747,6 +5757,9 @@ impl PdfDocument {
 
         // First pass: look for objects with /Type /Page
         for &obj_num in &obj_nums {
+            // ── pdf_manipulator patch: a cancel stops the object scan within one object ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             if let Ok(obj) = self.load_object(ObjectRef {
                 id: obj_num,
                 gen: 0,
@@ -5775,6 +5788,9 @@ impl PdfDocument {
         // of 253 pages) would silently short pass 2 and fail.
         let mut heuristic_index = current_index;
         for &obj_num in &obj_nums {
+            // ── pdf_manipulator patch: a cancel stops the object scan within one object ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             if let Ok(obj) = self.load_object(ObjectRef {
                 id: obj_num,
                 gen: 0,
@@ -6757,7 +6773,7 @@ impl PdfDocument {
                 // ── pdf_manipulator patch: the page's operators are read for a BT or Do ──
                 // Also check the content stream for BT/Do operators; a content
                 // stream that cannot be read counts as text, to be conservative.
-                !self.page_may_contain_text(page_index)
+                !self.page_may_contain_text(page_index)?
                 // ── end pdf_manipulator patch ──
             };
             if no_content_text {
@@ -7401,6 +7417,9 @@ impl PdfDocument {
                 // line came out ahead of the line it continues —
                 // `criterionThe ridge regression ...`.
                 Self::reorder_rowspan_labels(&mut spans);
+                // ── pdf_manipulator patch: a cancel ended the row-span reorder early ──
+                crate::cancel::poll()?;
+                // ── end pdf_manipulator patch ──
 
                 // Restore intra-line reading order after the row-aware band sort.
                 // Off-baseline glyphs (e.g. superscripts/subscripts) can land in
@@ -11647,7 +11666,7 @@ impl PdfDocument {
         // read the content stream, be conservative and say yes (let
         // extraction try).
         // ── pdf_manipulator patch: the page's operators are read for a BT or Do ──
-        Ok(self.page_may_contain_text(page_index))
+        self.page_may_contain_text(page_index)
         // ── end pdf_manipulator patch ──
     }
 
@@ -12581,6 +12600,11 @@ impl PdfDocument {
         };
         let mut links: Vec<([f32; 4], std::sync::Arc<str>)> = Vec::new();
         for a in &annots {
+            // ── pdf_manipulator patch: a cancel ends the link scan within one annotation; the callers poll right after ──
+            if crate::cancel::poll().is_err() {
+                break;
+            }
+            // ── end pdf_manipulator patch ──
             if a.subtype_enum != AnnotationSubtype::Link {
                 continue;
             }
@@ -13736,6 +13760,9 @@ impl PdfDocument {
                     );
                     Self::sort_spans_by_snapped_rows(&mut spans);
                     Self::reorder_rowspan_labels(&mut spans);
+                    // ── pdf_manipulator patch: a cancel ended the row-span reorder early ──
+                    cancel.check()?;
+                    // ── end pdf_manipulator patch ──
                 },
             }
         } else {
@@ -13752,6 +13779,9 @@ impl PdfDocument {
             Self::sort_spans_by_snapped_rows(&mut spans);
             // Lift multi-row-spanning labels to the top of their block.
             Self::reorder_rowspan_labels(&mut spans);
+            // ── pdf_manipulator patch: a cancel ended the row-span reorder early ──
+            cancel.check()?;
+            // ── end pdf_manipulator patch ──
         }
 
         // Per-span rotation firewall. Runs drawn with a rotated text matrix
@@ -18857,7 +18887,13 @@ impl PdfDocument {
             None => return Ok(()),
         };
 
+        // ── pdf_manipulator patch: a cancel stops the form's operators within a stride ──
+        let mut stride = crate::cancel::Stride::job();
+        // ── end pdf_manipulator patch ──
         for op in operators {
+            // ── pdf_manipulator patch: a cancel stops the form's operators within a stride ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             let name = match op {
                 crate::content::operators::Operator::Do { name } => name,
                 _ => continue,
@@ -20181,22 +20217,24 @@ impl PdfDocument {
     /// True when page `page_index` may show text: its content holds a `BT` or
     /// a `Do`, which can invoke a form that does. Conservative: true when the
     /// content cannot be opened.
-    pub(crate) fn page_may_contain_text(&self, page_index: usize) -> bool {
+    pub(crate) fn page_may_contain_text(&self, page_index: usize) -> Result<bool> {
         use crate::host::content::Mode;
 
         use crate::content::Operator;
 
         let Ok(operators) = self.page_operators(page_index) else {
-            return true;
+            return Ok(true);
         };
+        let mut stride = crate::cancel::Stride::job();
         for op in operators.with_mode(Mode::Text) {
+            stride.tick()?;
             match op {
-                Ok(Operator::BeginText | Operator::Do { .. }) => return true,
+                Ok(Operator::BeginText | Operator::Do { .. }) => return Ok(true),
                 Ok(_) => {},
-                Err(_) => return true,
+                Err(_) => return Ok(true),
             }
         }
-        false
+        Ok(false)
     }
 
     // ── end pdf_manipulator patch ──
@@ -22988,6 +23026,9 @@ impl PdfDocument {
         // per-page `to_markdown`; multi-page callers pay O(pages) extra scans.
         if options.strip_running_headers_footers {
             let repeated = self.repeated_running_head_foot(0.6);
+            // ── pdf_manipulator patch: a cancel ended the running-header scan early ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             if !repeated.is_empty() {
                 let media_h = self
                     .get_page_media_box(page_index)
@@ -23271,6 +23312,9 @@ impl PdfDocument {
 
         // Tag spans inside /Link annotations with their URI.
         self.apply_link_annotations_to_ordered_spans(page_index, &mut ordered_spans, reading_frame);
+        // ── pdf_manipulator patch: a cancel ended the link tagging early ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
 
         // Correct right-to-left reading order (Arabic/Hebrew) before the
         // converter emits spans verbatim — the converter pipeline does not
@@ -23364,6 +23408,9 @@ impl PdfDocument {
         // diagrams while skipping full-page renders.
         const MAX_BASE64_DATA_URI: usize = 200 * 1024;
         for (i, image) in images.iter().enumerate() {
+            // ── pdf_manipulator patch: a cancel stops the image list within one image ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             if options.embed_images {
                 match image.to_base64_data_uri() {
                     Ok(data_uri) => {
@@ -23770,6 +23817,9 @@ impl PdfDocument {
 
         // Tag spans inside /Link annotations with their URI.
         self.apply_link_annotations_to_ordered_spans(page_index, &mut ordered_spans, reading_frame);
+        // ── pdf_manipulator patch: a cancel ended the link tagging early ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
 
         // Correct right-to-left reading order (Arabic/Hebrew) before the
         // converter emits spans verbatim — the converter pipeline does not
@@ -23814,6 +23864,9 @@ impl PdfDocument {
         html.push_str("\n<div class=\"page-images\">\n");
 
         for (i, image) in images.iter().enumerate() {
+            // ── pdf_manipulator patch: a cancel stops the image list within one image ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             let alt = format!("Image {} from page {}", i + 1, page_index + 1);
 
             if options.embed_images {
@@ -23989,6 +24042,9 @@ impl PdfDocument {
 
         // Tag spans inside /Link annotations with their URI.
         self.apply_link_annotations_to_ordered_spans(page_index, &mut ordered_spans, reading_frame);
+        // ── pdf_manipulator patch: a cancel ended the link tagging early ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
 
         // Correct right-to-left reading order (Arabic/Hebrew) before the
         // converter emits spans verbatim — the converter pipeline does not
@@ -24358,7 +24414,7 @@ impl PdfDocument {
     pub fn to_docx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
         let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Docx)?;
         let mut w = office_oxide::create::ir_to_docx(&ir);
-        self.embed_pdf_fonts_into(|name, data| { w.embed_font(name, data); });
+        self.embed_pdf_fonts_into(|name, data| { w.embed_font(name, data); })?;
         w.write_to(writer).map_err(|e| crate::error::Error::InvalidOperation(format!("DOCX export: {e}")))
     }
 
@@ -24368,7 +24424,7 @@ impl PdfDocument {
     /// method but they take different `&mut self` types, so this
     /// helper centralises the iteration without trying to abstract
     /// over the writer types.
-    fn embed_pdf_fonts_into<F: FnMut(String, Vec<u8>)>(&self, mut sink: F) {
+    fn embed_pdf_fonts_into<F: FnMut(String, Vec<u8>)>(&self, mut sink: F) -> Result<()> {
         // CFF font subsets in source PDFs typically ship without a
         // Unicode cmap (CID-only encoding) and without an `hmtx`
         // table (widths live in the document's `/W` array, not the
@@ -24395,6 +24451,7 @@ impl PdfDocument {
         // hmtx happens to be in the embedded subset.
         if let Ok(fonts) = self.extract_embedded_fonts_with_unicode_maps_and_widths() {
             for (name, data, unicode_map, widths_by_gid) in fonts {
+                crate::cancel::poll()?;
                 let mut bytes = data;
                 if !unicode_map.is_empty() {
                     bytes = crate::fonts::cmap_injector::inject_unicode_cmap(&bytes, &unicode_map)
@@ -24406,13 +24463,15 @@ impl PdfDocument {
                 }
                 sink(name, bytes);
             }
-            return;
+            return Ok(());
         }
         if let Ok(fonts) = self.extract_embedded_fonts() {
             for (name, data) in fonts {
+                crate::cancel::poll()?;
                 sink(name, data);
             }
         }
+        Ok(())
     }
 
     /// Build a `DocumentIR` from the entire PDF, tagged for the target
@@ -24490,7 +24549,7 @@ impl PdfDocument {
     pub fn to_pptx_writer_flow<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
         let ir = self.pdf_to_office_ir(office_oxide::format::DocumentFormat::Pptx)?;
         let mut w = office_oxide::create::ir_to_pptx(&ir);
-        self.embed_pdf_fonts_into(|name, data| { w.embed_font(name, data); });
+        self.embed_pdf_fonts_into(|name, data| { w.embed_font(name, data); })?;
         w.write_to(writer).map_err(|e| crate::error::Error::InvalidOperation(format!("PPTX export: {e}")))
     }
 
@@ -24623,6 +24682,11 @@ impl PdfDocument {
         let min_occ = (((page_count as f32) * threshold).ceil() as usize).max(2);
         let mut occ: HashMap<String, usize> = HashMap::new();
         for p in 0..page_count {
+            // ── pdf_manipulator patch: a cancel ends the running-header scan within one page; the caller polls right after ──
+            if crate::cancel::poll().is_err() {
+                break;
+            }
+            // ── end pdf_manipulator patch ──
             let media_h = self.get_page_media_box(p).map(|m| m.3).unwrap_or(792.0);
             let Ok(lines) = self.extract_text_lines(p) else {
                 continue;
@@ -24935,7 +24999,13 @@ impl PdfDocument {
         let mut paint_order: usize = 0;
         let mut xobject_stack: Vec<crate::object::ObjectRef> = Vec::new();
 
+        // ── pdf_manipulator patch: a cancel stops the page's operators within a stride ──
+        let mut stride = crate::cancel::Stride::job();
+        // ── end pdf_manipulator patch ──
         for op in operators {
+            // ── pdf_manipulator patch: a cancel stops the page's operators within a stride ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             match op {
                 Operator::SaveState => {
                     if let Some(current) = ctm_stack.last() {
@@ -25164,7 +25234,13 @@ impl PdfDocument {
         let mut ctm_stack = vec![start_ctm];
         let mut handles = Vec::new();
 
+        // ── pdf_manipulator patch: a cancel stops the form's operators within a stride ──
+        let mut stride = crate::cancel::Stride::job();
+        // ── end pdf_manipulator patch ──
         for op in operators {
+            // ── pdf_manipulator patch: a cancel stops the form's operators within a stride ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             match op {
                 Operator::SaveState => {
                     if let Some(current) = ctm_stack.last() {
@@ -25296,7 +25372,13 @@ impl PdfDocument {
         };
 
         // Parse content stream operators to extract images from Do operators
+        // ── pdf_manipulator patch: a cancel stops the page's operators within a stride ──
+        let mut stride = crate::cancel::Stride::job();
+        // ── end pdf_manipulator patch ──
         for op in operators {
+            // ── pdf_manipulator patch: a cancel stops the page's operators within a stride ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             match op {
                 // Graphics state operators
                 Operator::SaveState => {
@@ -25612,7 +25694,13 @@ impl PdfDocument {
         let mut raw_images = Vec::new();
         let mut ctm_stack = vec![form_matrix];
 
+        // ── pdf_manipulator patch: a cancel stops the form's operators within a stride ──
+        let mut stride = crate::cancel::Stride::job();
+        // ── end pdf_manipulator patch ──
         for op in operators {
+            // ── pdf_manipulator patch: a cancel stops the form's operators within a stride ──
+            stride.tick()?;
+            // ── end pdf_manipulator patch ──
             match op {
                 Operator::SaveState => {
                     if let Some(current_ctm) = ctm_stack.last() {

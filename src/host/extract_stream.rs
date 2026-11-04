@@ -303,6 +303,7 @@ fn write_png<W: Write>(
     let mut read = vec![0u8; width as usize * if matches!(source, Source::Luma(_)) { 1 } else { 4 }];
     let mut row = Vec::with_capacity(width as usize * samples);
     for _ in 0..height {
+        crate::cancel::poll()?;
         row.clear();
         match &mut source {
             Source::Luma(rows) => {

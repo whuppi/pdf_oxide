@@ -219,6 +219,7 @@ impl Fax {
             self.row.resize(self.row_bytes, 0);
         }
         for _ in 0..rows {
+            crate::cancel::poll()?;
             if self.failed {
                 continue; // the rows past the failure are white already
             }
@@ -849,6 +850,7 @@ impl ImageRows {
         if let Kind::Stencil(stencil) = &mut self.kind {
             let rows = target - self.next;
             for _ in 0..rows {
+                crate::cancel::poll()?;
                 stencil.fill();
             }
         }
@@ -983,6 +985,7 @@ impl ImageRows {
         s.pixels.clear();
         s.pixels.resize(rows as usize * stride, 0);
         for r in 0..rows {
+            crate::cancel::poll()?;
             dynamic_row(&dynamic, r, output, &mut s.pixels[r as usize * stride..(r as usize + 1) * stride]);
         }
         if let (Some(ranges), Output::Rgba) = (&s.colour_key, output) {
