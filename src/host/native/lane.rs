@@ -40,7 +40,7 @@ use crate::host::native::shared_buffer::{self as sb, read_channel as rc, write_c
 use crossbeam_channel::Receiver;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ── Job — one operation, routed to exactly one lane ────────────────
@@ -288,6 +288,10 @@ pub struct LaneController {
     lease: AtomicU64,
     /// The last lease handed out. Ids count up from 1 and are never reused.
     last_lease: AtomicU64,
+    /// The most bytes the lane thread has held since its last reset, as of
+    /// the last job it finished or reset it ran. Stored before the answer is
+    /// posted, so the host reads it after the answer.
+    heap_peak: AtomicUsize,
 }
 
 impl LaneController {
@@ -302,7 +306,13 @@ impl LaneController {
             dead: AtomicBool::new(false),
             lease: AtomicU64::new(0),
             last_lease: AtomicU64::new(0),
+            heap_peak: AtomicUsize::new(0),
         }
+    }
+
+    /// The lane's peak heap since its last reset; see the field.
+    pub fn heap_peak(&self) -> usize {
+        self.heap_peak.load(Ordering::SeqCst)
     }
 
     /// Start a new lease on this lane and make it the current one: every
@@ -458,6 +468,8 @@ pub fn lane_main(mailbox: Receiver<Mail>, controller: Arc<LaneController>) {
 pub(crate) fn reset_lane(state: &mut LaneState, controller: &LaneController) {
     *state = LaneState::new();
     controller.channels.release_held();
+    heap::reset_peak();
+    controller.heap_peak.store(heap::peak(), Ordering::SeqCst);
 }
 
 /// What the Arc of a job's cancel flag takes: two counts and the flag, padded
@@ -578,6 +590,7 @@ fn run_job(state: &mut LaneState, controller: &LaneController, job: Job) -> bool
         controller.dead.store(true, Ordering::SeqCst);
     }
     *controller.running.lock().unwrap() = None;
+    controller.heap_peak.store(heap::peak(), Ordering::SeqCst);
     post_result(job.result_port, bytes);
     survives
 }

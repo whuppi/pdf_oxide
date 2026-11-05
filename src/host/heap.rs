@@ -11,6 +11,17 @@
 //! thread and freed on Dart's — would skew it, so the boundary moves those
 //! bytes with [`adopt`] and [`release`].
 //!
+//! The machine's font caches (the renderer's `FONT_BYTES_CACHE` and
+//! `FACE_CACHE`) belong to the process, not to the lane that happened to fill
+//! them, so their inserts and evictions run inside [`process_owned`], which
+//! keeps those bytes in the process-wide pair and out of the thread's. The one
+//! place the thread's figure can still drift: an evicted `Arc` that another
+//! lane still held a clone of is freed by that lane, which never counted it,
+//! and its live figure dips by the size of the value. The drift is bounded by
+//! the caches' budgets (`MACHINE_FONT_BYTES` and `MACHINE_FACE_BYTES`, which
+//! share their allocations) and is accepted: it can only lower that lane's
+//! figure, so it never retires an executor that should be kept.
+//!
 //! The per-thread pair is a `thread_local!` `Cell` with a const initialiser
 //! and no destructor. An allocator may touch only that kind: a lazily
 //! initialised or `Drop` thread-local allocates, or registers a destructor, on
@@ -36,6 +47,9 @@ struct Counting;
 std::thread_local! {
     /// What the current thread holds and the most it held since [`reset_peak`].
     static MINE: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
+
+    /// How many [`process_owned`] calls the current thread is inside.
+    static OWNED: Cell<u32> = const { Cell::new(0) };
 }
 
 /// What the process holds, and the most it held since [`process_reset_peak`].
@@ -54,6 +68,9 @@ fn shrink(bytes: usize) {
 }
 
 fn move_mine(bytes: isize) {
+    if OWNED.with(Cell::get) > 0 {
+        return;
+    }
     MINE.with(|m| {
         let (live, peak) = m.get();
         let live = live + bytes;
@@ -117,6 +134,21 @@ pub fn reset_peak() {
         let (live, _) = m.get();
         m.set((live, live));
     });
+}
+
+/// Runs `f` with every allocation and free on this thread kept out of its
+/// count and in the process's. For memory that outlives the lane that
+/// allocated it and serves every lane.
+pub fn process_owned<T>(f: impl FnOnce() -> T) -> T {
+    struct Owned;
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            OWNED.with(|o| o.set(o.get() - 1));
+        }
+    }
+    OWNED.with(|o| o.set(o.get() + 1));
+    let _owned = Owned;
+    f()
 }
 
 /// `bytes` that another thread allocated and this thread will free are now

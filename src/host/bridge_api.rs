@@ -144,7 +144,15 @@ mod wasm_entry {
     #[wasm_bindgen]
     pub fn lane_init() -> u32 {
         let lane = Box::new(LaneState::new());
+        crate::host::heap::reset_peak();
         Box::into_raw(lane) as u32
+    }
+
+    /// The most bytes this worker's heap has held since its last
+    /// `lane_init`, which a reset calls again.
+    #[wasm_bindgen]
+    pub fn lane_heap_peak() -> u32 {
+        crate::host::heap::peak() as u32
     }
 
     /// Allocate `size` bytes (align 1) from the module's global allocator.

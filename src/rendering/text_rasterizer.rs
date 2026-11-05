@@ -132,6 +132,8 @@ static SYSTEM_FONTDB: std::sync::OnceLock<std::sync::Arc<fontdb::Database>> =
     std::sync::OnceLock::new();
 
 fn system_fontdb() -> std::sync::Arc<fontdb::Database> {
+    // ── pdf_manipulator patch: the machine's font database is charged to the process, never to the lane that builds it first ──
+    crate::host::heap::process_owned(|| {
     SYSTEM_FONTDB
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
@@ -153,6 +155,8 @@ fn system_fontdb() -> std::sync::Arc<fontdb::Database> {
             std::sync::Arc::new(db)
         })
         .clone()
+    })
+    // ── end pdf_manipulator patch ──
 }
 
 /// Process-wide cache mapping fontdb::ID → (font bytes, face index).
@@ -178,17 +182,19 @@ fn cached_font_bytes(id: fontdb::ID, db: &fontdb::Database) -> Option<(Arc<Vec<u
         }
     }
     // ── end pdf_manipulator patch ──
-    let mut result: Option<(Arc<Vec<u8>>, u32)> = None;
-    db.with_face_data(id, |data, index| {
-        result = Some((Arc::new(data.to_vec()), index));
-    });
-    if let Some(ref entry) = result {
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        // ── pdf_manipulator patch: charged the font program it holds ──
-        guard.insert_charged(id, entry.clone(), entry.0.len());
-        // ── end pdf_manipulator patch ──
-    }
-    result
+    // ── pdf_manipulator patch: the machine's fonts are the process's bytes, not the lane's ──
+    crate::host::heap::process_owned(|| {
+        let mut result: Option<(Arc<Vec<u8>>, u32)> = None;
+        db.with_face_data(id, |data, index| {
+            result = Some((Arc::new(data.to_vec()), index));
+        });
+        if let Some(ref entry) = result {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            guard.insert_charged(id, entry.clone(), entry.0.len());
+        }
+        result
+    })
+    // ── end pdf_manipulator patch ──
 }
 
 /// Parsed font faces cached by fontdb ID.
@@ -256,13 +262,16 @@ fn cached_face(id: fontdb::ID, data: Arc<Vec<u8>>, index: u32) -> Option<Arc<Cac
     }
     let charge = data.len() + std::mem::size_of::<CachedFace>();
     // ── end pdf_manipulator patch ──
-    let face = CachedFace::new(data, index)?;
-    let arc = Arc::new(face);
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    // ── pdf_manipulator patch: a face above the budget is returned but not kept ──
-    guard.insert_charged((id, index), arc.clone(), charge);
+    // ── pdf_manipulator patch: the machine's faces are the process's bytes, not the lane's ──
+    crate::host::heap::process_owned(|| {
+        let face = CachedFace::new(data, index)?;
+        let arc = Arc::new(face);
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        // a face above the budget is returned but not kept
+        guard.insert_charged((id, index), arc.clone(), charge);
+        Some(arc)
+    })
     // ── end pdf_manipulator patch ──
-    Some(arc)
 }
 
 /// Process-wide CJK fallback font — loaded once per process, shared by all
@@ -275,6 +284,8 @@ static CJK_FALLBACK: std::sync::OnceLock<Option<(fontdb::ID, Arc<Vec<u8>>, u32)>
     std::sync::OnceLock::new();
 
 fn get_cjk_fallback_cached(db: &fontdb::Database) -> Option<(fontdb::ID, Arc<Vec<u8>>, u32)> {
+    // ── pdf_manipulator patch: the CJK fallback font is charged to the process, never to the lane that builds it first ──
+    crate::host::heap::process_owned(|| {
     CJK_FALLBACK
         .get_or_init(|| {
             let prioritized_variants = [
@@ -320,6 +331,8 @@ fn get_cjk_fallback_cached(db: &fontdb::Database) -> Option<(fontdb::ID, Arc<Vec
         })
         .as_ref()
         .map(|(id, arc, idx)| (*id, Arc::clone(arc), *idx))
+    })
+    // ── end pdf_manipulator patch ──
 }
 
 /// Process-wide cache for the bundled Droid Sans Fallback face used by the

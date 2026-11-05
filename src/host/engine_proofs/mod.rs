@@ -19,6 +19,9 @@ mod executor_state;
 #[cfg(feature = "native-bridge")]
 mod executor_lanes;
 mod heap_counts;
+mod shared_state;
+#[cfg(all(feature = "native-bridge", feature = "rendering"))]
+mod machine_font_caches;
 #[cfg(feature = "native-bridge")]
 mod lane_boundary;
 mod document_pages;

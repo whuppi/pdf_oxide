@@ -237,6 +237,12 @@ pub fn is_dead(lane_key: u64) -> bool {
         .is_some_and(|controller| controller.dead.load(Ordering::SeqCst))
 }
 
+/// The lane's peak heap in bytes since its last reset, 0 for a lane that is
+/// gone.
+pub fn heap_peak(lane_key: u64) -> usize {
+    table().lock().unwrap().get(&lane_key).map_or(0, |controller| controller.heap_peak())
+}
+
 /// Kill a lane. Instant, idempotent, never joins. After this returns
 /// no notify callback will ever fire for this lane (see the kill
 /// protocol in `lane.rs`); the thread drains and frees its state in
@@ -371,6 +377,13 @@ pub extern "C" fn lane_job_cancel(lane_key: u64, lease: u64, job_id: u64) -> u8 
 #[no_mangle]
 pub extern "C" fn lane_is_dead(lane_key: u64) -> u8 {
     is_dead(lane_key) as u8
+}
+
+/// The most bytes the lane's thread has held since its last reset, as of the
+/// last job or reset it answered; 0 for a lane that is gone.
+#[no_mangle]
+pub extern "C" fn lane_heap_peak(lane_key: u64) -> u64 {
+    heap_peak(lane_key) as u64
 }
 
 /// Kill a lane and everything on it. Instant; never blocks.
