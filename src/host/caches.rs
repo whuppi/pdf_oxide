@@ -1,17 +1,17 @@
-//! The executor's engine state: the caches and registrations one lane owns.
+//! The engine caches: the fonts, CMaps and fallback fonts one executor holds.
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
 //! Upstream keeps the parsed-font cache, the ToUnicode CMap cache and (here)
-//! the runtime fallback fonts in process-wide statics, so every lane of a
-//! process shared them and a reset could not empty them. An [`Executor`] holds
-//! the same three things for one lane. `LaneState` owns one and installs it
+//! the runtime fallback fonts in process-wide statics, so every executor of a
+//! process shared them and a reset could not empty them. An [`EngineCaches`] holds
+//! the same three things for one executor. `EngineState` owns one and installs it
 //! into a thread-local pointer for its whole life, so a reset, which drops the
-//! `LaneState` and makes a new one, empties them, and no upstream function
+//! `EngineState` and makes a new one, empties them, and no upstream function
 //! signature changes: every call site reaches the state through [`with`].
 //!
 //! With nothing installed (the python, ffi and wasm.rs bindings, upstream
-//! tests) [`with`] falls back to one process-wide default executor, which is
+//! tests) [`with`] falls back to one process-wide default [`EngineCaches`], which is
 //! what the statics were. On wasm32 a `thread_local!` is a plain static, so
 //! the same source is per-executor on both platforms.
 //!
@@ -34,8 +34,8 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::ThreadId;
 
-/// One lane's caches and registrations.
-pub struct Executor {
+/// One executor's caches and registrations.
+pub struct EngineCaches {
     fonts: RefCell<FifoFontCache>,
     cmaps: RefCell<ByteCache<CMapKey, Arc<CMap>>>,
     fallback: RefCell<[Option<Arc<[u8]>>; 2]>,
@@ -49,8 +49,8 @@ fn slot(kind: Fallback) -> usize {
     }
 }
 
-impl Executor {
-    /// An executor with empty caches and no registrations, owned by the
+impl EngineCaches {
+    /// Empty caches and no registrations, owned by the
     /// calling thread.
     pub fn new() -> Self {
         Self {
@@ -61,7 +61,7 @@ impl Executor {
         }
     }
 
-    /// The thread the executor was made on, which is the only thread that
+    /// The thread the caches were made on, which is the only thread that
     /// installs it.
     pub fn owner(&self) -> ThreadId {
         self.owner
@@ -121,26 +121,26 @@ impl Executor {
     }
 }
 
-impl Default for Executor {
+impl Default for EngineCaches {
     fn default() -> Self {
         Self::new()
     }
 }
 
 std::thread_local! {
-    static INSTALLED: Cell<Option<NonNull<Executor>>> = const { Cell::new(None) };
+    static INSTALLED: Cell<Option<NonNull<EngineCaches>>> = const { Cell::new(None) };
 }
 
-fn process_default() -> &'static Mutex<Executor> {
-    static DEFAULT: OnceLock<Mutex<Executor>> = OnceLock::new();
-    DEFAULT.get_or_init(|| Mutex::new(Executor::new()))
+fn process_default() -> &'static Mutex<EngineCaches> {
+    static DEFAULT: OnceLock<Mutex<EngineCaches>> = OnceLock::new();
+    DEFAULT.get_or_init(|| Mutex::new(EngineCaches::new()))
 }
 
-/// Makes `e` the executor of the calling thread and clears what the thread's
+/// Makes `e` the caches of the calling thread and clears what the thread's
 /// previous owner left in the thread-locals the engine keeps: the warning
 /// sink, the object-resolving stack, the office conversion context and the
 /// rasteriser's fill count. `e` must stay where it is until [`uninstall`].
-pub fn install(e: &Executor) {
+pub fn install(e: &EngineCaches) {
     INSTALLED.with(|installed| installed.set(Some(NonNull::from(e))));
     drop(crate::extractors::warnings::drain_global_warnings());
     crate::document::reset_resolving();
@@ -152,7 +152,7 @@ pub fn install(e: &Executor) {
 }
 
 /// Removes `e` from the calling thread, if it is the one installed there.
-pub fn uninstall(e: &Executor) {
+pub fn uninstall(e: &EngineCaches) {
     INSTALLED.with(|installed| {
         if installed.get() == Some(NonNull::from(e)) {
             installed.set(None);
@@ -160,12 +160,12 @@ pub fn uninstall(e: &Executor) {
     });
 }
 
-/// Runs `f` on the calling thread's installed executor, or on the process-wide
+/// Runs `f` on the calling thread's installed caches, or on the process-wide
 /// default when none is installed. `f` is one get or one put: it must not
 /// call engine code or `with` again.
-pub fn with<R>(f: impl FnOnce(&Executor) -> R) -> R {
+pub fn with<R>(f: impl FnOnce(&EngineCaches) -> R) -> R {
     match INSTALLED.with(Cell::get) {
-        // SAFETY: `install` stored the address of an executor its owner keeps
+        // SAFETY: `install` stored the address of the caches its owner keeps
         // alive until `uninstall` runs on this same thread, and a thread-local
         // is read only on its own thread.
         Some(installed) => f(unsafe { installed.as_ref() }),

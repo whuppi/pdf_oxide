@@ -4,7 +4,7 @@
 use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 use crate::host::positioned_write::{CountingWriter, PositionedWrite};
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
@@ -160,7 +160,7 @@ op_unit!(
 );
 
 fn handle_editor_open(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,
@@ -186,7 +186,7 @@ fn handle_editor_open(
 }
 
 fn handle_editor_merge_from(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     merge_reader: Option<BoxedReader>,
     cancel: &crate::cancel::CancelCheck,
@@ -220,7 +220,7 @@ fn handle_editor_merge_from(
 }
 
 fn handle_editor_mutate(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     data_reader: Option<BoxedReader>,
     cancel: &crate::cancel::CancelCheck,
@@ -847,7 +847,7 @@ fn do_editor_mutate(
 }
 
 fn handle_editor_save(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
     cancel: &crate::cancel::CancelCheck,
@@ -972,7 +972,7 @@ fn written_response(flag: &str, written: u64) -> Vec<u8> {
 /// save's prune plan drops everything only the other pages reach (#261).
 /// Editor state is unchanged after the call. O(1) streaming via sink.
 fn handle_editor_extract_pages(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
     cancel: &crate::cancel::CancelCheck,

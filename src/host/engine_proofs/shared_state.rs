@@ -1,24 +1,24 @@
-//! The wall around state shared between lanes.
+//! The wall around state shared between executors.
 //!
-//! A lane owns its engine state (executor.rs). A `static` that holds mutable
-//! or lazily built state would be shared by every lane of a process, so each
+//! An executor owns its engine caches (caches.rs). A `static` that holds mutable
+//! or lazily built state would be shared by every executor of a process, so each
 //! one in the engine outside test code is named in `shared_state.txt`, one
 //! `<file>::<name>  <class>  <reason>` a line, with a class that says why it
 //! may be shared:
 //!
-//! - `executor`: the lane's own state, installed per thread (executor.rs's
+//! - `executor`: the executor's own state, installed per thread (caches.rs's
 //!   `INSTALLED`, heap.rs's thread-locals);
-//! - `machine`: the same for every lane and never document data (the system
+//! - `machine`: the same for every executor and never document data (the system
 //!   font database, the machine font caches, bundled fonts, the gray
 //!   fallback, counters of the process);
-//! - `registry`: the native lane table;
+//! - `registry`: the native executor table;
 //! - `upstream-binding`: set only by upstream's python, ffi or wasm.rs
 //!   bindings, which the host never calls (the crypto provider and policy,
 //!   the inventory bitset, `MAX_OPERATORS_OVERRIDE`,
 //!   `PRESERVE_UNMAPPED_GLYPHS`) or reached only when no executor is installed;
-//! - `thread`: scratch of the one thread a lane is, empty between calls (a
-//!   recursion guard, a warning sink, a reused buffer); the lane's state
-//!   starts clean on its thread (`executor::install`);
+//! - `thread`: scratch of the one thread an executor is, empty between calls (a
+//!   recursion guard, a warning sink, a reused buffer); the executor's state
+//!   starts clean on its thread (`caches::install`);
 //! - `test`: a seam the engine's own tests set.
 //!
 //! The scan reads the source text: a `static` of type Mutex, RwLock, Atomic*,
@@ -38,8 +38,8 @@ const CLASSES: [&str; 6] =
 /// the lane table; `thread` only a `thread_local!`.
 fn class_fits(class: &str, item: &str, thread_local: bool) -> bool {
     match class {
-        "executor" => item.starts_with("src/host/executor.rs::") || item.starts_with("src/host/heap.rs::"),
-        "registry" => item.starts_with("src/host/native/lane_table.rs::"),
+        "executor" => item.starts_with("src/host/caches.rs::") || item.starts_with("src/host/heap.rs::"),
+        "registry" => item.starts_with("src/host/native/executor_table.rs::"),
         "thread" => thread_local,
         _ => true,
     }

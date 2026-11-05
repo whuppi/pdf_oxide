@@ -1,4 +1,4 @@
-//! Two lanes share nothing the engine caches, and a reset empties one.
+//! Two executors share nothing the engine caches, and a reset empties one.
 
 use super::support::{pdf_from_objects, stream_object};
 use crate::document::PdfDocument;
@@ -6,9 +6,9 @@ use crate::extractors::warnings::{push_global_warning, snapshot_global_warnings,
 use crate::fonts::cmap::cmap_cache_size;
 use crate::fonts::form_fallback::Fallback;
 use crate::fonts::global_cache::global_font_cache_stats;
-use crate::host::lane_state::LaneState;
-use crate::host::native::lane::{reset_lane, LaneController, Mail};
-use crate::host::{executor, heap};
+use crate::host::engine_state::EngineState;
+use crate::host::native::lane::{reset_lane, ExecutorController, Mail};
+use crate::host::{caches, heap};
 use std::sync::mpsc;
 use std::thread;
 
@@ -61,9 +61,9 @@ fn a_lane_owns_its_caches_and_a_reset_empties_them() {
     let (checked_tx, checked_rx) = mpsc::channel::<()>();
 
     let lane_1 = thread::spawn(move || {
-        let mut state = LaneState::new();
+        let mut state = EngineState::new();
         let (sender, _mailbox) = crossbeam_channel::unbounded::<Mail>();
-        let controller = LaneController::new(sender);
+        let controller = ExecutorController::new(sender);
         // A thread's first read allocates its thread-locals once and keeps
         // them (49 KiB, the same after one reset as after three); one read
         // and reset here put them in the figure the later reset is held to.
@@ -71,7 +71,7 @@ fn a_lane_owns_its_caches_and_a_reset_empties_them() {
         reset_lane(&mut state, &controller);
         let before = heap::live();
 
-        executor::with(|e| e.register(Fallback::Cjk, vec![7; 300]));
+        caches::with(|e| e.register(Fallback::Cjk, vec![7; 300]));
         push_global_warning(Warning {
             category: WarningCategory::Font,
             page: None,
@@ -84,11 +84,11 @@ fn a_lane_owns_its_caches_and_a_reset_empties_them() {
         loaded_tx.send(()).unwrap();
         checked_rx.recv().unwrap();
 
-        assert!(executor::with(|e| e.registered(Fallback::Cjk)).is_some());
+        assert!(caches::with(|e| e.registered(Fallback::Cjk)).is_some());
         assert!(global_font_cache_stats().0 > 0);
         reset_lane(&mut state, &controller);
 
-        assert!(executor::with(|e| e.registered(Fallback::Cjk)).is_none());
+        assert!(caches::with(|e| e.registered(Fallback::Cjk)).is_none());
         assert_eq!(global_font_cache_stats().0, 0, "the reset left fonts cached");
         assert_eq!(cmap_cache_size(), 0, "the reset left CMaps cached");
         assert!(snapshot_global_warnings().is_empty(), "the reset left a warning");
@@ -101,8 +101,8 @@ fn a_lane_owns_its_caches_and_a_reset_empties_them() {
 
     let lane_2 = thread::spawn(move || {
         loaded_rx.recv().unwrap();
-        let _state = LaneState::new();
-        assert!(executor::with(|e| e.registered(Fallback::Cjk)).is_none());
+        let _state = EngineState::new();
+        assert!(caches::with(|e| e.registered(Fallback::Cjk)).is_none());
         assert_eq!(global_font_cache_stats().0, 0, "lane 2 sees lane 1's fonts");
         assert_eq!(cmap_cache_size(), 0, "lane 2 sees lane 1's CMaps");
         checked_tx.send(()).unwrap();

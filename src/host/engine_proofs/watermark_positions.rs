@@ -16,7 +16,7 @@
 use crate::cancel::CancelCheck;
 use crate::host::binary_codec::{ErrorKind, Request};
 use crate::host::bridge_api::handle_request;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 use crate::rendering::{render_page, RenderOptions};
 use crate::PdfDocument;
 
@@ -77,7 +77,7 @@ fn blank_page() -> Vec<u8> {
 }
 
 /// What the lane answers to a request.
-fn answer(state: &mut LaneState, request: &[u8], source: Option<&[u8]>) -> Vec<u8> {
+fn answer(state: &mut EngineState, request: &[u8], source: Option<&[u8]>) -> Vec<u8> {
     handle_request(state, request, source, Vec::new(), Vec::new(), &CancelCheck::none())
 }
 
@@ -85,7 +85,7 @@ fn answer(state: &mut LaneState, request: &[u8], source: Option<&[u8]>) -> Vec<u
 /// unrotated black watermark on every page of a fresh one-page document. Returns the
 /// lane's answer and the saved bytes (None when the op was refused).
 fn apply(position: &[(&str, Field)]) -> (Vec<u8>, Option<Vec<u8>>) {
-    let mut state = LaneState::new();
+    let mut state = EngineState::new();
     let opened = answer(&mut state, &frame("editorOpen", &[]), Some(&blank_page()));
     assert_eq!(opened[0], 1, "the editor opens");
     let handle = {

@@ -94,12 +94,12 @@ impl std::ops::Deref for FallbackBytes {
 }
 
 /// Fallback bytes for the form-flatten path: a font registered on the lane's
-/// executor (see `crate::host::executor`) wins over the compiled-in asset, so
+/// executor (see `crate::host::caches`) wins over the compiled-in asset, so
 /// builds without `cjk-form-fonts` keep full CJK/emoji form fill when the
 /// app supplies the font. `None` = no fallback available; the caller keeps
 /// its no-font behavior.
 pub fn resolve_font_bytes(kind: Fallback) -> Option<FallbackBytes> {
-    if let Some(bytes) = crate::host::executor::with(|e| e.registered(kind)) {
+    if let Some(bytes) = crate::host::caches::with(|e| e.registered(kind)) {
         return Some(FallbackBytes::Registered(bytes));
     }
     #[cfg(any(feature = "cjk-form-fonts", feature = "cjk-render-fallback"))]

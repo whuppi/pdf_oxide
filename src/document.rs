@@ -382,7 +382,7 @@ thread_local! {
     static RECURSION_DEPTH: RefCell<u32> = const { RefCell::new(0) };
 }
 
-// ── pdf_manipulator patch: a lane starts on a clean thread (host::executor::install) ──
+// ── pdf_manipulator patch: a lane starts on a clean thread (host::caches::install) ──
 /// Forgets the objects this thread was resolving and its recursion depth.
 pub(crate) fn reset_resolving() {
     RESOLVING_STACK.with(|s| s.borrow_mut().clear());

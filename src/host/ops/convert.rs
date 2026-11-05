@@ -7,7 +7,7 @@
 use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
     authenticate_or_refuse, ok_flag, open_source, read_all_from_reader, req_handle,
@@ -44,7 +44,7 @@ op_unit!(
 );
 
 fn handle_convert_to(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,

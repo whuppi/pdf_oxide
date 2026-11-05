@@ -26,12 +26,12 @@
 //! cancel can never be erased by a racing request cycle. The token is
 //! checked before each request and re-checked (with the sticky flag)
 //! before notifying.
-//! Because the killer takes this buffer's pair mutex before flagging,
-//! a kill can never land between the re-check and the notify call —
-//! so once a kill returns, this reader will never invoke `notify_fn`
+//! Because the terminating caller takes this buffer's pair mutex before flagging,
+//! a terminate can never land between the re-check and the notify call —
+//! so once a terminate returns, this reader will never invoke `notify_fn`
 //! again.
 
-use crate::host::native::cancel::CancelToken;
+use crate::host::native::cancel::CancelFlags;
 use crate::host::native::shared_buffer::{self as sb, read_channel as rc};
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -39,7 +39,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 pub struct CallbackReader {
     buf: *mut u8,
     notify_fn: unsafe extern "C" fn(),
-    token: CancelToken,
+    token: CancelFlags,
     position: u64,
     length: u64,
     /// The source range the shared buffer's data region holds from the last
@@ -61,7 +61,7 @@ impl CallbackReader {
         buf: *mut u8,
         notify_fn: unsafe extern "C" fn(),
         length: u64,
-        token: CancelToken,
+        token: CancelFlags,
     ) -> Self {
         Self { buf, notify_fn, token, position: 0, length, window: (0, 0) }
     }
@@ -116,7 +116,7 @@ impl Read for CallbackReader {
         }
 
         // Re-check after the request is written: FLAG_CANCELLED is
-        // sticky, so both a token kill and a buffer-flag cancel are
+        // sticky, so both an executor terminate and a buffer-flag cancel are
         // caught here — before notify_fn could ring a dead callback.
         if self.is_cancelled() {
             return Err(crate::host::native::cancel::cancelled());
@@ -186,7 +186,7 @@ mod tests {
         unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
 
         let mut reader = unsafe {
-            CallbackReader::new(buf.as_mut_ptr(), noop_notify, 1000, CancelToken::unconnected())
+            CallbackReader::new(buf.as_mut_ptr(), noop_notify, 1000, CancelFlags::unconnected())
         };
 
         assert_eq!(reader.seek(SeekFrom::Start(500)).unwrap(), 500);
@@ -203,7 +203,7 @@ mod tests {
         unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
 
         let mut reader = unsafe {
-            CallbackReader::new(buf.as_mut_ptr(), noop_notify, 0, CancelToken::unconnected())
+            CallbackReader::new(buf.as_mut_ptr(), noop_notify, 0, CancelFlags::unconnected())
         };
         let mut out = [0u8; 16];
         assert_eq!(reader.read(&mut out).unwrap(), 0);
@@ -217,7 +217,7 @@ mod tests {
         unsafe { sb::init_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR); }
 
         let job = Arc::new(AtomicBool::new(true));
-        let token = CancelToken::new(Arc::new(AtomicBool::new(false)), job);
+        let token = CancelFlags::new(Arc::new(AtomicBool::new(false)), job);
         let mut reader = unsafe {
             CallbackReader::new(buf.as_mut_ptr(), noop_notify, 1000, token)
         };
@@ -237,7 +237,7 @@ mod tests {
         sb::set_cancelled(buf.as_mut_ptr(), rc::OFFSET_CANCEL);
 
         let mut reader = unsafe {
-            CallbackReader::new(buf.as_mut_ptr(), noop_notify, 1000, CancelToken::unconnected())
+            CallbackReader::new(buf.as_mut_ptr(), noop_notify, 1000, CancelFlags::unconnected())
         };
         let mut out = [0u8; 16];
         let err = reader.read(&mut out).unwrap_err();

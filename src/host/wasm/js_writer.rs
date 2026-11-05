@@ -7,7 +7,7 @@
 //! Byte offsets for xref tables come from a counting wrapper
 //! (`CountingWriter`); no seek ever occurs on the output.
 //!
-//! lane_worker.js sets `self.host_write_chunk = hostWriteChunk` before loading WASM.
+//! executor_worker.js sets `self.host_write_chunk = hostWriteChunk` before loading WASM.
 //!
 //! Small writes accumulate in a fixed internal buffer (256KB, matching
 //! the native condvar write channel). A round-trip to JS only happens
@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use wasm_bindgen::prelude::*;
 use crate::host::constants::WRITE_BUF_CAPACITY;
 
-// Imported from the JS global scope (self.host_write_chunk in lane_worker.js).
+// Imported from the JS global scope (self.host_write_chunk in executor_worker.js).
 // Uses u32 for buf_ptr because wasm_bindgen doesn't support raw pointers.
 #[wasm_bindgen]
 extern "C" {

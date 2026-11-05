@@ -3,7 +3,7 @@
 
 use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::BoxedReader;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 
 use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;
@@ -157,7 +157,7 @@ pub(crate) fn authenticate_or_refuse(doc: &PdfDocument, password: Option<&str>) 
     }
 }
 
-pub(crate) fn handle_with_doc<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
+pub(crate) fn handle_with_doc<F>(state: &mut EngineState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
     let hid = req_handle(req);
@@ -171,7 +171,7 @@ where F: FnOnce(&mut PdfDocument, &Request<'_>) -> crate::error::Result<Vec<u8>>
     }
 }
 
-pub(crate) fn handle_with_editor<F>(state: &mut LaneState, req: &Request<'_>, f: F) -> Vec<u8>
+pub(crate) fn handle_with_editor<F>(state: &mut EngineState, req: &Request<'_>, f: F) -> Vec<u8>
 where F: FnOnce(&mut DocumentEditor, &Request<'_>) -> crate::error::Result<Vec<u8>>
 {
     let hid = req_handle(req);

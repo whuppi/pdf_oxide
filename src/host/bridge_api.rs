@@ -2,27 +2,27 @@
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
-//! ## Lane model
+//! ## Executor model
 //!
-//! Engine state lives per LANE (`LaneState`) — one isolated execution
-//! unit per native thread / per Web Worker. This file never spawns,
-//! routes, or kills lanes; it is the decision-free request door that
-//! every lane body calls:
+//! Engine state lives per executor (`EngineState`) — one thread on native,
+//! one Web Worker on web. This file never boots, routes, or terminates
+//! executors; it is the decision-free request door that
+//! every executor body calls:
 //!
-//!   Native lane body: `host/native/lane.rs` (mailbox thread)
-//!   Web lane body:    `web_assets/lane_worker.js` (Worker + wasm_entry)
+//!   Native executor body: `host/native/lane.rs` (mailbox thread)
+//!   Web executor body:    `web_assets/executor_worker.js` (Worker + wasm_entry)
 //!
 //! ## Request routing
 //!
 //! `handle_request` parses binary request bytes, looks the op up in the
 //! registry (`host/ops/registry.rs`), runs that op unit's handler against
-//! the lane's own state, and returns the binary response bytes. Each op
+//! the executor's own state, and returns the binary response bytes. Each op
 //! unit under `host/ops/` owns its body. Same source code for both
-//! targets. 100% platform-agnostic. No locks — a lane's state has
-//! exactly one owner thread, so handlers take `&mut LaneState`.
+//! targets. 100% platform-agnostic. No locks — an executor's state has
+//! exactly one owner thread, so handlers take `&mut EngineState`.
 
 use crate::host::binary_codec::{Request, ResponseWriter};
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 
 // ═══════════════════════════════════════════════════════════════════
 // BoxedReader / BoxedWriter — concrete wrappers for trait objects
@@ -78,7 +78,7 @@ impl crate::host::positioned_write::PositionedWrite for BoxedWriter {
 /// O(1)-memory I/O: when reader/writer are Some, PDF bytes flow
 /// through them on demand — never fully buffered.
 pub(crate) fn handle_request(
-    state: &mut LaneState,
+    state: &mut EngineState,
     bytes: &[u8],
     source_bytes: Option<&[u8]>,
     mut sources: Vec<BoxedReader>,
@@ -86,7 +86,7 @@ pub(crate) fn handle_request(
     cancel: &crate::cancel::CancelCheck,
 ) -> Vec<u8> {
     debug_assert_eq!(
-        state.executor().owner(),
+        state.caches().owner(),
         std::thread::current().id(),
         "a lane's state is used on the thread that made it"
     );
@@ -119,18 +119,18 @@ pub(crate) fn handle_request(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// WASM lane body — one Worker = one lane = one LaneState
+// WASM executor body — one Worker = one executor = one EngineState
 // ═══════════════════════════════════════════════════════════════════
 //
-// The web twin of `host/native/lane.rs`. A Web Worker IS a lane: the
+// The web twin of `host/native/lane.rs`. A Web Worker IS an executor: the
 // browser provides the isolated thread; this module provides the
-// lane's owned state and the call into the shared request door.
+// executor's owned state and the call into the request door.
 // Decision-free by design — routing, pinning, queuing, and cancel
-// bookkeeping all live in the shared Dart Router.
+// bookkeeping all live in the Dart Router.
 //
-// Hard kill on web is `worker.terminate()` — the browser frees the
-// whole WASM heap with the worker, so `lane_destroy` exists only for
-// the graceful path (lane reuse without worker restart).
+// Terminating an executor on web is `worker.terminate()` — the browser frees the
+// whole WASM heap with the worker, so `engine_state_drop` exists only for
+// the graceful path (executor reuse without worker restart).
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_entry {
@@ -139,25 +139,25 @@ mod wasm_entry {
     use crate::host::wasm::js_writer::JsCallbackWriter;
     use wasm_bindgen::prelude::*;
 
-    /// Create this worker's lane state. Returns a WASM pointer.
-    /// Called exactly once per worker, from lane_worker.js bootstrap.
+    /// Create this worker's engine state. Returns a WASM pointer.
+    /// Called exactly once per worker, from executor_worker.js bootstrap.
     #[wasm_bindgen]
-    pub fn lane_init() -> u32 {
-        let lane = Box::new(LaneState::new());
+    pub fn engine_state_new() -> u32 {
+        let state = Box::new(EngineState::new());
         crate::host::heap::reset_peak();
-        Box::into_raw(lane) as u32
+        Box::into_raw(state) as u32
     }
 
     /// The most bytes this worker's heap has held since its last
-    /// `lane_init`, which a reset calls again.
+    /// `engine_state_new`, which a reset calls again.
     #[wasm_bindgen]
-    pub fn lane_heap_peak() -> u32 {
+    pub fn heap_peak() -> u32 {
         crate::host::heap::peak() as u32
     }
 
     /// Allocate `size` bytes (align 1) from the module's global allocator.
     ///
-    /// Stable twin of the glue's internal malloc, for lane_worker.js's JSPI
+    /// Stable twin of the glue's internal malloc, for executor_worker.js's JSPI
     /// driver: wasm-bindgen's `__wbindgen_export_N` aliases are renumbered
     /// whenever the module's export set changes, so the worker must never
     /// call those by name. Same allocator and layout as the glue's malloc,
@@ -175,7 +175,7 @@ mod wasm_entry {
     }
 
     /// Free a buffer from `lane_alloc` or a response buffer handed out by
-    /// `lane_execute` (both come from the same global allocator, align 1).
+    /// `execute` (both come from the same global allocator, align 1).
     #[wasm_bindgen]
     pub fn lane_dealloc(ptr: u32, size: u32) {
         if size == 0 {
@@ -188,7 +188,7 @@ mod wasm_entry {
         }
     }
 
-    /// Execute one job against this lane's state.
+    /// Execute one job against this executor's state.
     ///
     /// source_lengths: packed f64 array — each 8 bytes is one source
     /// length (f64 because JS numbers cross the boundary as doubles).
@@ -200,13 +200,13 @@ mod wasm_entry {
     /// the raw pointer is sound: no other code can hold a reference
     /// while this runs.
     #[wasm_bindgen]
-    pub fn lane_execute(
-        lane_ptr: u32,
+    pub fn execute(
+        state_ptr: u32,
         request_bytes: &[u8],
         source_lengths: &[u8],
         sink_count: u32,
     ) -> Vec<u8> {
-        let state = unsafe { &mut *(lane_ptr as *mut LaneState) };
+        let state = unsafe { &mut *(state_ptr as *mut EngineState) };
 
         let mut sources = Vec::new();
         let num_sources = source_lengths.len() / 8;
@@ -231,13 +231,13 @@ mod wasm_entry {
         handle_request(state, request_bytes, None, sources, sinks, &crate::cancel::CancelCheck::from_host())
     }
 
-    /// Drop this lane's state, freeing every handle it owns.
+    /// Drop this executor's engine state, freeing every handle it owns.
     /// Graceful-path only — `worker.terminate()` makes this moot.
     #[wasm_bindgen]
-    pub fn lane_destroy(lane_ptr: u32) {
-        if lane_ptr == 0 { return; }
+    pub fn engine_state_drop(state_ptr: u32) {
+        if state_ptr == 0 { return; }
         unsafe {
-            let _ = Box::from_raw(lane_ptr as *mut LaneState);
+            let _ = Box::from_raw(state_ptr as *mut EngineState);
         }
     }
 }

@@ -18,7 +18,7 @@
 
 use crate::host::binary_codec::Request;
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 
 pub(crate) mod builder;
 pub(crate) mod convert;
@@ -36,7 +36,7 @@ pub(crate) mod test_support;
 /// Everything a handler may need, bundled so every op shares one calling
 /// convention (uniform middleware, uniform registry signature).
 pub(crate) struct OpCtx<'a, 'req> {
-    pub state: &'a mut LaneState,
+    pub state: &'a mut EngineState,
     pub req: &'a Request<'req>,
     pub source_bytes: Option<&'req [u8]>,
     pub sources: &'a mut Vec<BoxedReader>,

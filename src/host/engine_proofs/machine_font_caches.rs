@@ -1,9 +1,9 @@
-//! The machine's font caches are the process's bytes, never a lane's.
+//! The machine's font caches are the process's bytes, never an executor's.
 
 use super::support::{pdf_from_objects, stream_object};
 use crate::document::PdfDocument;
-use crate::host::lane_state::LaneState;
-use crate::host::native::lane::{reset_lane, LaneController, Mail};
+use crate::host::engine_state::EngineState;
+use crate::host::native::lane::{reset_lane, ExecutorController, Mail};
 use crate::host::heap;
 use crate::rendering::{PageRenderer, RenderOptions};
 use std::thread;
@@ -48,9 +48,9 @@ fn a_machine_font_the_lane_cached_is_not_the_lanes_heap() {
     let blank = page_in_a_machine_font("0 0 10 10 re f");
 
     thread::spawn(move || {
-        let mut state = LaneState::new();
+        let mut state = EngineState::new();
         let (sender, _mailbox) = crossbeam_channel::unbounded::<Mail>();
-        let controller = LaneController::new(sender);
+        let controller = ExecutorController::new(sender);
         render(&blank);
         reset_lane(&mut state, &controller);
         let before = heap::live();

@@ -1,4 +1,4 @@
-//! A response the lane posts leaves the lane's heap figure, whether Dart takes it or not.
+//! A response the executor posts leaves the executor's heap figure, whether Dart takes it or not.
 
 use crate::host::heap;
 use crate::host::native::lane::post_result;

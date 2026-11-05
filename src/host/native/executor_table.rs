@@ -1,37 +1,37 @@
-//! Lane table — key registry, global thread budget, and the FFI
+//! Executor table — key registry, global thread budget, and the FFI
 //! surface the Dart Router drives.
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
 //! ## Keys, never pointers
 //!
-//! Dart holds lane KEYS — opaque u64s looked up in a locked table —
-//! never raw pointers. A call racing a kill finds nothing and returns
-//! a well-defined "lane disposed" result instead of touching freed
+//! Dart holds executor KEYS — opaque u64s looked up in a locked table —
+//! never raw pointers. A call racing a terminate finds nothing and returns
+//! a well-defined "executor disposed" result instead of touching freed
 //! memory. Keys are never reused (monotonic counter), so a stale key
-//! can never alias a newer lane.
+//! can never alias a newer executor.
 //!
 //! ## The no-exhaustion budget
 //!
-//! At most `MAX_LANES_GLOBAL` lane threads exist process-wide, across
+//! At most `MAX_LANES_GLOBAL` executor threads exist process-wide, across
 //! ALL instances. Hitting the cap never errors and never spins:
-//! the lane is created immediately (its mailbox accepts and buffers
-//! jobs), but its THREAD starts later — the spawn request waits in a
-//! FIFO, and a dying lane's last act is handing its budget slot to
-//! the next waiter. Lanes killed while still waiting are skipped.
+//! the executor is created immediately (its mailbox accepts and buffers
+//! jobs), but its THREAD starts later — the boot request waits in a
+//! FIFO, and a dying executor's last act is handing its budget slot to
+//! the next waiter. Executors terminated while still waiting are skipped.
 //!
-//! ## Kill semantics
+//! ## Terminate semantics
 //!
-//! `kill` is instant and idempotent: set the lane's cancel flag, wake
+//! `terminate` is instant and idempotent: set the executor's cancel flag, wake
 //! every parked I/O channel (lock-ordered — see `lane.rs`), drop the
 //! mailbox sender, remove from the table. It never joins the thread.
-//! After `kill` returns, no notify callback will ever fire for this
-//! lane, and the Dart Router owns the completion of its pending jobs.
+//! After `terminate` returns, no notify callback will ever fire for this
+//! executor, and the Dart Router owns the completion of its pending jobs.
 
 use crate::host::binary_codec::ResponseWriter;
 use crate::host::native::lane::{
-    lane_main, post_result, Job, LaneController, Mail, SinkChannel, SourceChannel,
-    LANE_DEAD_MESSAGE,
+    executor_main, post_result, Job, ExecutorController, Mail, SinkChannel, SourceChannel,
+    ENGINE_DEAD_MESSAGE,
 };
 use crossbeam_channel::{unbounded, Receiver};
 use std::collections::{HashMap, VecDeque};
@@ -39,25 +39,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-/// Hard cap on lane threads across the whole process. Far above what
+/// Hard cap on executor threads across the whole process. Far above what
 /// any sane workload runs concurrently, far below any OS thread limit.
 pub const MAX_LANES_GLOBAL: usize = 128;
 
 // ── Global state: the table and the budget ─────────────────────────
 
-/// Monotonic key source. Starts at 1 (0 reads as "no lane" on the
+/// Monotonic key source. Starts at 1 (0 reads as "no executor" on the
 /// wire). Never reused — ABA-proof by construction.
 static NEXT_LANE_KEY: AtomicU64 = AtomicU64::new(1);
 
-fn table() -> &'static Mutex<HashMap<u64, Arc<LaneController>>> {
-    static TABLE: OnceLock<Mutex<HashMap<u64, Arc<LaneController>>>> = OnceLock::new();
+fn table() -> &'static Mutex<HashMap<u64, Arc<ExecutorController>>> {
+    static TABLE: OnceLock<Mutex<HashMap<u64, Arc<ExecutorController>>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A lane whose thread hasn't started yet (budget was full at spawn).
+/// An executor whose thread hasn't started yet (budget was full at boot).
 struct PendingStart {
     key: u64,
-    controller: Arc<LaneController>,
+    controller: Arc<ExecutorController>,
     mailbox: Receiver<Mail>,
 }
 
@@ -74,7 +74,7 @@ fn budget() -> &'static Mutex<Budget> {
 }
 
 /// Returns the budget slot on thread exit — even on unwind, so a
-/// panicking lane can never leak its slot.
+/// panicking executor can never leak its slot.
 struct SlotGuard;
 
 impl Drop for SlotGuard {
@@ -82,9 +82,9 @@ impl Drop for SlotGuard {
         let mut b = budget().lock().unwrap();
         loop {
             match b.waiters.pop_front() {
-                // Killed while waiting: drain its queued jobs with a
+                // Terminated while waiting: answer its queued jobs with a
                 // cancelled post each — EVERY accepted job posts
-                // exactly once, started lane or not. That post is the
+                // exactly once, started executor or not. That post is the
                 // host's memory-safe signal to free the job's buffers.
                 // Then hand the slot to the next waiter.
                 Some(p) if p.controller.cancel.load(Ordering::SeqCst) => {
@@ -95,7 +95,7 @@ impl Drop for SlotGuard {
                         };
                         post_result(port, ResponseWriter::cancelled());
                     }
-                    p.controller.tickets.lock().unwrap().clear();
+                    p.controller.cancel_flags.lock().unwrap().clear();
                     continue;
                 }
                 // Transfer the slot: `live` stays unchanged.
@@ -112,24 +112,24 @@ impl Drop for SlotGuard {
     }
 }
 
-fn start_thread(key: u64, mailbox: Receiver<Mail>, controller: Arc<LaneController>) {
+fn start_thread(key: u64, mailbox: Receiver<Mail>, controller: Arc<ExecutorController>) {
     thread::Builder::new()
         .name(format!("pdf-lane-{key}"))
         .spawn(move || {
             let _slot = SlotGuard;
-            lane_main(mailbox, controller);
+            executor_main(mailbox, controller);
         })
-        .expect("failed to spawn lane thread (under MAX_LANES_GLOBAL — OS misconfigured?)");
+        .expect("failed to start executor thread (under MAX_LANES_GLOBAL — OS misconfigured?)");
 }
 
 // ── Public operations (called by the FFI surface and by tests) ─────
 
-/// Create a lane. Returns its key immediately; the thread starts now
+/// Boot an executor. Returns its key immediately; the thread starts now
 /// (budget permitting) or when a slot frees (FIFO). Never blocks,
 /// never errors.
-pub fn spawn() -> u64 {
+pub fn boot() -> u64 {
     let (sender, receiver) = unbounded::<Mail>();
-    let controller = Arc::new(LaneController::new(sender));
+    let controller = Arc::new(ExecutorController::new(sender));
 
     let key = NEXT_LANE_KEY.fetch_add(1, Ordering::Relaxed);
     table().lock().unwrap().insert(key, controller.clone());
@@ -145,29 +145,29 @@ pub fn spawn() -> u64 {
     key
 }
 
-/// Start a new lease on a lane and return its id, or 0 when the lane is
-/// gone, has a job outstanding, or died. Ids count up from 1, per lane,
+/// Start a new lease on an executor and return its id, or 0 when the executor is
+/// gone, has a job outstanding, or died. Ids count up from 1, per executor,
 /// and are never reused; from this call on, a message under an older
 /// lease is dropped.
-pub fn begin_lease(lane_key: u64) -> u64 {
-    let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
+pub fn begin_lease(executor_key: u64) -> u64 {
+    let Some(controller) = table().lock().unwrap().get(&executor_key).cloned() else {
         return 0;
     };
     controller.begin_lease().unwrap_or(0)
 }
 
-/// Submit a job to a lane under `lease`. Never blocks (unbounded mailbox).
-/// If the lane is gone, posts a "lane disposed" error to the result port;
+/// Submit a job to an executor under `lease`. Never blocks (unbounded mailbox).
+/// If the executor is gone, posts a "executor disposed" error to the result port;
 /// under a lease that is not current, posts the stale-lease error and
 /// touches nothing else — the caller always gets exactly one completion
 /// signal per job.
-pub fn submit(lane_key: u64, lease: u64, job: Job) {
-    let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
+pub fn submit(executor_key: u64, lease: u64, job: Job) {
+    let Some(controller) = table().lock().unwrap().get(&executor_key).cloned() else {
         post_result(job.result_port, ResponseWriter::cancelled());
         return;
     };
 
-    // Ticket goes in BEFORE the enqueue so a cancel arriving right
+    // Its cancel flag goes in BEFORE the enqueue so a cancel arriving right
     // after submit can always find its job.
     if let Err(refusal) = controller.admit_job(lease, &job) {
         post_result(job.result_port, ResponseWriter::error(refusal));
@@ -180,18 +180,18 @@ pub fn submit(lane_key: u64, lease: u64, job: Job) {
             let result_port = job.result_port;
             let job_id = job.job_id;
             if sender.send(Mail::Job(job)).is_err() {
-                // Receiver gone: lane was killed while waiting for a
+                // Receiver gone: the executor was terminated while waiting for a
                 // budget slot and its mailbox was discarded.
-                controller.tickets.lock().unwrap().remove(&job_id);
+                controller.cancel_flags.lock().unwrap().remove(&job_id);
                 post_result(result_port, ResponseWriter::cancelled());
             }
         }
         None => {
-            // Killed, or stopped after a panic, between the table lookup
+            // Terminated, or stopped after a panic, between the table lookup
             // and here.
-            controller.tickets.lock().unwrap().remove(&job.job_id);
+            controller.cancel_flags.lock().unwrap().remove(&job.job_id);
             let bytes = if controller.dead.load(Ordering::SeqCst) {
-                ResponseWriter::error(LANE_DEAD_MESSAGE)
+                ResponseWriter::error(ENGINE_DEAD_MESSAGE)
             } else {
                 ResponseWriter::cancelled()
             };
@@ -203,23 +203,23 @@ pub fn submit(lane_key: u64, lease: u64, job: Job) {
 /// Cancel one job. Instant, idempotent. Queued → it will be skipped
 /// at dequeue, never reaches the engine, and this returns true so the
 /// host can complete it at once. Running → its I/O wakes with
-/// FLAG_CANCELLED and the op unwinds at the next I/O boundary. The lane
+/// FLAG_CANCELLED and the op unwinds at the next I/O boundary. The executor
 /// and every other job on it are untouched. A cancel under a lease that
 /// is not current changes nothing.
-pub fn cancel_job(lane_key: u64, lease: u64, job_id: u64) -> bool {
-    let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
+pub fn cancel_job(executor_key: u64, lease: u64, job_id: u64) -> bool {
+    let Some(controller) = table().lock().unwrap().get(&executor_key).cloned() else {
         return false;
     };
     controller.cancel_job(lease, job_id)
 }
 
-/// Replace a lane's engine state with a fresh one and post the answer to
+/// Replace an executor's engine state with a fresh one and post the answer to
 /// `result_port` exactly once: success once the thread has done it, or the
-/// error that refused it (stale lease, a job outstanding, a dead lane).
+/// error that refused it (stale lease, a job outstanding, a dead executor).
 /// The thread takes the reset between jobs, so a reset never interrupts
 /// the engine.
-pub fn reset(lane_key: u64, lease: u64, result_port: i64) {
-    let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() else {
+pub fn reset(executor_key: u64, lease: u64, result_port: i64) {
+    let Some(controller) = table().lock().unwrap().get(&executor_key).cloned() else {
         post_result(result_port, ResponseWriter::cancelled());
         return;
     };
@@ -228,27 +228,27 @@ pub fn reset(lane_key: u64, lease: u64, result_port: i64) {
     }
 }
 
-/// True once the lane's engine panicked and the lane stopped serving.
-pub fn is_dead(lane_key: u64) -> bool {
+/// True once the executor's engine panicked and the executor stopped serving.
+pub fn is_dead(executor_key: u64) -> bool {
     table()
         .lock()
         .unwrap()
-        .get(&lane_key)
+        .get(&executor_key)
         .is_some_and(|controller| controller.dead.load(Ordering::SeqCst))
 }
 
-/// The lane's peak heap in bytes since its last reset, 0 for a lane that is
+/// The executor's peak heap in bytes since its last reset, 0 for an executor that is
 /// gone.
-pub fn heap_peak(lane_key: u64) -> usize {
-    table().lock().unwrap().get(&lane_key).map_or(0, |controller| controller.heap_peak())
+pub fn heap_peak(executor_key: u64) -> usize {
+    table().lock().unwrap().get(&executor_key).map_or(0, |controller| controller.heap_peak())
 }
 
-/// Kill a lane. Instant, idempotent, never joins. After this returns
-/// no notify callback will ever fire for this lane (see the kill
+/// Terminate an executor. Instant, idempotent, never joins. After this returns
+/// no notify callback will ever fire for this executor (see the terminate
 /// protocol in `lane.rs`); the thread drains and frees its state in
 /// the background; the budget slot is handed on when it exits.
-pub fn kill(lane_key: u64) {
-    let Some(controller) = table().lock().unwrap().remove(&lane_key) else {
+pub fn terminate(executor_key: u64) {
+    let Some(controller) = table().lock().unwrap().remove(&executor_key) else {
         return;
     };
 
@@ -256,58 +256,58 @@ pub fn kill(lane_key: u64) {
     // 1. Flag first — anything that wakes or dequeues next sees it.
     controller.cancel.store(true, Ordering::SeqCst);
     // 2. Wake every parked I/O channel (lock-ordered: after this, no
-    //    notify callback can ever fire again for this lane).
+    //    notify callback can ever fire again for this executor).
     controller.channels.cancel_all();
     // 3. Close the mailbox — the thread drains and exits.
     *controller.mailbox.lock().unwrap() = None;
 }
 
-/// Number of started lane threads (running or draining). Diagnostics
+/// Number of started executor threads (running or draining). Diagnostics
 /// and tests only — never used for decisions.
 pub fn live_lane_count() -> usize {
     budget().lock().unwrap().live
 }
 
 #[cfg(test)]
-pub(crate) fn controller_for(lane_key: u64) -> Option<Arc<LaneController>> {
-    table().lock().unwrap().get(&lane_key).cloned()
+pub(crate) fn controller_for(executor_key: u64) -> Option<Arc<ExecutorController>> {
+    table().lock().unwrap().get(&executor_key).cloned()
 }
 
 // ── FFI surface — what the Dart Router calls ───────────────────────
 //
-// Dumb by design: every function is a direct translation of one
+// Every function is a direct translation of one
 // Router verb. No logic lives here.
 
-/// Create a lane. Returns its opaque key.
+/// Boot an executor. Returns its opaque key.
 #[no_mangle]
-pub extern "C" fn lane_spawn() -> u64 {
-    spawn()
+pub extern "C" fn executor_boot() -> u64 {
+    boot()
 }
 
-/// Start a new lease on a lane. Returns the lease id (from 1, never
-/// reused on a lane), or 0 when the lane is gone, has a job outstanding or
+/// Start a new lease on an executor. Returns the lease id (from 1, never
+/// reused on an executor), or 0 when the executor is gone, has a job outstanding or
 /// a held channel registered, or died.
 #[no_mangle]
-pub extern "C" fn lane_lease_begin(lane_key: u64) -> u64 {
-    begin_lease(lane_key)
+pub extern "C" fn executor_lease_begin(executor_key: u64) -> u64 {
+    begin_lease(executor_key)
 }
 
-/// Replace the lane's engine state with a fresh one. The answer is posted
-/// to `result_port` exactly once: a success once the lane has reset, or an
-/// error that refuses it (stale lease, a job outstanding, a dead lane).
+/// Replace the executor's engine state with a fresh one. The answer is posted
+/// to `result_port` exactly once: a success once the executor has reset, or an
+/// error that refuses it (stale lease, a job outstanding, a dead executor).
 #[no_mangle]
-pub extern "C" fn lane_reset(lane_key: u64, lease: u64, result_port: i64) {
-    reset(lane_key, lease, result_port);
+pub extern "C" fn executor_reset(executor_key: u64, lease: u64, result_port: i64) {
+    reset(executor_key, lease, result_port);
 }
 
-/// Submit one job to a lane under `lease`. A lease that is not the lane's
-/// current one makes the lane post the stale-lease error and nothing else.
+/// Submit one job to an executor under `lease`. A lease that is not the executor's
+/// current one makes the executor post the stale-lease error and nothing else.
 ///
 /// Sources: parallel arrays of (buffer ptr, notify fn ptr, length,
 /// keep flag), `source_count` entries each. A keep flag of 1 marks a
 /// channel that outlives the job (handle-creating ops move the
-/// source into the document) — it stays registered for kill/cancel
-/// wakes until `lane_channel_release`. Sinks: parallel arrays of (buffer
+/// source into the document) — it stays registered for terminate/cancel
+/// wakes until `executor_hold_release`. Sinks: parallel arrays of (buffer
 /// ptr, notify fn ptr), `sink_count` entries each. The result is
 /// posted to `result_port` exactly once.
 ///
@@ -317,8 +317,8 @@ pub extern "C" fn lane_reset(lane_key: u64, lease: u64, result_port: i64) {
 /// readable elements. Buffers must stay alive until the job's result
 /// has been posted.
 #[no_mangle]
-pub unsafe extern "C" fn lane_submit(
-    lane_key: u64,
+pub unsafe extern "C" fn executor_submit(
+    executor_key: u64,
     lease: u64,
     job_id: u64,
     request_ptr: *const u8,
@@ -352,7 +352,7 @@ pub unsafe extern "C" fn lane_submit(
         .collect();
 
     submit(
-        lane_key,
+        executor_key,
         lease,
         Job {
             job_id,
@@ -365,50 +365,50 @@ pub unsafe extern "C" fn lane_submit(
     );
 }
 
-/// Cancel one job on a lane. Returns 1 when the job had not started and
-/// the lane will skip it, 0 otherwise, and always 0, changing nothing,
+/// Cancel one job on an executor. Returns 1 when the job had not started and
+/// the executor will skip it, 0 otherwise, and always 0, changing nothing,
 /// under a lease that is not current.
 #[no_mangle]
-pub extern "C" fn lane_job_cancel(lane_key: u64, lease: u64, job_id: u64) -> u8 {
-    cancel_job(lane_key, lease, job_id) as u8
+pub extern "C" fn executor_job_cancel(executor_key: u64, lease: u64, job_id: u64) -> u8 {
+    cancel_job(executor_key, lease, job_id) as u8
 }
 
-/// 1 when the lane's engine panicked and the lane stopped serving, else 0.
+/// 1 when the executor's engine panicked and the executor stopped serving, else 0.
 #[no_mangle]
-pub extern "C" fn lane_is_dead(lane_key: u64) -> u8 {
-    is_dead(lane_key) as u8
+pub extern "C" fn executor_is_dead(executor_key: u64) -> u8 {
+    is_dead(executor_key) as u8
 }
 
-/// The most bytes the lane's thread has held since its last reset, as of the
-/// last job or reset it answered; 0 for a lane that is gone.
+/// The most bytes the executor's thread has held since its last reset, as of the
+/// last job or reset it answered; 0 for an executor that is gone.
 #[no_mangle]
-pub extern "C" fn lane_heap_peak(lane_key: u64) -> u64 {
-    heap_peak(lane_key) as u64
+pub extern "C" fn executor_heap_peak(executor_key: u64) -> u64 {
+    heap_peak(executor_key) as u64
 }
 
-/// Kill a lane and everything on it. Instant; never blocks.
+/// Terminate an executor and everything on it. Instant; never blocks.
 #[no_mangle]
-pub extern "C" fn lane_kill(lane_key: u64) {
-    kill(lane_key);
+pub extern "C" fn executor_terminate(executor_key: u64) {
+    terminate(executor_key);
 }
 
 /// Release one held channel (its handle was disposed). The caller
-/// must free the buffer only AFTER this returns. No-op if the lane
-/// is already gone (kill covers its channels) or the lease is not current
+/// must free the buffer only AFTER this returns. No-op if the executor
+/// is already gone (terminate covers its channels) or the lease is not current
 /// (a lease changes hands only once no held channel is registered, so a
 /// stale lease owes no release).
 #[no_mangle]
-pub extern "C" fn lane_channel_release(lane_key: u64, lease: u64, buf: *mut u8) {
-    if let Some(controller) = table().lock().unwrap().get(&lane_key).cloned() {
+pub extern "C" fn executor_hold_release(executor_key: u64, lease: u64, buf: *mut u8) {
+    if let Some(controller) = table().lock().unwrap().get(&executor_key).cloned() {
         if controller.is_current(lease) {
             controller.channels.release_one(buf as usize);
         }
     }
 }
 
-/// Started lane threads, process-wide. Diagnostics only.
+/// Started executor threads, process-wide. Diagnostics only.
 #[no_mangle]
-pub extern "C" fn lane_live_count() -> u32 {
+pub extern "C" fn executor_live_count() -> u32 {
     live_lane_count() as u32
 }
 
@@ -498,8 +498,8 @@ mod tests {
     }
 
     /// Minimal parseable request: op "open" with zero fields. With a
-    /// parked source channel this makes the lane block on its first
-    /// read — the canonical "stuck cook" every kill test needs.
+    /// parked source channel this makes the executor block on its first
+    /// read — the canonical "stuck cook" every terminate test needs.
     fn open_request() -> Vec<u8> {
         let mut bytes = vec![4u8];
         bytes.extend_from_slice(b"open");
@@ -509,9 +509,9 @@ mod tests {
 
     unsafe extern "C" fn noop_notify() {}
 
-    /// A fresh lane and the first lease on it.
+    /// A fresh executor and the first lease on it.
     fn spawn_leased() -> (u64, u64) {
-        let key = spawn();
+        let key = boot();
         let lease = begin_lease(key);
         assert_ne!(lease, 0, "a fresh lane could not be leased");
         (key, lease)
@@ -557,16 +557,16 @@ mod tests {
         }
     }
 
-    fn tickets_empty(key_controller: &Arc<LaneController>) -> bool {
-        key_controller.tickets.lock().unwrap().is_empty()
+    fn tickets_empty(key_controller: &Arc<ExecutorController>) -> bool {
+        key_controller.cancel_flags.lock().unwrap().is_empty()
     }
 
     /// Wait until a submitted job's I/O channels are registered —
-    /// i.e. the lane thread has genuinely started and is running the
+    /// i.e. the executor thread has genuinely started and is running the
     /// job. Needed because under a saturated global budget (e.g. the
-    /// budget test running in parallel) a fresh lane may legitimately
+    /// budget test running in parallel) a fresh executor may legitimately
     /// wait for a thread slot.
-    fn wait_running(controller: &Arc<LaneController>) -> bool {
+    fn wait_running(controller: &Arc<ExecutorController>) -> bool {
         wait_until(Duration::from_secs(20), || controller.channels.live_count() > 0)
     }
 
@@ -589,7 +589,7 @@ mod tests {
     fn leave_held_channel(
         key: u64,
         lease: u64,
-        controller: &Arc<LaneController>,
+        controller: &Arc<ExecutorController>,
         job_id: u64,
         source: &mut ParkedSource,
     ) {
@@ -619,8 +619,8 @@ mod tests {
         let current = begin_lease(key);
         assert!(current > stale);
 
-        // The stale submit files no ticket and runs nothing: its job would
-        // park the lane, and the channel registry stays empty.
+        // The stale submit files no cancel flag and runs nothing: its job would
+        // park the executor, and the channel registry stays empty.
         let mut source = ParkedSource::new();
         submit(key, stale, parked_job(1, &mut source));
         assert!(tickets_empty(&controller));
@@ -632,12 +632,12 @@ mod tests {
         submit(key, current, parked_job(1, &mut running));
         assert!(wait_running(&controller), "lane never started the job");
         assert!(!cancel_job(key, stale, 1));
-        let flagged = controller.tickets.lock().unwrap()[&1].load(Ordering::SeqCst);
+        let flagged = controller.cancel_flags.lock().unwrap()[&1].load(Ordering::SeqCst);
         assert!(!flagged, "a stale cancel flagged the current lease's job");
 
         cancel_job(key, current, 1);
         assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
-        kill(key);
+        terminate(key);
     }
 
     #[test]
@@ -652,7 +652,7 @@ mod tests {
         submit(key, lease, parked_job(2, &mut second));
 
         // The mailbox accepted job 2 while job 1 runs...
-        assert_eq!(controller.tickets.lock().unwrap().len(), 2);
+        assert_eq!(controller.cancel_flags.lock().unwrap().len(), 2);
         // ...and the thread has not touched it: only job 1's channel is
         // registered, however long job 2 waits.
         for _ in 0..25 {
@@ -666,11 +666,11 @@ mod tests {
         assert!(wait_until(Duration::from_secs(5), || {
             *controller.running.lock().unwrap() == Some(2) && controller.channels.live_count() == 1
         }));
-        assert_eq!(controller.tickets.lock().unwrap().len(), 1);
+        assert_eq!(controller.cancel_flags.lock().unwrap().len(), 1);
 
         cancel_job(key, lease, 2);
         assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
-        kill(key);
+        terminate(key);
     }
 
     #[test]
@@ -691,7 +691,7 @@ mod tests {
         }
         assert!(!is_dead(key));
         assert!(begin_lease(key) > lease, "a reset lane takes the next lease");
-        kill(key);
+        terminate(key);
     }
 
     #[test]
@@ -713,7 +713,7 @@ mod tests {
         submit(key, lease, quiet_job(2));
         assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
         assert_eq!(controller.channels.live_count(), 1, "the refused reset ran after all");
-        kill(key);
+        terminate(key);
     }
 
     #[test]
@@ -735,23 +735,23 @@ mod tests {
         submit(key, current, quiet_job(2));
         assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
         assert_eq!(controller.channels.live_count(), 1, "a stale reset dropped the current lease's channel");
-        kill(key);
+        terminate(key);
     }
 
     #[test]
     fn spawn_and_kill_lane_with_no_jobs() {
-        let key = spawn();
+        let key = boot();
         assert!(controller_for(key).is_some());
-        kill(key);
+        terminate(key);
         assert!(controller_for(key).is_none());
         // Idempotent.
-        kill(key);
+        terminate(key);
     }
 
     #[test]
     fn kill_wakes_a_parked_job_instantly() {
         // THE test this architecture exists for: a job parked on I/O
-        // that no host will ever answer must die promptly on kill —
+        // that no host will ever answer must die promptly on terminate —
         // not after a timeout, not never.
         let mut source = ParkedSource::new();
         let (key, lease) = spawn_leased();
@@ -764,13 +764,13 @@ mod tests {
         assert!(!tickets_empty(&controller));
 
         let killed_at = Instant::now();
-        kill(key);
+        terminate(key);
         assert!(
             wait_until(Duration::from_secs(5), || tickets_empty(&controller)),
             "parked job did not unwind after kill"
         );
         // Promptly — far inside the 30s heartbeat, proving the wake
-        // came from the kill, not the safety-net timer.
+        // came from the terminate, not the safety-net timer.
         assert!(killed_at.elapsed() < Duration::from_secs(5));
     }
 
@@ -797,7 +797,7 @@ mod tests {
         cancel_job(key, lease, 8);
         assert!(wait_until(Duration::from_secs(5), || tickets_empty(&controller)));
 
-        kill(key);
+        terminate(key);
     }
 
     #[test]
@@ -806,7 +806,7 @@ mod tests {
         let (key, lease) = spawn_leased();
         let controller = controller_for(key).unwrap();
 
-        // Job 1 parks the lane; jobs 2 and 3 queue behind it.
+        // Job 1 parks the executor; jobs 2 and 3 queue behind it.
         submit(key, lease, parked_job(1, &mut parked));
         assert!(wait_running(&controller), "lane never started job 1");
         submit(
@@ -834,9 +834,9 @@ mod tests {
             },
         );
 
-        kill(key);
-        // All three tickets drain: job 1 via the I/O wake, jobs 2+3
-        // via the dequeue-time lane-cancel check.
+        terminate(key);
+        // All three cancel flags clear: job 1 via the I/O wake, jobs 2+3
+        // via the dequeue-time executor-cancel check.
         assert!(
             wait_until(Duration::from_secs(5), || tickets_empty(&controller)),
             "queued jobs were not drained after kill"
@@ -846,10 +846,10 @@ mod tests {
     #[test]
     fn submit_to_dead_lane_is_safe() {
         let (key, lease) = spawn_leased();
-        kill(key);
+        terminate(key);
 
         let mut source = ParkedSource::new();
-        // Must not panic, must not leave a ticket anywhere.
+        // Must not panic, must not leave a cancel flag anywhere.
         submit(key, lease, parked_job(42, &mut source));
     }
 
@@ -858,8 +858,8 @@ mod tests {
         // Rapid create/dispose cycles must never exhaust anything.
         let before = live_lane_count();
         for _ in 0..500 {
-            let key = spawn();
-            kill(key);
+            let key = boot();
+            terminate(key);
         }
         assert!(
             wait_until(Duration::from_secs(10), || live_lane_count() <= before),
@@ -870,12 +870,12 @@ mod tests {
 
     #[test]
     fn budget_cap_holds_and_waiters_start_fifo() {
-        // Fill the budget past the cap; waiting lanes must still
+        // Fill the budget past the cap; waiting executors must still
         // accept jobs and must start once slots free up.
-        let keys: Vec<u64> = (0..MAX_LANES_GLOBAL + 8).map(|_| spawn()).collect();
+        let keys: Vec<u64> = (0..MAX_LANES_GLOBAL + 8).map(|_| boot()).collect();
         assert!(live_lane_count() <= MAX_LANES_GLOBAL);
 
-        // A lane beyond the cap accepts a job (queued, not running).
+        // An executor beyond the cap accepts a job (queued, not running).
         let last = *keys.last().unwrap();
         let controller = controller_for(last).unwrap();
         let lease = begin_lease(last);
@@ -897,7 +897,7 @@ mod tests {
         // no-source "open" job completes immediately with an error
         // result — completion == ticket removal.)
         for &key in &keys[..MAX_LANES_GLOBAL] {
-            kill(key);
+            terminate(key);
         }
         assert!(
             wait_until(Duration::from_secs(10), || tickets_empty(&controller)),
@@ -905,7 +905,7 @@ mod tests {
         );
 
         for &key in &keys {
-            kill(key);
+            terminate(key);
         }
         assert!(wait_until(Duration::from_secs(10), || {
             controller_for(last).is_none()
@@ -914,15 +914,15 @@ mod tests {
 
     #[test]
     fn lane_killed_while_waiting_for_budget_is_skipped() {
-        let keys: Vec<u64> = (0..MAX_LANES_GLOBAL + 4).map(|_| spawn()).collect();
+        let keys: Vec<u64> = (0..MAX_LANES_GLOBAL + 4).map(|_| boot()).collect();
 
-        // Kill the over-cap waiters before they ever start.
+        // Terminate the over-cap waiters before they ever start.
         for &key in &keys[MAX_LANES_GLOBAL..] {
-            kill(key);
+            terminate(key);
         }
         // Then everything else.
         for &key in &keys[..MAX_LANES_GLOBAL] {
-            kill(key);
+            terminate(key);
         }
 
         // No thread may remain for the skipped waiters (or anything
@@ -960,7 +960,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn cancelling_a_queued_job_skips_it_and_nothing_reaches_the_engine() {
-        // The queued job would panic the engine if it ran, so a lane still
+        // The queued job would panic the engine if it ran, so an executor still
         // alive afterwards proves it never reached it.
         let mut parked = ParkedSource::new();
         let (key, lease) = spawn_leased();
@@ -976,7 +976,7 @@ mod tests {
         assert!(!is_dead(key), "the cancelled job reached the engine");
         assert!(!cancel_job(key, lease, 2), "a finished job is no longer queued");
 
-        kill(key);
+        terminate(key);
     }
 
     #[cfg(feature = "test-support")]
@@ -1005,10 +1005,10 @@ mod tests {
         assert!(tickets_empty(&controller));
         assert!(controller.mailbox.lock().unwrap().is_none());
 
-        // A fresh lane serves as before.
-        let other = spawn();
+        // A fresh executor serves as before.
+        let other = boot();
         assert!(!is_dead(other));
-        kill(other);
-        kill(key);
+        terminate(other);
+        terminate(key);
     }
 }

@@ -1356,7 +1356,7 @@ thread_local! {
         = const { std::cell::RefCell::new(None) };
 }
 
-// ── pdf_manipulator patch: a lane starts on a clean thread (host::executor::install) ──
+// ── pdf_manipulator patch: a lane starts on a clean thread (host::caches::install) ──
 /// Forgets the font-resolution context a conversion that never finished left.
 pub(crate) fn reset_conversion_context() {
     REGISTERED_FONTS.with(|cell| cell.replace(None));

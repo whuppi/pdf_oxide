@@ -16,7 +16,7 @@
 //! The lane thread sleeps (zero CPU) while waiting. The Dart isolate
 //! signals via an FFI call that locks the mutex before notify_one().
 
-use crate::host::native::cancel::CancelToken;
+use crate::host::native::cancel::CancelFlags;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -323,7 +323,7 @@ pub fn wait_for_response(
     response_offset: usize,
     cancel_offset: usize,
     request: u32,
-    token: &CancelToken,
+    token: &CancelFlags,
 ) -> Result<u32, std::io::Error> {
     const HEARTBEAT: Duration = Duration::from_secs(30);
 
@@ -473,7 +473,7 @@ mod tests {
             host_respond(buf.as_mut_ptr(), 40, 24, FLAG_READY);
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
-            let token = CancelToken::unconnected();
+            let token = CancelFlags::unconnected();
             let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, request, &token);
             assert_eq!(result.unwrap(), FLAG_READY);
             destroy_sync(buf.as_mut_ptr(), ptr_offset);
@@ -512,7 +512,7 @@ mod tests {
             let started = std::time::Instant::now();
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
-            let token = CancelToken::unconnected();
+            let token = CancelFlags::unconnected();
             let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, second, &token);
             assert_eq!(result.unwrap(), FLAG_READY, "took the earlier request's answer");
             assert!(started.elapsed() >= Duration::from_millis(50), "returned on the stale answer");
@@ -534,7 +534,7 @@ mod tests {
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
             let lane = Arc::new(AtomicBool::new(true));
-            let token = CancelToken::new(lane, Arc::new(AtomicBool::new(false)));
+            let token = CancelFlags::new(lane, Arc::new(AtomicBool::new(false)));
             let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, 1, &token);
             let err = result.unwrap_err();
             // Must NOT be Interrupted — std combinators retry that kind.
@@ -567,7 +567,7 @@ mod tests {
 
             let pair = get_sync(buf.as_ptr(), ptr_offset);
             let guard = pair.mutex.lock().unwrap();
-            let token = CancelToken::unconnected();
+            let token = CancelFlags::unconnected();
             let result = wait_for_response(pair, guard, buf.as_ptr(), 24, 28, 1, &token);
             assert!(result.unwrap() & FLAG_CANCELLED != 0);
 

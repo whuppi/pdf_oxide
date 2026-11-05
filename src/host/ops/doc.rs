@@ -4,7 +4,7 @@
 use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::BoxedReader;
 use crate::host::dispatch;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
     authenticate_or_refuse, handle_with_doc, ok_flag, open_source_cancellable, page_of, pages_of,
@@ -284,7 +284,7 @@ op_unit!(
 );
 
 fn handle_open(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     source_bytes: Option<&[u8]>,
     source_reader: Option<BoxedReader>,

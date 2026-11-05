@@ -4,7 +4,7 @@
 //! It is NOT part of upstream pdf_oxide.
 //!
 //! Target-shared modules carry the operation logic and wire format;
-//! `native/` (lane threads, condvar I/O) and `wasm/` (JS-callback I/O)
+//! `native/` (executor threads, condvar I/O) and `wasm/` (JS-callback I/O)
 //! are the per-target edges. Each module's own header states its job.
 
 pub mod attachments;
@@ -20,9 +20,9 @@ pub(crate) mod form_choice;
 mod engine_proofs;
 #[cfg(test)]
 pub(crate) mod flat_extras_seam;
-pub mod executor;
+pub mod caches;
 pub mod heap;
-pub mod lane_state;
+pub mod engine_state;
 /// Per-op dispatch units (entry + handler + linker anchor).
 pub mod ops;
 pub(crate) mod page_prune;

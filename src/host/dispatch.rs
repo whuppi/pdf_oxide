@@ -1581,7 +1581,7 @@ pub fn register_fallback_font(kind: &str, bytes: Vec<u8>) -> Result<()> {
     if bytes.is_empty() {
         return Err(Error::InvalidPdf("fallback font bytes are empty".into()));
     }
-    crate::host::executor::with(|e| e.register(k, bytes));
+    crate::host::caches::with(|e| e.register(k, bytes));
     Ok(())
 }
 

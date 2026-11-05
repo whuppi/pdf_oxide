@@ -3,7 +3,7 @@
 use crate::host::binary_codec::{ErrorKind, FieldValue, Request, ResponseWriter};
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{ok_flag, read_all_from_reader, req_handle};
 
@@ -66,7 +66,7 @@ op_unit!(SAVE, "builderSave", pdf_op_builder_save_anchor, |ctx| {
     handle_builder_save(ctx.state, ctx.req, sink)
 });
 
-fn handle_builder_create(state: &mut LaneState) -> Vec<u8> {
+fn handle_builder_create(state: &mut EngineState) -> Vec<u8> {
     let builder = dispatch::builder_new();
     let hid = state.next_handle_id();
     state.builders.insert(hid, builder);
@@ -75,7 +75,7 @@ fn handle_builder_create(state: &mut LaneState) -> Vec<u8> {
     w.finish()
 }
 
-fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+fn handle_builder_set_metadata(state: &mut EngineState, req: &Request<'_>) -> Vec<u8> {
     let hid = req_handle(req);
     let Some(mut b) = state.builders.remove(&hid) else {
         return ResponseWriter::error("builder not found");
@@ -110,7 +110,7 @@ fn handle_builder_set_metadata(state: &mut LaneState, req: &Request<'_>) -> Vec<
     ok_flag("set")
 }
 
-fn handle_builder_add_page(state: &mut LaneState, req: &Request<'_>) -> Vec<u8> {
+fn handle_builder_add_page(state: &mut EngineState, req: &Request<'_>) -> Vec<u8> {
     let size = match req.get_str("pageType") {
         Some("a4") => PageSize::A4,
         Some("letter") => PageSize::Letter,
@@ -180,7 +180,7 @@ fn image_pixel_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 /// content rect the margin leaves; `cover` may overflow the media box, which
 /// viewers clip.
 fn handle_builder_add_image_page(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     mut data_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
@@ -241,7 +241,7 @@ fn handle_builder_add_image_page(
 }
 
 fn handle_builder_page_op(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     mut data_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
@@ -586,7 +586,7 @@ fn handle_builder_page_op(
     }
 }
 
-fn handle_builder_save(state: &mut LaneState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
+fn handle_builder_save(state: &mut EngineState, req: &Request<'_>, sink_writer: Option<BoxedWriter>) -> Vec<u8> {
     let hid = req_handle(req);
     let builders_map = &mut state.builders;
     let builder = match builders_map.remove(&hid) {

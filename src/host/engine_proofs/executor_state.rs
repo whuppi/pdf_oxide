@@ -1,4 +1,4 @@
-//! The executor's caches and registrations: a font loaded inside a font load,
+//! The engine caches and registrations: a font loaded inside a font load,
 //! and a fallback font registered twice.
 
 use super::support::{pdf_from_objects, stream_object};
@@ -6,7 +6,7 @@ use crate::document::PdfDocument;
 use crate::fonts::cmap::cmap_cache_size;
 use crate::fonts::form_fallback::{self, Fallback};
 use crate::fonts::global_cache::global_font_cache_stats;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 
 fn plain(id: u32, body: &str) -> Vec<u8> {
     format!("{id} 0 obj\n{body}\nendobj\n").into_bytes()
@@ -60,13 +60,13 @@ fn fonts_loading_fonts() -> Vec<u8> {
 /// procedure, a Helvetica of its own and a Courier inside a Form XObject
 /// renders it, with ink where only the nested Helvetica can paint, and extracts
 /// all its text: fonts load inside the extraction of a page and inside a glyph,
-/// the lane's caches fill, and no cache borrow is held across a load. No Dart
+/// the executor's caches fill, and no cache borrow is held across a load. No Dart
 /// battery can observe this: a RefCell double borrow is a panic that depends on
 /// the order of cache accesses inside nested font loads, and only the engine's
-/// own fixture, with a lane installed, reaches it.
+/// own fixture, with an engine state installed, reaches it.
 #[test]
 fn fonts_that_load_fonts_render_and_extract_inside_a_lane() {
-    let _lane = LaneState::new();
+    let _lane = EngineState::new();
     let doc = PdfDocument::from_bytes(fonts_loading_fonts()).unwrap();
 
     let text = doc.extract_text(0).unwrap();
@@ -96,13 +96,13 @@ fn fonts_that_load_fonts_render_and_extract_inside_a_lane() {
 /// font the engine embeds, which a form fixture would have to render to tell.
 #[test]
 fn a_fallback_font_registered_twice_is_the_second() {
-    let _lane = LaneState::new();
+    let _lane = EngineState::new();
     crate::host::dispatch::register_fallback_font("cjk", vec![1, 2, 3]).unwrap();
     crate::host::dispatch::register_fallback_font("cjk", vec![9, 8]).unwrap();
 
-    let registered = crate::host::executor::with(|e| e.registered(Fallback::Cjk));
+    let registered = crate::host::caches::with(|e| e.registered(Fallback::Cjk));
     assert_eq!(registered.as_deref(), Some(&[9u8, 8][..]));
     let resolved = form_fallback::resolve_font_bytes(Fallback::Cjk).expect("a registered font");
     assert_eq!(&*resolved, &[9u8, 8][..]);
-    assert!(crate::host::executor::with(|e| e.registered(Fallback::Emoji)).is_none());
+    assert!(crate::host::caches::with(|e| e.registered(Fallback::Emoji)).is_none());
 }

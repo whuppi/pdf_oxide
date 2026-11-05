@@ -35,7 +35,7 @@
 
 use super::FontInfo;
 // ── pdf_manipulator patch: the byte-bounded cache and its charge ──
-use crate::host::executor;
+use crate::host::caches;
 use crate::host::font_budget::ByteCache;
 // ── end pdf_manipulator patch ──
 use std::sync::Arc;
@@ -101,7 +101,7 @@ pub fn global_font_cache_get(identity_hash: u64) -> Option<Arc<FontInfo>> {
     // Concurrent read lock; on poison (another thread panicked) skip the cache
     // rather than propagating the panic — font loading should still work.
     // ── pdf_manipulator patch: the executor's cache ──
-    executor::with(|e| e.font(identity_hash))
+    caches::with(|e| e.font(identity_hash))
     // ── end pdf_manipulator patch ──
 }
 
@@ -112,7 +112,7 @@ pub fn global_font_cache_get(identity_hash: u64) -> Option<Arc<FontInfo>> {
 /// in other documents will get a cache hit.
 pub fn global_font_cache_insert(identity_hash: u64, font: Arc<FontInfo>) {
     // ── pdf_manipulator patch: the executor's cache ──
-    executor::with(|e| e.put_font(identity_hash, font));
+    caches::with(|e| e.put_font(identity_hash, font));
     // ── end pdf_manipulator patch ──
 }
 
@@ -132,7 +132,7 @@ pub fn global_font_cache_insert(identity_hash: u64, font: Arc<FontInfo>) {
 /// ```
 pub fn clear_global_font_cache() {
     // ── pdf_manipulator patch: the executor's cache ──
-    executor::with(|e| e.clear_fonts());
+    caches::with(|e| e.clear_fonts());
     // ── end pdf_manipulator patch ──
 }
 
@@ -152,7 +152,7 @@ pub fn clear_global_font_cache() {
 // ── end pdf_manipulator patch ──
 pub fn global_font_cache_stats() -> (usize, usize) {
     // ── pdf_manipulator patch: the executor's cache ──
-    executor::with(|e| e.font_stats())
+    caches::with(|e| e.font_stats())
     // ── end pdf_manipulator patch ──
 }
 
@@ -173,7 +173,7 @@ pub fn global_font_cache_stats() -> (usize, usize) {
 /// set_global_font_cache_capacity(64 * 1024 * 1024);
 /// ```
 pub fn set_global_font_cache_capacity(max_bytes: usize) {
-    executor::with(|e| e.set_font_budget(max_bytes));
+    caches::with(|e| e.set_font_budget(max_bytes));
 }
 // ── end pdf_manipulator patch ──
 

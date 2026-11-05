@@ -1,40 +1,40 @@
-//! CancelToken — the two-flag cancellation check for lane I/O.
+//! CancelFlags — the two-flag cancellation check for executor I/O.
 //!
 //! This file is part of the pdf_manipulator host layer (NOT upstream).
 //!
-//! Every job carries one token combining the two ways it can die:
+//! Every job carries one CancelFlags combining the two ways it can die:
 //!
-//!   lane flag — `lane_kill` (instance dispose). Kills every job on
-//!               the lane. Set once, never cleared.
-//!   job flag  — `lane_job_cancel` (PdfTask.cancel()). Kills exactly
-//!               one job. Set once, never cleared.
+//!   executor flag — `executor_terminate` (instance dispose). Ends every job on
+//!                   the executor. Set once, never cleared.
+//!   job flag      — `executor_job_cancel` (PdfTask.cancel()). Ends exactly
+//!                   one job. Set once, never cleared.
 //!
-//! Readers and writers check the token at every I/O boundary. The
-//! flags are set-once and monotonic — a token that reports cancelled
+//! Readers and writers check the flags at every I/O boundary. The
+//! flags are set-once and monotonic — a CancelFlags that reports cancelled
 //! never reports uncancelled again, so a stale read is at worst one
 //! I/O boundary late, never wrong.
 //!
-//! Tokens are NOT optional on readers/writers. Production I/O is
-//! always cancellable; tests use [`CancelToken::unconnected`].
+//! A CancelFlags is NOT optional on readers/writers. Production I/O is
+//! always cancellable; tests use [`CancelFlags::unconnected`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Combined lane + job cancellation flags. Cheap to clone.
+/// Combined executor + job cancellation flags. Cheap to clone.
 #[derive(Clone)]
-pub struct CancelToken {
+pub struct CancelFlags {
     lane: Arc<AtomicBool>,
     job: Arc<AtomicBool>,
 }
 
-impl CancelToken {
-    /// Token wired to a lane's kill flag and one job's cancel flag.
+impl CancelFlags {
+    /// Flags wired to an executor's terminate flag and one job's cancel flag.
     pub fn new(lane: Arc<AtomicBool>, job: Arc<AtomicBool>) -> Self {
         Self { lane, job }
     }
 
-    /// Token with fresh, never-set flags. For tests and for contexts
-    /// that have no kill surface (e.g. pure unit fixtures).
+    /// Fresh, never-set flags. For tests and for contexts
+    /// that have no terminate surface (e.g. pure unit fixtures).
     pub fn unconnected() -> Self {
         Self {
             lane: Arc::new(AtomicBool::new(false)),
@@ -47,7 +47,7 @@ impl CancelToken {
         crate::cancel::CancelCheck::from_flags(self.lane.clone(), self.job.clone())
     }
 
-    /// True once either the lane or the job has been cancelled.
+    /// True once either the executor or the job has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.lane.load(Ordering::Relaxed) || self.job.load(Ordering::Relaxed)
     }
@@ -65,9 +65,9 @@ pub fn cancelled() -> std::io::Error {
     std::io::Error::other("operation cancelled")
 }
 
-impl std::fmt::Debug for CancelToken {
+impl std::fmt::Debug for CancelFlags {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancelToken")
+        f.debug_struct("CancelFlags")
             .field("cancelled", &self.is_cancelled())
             .finish()
     }
@@ -79,13 +79,13 @@ mod tests {
 
     #[test]
     fn unconnected_is_not_cancelled() {
-        assert!(!CancelToken::unconnected().is_cancelled());
+        assert!(!CancelFlags::unconnected().is_cancelled());
     }
 
     #[test]
     fn lane_flag_cancels() {
         let lane = Arc::new(AtomicBool::new(false));
-        let token = CancelToken::new(lane.clone(), Arc::new(AtomicBool::new(false)));
+        let token = CancelFlags::new(lane.clone(), Arc::new(AtomicBool::new(false)));
         assert!(!token.is_cancelled());
         lane.store(true, Ordering::SeqCst);
         assert!(token.is_cancelled());
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn job_flag_cancels() {
         let job = Arc::new(AtomicBool::new(false));
-        let token = CancelToken::new(Arc::new(AtomicBool::new(false)), job.clone());
+        let token = CancelFlags::new(Arc::new(AtomicBool::new(false)), job.clone());
         assert!(!token.is_cancelled());
         job.store(true, Ordering::SeqCst);
         assert!(token.is_cancelled());
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn each_stops_after_the_item_that_cancelled() {
         let job = Arc::new(AtomicBool::new(false));
-        let check = CancelToken::new(Arc::new(AtomicBool::new(false)), job.clone()).check();
+        let check = CancelFlags::new(Arc::new(AtomicBool::new(false)), job.clone()).check();
         let mut calls = 0;
         let result = check.each(0..100, |i| {
             calls += 1;
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn each_runs_every_item_without_a_cancel() {
-        let check = CancelToken::unconnected().check();
+        let check = CancelFlags::unconnected().check();
         let mut seen = Vec::new();
         check
             .each(0..5, |i| {
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn each_returns_the_bodys_own_error() {
-        let check = CancelToken::unconnected().check();
+        let check = CancelFlags::unconnected().check();
         let result = check.each(0..5, |i| {
             if i == 1 {
                 Err(crate::error::Error::InvalidPdf("body".into()))
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn clones_share_flags() {
         let job = Arc::new(AtomicBool::new(false));
-        let token = CancelToken::new(Arc::new(AtomicBool::new(false)), job.clone());
+        let token = CancelFlags::new(Arc::new(AtomicBool::new(false)), job.clone());
         let clone = token.clone();
         job.store(true, Ordering::SeqCst);
         assert!(clone.is_cancelled());

@@ -16,11 +16,11 @@
 //! Cancellation mirrors CallbackReader: FLAG_CANCELLED is sticky
 //! (it lives in the channel's Rust-written cancel word, which a flush
 //! never touches), and the token + flag
-//! are re-checked before notifying, under the pair mutex the killer
-//! must take first — so once a kill returns, this writer will never
+//! are re-checked before notifying, under the pair mutex the terminating caller
+//! must take first — so once a terminate returns, this writer will never
 //! invoke `notify_fn` again.
 
-use crate::host::native::cancel::CancelToken;
+use crate::host::native::cancel::CancelFlags;
 use crate::host::native::shared_buffer::{self as sb, write_channel as wc};
 use std::io::{self, Write};
 
@@ -28,7 +28,7 @@ use std::io::{self, Write};
 pub struct CallbackWriter {
     buf: *mut u8,
     notify_fn: unsafe extern "C" fn(),
-    token: CancelToken,
+    token: CancelFlags,
     pending: usize,
 }
 
@@ -45,7 +45,7 @@ impl CallbackWriter {
     pub unsafe fn new(
         buf: *mut u8,
         notify_fn: unsafe extern "C" fn(),
-        token: CancelToken,
+        token: CancelFlags,
     ) -> Self {
         Self { buf, notify_fn, token, pending: 0 }
     }
@@ -158,7 +158,7 @@ mod tests {
         unsafe { sb::init_sync(buf.as_mut_ptr(), wc::OFFSET_SYNC_PTR); }
 
         let job = Arc::new(AtomicBool::new(true));
-        let token = CancelToken::new(Arc::new(AtomicBool::new(false)), job);
+        let token = CancelFlags::new(Arc::new(AtomicBool::new(false)), job);
         let mut writer = unsafe {
             CallbackWriter::new(buf.as_mut_ptr(), noop_notify, token)
         };
@@ -175,7 +175,7 @@ mod tests {
         let mut writer = CallbackWriter {
             buf: std::ptr::null_mut(),
             notify_fn: noop_notify,
-            token: CancelToken::unconnected(),
+            token: CancelFlags::unconnected(),
             pending: 0,
         };
         assert_eq!(writer.write(&[]).unwrap(), 0);

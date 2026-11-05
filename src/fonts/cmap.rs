@@ -318,7 +318,7 @@ fn compute_stream_hash(data: &[u8]) -> CMapKey {
 // - Access shared CMaps concurrently (Arc is thread-safe)
 
 // ── pdf_manipulator patch: the CMap cache belongs to the lane's executor and is bounded by the bytes its CMaps take ──
-// It is an LRU of `CMAP_CACHE_BYTES` on `crate::host::executor::Executor`;
+// It is an LRU of `CMAP_CACHE_BYTES` on `crate::host::caches::EngineCaches`;
 // each access below is one get or one put.
 // ── end pdf_manipulator patch ──
 
@@ -328,14 +328,14 @@ fn compute_stream_hash(data: &[u8]) -> CMapKey {
 /// Python REPLs, Node.js services) that process many different PDFs.
 pub fn clear_cmap_cache() {
     // ── pdf_manipulator patch: the executor's cache ──
-    crate::host::executor::with(|e| e.clear_cmaps());
+    crate::host::caches::with(|e| e.clear_cmaps());
     // ── end pdf_manipulator patch ──
 }
 
 /// Returns the current number of entries in the global CMap cache.
 pub fn cmap_cache_size() -> usize {
     // ── pdf_manipulator patch: the executor's cache ──
-    crate::host::executor::with(|e| e.cmap_count())
+    crate::host::caches::with(|e| e.cmap_count())
     // ── end pdf_manipulator patch ──
 }
 
@@ -466,7 +466,7 @@ impl LazyCMap {
 
         // Step 2: Check global cache
         // ── pdf_manipulator patch: the executor's cache, one get ──
-        if let Some(arc) = crate::host::executor::with(|e| e.cmap(&self.cache_key)) {
+        if let Some(arc) = crate::host::caches::with(|e| e.cmap(&self.cache_key)) {
             // ── end pdf_manipulator patch ──
             // Update local cache for next access
             *parsed_guard = Some(Arc::clone(&arc));
@@ -484,7 +484,7 @@ impl LazyCMap {
 
                 // Update global cache
                 // ── pdf_manipulator patch: the executor's cache, one put, charged by the bytes the CMap takes ──
-                crate::host::executor::with(|e| {
+                crate::host::caches::with(|e| {
                     e.put_cmap(self.cache_key, Arc::clone(&cmap_arc), cmap_arc.heap_bytes())
                 });
                 // ── end pdf_manipulator patch ──

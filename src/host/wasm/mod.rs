@@ -12,10 +12,10 @@ pub mod js_writer;
 
 use wasm_bindgen::prelude::*;
 
-// Imported from the JS global scope (self.host_cancelled in lane_worker.js).
+// Imported from the JS global scope (self.host_cancelled in executor_worker.js).
 // Synchronous in every mode: it reads the job's cancel word and never suspends.
 #[wasm_bindgen]
 extern "C" {
-    /// 1 once the running job (or its lane) is cancelled, else 0.
+    /// 1 once the running job (or its executor) is cancelled, else 0.
     pub fn host_cancelled() -> i32;
 }

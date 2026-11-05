@@ -14,7 +14,7 @@ pub const READ_BUF_CAPACITY: usize = 64 * 1024;
 /// BufWriter capacity (256KB) — one shared-buffer write trip.
 pub const WRITE_BUF_CAPACITY: usize = 256 * 1024;
 
-// ── Host I/O status codes (web lane bodies return these from
+// ── Host I/O status codes (web executor bodies return these from
 //    host_read_at / host_write_chunk; Dart mirrors them in
 //    web/protocol.dart) ──────────────────────────────────────────
 

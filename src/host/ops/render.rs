@@ -3,7 +3,7 @@
 
 use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::BoxedWriter;
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{pages_of, req_handle};
 
@@ -23,7 +23,7 @@ op_unit!(
 );
 
 fn handle_render_streamed(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
     cancel: &crate::cancel::CancelCheck,
@@ -111,7 +111,7 @@ fn wire_size_and_format(
 }
 
 fn handle_extract_images_streamed(
-    state: &mut LaneState,
+    state: &mut EngineState,
     req: &Request<'_>,
     sink_writer: Option<BoxedWriter>,
     cancel: &crate::cancel::CancelCheck,

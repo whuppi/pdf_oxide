@@ -225,7 +225,7 @@ pub(crate) fn count_fill() {
     FILLS.with(|fills| fills.set(fills.get().wrapping_add(1)));
 }
 
-// ── pdf_manipulator patch: a lane starts on a clean thread (host::executor::install) ──
+// ── pdf_manipulator patch: a lane starts on a clean thread (host::caches::install) ──
 /// Starts this thread's fill count over.
 pub(crate) fn reset_fills() {
     FILLS.with(|fills| fills.set(0));

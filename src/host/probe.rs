@@ -1,14 +1,14 @@
-//! Out-of-crate measurement door — runs one wire request the way a lane
+//! Out-of-crate measurement door — runs one wire request the way an executor
 //! does, for memory probes that live outside this crate.
 
 use crate::host::bridge_api::{self, BoxedReader, BoxedWriter};
-use crate::host::lane_state::LaneState;
+use crate::host::engine_state::EngineState;
 use std::fs::File;
 
 /// Runs one wire request against `state`, wrapping each `File` in
 /// the bridge's boxed reader/writer exactly as the transports do.
 pub fn run(
-    state: &mut LaneState,
+    state: &mut EngineState,
     request: &[u8],
     sources: Vec<File>,
     sinks: Vec<File>,
@@ -102,7 +102,7 @@ pub fn extract_pages(
 }
 
 /// `open` / `editorOpen`'s source: the PDF in `bytes`, read through the
-/// external-reader path the lanes use, not the in-memory one.
+/// external-reader path the executors use, not the in-memory one.
 pub fn open_source(bytes: Vec<u8>, cancel: &CancelCheck) -> Result<PdfDocument> {
     let _job = crate::cancel::enter(cancel);
     PdfDocument::from_external_reader_cancellable(Box::new(std::io::Cursor::new(bytes)), cancel)

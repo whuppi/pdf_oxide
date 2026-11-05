@@ -12,7 +12,7 @@ use crate::document::PdfDocument;
 use crate::editor::{DocumentEditor, SaveOptions};
 use crate::host::images::execute::reduce_images;
 use crate::host::images::policy::{Chroma, Policy};
-use crate::host::native::cancel::CancelToken;
+use crate::host::native::cancel::CancelFlags;
 use crate::host::native::callback_reader::CallbackReader;
 use crate::host::native::shared_buffer::{self as sb, read_channel as rc};
 use crate::host::positioned_write::CountingWriter;
@@ -82,7 +82,7 @@ fn a_lossless_compress_reads_its_source_in_few_trips() {
     unsafe { sb::init_sync(channel.as_mut_ptr(), rc::OFFSET_SYNC_PTR) };
     CHANNEL.store(channel.as_mut_ptr(), Ordering::Relaxed);
     let reader = unsafe {
-        CallbackReader::new(channel.as_mut_ptr(), answer_read, source.len() as u64, CancelToken::unconnected())
+        CallbackReader::new(channel.as_mut_ptr(), answer_read, source.len() as u64, CancelFlags::unconnected())
     };
     let doc = PdfDocument::from_external_reader(Box::new(reader)).unwrap();
     let mut editor = DocumentEditor::from_document(doc).unwrap();

@@ -5,7 +5,7 @@
 //! Implements `Read + Seek` by calling `host_read_at` imported from
 //! the JS global scope via wasm_bindgen.
 //!
-//! lane_worker.js sets `self.host_read_at = hostReadAt` before loading WASM.
+//! executor_worker.js sets `self.host_read_at = hostReadAt` before loading WASM.
 //! wasm_bindgen resolves the import via global lookup — no bare "env"
 //! import specifier that would break in ES module Workers.
 //!
@@ -21,7 +21,7 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use wasm_bindgen::prelude::*;
 
-// Imported from the JS global scope (self.host_read_at in lane_worker.js).
+// Imported from the JS global scope (self.host_read_at in executor_worker.js).
 // Uses u32 for buf_ptr because wasm_bindgen doesn't support raw pointers.
 // WASM pointers are u32. Cast at the call site.
 #[wasm_bindgen]

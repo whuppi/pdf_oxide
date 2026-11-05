@@ -14,15 +14,15 @@ src/extractors/warnings.rs::DROPPED  thread  the count of warnings one thread's 
 src/extractors/warnings.rs::WARNING_SINK  thread  the warnings one thread raised; a lane's own, emptied when it starts and on reset
 src/fonts/unicode_fallback.rs::CACHED_BYTES  machine  the bytes of a system Unicode font, read once from the host's font files
 src/fonts/unicode_fallback.rs::CACHED_CJK_BYTES  machine  the bytes of a system CJK font, read once from the host's font files
-src/host/executor.rs::DEFAULT  upstream-binding  the executor used when none is installed: the python, ffi and wasm.rs bindings and upstream tests; a lane always installs its own
-src/host/executor.rs::INSTALLED  executor  the pointer to the executor the current lane thread installed
+src/host/caches.rs::DEFAULT  upstream-binding  the EngineCaches used when none is installed: the python, ffi and wasm.rs bindings and upstream tests; an executor always installs its own
+src/host/caches.rs::INSTALLED  executor  the pointer to the EngineCaches the current executor thread installed
 src/host/heap.rs::MINE  executor  what the current thread holds and its peak
 src/host/heap.rs::OWNED  executor  how many process-owned calls the current thread is inside
 src/host/heap.rs::PROCESS_LIVE  machine  what the whole process holds, a counter that holds no data
 src/host/heap.rs::PROCESS_PEAK  machine  the most the whole process held, a counter that holds no data
-src/host/native/lane_table.rs::BUDGET  registry  the lane thread budget and its waiters
-src/host/native/lane_table.rs::NEXT_LANE_KEY  registry  the next lane key
-src/host/native/lane_table.rs::TABLE  registry  the table of live lanes by key
+src/host/native/executor_table.rs::BUDGET  registry  the executor thread budget and its waiters
+src/host/native/executor_table.rs::NEXT_LANE_KEY  registry  the next executor key
+src/host/native/executor_table.rs::TABLE  registry  the table of live executors by key
 src/html_css/html/tokenizer.rs::NAMED_ENTITIES  machine  the HTML named-entity table, built once from literals
 src/pipeline/reading_order/xycut.rs::SMOOTH_SCRATCH  thread  a buffer one thread clears and refills on every call
 src/python.rs::PYO3_LOG_RESET_HANDLE  upstream-binding  the Python logging handle, set only by the python binding
