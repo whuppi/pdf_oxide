@@ -507,7 +507,9 @@ fn build_document_body(pages: &[PageSpans], page_w_pt: f32, page_h_pt: f32) -> S
                 let italic = if span.is_italic { "<w:i/><w:iCs/>" } else { "" };
 
                 let raw_font = &span.font_name;
-                let resolved: String = if let Some(real) = page.font_lookup.get(raw_font) {
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                let resolved: String = if let Some(real) = page.font_lookup.get(raw_font.as_str()) {
+                // ── end pdf_manipulator patch ──
                     real.clone()
                 } else {
                     let stripped = raw_font

@@ -37,7 +37,9 @@ fn create_test_span(
         artifact_type: None,
         text: text.to_string(),
         bbox: Rect::new(x, y, width, height),
-        font_name: "TimesRoman".to_string(),
+        // ── pdf_manipulator patch: the name of a span's font is shared ──
+        font_name: "TimesRoman".into(),
+        // ── end pdf_manipulator patch ──
         font_size: height,
         font_weight: FontWeight::Normal,
         is_italic: false,

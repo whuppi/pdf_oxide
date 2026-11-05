@@ -217,7 +217,9 @@ mod tests {
         TextSpan {
             text: text.to_string(),
             bbox: Rect::new(x, y, text.chars().count() as f32 * size * 0.5, size),
-            font_name: font.to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: font.to_string().into(),
+            // ── end pdf_manipulator patch ──
             font_size: size,
             ..Default::default()
         }

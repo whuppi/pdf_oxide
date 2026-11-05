@@ -140,7 +140,9 @@ impl HtmlConverter {
                 bbox: span.bbox,
                 text: span.text.clone(),
                 avg_font_size: span.font_size,
-                dominant_font: span.font_name.clone(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                dominant_font: span.font_name.to_string(),
+                // ── end pdf_manipulator patch ──
                 is_bold: matches!(span.font_weight, crate::layout::FontWeight::Bold),
                 is_italic: span.is_italic,
                 mcid: span.mcid,
@@ -785,7 +787,9 @@ mod tests {
                 artifact_type: None,
                 text: "First".to_string(),
                 bbox: Rect::new(10.0, 20.0, 30.0, 12.0), // width ~= 5 chars * 6pt
-                font_name: "Times".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Times".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 is_italic: false,
@@ -815,7 +819,9 @@ mod tests {
                 artifact_type: None,
                 text: "Second".to_string(),
                 bbox: Rect::new(10.0, 40.0, 36.0, 12.0), // width ~= 6 chars * 6pt
-                font_name: "Times".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Times".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 is_italic: false,

@@ -35,11 +35,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// One resident document holds an object cache of `DEFAULT_OBJECT_CACHE_MAX_BYTES`
 /// (8 MiB, document.rs), a content cache of `CONTENT_CACHE_BYTES` (4 MiB,
-/// host/content/cache.rs) and fonts of `DOCUMENT_FONT_BYTES` (1 MiB,
-/// host/font_budget.rs): 13 MiB. Every lawful operation peaks at most 16 MiB
-/// over its baseline (the `limit` rows of tool/memprobe/src/main.rs), so one
-/// document and one operation stay under 29 MiB, inside 32 MiB. The three
-/// exception rows retire their executor.
+/// host/content/cache.rs), fonts of `DOCUMENT_FONT_BYTES` (1 MiB,
+/// host/font_budget.rs) and the text caches of host/font_budget.rs (spans
+/// 512 KiB, characters, pages, Form spans and Form images 256 KiB each, the
+/// search index 1 MiB: 2.5 MiB): 15.5 MiB. Every lawful operation peaks at
+/// most 16 MiB over its baseline (the `limit` rows of tool/memprobe/src/main.rs),
+/// so one document and one operation stay under 31.5 MiB, inside 32 MiB. The
+/// three exception rows retire their executor.
 pub const KEEP_BYTES: usize = 32 * 1024 * 1024;
 
 struct Counting;

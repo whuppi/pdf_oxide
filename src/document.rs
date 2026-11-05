@@ -130,15 +130,7 @@ impl PageFacts {
 }
 // ── end pdf_manipulator patch ──
 
-// ── pdf_manipulator patch: the page cache is a window, the page tree an index of refs ──
-/// Pages the page cache keeps; the same window as `page_content_cache`.
-pub(crate) const PAGE_WINDOW: usize = 64;
-
-/// Pages whose spans and chars stay cached. A text-dense page holds about a
-/// megabyte of spans, so the window is what a page's two reads need, not the
-/// eight pages a count-bounded cache would otherwise keep.
-const TEXT_PAGE_WINDOW: usize = 2;
-
+// ── pdf_manipulator patch: the page tree is an index of refs ──
 /// Where every page sits in the page tree: a leaf's ref and its nearest
 /// `/Pages` ancestor, and each `/Pages` node's ref and own parent (indexes
 /// into `nodes`). A page dictionary is rebuilt from these on demand.
@@ -156,9 +148,6 @@ pub(crate) fn estimated_object_size(obj: &Object) -> usize {
     BoundedObjectCache::estimate_size(obj)
 }
 // ── end pdf_manipulator patch ──
-
-/// Default maximum number of entries for the XObject span/image caches.
-const DEFAULT_XOBJECT_CACHE_MAX_ENTRIES: usize = 1024;
 
 /// Heuristic multiplier for the forward-gap guard in the main
 /// assembly loop's compound newline predicate
@@ -188,7 +177,10 @@ const ARTIFACT_POS_TOL_Y: f32 = 24.0;
 // Re-export BoundedEntryCache from cache module for local use and backward compatibility
 pub(crate) use crate::cache::BoundedEntryCache;
 // ── pdf_manipulator patch: the font caches are bounded by bytes ──
-use crate::host::font_budget::{font_bytes, ByteCache, DOCUMENT_FONT_BYTES, PAGE_FONT_BYTES};
+use crate::host::font_budget::{
+    font_bytes, ByteCache, Charge, DOCUMENT_FONT_BYTES, FORM_IMAGES_BYTES, FORM_SPANS_BYTES,
+    PAGE_CHARS_BYTES, PAGE_FONT_BYTES, PAGE_OBJECT_BYTES, PAGE_SPANS_BYTES, SEARCH_INDEX_BYTES,
+};
 // ── end pdf_manipulator patch ──
 
 /// Size-bounded object cache with FIFO eviction.
@@ -216,6 +208,14 @@ struct BoundedObjectCache {
     /// cache turned over.
     pinned: HashSet<ObjectRef>,
 }
+
+// ── pdf_manipulator patch: a page's dictionary is charged what the object cache charges ──
+impl Charge for Object {
+    fn charge(&self) -> usize {
+        BoundedObjectCache::estimate_size(self)
+    }
+}
+// ── end pdf_manipulator patch ──
 
 impl BoundedObjectCache {
     fn new(max_bytes: usize) -> Self {
@@ -544,10 +544,10 @@ pub struct PdfDocument {
     /// Page object cache keyed by page index to avoid re-traversing the page tree.
     /// The page tree structure is static (§7.7.3.2), so pages can be safely cached.
     /// Mutex provides interior mutability for `&self` read-path methods (#398).
-    // ── pdf_manipulator patch: the page cache is a window, the page tree an index of refs ──
-    /// Holds the last [`PAGE_WINDOW`] pages served; the rest are rebuilt from
-    /// `page_tree_index`, so memory does not scale with the page count.
-    page_cache: Mutex<BoundedEntryCache<usize, Object>>,
+    // ── pdf_manipulator patch: the page cache is a window of bytes, the page tree an index of refs ──
+    /// Holds [`PAGE_OBJECT_BYTES`] of the pages last served; the rest are
+    /// rebuilt from `page_tree_index`, so memory does not scale with the page count.
+    page_cache: Mutex<ByteCache<usize, Object>>,
     /// Leaf and ancestor refs of every page, built by the bulk walk. Eight
     /// bytes per page and per tree node; no page dictionary is held.
     page_tree_index: Mutex<Option<Arc<PageTreeIndex>>>,
@@ -592,14 +592,17 @@ pub struct PdfDocument {
     /// Key is `(ObjectRef, [i64; 6])` where the array encodes the caller's CTM
     /// as millipoint-rounded integers, allowing the same Form XObject to cache
     /// distinct results for each unique CTM it is painted with.
-    /// Bounded at [`DEFAULT_XOBJECT_CACHE_MAX_ENTRIES`] entries with FIFO eviction.
+    // ── pdf_manipulator patch: bounded by the bytes the spans take ──
+    /// Holds [`FORM_SPANS_BYTES`] of spans, the oldest evicted first.
     pub(crate) xobject_spans_cache:
-        Mutex<BoundedEntryCache<(ObjectRef, [i64; 6]), Option<Vec<crate::layout::TextSpan>>>>,
+        Mutex<ByteCache<(ObjectRef, [i64; 6]), Option<Vec<crate::layout::TextSpan>>>>,
+    // ── end pdf_manipulator patch ──
     /// Cache of extracted images from Form XObjects (keyed by ObjectRef).
     /// Images are stored without CTM applied — caller applies its own CTM.
-    /// Bounded at [`DEFAULT_XOBJECT_CACHE_MAX_ENTRIES`] entries with FIFO eviction.
-    pub(crate) form_xobject_images_cache:
-        Mutex<BoundedEntryCache<ObjectRef, Vec<crate::extractors::PdfImage>>>,
+    // ── pdf_manipulator patch: bounded by the bytes the images take ──
+    /// Holds [`FORM_IMAGES_BYTES`] of images, the oldest evicted first.
+    pub(crate) form_xobject_images_cache: Mutex<ByteCache<ObjectRef, Vec<crate::extractors::PdfImage>>>,
+    // ── end pdf_manipulator patch ──
     /// Regions marked for erasure per page. Mutex for `&self` write-path methods (#398).
     pub(crate) erase_regions: Mutex<HashMap<usize, Vec<crate::geometry::Rect>>>,
     /// LRU cache of decompressed page content streams, keyed by page index.
@@ -612,9 +615,14 @@ pub struct PdfDocument {
     /// LRU cache of postprocessed [`TextSpan`]s per page. `to_markdown`/`to_html`
     /// reach `extract_spans` twice per page — once directly, once via
     /// `extract_page_tables` → `extract_words` → `page_reading_order`; this serves
-    /// the second from cache. Holds [`TEXT_PAGE_WINDOW`] pages. Cleared by redaction (`erase_region` /
+    // ── pdf_manipulator patch: the name of a span's font is shared ──
+    /// the second from cache. Cleared by redaction (`erase_region` /
+    // ── end pdf_manipulator patch ──
     /// `clear_erase_regions`), the only span-affecting mutation.
-    page_spans_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
+    // ── pdf_manipulator patch: bounded by the bytes the spans take; a page above the budget is not kept ──
+    /// Holds [`PAGE_SPANS_BYTES`] of spans.
+    page_spans_cache: Mutex<ByteCache<usize, std::sync::Arc<Vec<crate::layout::TextSpan>>>>,
+    // ── end pdf_manipulator patch ──
     /// Per-page lightweight search index (page text + span bounding boxes,
     /// no fonts/glyph widths) built lazily by `search()`/`search_page()` and
     /// reused across repeated calls on the same document. Unlike
@@ -622,12 +630,16 @@ pub struct PdfDocument {
     /// reads font/glyph data, so retaining every page's projection is far
     /// cheaper than retaining every page's full `TextSpan`s would be.
     /// Cleared alongside `page_spans_cache` wherever spans are invalidated.
-    search_index: Mutex<HashMap<usize, std::sync::Arc<crate::search::SearchPageIndex>>>,
+    // ── pdf_manipulator patch: bounded by the bytes the indexes take; a page evicted is indexed again when searched ──
+    search_index: Mutex<ByteCache<usize, std::sync::Arc<crate::search::SearchPageIndex>>>,
+    // ── end pdf_manipulator patch ──
     /// Per-page character cache for the unfiltered (`extract_chars`) result.
     /// `postprocess_spans` needs the same char sequence the public API returns,
     /// so without this every span extraction re-parses the content stream a
     /// second time purely to stamp per-glyph x-origins.
-    page_chars_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<crate::layout::TextChar>>>>,
+    // ── pdf_manipulator patch: bounded by the bytes the characters take ──
+    page_chars_cache: Mutex<ByteCache<usize, std::sync::Arc<Vec<crate::layout::TextChar>>>>,
+    // ── end pdf_manipulator patch ──
     /// Cached signatures of running headers/footers detected via cross-page
     /// repetition. A span whose normalized text matches a signature
     /// sits near the top/bottom of the page is treated as an artifact.
@@ -1371,7 +1383,9 @@ impl PdfDocument {
             structure_page_cache: Mutex::new(None),
             actualtext_index_cache: Mutex::new(None),
             mc_actualtext_mcids: Mutex::new(HashMap::new()),
-            page_cache: Mutex::new(BoundedEntryCache::new(PAGE_WINDOW)),
+            // ── pdf_manipulator patch: bounded by bytes ──
+            page_cache: Mutex::new(ByteCache::lru(PAGE_OBJECT_BYTES)),
+            // ── end pdf_manipulator patch ──
             page_tree_index: Mutex::new(None),
             page_walks: AtomicUsize::new(0),
             page_cache_populated: AtomicBool::new(false),
@@ -1386,18 +1400,16 @@ impl PdfDocument {
             // ── pdf_manipulator patch: one byte-budgeted cache of decoded content ──
             content_cache: Arc::new(Mutex::new(crate::host::content::cache::ContentCache::new())),
             // ── end pdf_manipulator patch ──
-            xobject_spans_cache: Mutex::new(BoundedEntryCache::new(
-                DEFAULT_XOBJECT_CACHE_MAX_ENTRIES,
-            )),
-            form_xobject_images_cache: Mutex::new(BoundedEntryCache::new(
-                DEFAULT_XOBJECT_CACHE_MAX_ENTRIES,
-            )),
+            // ── pdf_manipulator patch: bounded by bytes ──
+            xobject_spans_cache: Mutex::new(ByteCache::fifo(FORM_SPANS_BYTES)),
+            form_xobject_images_cache: Mutex::new(ByteCache::fifo(FORM_IMAGES_BYTES)),
+            // ── end pdf_manipulator patch ──
             erase_regions: Mutex::new(HashMap::new()),
             page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
-            // ── pdf_manipulator patch: a page's spans and chars are held for its two reads, not for eight pages ──
-            page_spans_cache: Mutex::new(BoundedEntryCache::new(TEXT_PAGE_WINDOW)),
-            search_index: Mutex::new(HashMap::new()),
-            page_chars_cache: Mutex::new(BoundedEntryCache::new(TEXT_PAGE_WINDOW)),
+            // ── pdf_manipulator patch: a page's spans, characters and search index are held for the bytes they take ──
+            page_spans_cache: Mutex::new(ByteCache::lru(PAGE_SPANS_BYTES)),
+            search_index: Mutex::new(ByteCache::lru(SEARCH_INDEX_BYTES)),
+            page_chars_cache: Mutex::new(ByteCache::lru(PAGE_CHARS_BYTES)),
             // ── end pdf_manipulator patch ──
             running_artifact_signatures: Mutex::new(None),
             article_threads_cache: Mutex::new(None),
@@ -5498,7 +5510,7 @@ impl PdfDocument {
             if let Some(page) = self.page_from_index(&index, page_index) {
                 self.page_cache
                     .lock_or_recover()
-                    .insert(page_index, page.clone());
+                    .put(page_index, page.clone());
                 return Ok(page);
             }
         }
@@ -5551,7 +5563,9 @@ impl PdfDocument {
         self.page_walks.fetch_add(1, Ordering::AcqRel);
         self.page_cache
             .lock_or_recover()
-            .insert(page_index, page.clone());
+            // ── pdf_manipulator patch: the cache is bounded by bytes, so the entry is charged ──
+            .put(page_index, page.clone());
+            // ── end pdf_manipulator patch ──
         Ok(page)
     }
 
@@ -10741,7 +10755,9 @@ impl PdfDocument {
                 artifact_type: None,
                 text,
                 bbox: rect,
-                font_name: String::new(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: String::new().into(),
+                // ── end pdf_manipulator patch ──
                 font_size,
                 font_weight: crate::layout::text_block::FontWeight::Normal,
                 is_italic: false,
@@ -10914,7 +10930,9 @@ impl PdfDocument {
                 artifact_type: None,
                 text,
                 bbox: rect,
-                font_name: String::new(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: String::new().into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: crate::layout::text_block::FontWeight::Normal,
                 is_italic: false,
@@ -11817,23 +11835,18 @@ impl PdfDocument {
             }
             crate::structure::resolve_mcid_key(&mcid_map, &drawn_once, key)
         };
-        // Per-key rendered glyph text for the §14.9.4 conformance gate.
-        let mut glyph_text: HashMap<(crate::structure::McidScope, u32), String> = HashMap::new();
-        for (scope, m) in &mcid_order {
-            if let Some(sp) = bucket_for(&(scope.clone(), *m)).and_then(|k| mcid_map.get(&k)) {
-                let joined: String = sp.iter().map(|s| s.text.as_str()).collect();
-                glyph_text
-                    .entry((scope.clone(), *m))
-                    .or_default()
-                    .push_str(&joined);
-            }
-        }
         let actions = Self::actualtext_actions_for_page(
             at_index.as_deref(),
             &mcid_order,
             |scope, m| bucket_for(&(scope.clone(), m)).is_some(),
             &mc_wins,
-            &glyph_text,
+            // ── pdf_manipulator patch: the §14.9.4 gate asks the id's runs, not a copy of their text ──
+            |scope, m| {
+                bucket_for(&(scope.clone(), m))
+                    .and_then(|k| mcid_map.get(&k))
+                    .is_some_and(|runs| runs.iter().any(|s| s.text.chars().any(char::is_alphanumeric)))
+            },
+            // ── end pdf_manipulator patch ──
         );
 
         // Step 4: Assemble text in structure order
@@ -12519,17 +12532,24 @@ impl PdfDocument {
 
         let default_scope = crate::structure::McidScope::Page(page_index as u32);
         // Visibility = "has at least one raw span at this (scope, mcid)".
-        // glyph_text accumulates each key's rendered text for the §14.9.4
-        // conformance gate (decline destructive replacements).
+        // ── pdf_manipulator patch: the name of a span's font is shared ──
+        // carries_alphanumeric marks the keys whose rendered text has an
+        // alphanumeric, for the §14.9.4 conformance gate (decline destructive
+        // replacements).
+        // ── end pdf_manipulator patch ──
         let mut present: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
-        let mut glyph_text: HashMap<(crate::structure::McidScope, u32), String> = HashMap::new();
+        // ── pdf_manipulator patch: the ids whose glyphs carry an alphanumeric, not a copy of the text per id ──
+        let mut carries_alphanumeric: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
         for s in spans.iter() {
             if let Some(m) = s.mcid {
                 let scope = s.mcid_scope.clone().unwrap_or(default_scope.clone());
                 present.insert((scope.clone(), m));
-                glyph_text.entry((scope, m)).or_default().push_str(&s.text);
+                if s.text.chars().any(char::is_alphanumeric) {
+                    carries_alphanumeric.insert((scope, m));
+                }
             }
         }
+        // ── end pdf_manipulator patch ──
         // Walk the structure-tree's per-page MCID order so the
         // consecutive-run dedup matches the assemblers'.
         let mcid_order = self
@@ -12541,7 +12561,9 @@ impl PdfDocument {
             &mcid_order,
             |scope, m| present.contains(&(scope.clone(), m)),
             &mc_wins,
-            &glyph_text,
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            |scope, m| carries_alphanumeric.contains(&(scope.clone(), m)),
+            // ── end pdf_manipulator patch ──
         );
         if actions.is_empty() {
             return;
@@ -12682,17 +12704,18 @@ impl PdfDocument {
 
         let default_scope = crate::structure::McidScope::Page(page_index as u32);
         let mut present: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
-        let mut glyph_text: HashMap<(crate::structure::McidScope, u32), String> = HashMap::new();
+        // ── pdf_manipulator patch: the ids whose glyphs carry an alphanumeric, not a copy of the text per id ──
+        let mut carries_alphanumeric: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
         for o in ordered.iter() {
             if let Some(m) = o.span.mcid {
                 let scope = o.span.mcid_scope.clone().unwrap_or(default_scope.clone());
                 present.insert((scope.clone(), m));
-                glyph_text
-                    .entry((scope, m))
-                    .or_default()
-                    .push_str(&o.span.text);
+                if o.span.text.chars().any(char::is_alphanumeric) {
+                    carries_alphanumeric.insert((scope, m));
+                }
             }
         }
+        // ── end pdf_manipulator patch ──
         let mcid_order = self
             .struct_tree_marked()
             .map(|t| self.cached_mcid_order_for_page(&t, page_index as u32))
@@ -12702,7 +12725,9 @@ impl PdfDocument {
             &mcid_order,
             |scope, m| present.contains(&(scope.clone(), m)),
             &mc_wins,
-            &glyph_text,
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            |scope, m| carries_alphanumeric.contains(&(scope.clone(), m)),
+            // ── end pdf_manipulator patch ──
         );
         if actions.is_empty() {
             return;
@@ -12770,18 +12795,24 @@ impl PdfDocument {
     /// Legitimate ActualText — the spec's hyphenation EXAMPLE `(c)`→`k-`,
     /// ligature/soft-hyphen substitution (NOTE 3), any real-character
     /// replacement — is alphanumeric and passes.
-    fn actual_text_is_destructive(replacement: &str, covered_glyphs: &str) -> bool {
-        covered_glyphs.chars().any(char::is_alphanumeric)
-            && !replacement.chars().any(char::is_alphanumeric)
+    // ── pdf_manipulator patch: the covered glyphs arrive as the answer to whether they carry an alphanumeric ──
+    fn actual_text_is_destructive(replacement: &str, glyphs_carry_alphanumeric: bool) -> bool {
+        glyphs_carry_alphanumeric && !replacement.chars().any(char::is_alphanumeric)
     }
+    // ── end pdf_manipulator patch ──
 
-    fn actualtext_actions_for_page<F: Fn(&crate::structure::McidScope, u32) -> bool>(
+    // ── pdf_manipulator patch: the gate asks the page's runs whether an id's glyphs carry an alphanumeric, so no copy of their text is kept per id ──
+    fn actualtext_actions_for_page<
+        F: Fn(&crate::structure::McidScope, u32) -> bool,
+        G: Fn(&crate::structure::McidScope, u32) -> bool,
+    >(
         idx: Option<&crate::structure::ActualTextIndex>,
         mcid_order: &[(crate::structure::McidScope, u32)],
         visible: F,
         mc_wins: &HashSet<u32>,
-        glyph_text: &HashMap<(crate::structure::McidScope, u32), String>,
+        glyphs_carry_alphanumeric: G,
     ) -> HashMap<(crate::structure::McidScope, u32), ActualTextAction> {
+        // ── end pdf_manipulator patch ──
         let mut out: HashMap<(crate::structure::McidScope, u32), ActualTextAction> = HashMap::new();
         let Some(idx) = idx else {
             return out;
@@ -12832,12 +12863,11 @@ impl PdfDocument {
                 // carrying none itself, it is not "equivalent to what a person
                 // would see" — decline it (emit no action for the run) so the
                 // rendered glyphs survive. See `actual_text_is_destructive`.
-                let run_glyphs: String = entries[i..j]
-                    .iter()
-                    .filter_map(|e| glyph_text.get(&(e.0.clone(), e.1)))
-                    .map(String::as_str)
-                    .collect();
-                if Self::actual_text_is_destructive(repl, &run_glyphs) {
+                // ── pdf_manipulator patch: asked of the run's glyphs, not read from a copy ──
+                let run_glyphs_alphanumeric =
+                    entries[i..j].iter().any(|e| glyphs_carry_alphanumeric(&e.0, e.1));
+                if Self::actual_text_is_destructive(repl, run_glyphs_alphanumeric) {
+                    // ── end pdf_manipulator patch ──
                     i = j;
                     continue;
                 }
@@ -12915,7 +12945,9 @@ impl PdfDocument {
     /// This is the optimized version of `extract_text_structure_order` that uses
     /// the page's structure from `structure_page_cache` instead of re-traversing
     /// the entire structure tree for each use.
-    fn extract_text_structure_order_cached_with_spans(
+    // ── pdf_manipulator patch: the memory proofs run this stage alone ──
+    pub(crate) fn extract_text_structure_order_cached_with_spans(
+        // ── end pdf_manipulator patch ──
         &self,
         page_index: usize,
         // ── pdf_manipulator patch: the structure tree's head is passed so the page's structure can be walked ──
@@ -12960,18 +12992,13 @@ impl PdfDocument {
         // while the form's own structure element then found the id already
         // consumed and emitted nothing.
         let default_scope = crate::structure::McidScope::Page(page_index as u32);
-        let mut mcid_map: HashMap<(crate::structure::McidScope, u32), Vec<TextSpan>> =
-            HashMap::new();
-        let mut spans_without_mcid: Vec<TextSpan> = Vec::new();
-
-        for span in all_spans {
-            if let Some(mcid) = span.mcid {
-                let key = (span.mcid_scope.clone().unwrap_or(default_scope.clone()), mcid);
-                mcid_map.entry(key).or_default().push(span);
-            } else {
-                spans_without_mcid.push(span);
-            }
-        }
+        // ── pdf_manipulator patch: the runs of one id are a range of the one list the page's runs are grouped into, not a list of their own ──
+        let (mut grouped, mcid_map, unmarked_from) =
+            Self::group_spans_by_mcid(all_spans, &default_scope);
+        let (marked, spans_without_mcid) = grouped.split_at_mut(unmarked_from);
+        let marked: &[TextSpan] = marked;
+        let runs_of = |range: &std::ops::Range<usize>| &marked[range.clone()];
+        // ── end pdf_manipulator patch ──
 
         // Step 3: Get pre-computed ordered content for this page (O(1) lookup)
         // ── pdf_manipulator patch: the page's content comes from its own walk ──
@@ -13016,23 +13043,18 @@ impl PdfDocument {
             }
             crate::structure::resolve_mcid_key(&mcid_map, &drawn_once, key)
         };
-        // Per-key rendered glyph text for the §14.9.4 conformance gate.
-        let mut glyph_text: HashMap<(crate::structure::McidScope, u32), String> = HashMap::new();
-        for (scope, m) in &mcid_order {
-            if let Some(sp) = bucket_for(&(scope.clone(), *m)).and_then(|k| mcid_map.get(&k)) {
-                let joined: String = sp.iter().map(|s| s.text.as_str()).collect();
-                glyph_text
-                    .entry((scope.clone(), *m))
-                    .or_default()
-                    .push_str(&joined);
-            }
-        }
         let actions = Self::actualtext_actions_for_page(
             at_index.as_deref(),
             &mcid_order,
             |scope, m| bucket_for(&(scope.clone(), m)).is_some(),
             &mc_wins,
-            &glyph_text,
+            // ── pdf_manipulator patch: the §14.9.4 gate asks the id's runs, not a copy of their text ──
+            |scope, m| {
+                bucket_for(&(scope.clone(), m))
+                    .and_then(|k| mcid_map.get(&k))
+                    .is_some_and(|runs| runs_of(runs).iter().any(|s| s.text.chars().any(char::is_alphanumeric)))
+            },
+            // ── end pdf_manipulator patch ──
         );
 
         log::debug!(
@@ -13096,7 +13118,9 @@ impl PdfDocument {
                 None => {},
             }
 
-            if let Some(spans) = bucket_key.as_ref().and_then(|k| mcid_map.get(k)) {
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            if let Some(spans) = bucket_key.as_ref().and_then(|k| mcid_map.get(k)).map(runs_of) {
+            // ── end pdf_manipulator patch ──
                 if let Some(k) = bucket_key.clone() {
                     consumed_mcids.insert(k);
                 }
@@ -13136,9 +13160,14 @@ impl PdfDocument {
         }
 
         // Append spans with MCIDs not referenced by the structure tree
-        let mut unconsumed: Vec<(&(crate::structure::McidScope, u32), &Vec<TextSpan>)> = mcid_map
+        // ── pdf_manipulator patch: the name of a span's font is shared ──
+        let mut unconsumed: Vec<(&(crate::structure::McidScope, u32), &[TextSpan])> = mcid_map
+        // ── end pdf_manipulator patch ──
             .iter()
             .filter(|(key, _)| !consumed_mcids.contains(*key))
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            .map(|(key, range)| (key, runs_of(range)))
+            // ── end pdf_manipulator patch ──
             .collect();
         // Deterministic order: by id, then by scope, so two streams that both
         // number from 0 still append in a stable sequence.
@@ -13176,8 +13205,10 @@ impl PdfDocument {
                 spans_without_mcid.len()
             );
             // Row-aware sort: Y-band descending (top→bottom), then X ascending.
-            crate::utils::sort_by_row_band(&mut spans_without_mcid, |s| s.bbox.y, |s| s.bbox.x);
-            for span in &spans_without_mcid {
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            crate::utils::sort_by_row_band(spans_without_mcid, |s| s.bbox.y, |s| s.bbox.x);
+            for span in spans_without_mcid.iter() {
+            // ── end pdf_manipulator patch ──
                 if let Some(prev) = &prev_span {
                     let y_diff = (prev.bbox.y - span.bbox.y).abs();
                     if y_diff > Self::same_line_threshold(prev, span) {
@@ -13197,6 +13228,106 @@ impl PdfDocument {
 
         Ok(text)
     }
+
+    // ── pdf_manipulator patch: runs moved to the places a list of destinations names, where they are ──
+    /// Moves the run at `i` to `destination[i]`, for every `i`, in place.
+    /// `destination` is a permutation of `0..spans.len()` and is spent.
+    fn permute_in_place(spans: &mut [TextSpan], destination: &mut [u32]) {
+        for i in 0..spans.len() {
+            while destination[i] as usize != i {
+                let to = destination[i] as usize;
+                spans.swap(i, to);
+                destination.swap(i, to);
+            }
+        }
+    }
+
+    /// The page's runs in the order XY-cut partitions them, put there in
+    /// place: the partition is read as indices, so no copy of the runs is
+    /// made. A run the partition does not name is dropped, as it was when the
+    /// runs were moved out by index.
+    pub(crate) fn order_by_xy_cut(spans: &mut Vec<TextSpan>) {
+        const UNNAMED: u32 = u32::MAX;
+        let groups = crate::pipeline::reading_order::XYCutStrategy::new().index_groups(spans);
+        let mut destination: Vec<u32> = vec![UNNAMED; spans.len()];
+        let mut named = 0usize;
+        for &i in groups.iter().flatten() {
+            if destination[i] == UNNAMED {
+                destination[i] = named as u32;
+                named += 1;
+            }
+        }
+        drop(groups);
+        let mut unnamed = named;
+        for slot in destination.iter_mut().filter(|slot| **slot == UNNAMED) {
+            *slot = unnamed as u32;
+            unnamed += 1;
+        }
+        Self::permute_in_place(spans, &mut destination);
+        spans.truncate(named);
+    }
+    // ── end pdf_manipulator patch ──
+
+    // ── pdf_manipulator patch: the page's runs grouped by marked-content id in place ──
+    /// The page's runs reordered in place so those of one id (the id of the
+    /// run, in its scope, as the page numbers it) are contiguous and in their
+    /// order on the page, then the runs with no id; the range of each id, and
+    /// where the runs with no id begin. Holds four bytes a run beside them.
+    fn group_spans_by_mcid(
+        mut spans: Vec<TextSpan>,
+        default_scope: &crate::structure::McidScope,
+    ) -> (
+        Vec<TextSpan>,
+        HashMap<(crate::structure::McidScope, u32), std::ops::Range<usize>>,
+        usize,
+    ) {
+        const UNMARKED: u32 = u32::MAX;
+        let mut slots: HashMap<(crate::structure::McidScope, u32), u32> = HashMap::new();
+        let mut counts: Vec<usize> = Vec::new();
+        let mut destination: Vec<u32> = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let Some(mcid) = span.mcid else {
+                destination.push(UNMARKED);
+                continue;
+            };
+            let key = (span.mcid_scope.clone().unwrap_or(default_scope.clone()), mcid);
+            let next = counts.len() as u32;
+            let slot = *slots.entry(key).or_insert(next);
+            if slot == next {
+                counts.push(0);
+            }
+            counts[slot as usize] += 1;
+            destination.push(slot);
+        }
+        let mut starts: Vec<usize> = Vec::with_capacity(counts.len());
+        let mut marked = 0usize;
+        for count in &counts {
+            starts.push(marked);
+            marked += count;
+        }
+        let mut fill = starts.clone();
+        let mut unmarked = marked;
+        for slot in destination.iter_mut() {
+            let at = if *slot == UNMARKED {
+                unmarked += 1;
+                unmarked - 1
+            } else {
+                fill[*slot as usize] += 1;
+                fill[*slot as usize] - 1
+            };
+            *slot = at as u32;
+        }
+        Self::permute_in_place(&mut spans, &mut destination);
+        let ranges = slots
+            .into_iter()
+            .map(|(key, slot)| {
+                let start = starts[slot as usize];
+                (key, start..start + counts[slot as usize])
+            })
+            .collect();
+        (spans, ranges, marked)
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Extract text spans from a page (PDF spec compliant - RECOMMENDED).
     ///
@@ -13245,12 +13376,26 @@ impl PdfDocument {
         cancel: &crate::cancel::CancelCheck,
     ) -> Result<Vec<crate::layout::TextSpan>> {
         // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: a page the cache did not keep is handed over as built; one it kept is copied out ──
+        let shared = self.shared_spans(page_index, cancel)?;
+        Ok(std::sync::Arc::try_unwrap(shared).unwrap_or_else(|kept| (*kept).clone()))
+        // ── end pdf_manipulator patch ──
+    }
+
+    // ── pdf_manipulator patch: the page's spans as the cache holds them, shared ──
+    /// The postprocessed spans of a page, from the cache when it holds them.
+    /// A page the cache cannot hold (its spans take more than its budget) is
+    /// built and handed out with no other owner.
+    pub(crate) fn shared_spans(
+        &self,
+        page_index: usize,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<std::sync::Arc<Vec<crate::layout::TextSpan>>> {
         // Serve repeat per-page extractions from cache (the converters reach
         // here twice per page; see `page_spans_cache`).
         if let Some(cached) = self.page_spans_cache.lock_or_recover().get(&page_index) {
-            return Ok((**cached).clone());
+            return Ok(std::sync::Arc::clone(cached));
         }
-        // ── pdf_manipulator patch: the page's operators poll the cancel check ──
         let spans = self.extract_spans_impl(
             page_index,
             crate::extractors::TextExtractionConfig::default(),
@@ -13258,17 +13403,16 @@ impl PdfDocument {
             HashSet::new(),
             cancel,
         )?;
-        // ── end pdf_manipulator patch ──
-        // ── pdf_manipulator patch: the cancel check rides to the pre-pass ──
         let spans = self.postprocess_spans(page_index, spans, cancel)?;
         // A page a cancel cut short is never cached as the page's spans.
         cancel.check()?;
-        // ── end pdf_manipulator patch ──
+        let spans = std::sync::Arc::new(spans);
         self.page_spans_cache
             .lock_or_recover()
-            .insert(page_index, std::sync::Arc::new(spans.clone()));
+            .put(page_index, std::sync::Arc::clone(&spans));
         Ok(spans)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Get (building and caching if needed) the lightweight search index for
     /// one page. Backs `search()`/`search_page()` — see `search_index` field
@@ -13299,7 +13443,9 @@ impl PdfDocument {
         let index = std::sync::Arc::new(crate::search::SearchPageIndex::from_spans(&spans));
         self.search_index
             .lock_or_recover()
-            .insert(page_index, std::sync::Arc::clone(&index));
+            // ── pdf_manipulator patch: the cache is bounded by bytes, so the entry is charged ──
+            .put(page_index, std::sync::Arc::clone(&index));
+            // ── end pdf_manipulator patch ──
         Ok(index)
     }
 
@@ -13752,29 +13898,9 @@ impl PdfDocument {
             // title is not sliced along the body gutter (§14.8.3).
             spans = ordered;
         } else if Self::is_multi_column_page(&spans) {
-            use crate::pipeline::reading_order::{
-                ReadingOrderContext as ROContext, ReadingOrderStrategy, XYCutStrategy,
-            };
-            let strategy = XYCutStrategy::new();
-            let context = ROContext::new().with_page(page_index as u32);
-            // Clone needed: apply() takes ownership, and the Err branch
-            // falls back to sorting the original vec in place.
-            match strategy.apply(spans.clone(), &context) {
-                Ok(ordered) => {
-                    spans = ordered.into_iter().map(|o| o.span).collect();
-                },
-                Err(e) => {
-                    log::debug!(
-                        "XY-cut reading order failed on page {page_index} ({e}), \
-                         falling back to row-aware sort"
-                    );
-                    Self::sort_spans_by_snapped_rows(&mut spans);
-                    Self::reorder_rowspan_labels(&mut spans);
-                    // ── pdf_manipulator patch: a cancel ended the row-span reorder early ──
-                    cancel.check()?;
-                    // ── end pdf_manipulator patch ──
-                },
-            }
+            // ── pdf_manipulator patch: the spans are put in the partition's order where they are, not into a copy beside them ──
+            Self::order_by_xy_cut(&mut spans);
+            // ── end pdf_manipulator patch ──
         } else {
             // Row-aware sort: Y-band descending (top→bottom), X ascending
             // within a row.
@@ -13959,7 +14085,9 @@ impl PdfDocument {
     /// spans (`rotation_degrees != 0`) have been mapped into the displayed frame
     /// (see `postprocess_spans`) and their glyphs run along a rotated axis, so a
     /// horizontal-x stamp would misalign — those individual spans are skipped.
-    fn stamp_char_x_offsets(
+    // ── pdf_manipulator patch: the memory proofs run this stage alone ──
+    pub(crate) fn stamp_char_x_offsets(
+        // ── end pdf_manipulator patch ──
         &self,
         page_index: usize,
         spans: &mut [crate::layout::TextSpan],
@@ -13978,12 +14106,15 @@ impl PdfDocument {
             return;
         }
 
-        // ── pdf_manipulator patch: the page's operators poll the cancel check ──
-        let accurate = match self.cached_page_chars(page_index, cancel) {
-        // ── end pdf_manipulator patch ──
+        // ── pdf_manipulator patch: the characters are read for this pass alone and freed with it, not kept beside the spans ──
+        let accurate = match self
+            .extract_chars_impl(page_index, HashSet::new(), HashSet::new(), cancel)
+            .and_then(|chars| cancel.check().map(|()| chars))
+        {
             Ok(chars) if !chars.is_empty() => chars,
             _ => return,
         };
+        // ── end pdf_manipulator patch ──
 
         // Baseline index: char positions ordered by `origin_y`, so each span's
         // baseline slice is a binary-searched range rather than a linear scan
@@ -19010,7 +19141,9 @@ impl PdfDocument {
         // ── end pdf_manipulator patch ──
         self.page_chars_cache
             .lock_or_recover()
-            .insert(page_index, std::sync::Arc::clone(&chars));
+            // ── pdf_manipulator patch: the cache is bounded by bytes, so the entry is charged ──
+            .put(page_index, std::sync::Arc::clone(&chars));
+            // ── end pdf_manipulator patch ──
         Ok(chars)
     }
 
@@ -20757,7 +20890,9 @@ impl PdfDocument {
                 artifact_type: None,
                 text: w.text,
                 bbox: w.bbox,
-                font_name: w.dominant_font,
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: w.dominant_font.into(),
+                // ── end pdf_manipulator patch ──
                 font_size: w.avg_font_size,
                 font_weight: if w.is_bold {
                     crate::layout::FontWeight::Bold
@@ -25770,7 +25905,9 @@ impl PdfDocument {
         // Cache the raw images (with Form's own Matrix applied, but no parent CTM)
         self.form_xobject_images_cache
             .lock_or_recover()
-            .insert(xobject_ref, raw_images.clone());
+            // ── pdf_manipulator patch: the cache is bounded by bytes, so the entry is charged ──
+            .put(xobject_ref, raw_images.clone());
+            // ── end pdf_manipulator patch ──
 
         // Apply parent_ctm to produce final images for this call
         let images = raw_images
@@ -28084,7 +28221,9 @@ mod tests {
     /// `prepare_search()` must populate the index for every page so a
     /// subsequent full-document `search()` sweep hits cache on every page,
     /// not just the last few (the failure mode `search()`'s own bounded
-    /// `page_spans_cache` has for documents with more than `TEXT_PAGE_WINDOW` pages).
+    // ── pdf_manipulator patch: the cache of spans is bounded by bytes, not by a count of pages ──
+    /// `page_spans_cache` has for documents whose pages take more than its budget).
+    // ── end pdf_manipulator patch ──
     #[test]
     fn prepare_search_populates_every_page() {
         let pdf = build_multi_page_pdf(10);
@@ -28775,7 +28914,9 @@ mod tests {
                 width,
                 height: font_size,
             },
-            font_name: "F1".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "F1".into(),
+            // ── end pdf_manipulator patch ──
             font_size,
             font_weight: crate::layout::FontWeight::Normal,
             is_italic: false,
@@ -29308,7 +29449,9 @@ mod tests {
                 width: bbox_w,
                 height: font_size,
             },
-            font_name: "F1".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "F1".into(),
+            // ── end pdf_manipulator patch ──
             font_size,
             font_weight: crate::layout::FontWeight::Normal,
             is_italic: false,
@@ -33165,7 +33308,9 @@ mod tests {
         let pdf = build_minimal_pdf(b"");
         let doc = PdfDocument::from_bytes(pdf).unwrap();
         let mut span = make_test_span("Test  Text", 0.0, 0.0, 100.0, 12.0);
-        span.font_name = "OCR".to_string();
+        // ── pdf_manipulator patch: the name of a span's font is shared ──
+        span.font_name = "OCR".into();
+        // ── end pdf_manipulator patch ──
         let result = doc.apply_intelligent_text_processing(vec![span]);
         assert!(!result[0].text.contains("  "));
     }
@@ -33387,7 +33532,9 @@ mod tests {
                 text: label.to_string(),
                 bbox: Rect::new(x, y, 80.0, 12.0),
                 font_size: 12.0,
-                font_name: "Test".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Test".into(),
+                // ── end pdf_manipulator patch ──
                 font_weight: FontWeight::Normal,
                 is_italic: false,
                 is_monospace: false,
@@ -33478,7 +33625,9 @@ mod tests {
                 text: label.to_string(),
                 bbox: Rect::new(x, y, 80.0, 12.0),
                 font_size: 12.0,
-                font_name: "Test".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Test".into(),
+                // ── end pdf_manipulator patch ──
                 font_weight: FontWeight::Normal,
                 is_italic: false,
                 is_monospace: false,
@@ -33557,7 +33706,9 @@ mod tests {
                 text: label.to_string(),
                 bbox: Rect::new(x, y, 80.0, 12.0),
                 font_size: 12.0,
-                font_name: "Test".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Test".into(),
+                // ── end pdf_manipulator patch ──
                 font_weight: FontWeight::Normal,
                 is_italic: false,
                 is_monospace: false,
@@ -33623,7 +33774,9 @@ mod tests {
             text: text.to_string(),
             bbox: Rect::new(x, y, w, 10.0),
             font_size: 10.0,
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_weight: FontWeight::Normal,
             is_italic: false,
             is_monospace: false,
@@ -35639,7 +35792,9 @@ mod soft_hyphen_seam_tests {
                 width,
                 height: font_size,
             },
-            font_name: "F1".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "F1".into(),
+            // ── end pdf_manipulator patch ──
             font_size,
             font_weight: crate::layout::FontWeight::Normal,
             is_italic: false,

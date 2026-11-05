@@ -165,9 +165,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::collections::BTreeMap::new();
 
             for span in spans.iter() {
-                *fonts_used.entry(span.font_name.clone()).or_insert(0) += 1;
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                *fonts_used.entry(span.font_name.to_string()).or_insert(0) += 1;
+                // ── end pdf_manipulator patch ──
                 font_weights
-                    .entry(span.font_name.clone())
+                    // ── pdf_manipulator patch: the name of a span's font is shared ──
+                    .entry(span.font_name.to_string())
+                    // ── end pdf_manipulator patch ──
                     .or_default()
                     .push(if span.font_weight.is_bold() {
                         "bold".to_string()

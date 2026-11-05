@@ -5280,7 +5280,9 @@ mod tests {
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, width, height),
-            font_name: "TestFont".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "TestFont".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             is_italic: false,
@@ -7992,7 +7994,9 @@ mod tests {
             text: text.to_string(),
             bbox: Rect::new(x, y, width, fs),
             font_size: fs,
-            font_name: String::new(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: String::new().into(),
+            // ── end pdf_manipulator patch ──
             font_weight: crate::layout::text_block::FontWeight::Normal,
             color: Color::black(),
             mcid: None,

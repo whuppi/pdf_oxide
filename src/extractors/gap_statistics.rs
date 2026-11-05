@@ -827,7 +827,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(0.0, 0.0, 30.0, 12.0),
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: crate::layout::FontWeight::Normal,
                 is_italic: false,
@@ -857,7 +859,9 @@ mod tests {
                 artifact_type: None,
                 text: "World".to_string(),
                 bbox: Rect::new(35.0, 0.0, 30.0, 12.0),
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: crate::layout::FontWeight::Normal,
                 is_italic: false,
@@ -972,7 +976,9 @@ mod tests {
                 artifact_type: None,
                 text: "A".to_string(),
                 bbox: Rect::new(0.0, 0.0, 10.0, 12.0),
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: crate::layout::FontWeight::Normal,
                 is_italic: false,
@@ -1002,7 +1008,9 @@ mod tests {
                 artifact_type: None,
                 text: "B".to_string(),
                 bbox: Rect::new(15.0, 0.0, 10.0, 12.0),
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: crate::layout::FontWeight::Normal,
                 is_italic: false,

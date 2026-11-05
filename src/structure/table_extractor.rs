@@ -519,7 +519,9 @@ pub fn extract_table_from_spans_on_page(
                 bbox: s.bbox,
                 text,
                 avg_font_size: s.font_size,
-                dominant_font: s.font_name.clone(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                dominant_font: s.font_name.to_string(),
+                // ── end pdf_manipulator patch ──
                 is_bold: s.font_weight.is_bold(),
                 is_italic: s.is_italic,
                 mcid: s.mcid,
@@ -852,7 +854,9 @@ fn extract_cell(
                         artifact_type: None,
                         text: span_text,
                         bbox: block.bbox,
-                        font_name: block.dominant_font.clone(),
+                        // ── pdf_manipulator patch: the name of a span's font is shared ──
+                        font_name: block.dominant_font.clone().into(),
+                        // ── end pdf_manipulator patch ──
                         font_size: block.avg_font_size,
                         font_weight: if block.is_bold {
                             FontWeight::Bold
@@ -1224,7 +1228,9 @@ mod tests {
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(0.0, 0.0, 50.0, 12.0),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             is_italic: false,
@@ -1422,7 +1428,9 @@ mod tests {
             artifact_type: None,
             text: String::new(),
             bbox: Rect::new(0.0, 678.0, 0.0, 10.56),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 10.56,
             font_weight: FontWeight::Normal,
             is_italic: false,
@@ -1502,7 +1510,9 @@ mod tests {
             artifact_type: None,
             text: String::new(),
             bbox: Rect::new(0.0, 0.0, 0.0, 12.0),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: crate::layout::text_block::FontWeight::Normal,
             is_italic: false,
@@ -1581,7 +1591,9 @@ mod tests {
             artifact_type: None,
             text: String::new(),
             bbox: Rect::new(0.0, 0.0, 0.0, 12.0),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             is_italic: false,
@@ -1671,7 +1683,9 @@ mod tests {
             artifact_type: None,
             text: "Rotated".into(),
             bbox: Rect::new(10.0, 200.0, 40.0, 12.0),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             is_italic: false,
@@ -1742,7 +1756,9 @@ mod tests {
             artifact_type: None,
             text: String::new(),
             bbox: Rect::new(0.0, 100.0, 0.0, 10.0),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 10.0,
             font_weight: FontWeight::Normal,
             is_italic: false,
@@ -1830,7 +1846,9 @@ mod tests {
             artifact_type: None,
             text: String::new(),
             bbox: Rect::new(0.0, 100.0, 0.0, 10.0),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 10.0,
             font_weight: FontWeight::Normal,
             is_italic: false,

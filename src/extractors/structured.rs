@@ -319,7 +319,9 @@ impl StructuredExtractor {
                 bbox: span.bbox,
                 text: span.text.clone(),
                 avg_font_size: span.font_size,
-                dominant_font: span.font_name.clone(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                dominant_font: span.font_name.to_string(),
+                // ── end pdf_manipulator patch ──
                 is_bold: span.font_weight == crate::layout::FontWeight::Bold,
                 is_italic: span.is_italic,
                 mcid: span.mcid,

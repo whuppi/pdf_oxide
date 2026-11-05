@@ -4284,7 +4284,9 @@ mod tests {
                 artifact_type: None,
                 text: text.to_string(),
                 bbox: Rect::new(x, y, width, font_size),
-                font_name: "Test".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Test".into(),
+                // ── end pdf_manipulator patch ──
                 font_size,
                 font_weight: weight,
                 is_italic: false,
@@ -4326,7 +4328,9 @@ mod tests {
                 artifact_type: None,
                 text: text.to_string(),
                 bbox: Rect::new(x, y, 50.0, font_size),
-                font_name: "Test".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Test".into(),
+                // ── end pdf_manipulator patch ──
                 font_size,
                 font_weight: weight,
                 is_italic: false,
@@ -5081,7 +5085,9 @@ mod tests {
                 artifact_type: None,
                 text: text.to_string(),
                 bbox: Rect::new(x, y, width, font_size),
-                font_name: "Test".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Test".into(),
+                // ── end pdf_manipulator patch ──
                 font_size,
                 font_weight: weight,
                 is_italic: false,
@@ -5857,7 +5863,9 @@ mod tests {
             artifact_type: None,
             text: "Critical".to_string(),
             bbox: Rect::new(0.0, 0.0, 50.0, 12.0),
-            font_name: "Test-Bold".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test-Bold".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Bold,
             is_italic: false,

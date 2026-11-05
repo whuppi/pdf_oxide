@@ -124,7 +124,9 @@ impl From<TextSpan> for TextContent {
             text: span.text,
             bbox: span.bbox,
             font: FontSpec {
-                name: span.font_name,
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                name: span.font_name.to_string(),
+                // ── end pdf_manipulator patch ──
                 size: span.font_size,
             },
             style: TextStyle {
@@ -150,7 +152,9 @@ impl From<TextContent> for TextSpan {
             provenance: None,
             text: content.text,
             bbox: content.bbox,
-            font_name: content.font.name,
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: content.font.name.into(),
+            // ── end pdf_manipulator patch ──
             font_size: content.font.size,
             font_weight: content.style.weight,
             is_italic: content.style.italic,
@@ -326,7 +330,9 @@ mod tests {
             artifact_type: None,
             text: "Test".to_string(),
             bbox: Rect::new(10.0, 20.0, 40.0, 12.0),
-            font_name: "Times".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Times".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Bold,
             is_italic: false,

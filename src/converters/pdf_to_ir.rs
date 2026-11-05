@@ -1255,9 +1255,13 @@ fn span_to_ir(
     // "AvantGarde-Book" so the round-trip can match it against the
     // embedded font program shipped under `word/fonts/`.
     let resolved_name = face_lookup
-        .get(&span.font_name)
+        // ── pdf_manipulator patch: the name of a span's font is shared ──
+        .get(span.font_name.as_str())
+        // ── end pdf_manipulator patch ──
         .cloned()
-        .unwrap_or_else(|| span.font_name.clone());
+        // ── pdf_manipulator patch: the name of a span's font is shared ──
+        .unwrap_or_else(|| span.font_name.to_string());
+        // ── end pdf_manipulator patch ──
     IrSpan {
         text: span.text.clone(),
         bold: span.font_weight.is_bold(),

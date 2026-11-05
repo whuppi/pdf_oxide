@@ -8,6 +8,122 @@ use crate::geometry::{Point, Rect};
 use crate::structure::McidScope;
 use std::collections::HashMap;
 
+// ── pdf_manipulator patch: the font name of a span is shared by the spans of its font ──
+/// The name of a span's font. The spans of one font on a page share one
+/// allocation of it, so a page of a million runs holds the name of each
+/// font once; it reads as the `str` it names.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FontName(std::sync::Arc<str>);
+
+impl FontName {
+    /// The name as a `str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for FontName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for FontName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Display for FontName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for FontName {
+    fn from(name: &str) -> Self {
+        Self(name.into())
+    }
+}
+
+impl From<String> for FontName {
+    fn from(name: String) -> Self {
+        Self(name.into())
+    }
+}
+
+impl From<&String> for FontName {
+    fn from(name: &String) -> Self {
+        Self(name.as_str().into())
+    }
+}
+
+impl From<std::sync::Arc<str>> for FontName {
+    fn from(name: std::sync::Arc<str>) -> Self {
+        Self(name)
+    }
+}
+
+impl From<FontName> for String {
+    fn from(name: FontName) -> Self {
+        name.0.to_string()
+    }
+}
+
+impl PartialEq<str> for FontName {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for FontName {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for FontName {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl AsRef<str> for FontName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for FontName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The names of the fonts a page has met, each held once.
+#[derive(Debug, Default)]
+pub(crate) struct FontNames(HashMap<String, FontName>);
+
+impl FontNames {
+    /// The shared name for `name`.
+    pub(crate) fn name(&mut self, name: &str) -> FontName {
+        if let Some(known) = self.0.get(name) {
+            return known.clone();
+        }
+        let shared = FontName::from(name);
+        self.0.insert(name.to_string(), shared.clone());
+        shared
+    }
+}
+
+impl serde::Serialize for FontName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+// ── end pdf_manipulator patch ──
+
 /// A text span (complete string from a Tj/TJ operator).
 ///
 /// This represents text as the PDF specification provides it - complete strings
@@ -27,7 +143,9 @@ pub struct TextSpan {
     /// Bounding box of the entire span in PDF coordinates (points)
     pub bbox: Rect,
     /// Font name/family
-    pub font_name: String,
+    // ── pdf_manipulator patch: shared by the spans of one font ──
+    pub font_name: FontName,
+    // ── end pdf_manipulator patch ──
     /// Font size in points
     pub font_size: f32,
     /// Font weight (normal or bold)
@@ -201,7 +319,9 @@ impl Default for TextSpan {
         Self {
             text: String::new(),
             bbox: Rect::default(),
-            font_name: "Helvetica".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Helvetica".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             is_italic: false,
@@ -387,7 +507,9 @@ impl TextSpan {
                     TextChar {
                         char: c,
                         bbox: Rect::new(char_x, self.bbox.y, w, self.bbox.height),
-                        font_name: self.font_name.clone(),
+                        // ── pdf_manipulator patch: the name of a span's font is shared ──
+                        font_name: self.font_name.to_string(),
+                        // ── end pdf_manipulator patch ──
                         font_size: self.font_size,
                         font_weight: self.font_weight,
                         is_italic: self.is_italic,
@@ -421,7 +543,9 @@ impl TextSpan {
                     TextChar {
                         char: c,
                         bbox: Rect::new(char_x, self.bbox.y, w, self.bbox.height),
-                        font_name: self.font_name.clone(),
+                        // ── pdf_manipulator patch: the name of a span's font is shared ──
+                        font_name: self.font_name.to_string(),
+                        // ── end pdf_manipulator patch ──
                         font_size: self.font_size,
                         font_weight: self.font_weight,
                         is_italic: self.is_italic,
@@ -452,7 +576,9 @@ impl TextSpan {
                         char_width,
                         self.bbox.height,
                     ),
-                    font_name: self.font_name.clone(),
+                    // ── pdf_manipulator patch: the name of a span's font is shared ──
+                    font_name: self.font_name.to_string(),
+                    // ── end pdf_manipulator patch ──
                     font_size: self.font_size,
                     font_weight: self.font_weight,
                     is_italic: self.is_italic,

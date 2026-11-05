@@ -35,7 +35,9 @@ pub struct OrderedContent {
     pub mcid: Option<u32>,
 
     /// Structure type (for semantic information)
-    pub struct_type: String,
+    // ── pdf_manipulator patch: shared by the references of one element, not a string of its own ──
+    pub struct_type: std::sync::Arc<str>,
+    // ── end pdf_manipulator patch ──
 
     /// Pre-parsed structure type for efficient access
     pub parsed_type: StructType,
@@ -299,7 +301,9 @@ fn traverse_element_all_pages(
     block_counter: &mut u32,
     result: &mut std::collections::HashMap<u32, Vec<OrderedContent>>,
 ) {
-    let struct_type_str = format!("{:?}", elem.struct_type);
+    // ── pdf_manipulator patch: one string for the element's references ──
+    let struct_type_str: std::sync::Arc<str> = format!("{:?}", elem.struct_type).into();
+    // ── end pdf_manipulator patch ──
     let parsed_type = elem.struct_type.clone();
     let descended = ctx.descend(&parsed_type, block_counter);
     let is_heading_inherited = descended.heading_level.is_some();
@@ -415,7 +419,9 @@ fn traverse_element(
     block_counter: &mut u32,
     result: &mut Vec<OrderedContent>,
 ) -> Result<(), Error> {
-    let struct_type_str = format!("{:?}", elem.struct_type);
+    // ── pdf_manipulator patch: one string for the element's references ──
+    let struct_type_str: std::sync::Arc<str> = format!("{:?}", elem.struct_type).into();
+    // ── end pdf_manipulator patch ──
     let parsed_type = elem.struct_type.clone();
     let descended = ctx.descend(&parsed_type, block_counter);
     let is_heading_inherited = descended.heading_level.is_some();
@@ -741,7 +747,7 @@ pub(crate) struct PageStructure {
 struct PageFrame {
     /// The context this element's children inherit.
     ctx: InheritedContext,
-    type_str: String,
+    type_str: std::sync::Arc<str>,
     parsed_type: StructType,
     is_heading: bool,
     is_block: bool,
@@ -763,6 +769,20 @@ struct PageWalk {
     capture: Option<PageCapture>,
     content: Vec<OrderedContent>,
     tables: Vec<StructElem>,
+    types: std::collections::HashMap<String, std::sync::Arc<str>>,
+}
+
+impl PageWalk {
+    /// The text of `struct_type`, shared by every element of that type.
+    fn type_string(&mut self, struct_type: &StructType) -> std::sync::Arc<str> {
+        let named = format!("{:?}", struct_type);
+        if let Some(text) = self.types.get(&named) {
+            return std::sync::Arc::clone(text);
+        }
+        let text: std::sync::Arc<str> = named.as_str().into();
+        self.types.insert(named, std::sync::Arc::clone(&text));
+        text
+    }
 }
 
 impl StructVisitor for PageWalk {
@@ -784,9 +804,10 @@ impl StructVisitor for PageWalk {
             return;
         }
         let descended = ctx.descend(&head.struct_type, &mut self.counter);
+        let type_str = self.type_string(&head.struct_type);
         self.frames.push(PageFrame {
             ctx: descended,
-            type_str: format!("{:?}", head.struct_type),
+            type_str,
             is_heading: descended.heading_level.is_some(),
             is_block: head.struct_type.is_block(),
             parsed_type: head.struct_type,
@@ -860,6 +881,7 @@ pub(crate) fn page_structure(
         capture: None,
         content: Vec::new(),
         tables: Vec::new(),
+        types: std::collections::HashMap::new(),
     };
     walk_structure_tree(document, header, ParseBudget::unbounded(), &mut walk)?;
     Ok(PageStructure {

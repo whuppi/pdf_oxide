@@ -27,7 +27,9 @@ fn make_span(text: &str, x: f32, y: f32, font_size: f32, weight: FontWeight) -> 
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, 50.0, font_size),
-            font_name: "Arial".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Arial".into(),
+            // ── end pdf_manipulator patch ──
             font_size,
             font_weight: weight,
             is_italic: false,
@@ -71,7 +73,9 @@ fn make_span_with_color(
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, 50.0, font_size),
-            font_name: "Arial".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Arial".into(),
+            // ── end pdf_manipulator patch ──
             font_size,
             font_weight: weight,
             is_italic: false,
@@ -115,7 +119,9 @@ fn make_span_italic(
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, 50.0, font_size),
-            font_name: "Arial".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Arial".into(),
+            // ── end pdf_manipulator patch ──
             font_size,
             font_weight: weight,
             is_italic,

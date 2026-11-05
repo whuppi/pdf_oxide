@@ -1,6 +1,6 @@
 //! Page facts, the page index and the object cache's size estimate.
 
-use crate::document::{estimated_object_size, PageFacts, PdfDocument, PAGE_WINDOW};
+use crate::document::{estimated_object_size, PageFacts, PdfDocument};
 use crate::object::{Object, ObjectRef};
 
 /// Build a minimal PDF with a multi-page structure (given page count).
@@ -165,13 +165,15 @@ fn test_indexed_pages_equal_traversed_pages_and_cache_is_a_window() {
         );
     }
 
-    let many = PdfDocument::from_bytes(build_multi_page_pdf(PAGE_WINDOW + 40)).unwrap();
-    for i in 0..PAGE_WINDOW + 40 {
+    // More pages than the cache's byte budget holds.
+    const PAGES: usize = 4_000;
+    let many = PdfDocument::from_bytes(build_multi_page_pdf(PAGES)).unwrap();
+    for i in 0..PAGES {
         many.get_page(i).unwrap();
     }
     assert!(
-        many.cached_page_count() <= PAGE_WINDOW,
-        "the page cache must hold a window, not every page"
+        many.cached_page_count() < PAGES,
+        "the page cache must hold the bytes of its budget, not every page"
     );
     assert!(many.page_tree_is_indexed());
 }

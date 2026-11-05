@@ -2253,7 +2253,9 @@ pub extern "C" fn pdf_document_get_embedded_fonts(
                     let is_subset = name.len() > 7 && name.as_bytes().get(6) == Some(&b'+');
                     let is_embedded = span.font_name.contains('+') || !span.font_name.is_empty();
                     result.push(FfiFont {
-                        name: name.clone(),
+                        // ── pdf_manipulator patch: the name of a span's font is shared ──
+                        name: name.to_string(),
+                        // ── end pdf_manipulator patch ──
                         subtype: String::from("Unknown"),
                         encoding: String::from("Unknown"),
                         is_embedded,

@@ -2348,6 +2348,8 @@ pub struct TextExtractor<'doc> {
     deferred_fonts: HashMap<String, ObjectRef>,
     /// The deferred fonts read so far, the newest within `PAGE_FONT_BYTES`.
     resident_fonts: std::sync::Mutex<crate::host::font_budget::ByteCache<ObjectRef, Arc<FontInfo>>>,
+    /// The names of the fonts the spans carry, each held once.
+    font_names: crate::layout::text_block::FontNames,
     /// The `/BaseFont` of each deferred font read so far, which the spans are
     /// named by at the end of the page without reading the fonts again.
     deferred_base_fonts: std::sync::Mutex<HashMap<ObjectRef, String>>,
@@ -2572,6 +2574,7 @@ impl<'doc> TextExtractor<'doc> {
                 crate::host::font_budget::PAGE_FONT_BYTES,
             )),
             deferred_base_fonts: std::sync::Mutex::new(HashMap::new()),
+            font_names: Default::default(),
             // ── end pdf_manipulator patch ──
             spans: Vec::new(),
             chars: Vec::new(),
@@ -3689,11 +3692,15 @@ impl<'doc> TextExtractor<'doc> {
                     .filter(|b| !b.is_empty())
             })
             .collect();
+        // ── pdf_manipulator patch: the spans of one font hold its name once ──
+        let mut names = std::mem::take(&mut self.font_names);
         for (span, resolved) in self.spans.iter_mut().zip(resolved_fonts) {
             if let Some(base_font) = resolved {
-                span.font_name = base_font;
+                span.font_name = names.name(&base_font);
             }
         }
+        self.font_names = names;
+        // ── end pdf_manipulator patch ──
 
         // Attach the §9.10.2 mapping provenance now that each span's font name
         // is finalized: the tier the span's font offered, or `Fallback` when it
@@ -7467,7 +7474,9 @@ impl<'doc> TextExtractor<'doc> {
                     doc.xobject_spans_cache
                         .lock()
                         .unwrap()
-                        .insert(spans_cache_key, new_spans);
+                        // ── pdf_manipulator patch: the cache is bounded by bytes, so the entry is charged ──
+                        .put(spans_cache_key, new_spans);
+                        // ── end pdf_manipulator patch ──
                 }
 
                 // Restore graphics state (implicit Q per ISO 32000-1 §8.10.1)
@@ -7604,7 +7613,9 @@ impl<'doc> TextExtractor<'doc> {
                 width: total_width,
                 height: effective_font_size,
             },
-            font_name: font_name_span,
+            // ── pdf_manipulator patch: the spans of one font hold its name once ──
+            font_name: self.font_names.name(&font_name_span),
+            // ── end pdf_manipulator patch ──
             font_size: effective_font_size,
             font_weight,
             color: Color::new(
@@ -8154,7 +8165,9 @@ impl<'doc> TextExtractor<'doc> {
             font_name: state
                 .font_name
                 .clone()
-                .unwrap_or_else(|| "Unknown".to_string()),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                .unwrap_or_else(|| "Unknown".to_string()).into(),
+                // ── end pdf_manipulator patch ──
             font_size: cluster[0].font_size,
             font_weight,
             color: Color::new(
@@ -8914,7 +8927,9 @@ impl<'doc> TextExtractor<'doc> {
                 width: space_width,
                 height: space_height,
             },
-            font_name: font_name_space,
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: font_name_space.into(),
+            // ── end pdf_manipulator patch ──
             font_size: effective_font_size,
             font_weight: FontWeight::Normal,
             color: Color::new(
@@ -9172,7 +9187,9 @@ impl<'doc> TextExtractor<'doc> {
                         width: total_width,
                         height: effective_font_size,
                     },
-                    font_name: font_name_buf,
+                    // ── pdf_manipulator patch: the name of a span's font is shared ──
+                    font_name: font_name_buf.into(),
+                    // ── end pdf_manipulator patch ──
                     font_size: effective_font_size,
                     font_weight,
                     color: Color::new(
@@ -10433,7 +10450,9 @@ mod tests {
                     width: 10.0,
                     height: 12.0,
                 },
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -10468,7 +10487,9 @@ mod tests {
                     width: 25.0,
                     height: 12.0,
                 },
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -11358,7 +11379,9 @@ mod tests {
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(x, y, w, fs),
-            font_name: "F1".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "F1".into(),
+            // ── end pdf_manipulator patch ──
             font_size: fs,
             font_weight: FontWeight::Normal,
             color: Color::black(),
@@ -12383,7 +12406,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12413,7 +12438,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(101.0, 700.0, 30.0, 12.0), // Very close
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12468,7 +12495,9 @@ mod tests {
                 artifact_type: None,
                 text: glyph.to_string(),
                 bbox: Rect::new(x, 700.0, advance, font_size),
-                font_name: "Helvetica".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Helvetica".into(),
+                // ── end pdf_manipulator patch ──
                 font_size,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12531,7 +12560,9 @@ mod tests {
             artifact_type: None,
             text: "l".to_string(),
             bbox: Rect::new(x, 700.0, 2.5, 9.0),
-            font_name: "Helvetica".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Helvetica".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 9.0,
             font_weight: FontWeight::Normal,
             color: Color::black(),
@@ -12590,7 +12621,9 @@ mod tests {
                 artifact_type: None,
                 text: format!("Line {}", i),
                 bbox: Rect::new(50.0, 700.0 - (i as f32 * 14.0), 200.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12791,7 +12824,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12821,7 +12856,9 @@ mod tests {
                 artifact_type: None,
                 text: "World".to_string(),
                 bbox: Rect::new(131.0, 700.0, 30.0, 12.0), // 1pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12876,7 +12913,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12906,7 +12945,9 @@ mod tests {
                 artifact_type: None,
                 text: "World".to_string(),
                 bbox: Rect::new(131.0, 700.0, 30.0, 12.0), // 1pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12951,7 +12992,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -12981,7 +13024,9 @@ mod tests {
                 artifact_type: None,
                 text: "World".to_string(),
                 bbox: Rect::new(100.0, 680.0, 30.0, 12.0), // Different line
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -13030,7 +13075,9 @@ mod tests {
                 artifact_type: None,
                 text: "Left".to_string(),
                 bbox: Rect::new(50.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -13060,7 +13107,9 @@ mod tests {
                 artifact_type: None,
                 text: "Right".to_string(),
                 bbox: Rect::new(300.0, 700.0, 30.0, 12.0), // Large gap (column boundary)
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -13102,7 +13151,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -13132,7 +13183,9 @@ mod tests {
                 artifact_type: None,
                 text: " ".to_string(),
                 bbox: Rect::new(130.0, 700.0, 2.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -13162,7 +13215,9 @@ mod tests {
                 artifact_type: None,
                 text: "World".to_string(),
                 bbox: Rect::new(132.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -15598,7 +15653,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello World".to_string(), // >= 5 chars
                 bbox: Rect::new(100.0, 700.0, 60.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -15628,7 +15685,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello World".to_string(), // Same text, overlapping position
                 bbox: Rect::new(102.0, 700.0, 60.0, 12.0), // X within 5pt
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -15668,7 +15727,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello World".to_string(),
                 bbox: Rect::new(100.0, 700.0, 60.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -15698,7 +15759,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello World".to_string(), // Same text but far apart
                 bbox: Rect::new(500.0, 700.0, 60.0, 12.0), // X > 5pt difference
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -15798,7 +15861,9 @@ mod tests {
             artifact_type: None,
             text: "theGeneral".to_string(),
             bbox: Rect::new(100.0, 700.0, 60.0, 12.0),
-            font_name: "F1".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "F1".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             color: Color::black(),
@@ -15839,7 +15904,9 @@ mod tests {
             artifact_type: None,
             text: "hello".to_string(),
             bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
-            font_name: "F1".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "F1".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             color: Color::black(),
@@ -16027,7 +16094,9 @@ mod tests {
                 artifact_type: None,
                 text: "Right Col".to_string(),
                 bbox: Rect::new(350.0, 700.0, 100.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -16057,7 +16126,9 @@ mod tests {
                 artifact_type: None,
                 text: "Left Col".to_string(),
                 bbox: Rect::new(50.0, 700.0, 100.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -16143,7 +16214,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello ".to_string(), // ends with space
                 bbox: Rect::new(100.0, 700.0, 35.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -16173,7 +16246,9 @@ mod tests {
                 artifact_type: None,
                 text: " World".to_string(), // starts with space
                 bbox: Rect::new(136.0, 700.0, 35.0, 12.0), // 1pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -16479,7 +16554,9 @@ mod tests {
                 artifact_type: None,
                 text: "Line2".to_string(),
                 bbox: Rect::new(50.0, 680.0, 100.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -16509,7 +16586,9 @@ mod tests {
                 artifact_type: None,
                 text: "Line1".to_string(),
                 bbox: Rect::new(50.0, 700.0, 100.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -16721,7 +16800,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -16751,7 +16832,9 @@ mod tests {
                 artifact_type: None,
                 text: " ".to_string(), // offset_semantic space
                 bbox: Rect::new(130.5, 700.0, 2.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17298,7 +17381,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "$0.00".to_string(),
                 bbox: Rect::new(100.0, 700.0, 30.0, 10.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 10.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17328,7 +17413,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "$0.00".to_string(),
                 bbox: Rect::new(131.0, 700.0, 30.0, 10.0), // 1pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 10.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17377,7 +17464,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "100".to_string(),
                 bbox: Rect::new(200.0, 500.0, 18.0, 10.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 10.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17407,7 +17496,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "200".to_string(),
                 bbox: Rect::new(219.5, 500.0, 18.0, 10.0), // 1.5pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 10.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17456,7 +17547,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "Hel".to_string(),
                 bbox: Rect::new(100.0, 700.0, 18.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17486,7 +17579,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "lo".to_string(),
                 bbox: Rect::new(118.0, 700.0, 12.0, 12.0), // 0pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17541,7 +17636,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "123456".to_string(),
                 bbox: Rect::new(382.3, 700.0, 39.6, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17571,7 +17668,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "72".to_string(),
                 bbox: Rect::new(432.7, 700.0, 13.2, 12.0), // 10.8pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17618,7 +17717,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "50".to_string(),
                 bbox: Rect::new(382.3, 700.0, 15.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17648,7 +17749,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "00".to_string(),
                 bbox: Rect::new(407.0, 700.0, 13.2, 12.0), // 9.7pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17692,7 +17795,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(382.3, 700.0, 39.6, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17722,7 +17827,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "72".to_string(),
                 bbox: Rect::new(432.7, 700.0, 13.2, 12.0), // 10.8pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17770,7 +17877,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "123456".to_string(),
                 bbox: Rect::new(382.3, 700.0, 39.6, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17800,7 +17909,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "723".to_string(),
                 bbox: Rect::new(432.7, 700.0, 18.0, 12.0), // 10.8pt gap
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -17843,7 +17954,9 @@ mod profile_based_space_tests {
             artifact_type: None,
             text: text.to_string(),
             bbox,
-            font_name: "F1".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "F1".into(),
+            // ── end pdf_manipulator patch ──
             font_size,
             font_weight: FontWeight::Normal,
             color: Color::black(),
@@ -17977,7 +18090,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "1".to_string(),
                 bbox: Rect::new(100.0, 700.0, 3.5, 7.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 7.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -18007,7 +18122,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "0".to_string(),
                 bbox: Rect::new(114.5, 700.0, 3.5, 7.0), // 11.0pt gap = 1.57x font
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 7.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -18064,7 +18181,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "1234".to_string(),
                 bbox: Rect::new(200.0, 700.0, 24.0, 12.0),
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -18094,7 +18213,9 @@ mod profile_based_space_tests {
                 artifact_type: None,
                 text: "56".to_string(),
                 bbox: Rect::new(238.4, 700.0, 12.0, 12.0), // 14.4pt gap = 1.2x font
-                font_name: "F1".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "F1".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: FontWeight::Normal,
                 color: Color::black(),
@@ -18139,7 +18260,9 @@ mod profile_based_space_tests {
             TextSpan {
                 text: "S".to_string(),
                 bbox: Rect::new(72.0, 700.0, 10.0, 12.0),
-                font_name: "Helvetica-Bold".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Helvetica-Bold".into(),
+                // ── end pdf_manipulator patch ──
                 font_weight: FontWeight::Bold,
                 font_size: 12.0,
                 ..TextSpan::default()
@@ -18147,7 +18270,9 @@ mod profile_based_space_tests {
             TextSpan {
                 text: "ales".to_string(),
                 bbox: Rect::new(82.0, 700.0, 30.0, 12.0),
-                font_name: "Helvetica".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Helvetica".into(),
+                // ── end pdf_manipulator patch ──
                 font_weight: FontWeight::Normal,
                 font_size: 12.0,
                 ..TextSpan::default()
@@ -18214,14 +18339,18 @@ mod profile_based_space_tests {
             TextSpan {
                 text: "solution".to_string(),
                 bbox: Rect::new(72.0, 700.0, 40.0, 10.0),
-                font_name: "NimbusRomNo9L-Regu".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "NimbusRomNo9L-Regu".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 10.0,
                 ..TextSpan::default()
             },
             TextSpan {
                 text: "U".to_string(),
                 bbox: Rect::new(114.4, 700.0, 7.0, 10.0),
-                font_name: "NimbusRomNo9L-Ital".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "NimbusRomNo9L-Ital".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 10.0,
                 ..TextSpan::default()
             },

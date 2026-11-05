@@ -66,6 +66,7 @@ mod mem_encrypted_duplicates;
 mod mem_fixture;
 mod mem_fonts;
 mod mem_incremental;
+mod mem_page_text;
 mod mem_structure;
 mod mem_xfa;
 mod mem_xmp;

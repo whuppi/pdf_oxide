@@ -80,12 +80,16 @@ impl<K: Eq + std::hash::Hash + Copy, V> BoundedEntryCache<K, V> {
         self.insertion_order.push_back(key);
     }
 
+    // ── pdf_manipulator patch: no document cache of this kind is cleared or counted any more; the tests do ──
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.insertion_order.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
+    // ── end pdf_manipulator patch ──
 }

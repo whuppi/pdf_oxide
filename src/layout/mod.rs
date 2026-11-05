@@ -24,6 +24,9 @@ pub use document_analyzer::{AdaptiveLayoutParams, DocumentProperties};
 pub use font_stats::PageFontStats;
 pub use reading_order::graph_based_reading_order;
 pub use region_classifier::{classify_region, RegionClass};
+// ── pdf_manipulator patch: the name of a span's font is shared ──
+pub use text_block::FontName;
+// ── end pdf_manipulator patch ──
 pub use text_block::{Color, FontWeight, PageText, TextBlock, TextChar, TextLine, TextSpan, Word};
 
 // Re-export Phase 2 components

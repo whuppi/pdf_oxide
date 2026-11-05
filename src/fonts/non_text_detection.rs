@@ -420,7 +420,9 @@ mod tests {
             artifact_type: None,
             text: text.to_string(),
             bbox: Rect::new(0.0, 0.0, 10.0, 12.0),
-            font_name: "Helvetica".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Helvetica".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             font_weight: FontWeight::Normal,
             color: Color::black(),

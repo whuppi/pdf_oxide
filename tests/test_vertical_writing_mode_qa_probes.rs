@@ -202,7 +202,9 @@ fn span_with_wmode(text: &str, x: f32, y: f32, wmode: u8) -> TextSpan {
     TextSpan {
         text: text.to_string(),
         bbox: Rect::new(x, y, 12.0, 12.0),
-        font_name: "TestFont".to_string(),
+        // ── pdf_manipulator patch: the name of a span's font is shared ──
+        font_name: "TestFont".into(),
+        // ── end pdf_manipulator patch ──
         font_size: 12.0,
         wmode,
         ..TextSpan::default()

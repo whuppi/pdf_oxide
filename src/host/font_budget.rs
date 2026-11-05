@@ -83,6 +83,73 @@ pub(crate) fn font_bytes(font: &FontInfo) -> usize {
         + LAZY_TABLES
 }
 
+/// What a document's cache of the spans of the pages last read may hold. A
+/// page whose spans take more is handed to its caller and not kept.
+pub(crate) const PAGE_SPANS_BYTES: usize = 512 * KIB;
+
+/// What a document's cache of the characters of the pages last read through
+/// `extract_chars` may hold, and each of its caches of the pages' dictionaries,
+/// of the spans of Form XObjects and of their images.
+pub(crate) const PAGE_CHARS_BYTES: usize = 256 * KIB;
+pub(crate) const PAGE_OBJECT_BYTES: usize = 256 * KIB;
+pub(crate) const FORM_SPANS_BYTES: usize = 256 * KIB;
+pub(crate) const FORM_IMAGES_BYTES: usize = 256 * KIB;
+
+/// What a document's search index may hold: the text of each page searched
+/// and the box of each of its runs.
+pub(crate) const SEARCH_INDEX_BYTES: usize = MIB;
+
+/// The bytes a list of spans takes: each record and every buffer it owns.
+pub(crate) fn span_bytes(spans: &[crate::layout::TextSpan]) -> usize {
+    spans.len() * std::mem::size_of::<crate::layout::TextSpan>()
+        + spans
+            .iter()
+            .map(|s| {
+                s.text.capacity()
+                    + 4 * (s.char_widths.capacity() + s.char_x_offsets.capacity())
+            })
+            .sum::<usize>()
+}
+
+impl Charge for Arc<Vec<crate::layout::TextChar>> {
+    fn charge(&self) -> usize {
+        self.len() * std::mem::size_of::<crate::layout::TextChar>()
+            + self.iter().map(|c| c.font_name.capacity()).sum::<usize>()
+    }
+}
+
+impl Charge for Option<Vec<crate::layout::TextSpan>> {
+    fn charge(&self) -> usize {
+        std::mem::size_of::<Self>() + self.as_deref().map_or(0, span_bytes)
+    }
+}
+
+impl Charge for Vec<crate::extractors::PdfImage> {
+    fn charge(&self) -> usize {
+        self.iter()
+            .map(|image| {
+                std::mem::size_of::<crate::extractors::PdfImage>()
+                    + match image.data() {
+                        crate::extractors::ImageData::Jpeg(bytes) => bytes.capacity(),
+                        crate::extractors::ImageData::Raw { pixels, .. } => pixels.capacity(),
+                    }
+            })
+            .sum()
+    }
+}
+
+impl Charge for Arc<crate::search::SearchPageIndex> {
+    fn charge(&self) -> usize {
+        self.bytes()
+    }
+}
+
+impl Charge for Arc<Vec<crate::layout::TextSpan>> {
+    fn charge(&self) -> usize {
+        span_bytes(self)
+    }
+}
+
 /// What a cached value takes, for the budget it is charged against.
 pub(crate) trait Charge {
     fn charge(&self) -> usize;

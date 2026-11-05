@@ -101,6 +101,16 @@ pub(crate) struct SearchPageIndex {
 }
 
 impl SearchPageIndex {
+    // ── pdf_manipulator patch: the cache that keeps the index is bounded by the bytes it takes ──
+    /// The bytes the index takes.
+    pub(crate) fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.full_text.capacity()
+            + self.span_positions.capacity() * std::mem::size_of::<(usize, usize, usize)>()
+            + self.span_boxes.capacity() * std::mem::size_of::<Rect>()
+    }
+    // ── end pdf_manipulator patch ──
+
     pub(crate) fn from_spans(spans: &[TextSpan]) -> Self {
         let (full_text, span_positions) = TextSearcher::build_text_with_positions(spans);
         let span_boxes = spans.iter().map(|s| s.bbox).collect();
@@ -377,7 +387,9 @@ mod tests {
                 artifact_type: None,
                 text: "Hello".to_string(),
                 bbox: Rect::new(0.0, 0.0, 50.0, 12.0),
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: crate::layout::FontWeight::Normal,
                 is_italic: false,
@@ -411,7 +423,9 @@ mod tests {
                 artifact_type: None,
                 text: "World".to_string(),
                 bbox: Rect::new(55.0, 0.0, 105.0, 12.0),
-                font_name: "Arial".to_string(),
+                // ── pdf_manipulator patch: the name of a span's font is shared ──
+                font_name: "Arial".into(),
+                // ── end pdf_manipulator patch ──
                 font_size: 12.0,
                 font_weight: crate::layout::FontWeight::Normal,
                 is_italic: false,

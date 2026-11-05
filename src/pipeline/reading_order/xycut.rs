@@ -2439,25 +2439,25 @@ struct ProjectionProfile {
     y_min: f32,
 }
 
-impl ReadingOrderStrategy for XYCutStrategy {
-    fn apply(
-        &self,
-        spans: Vec<TextSpan>,
-        _context: &ReadingOrderContext,
-    ) -> Result<Vec<OrderedTextSpan>> {
+// ── pdf_manipulator patch: the groups of the partition are available without the spans being moved ──
+impl XYCutStrategy {
+    /// The partition of `spans` into reading-order groups, as indices into
+    /// `spans`: the groups in reading order, each group's indices in its
+    /// order. [`ReadingOrderStrategy::apply`] moves the spans out in this order.
+    pub(crate) fn index_groups(&self, spans: &[TextSpan]) -> Vec<Vec<usize>> {
         // (#543): detect multi-line heading runs and route the
         // partition through synthetic-span space so the splitter treats
         // each wrapped heading as a single atomic block. When no
         // headings are found we use the original index-only path that
         // avoids span clones during recursion.
-        let heading_runs = self.find_heading_runs(&spans);
+        let heading_runs = self.find_heading_runs(spans);
 
-        let index_groups: Vec<Vec<usize>> = if heading_runs.is_empty() {
+        if heading_runs.is_empty() {
             let indices: Vec<usize> = (0..spans.len()).collect();
-            self.partition_indexed(&spans, &indices)
+            self.partition_indexed(spans, &indices)
         } else {
             let (synthetic, synthetic_origin) =
-                self.synthesize_for_partition(&spans, &heading_runs);
+                self.synthesize_for_partition(spans, &heading_runs);
             let synth_indices: Vec<usize> = (0..synthetic.len()).collect();
             let synth_groups = self.partition_indexed(&synthetic, &synth_indices);
             // Project synthetic-space groups back to ORIGINAL-span
@@ -2472,7 +2472,20 @@ impl ReadingOrderStrategy for XYCutStrategy {
                     out
                 })
                 .collect()
-        };
+        }
+    }
+}
+// ── end pdf_manipulator patch ──
+
+impl ReadingOrderStrategy for XYCutStrategy {
+    fn apply(
+        &self,
+        spans: Vec<TextSpan>,
+        _context: &ReadingOrderContext,
+    ) -> Result<Vec<OrderedTextSpan>> {
+        // ── pdf_manipulator patch: the partition is the shared function above ──
+        let index_groups = self.index_groups(&spans);
+        // ── end pdf_manipulator patch ──
 
         // Build result — moves spans out by index (no extra clone)
         let mut ordered = Vec::with_capacity(spans.len());
@@ -2536,7 +2549,9 @@ mod tests {
             text: text.to_string(),
             bbox: Rect::new(x, y, width, height),
             font_size,
-            font_name: "Arial".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Arial".into(),
+            // ── end pdf_manipulator patch ──
             font_weight: FontWeight::Normal,
             is_italic: false,
             is_monospace: false,

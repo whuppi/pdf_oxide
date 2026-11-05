@@ -1292,7 +1292,9 @@ mod tests {
             text: text.to_string(),
             bbox: crate::geometry::Rect::new(x, 0.0, w, fs),
             font_size: fs,
-            font_name: font.to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: font.to_string().into(),
+            // ── end pdf_manipulator patch ──
             ..Default::default()
         }
     }

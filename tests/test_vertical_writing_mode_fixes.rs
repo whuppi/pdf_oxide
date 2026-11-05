@@ -307,7 +307,9 @@ fn i1_pipeline_routes_vertical_majority_through_tategaki_sort() {
         TextSpan {
             text: text.to_string(),
             bbox: Rect::new(x, y, 12.0, 12.0),
-            font_name: "Test".to_string(),
+            // ── pdf_manipulator patch: the name of a span's font is shared ──
+            font_name: "Test".into(),
+            // ── end pdf_manipulator patch ──
             font_size: 12.0,
             wmode: 1,
             ..TextSpan::default()
