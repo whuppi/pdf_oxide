@@ -697,7 +697,8 @@ fn a_subset_that_is_not_smaller_is_not_written() {
     let rebuilt = truetype::subset(&font, &all).expect("the font can be rewritten");
     let deflated = |bytes: &[u8]| {
         let mut out = Vec::new();
-        crate::host::deflate::recode(std::io::Cursor::new(bytes), false, 9, &mut out).unwrap();
+        let raw = crate::host::deflate::Encoding::Raw;
+        crate::host::deflate::recode(std::io::Cursor::new(bytes), raw, 9, &mut out).unwrap();
         out.len()
     };
     assert!(deflated(&rebuilt) >= deflated(&font), "the odd-length font does not make the proof's point");

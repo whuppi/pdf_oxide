@@ -291,3 +291,134 @@ fn a_reference_the_source_itself_leaves_dangling_does_not_fail_the_rewrite() {
     let mut editor = DocumentEditor::from_bytes(source).unwrap();
     editor.save_to_bytes().unwrap();
 }
+
+/// The number of `/Type /ObjStm` streams in a saved file.
+fn object_stream_count(bytes: &[u8]) -> usize {
+    bytes.windows(7).filter(|w| *w == b"/ObjStm").count()
+}
+
+/// A document of `count` link annotations (about 230 bytes serialized each:
+/// the same keys, a rectangle and a target that vary) the catalog reaches
+/// through `/Extra`.
+fn many_small_objects(count: u32) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = |bound: u64| -> u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 20) % bound
+    };
+    let first = 4;
+    let extra: String = (first..first + count).map(|id| format!("{id} 0 R ")).collect();
+    let mut objects = vec![
+        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra [{extra}] >>\nendobj\n").into_bytes(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+    ];
+    for id in first..first + count {
+        let (x, y) = (next(500), next(700));
+        let target = format!("https://example.org/articles/{}/{}.html#s{}", next(900), next(90_000), next(40));
+        objects.push(
+            format!(
+                "{id} 0 obj\n<< /Type /Annot /Subtype /Link /Border [0 0 0] /C [0 1 1] /F 4 \
+                 /Rect [{x} {y} {} {}] /A << /Type /Action /S /URI /URI ({target}) >> >>\nendobj\n",
+                x + 20 + next(80),
+                y + 8 + next(6)
+            )
+            .into_bytes(),
+        );
+    }
+    pdf_from_objects(&objects)
+}
+
+/// No Dart battery sees it: Dart reads a saved file's objects, not how many object streams hold them.
+#[test]
+fn small_objects_fill_every_object_stream_to_its_member_count() {
+    let count = 1000;
+    let source = many_small_objects(count);
+    let mut editor = DocumentEditor::from_bytes(source).unwrap();
+    let bytes = editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap();
+
+    let objects = count as usize + 3;
+    let streams = object_stream_count(&bytes);
+    let members = crate::host::object_streams::MEMBERS;
+    assert!(
+        streams <= objects.div_ceil(members) + 1,
+        "{objects} objects in {streams} object streams of at most {members}"
+    );
+
+    let saved = crate::document::PdfDocument::from_bytes(bytes).unwrap();
+    for id in 4..4 + count {
+        assert!(matches!(saved.load_object(ObjectRef::new(id, 0)).unwrap(), Object::Dictionary(_)), "object {id}");
+    }
+}
+
+/// The offsets of `rows` objects whose sizes vary from 150 to 549 bytes with no period.
+fn xref_offsets(rows: u32) -> Vec<u64> {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut at = 9;
+    (0..rows)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            at += 150 + (state >> 20) % 400;
+            at
+        })
+        .collect()
+}
+
+/// The (type, field two, field three) of `rows` objects the way a save with object streams lays them out: a stream every 128th object, the rest packed in it by index.
+fn xref_fields(rows: u32) -> Vec<(u8, u64, u16)> {
+    let offsets = xref_offsets(rows);
+    (0..rows)
+        .map(|id| match id {
+            0 => (0, 0, 65535),
+            id if id % 128 == 0 => (1, offsets[id as usize], 0),
+            id => (2, (id - id % 128) as u64, (id % 128) as u16),
+        })
+        .collect()
+}
+
+/// The cross-reference stream of those rows, as `compress` writes it.
+fn xref_of(rows: u32) -> Object {
+    use crate::host::object_streams::{field_width, xref_stream, Row};
+    let fields = xref_fields(rows);
+    let widest = fields.iter().map(|f| f.1).max().unwrap_or(0);
+    let table = fields.into_iter().map(|(kind, second, third)| match kind {
+        0 => Row::Free { next: second as u32, gen: third },
+        1 => Row::Offset { offset: second, gen: third },
+        _ => Row::Packed { stream: second as u32, index: third as u32 },
+    });
+    xref_stream(table, field_width(widest), Some(9), HashMap::new(), &crate::cancel::CancelCheck::none())
+        .unwrap()
+}
+
+/// What the rows of `xref_of` hold, with the given field-two width.
+fn xref_rows(rows: u32, width: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (kind, second, third) in xref_fields(rows) {
+        out.push(kind);
+        out.extend((0..width).map(|i| (second >> (8 * (width - 1 - i))) as u8));
+        out.extend_from_slice(&third.to_be_bytes());
+    }
+    out
+}
+
+/// No Dart battery sees it: Dart reads the objects of a saved file, and which way the cross-reference stream is encoded changes no object.
+#[test]
+fn a_small_cross_reference_stream_is_written_without_the_predictor() {
+    let xref = xref_of(24);
+    let Object::Stream { dict, .. } = &xref else { panic!("not a stream") };
+    assert!(!dict.contains_key("DecodeParms"), "the predictor was kept: {dict:?}");
+    assert_eq!(xref.decode_stream_data().unwrap(), xref_rows(24, 1));
+}
+
+/// No Dart battery sees it: Dart reads the objects of a saved file, and which way the cross-reference stream is encoded changes no object.
+#[test]
+fn a_large_cross_reference_stream_keeps_the_predictor_and_decodes_to_its_rows() {
+    let xref = xref_of(20_000);
+    let Object::Stream { dict, .. } = &xref else { panic!("not a stream") };
+    assert!(dict.contains_key("DecodeParms"), "the predictor was dropped: {dict:?}");
+    assert_eq!(xref.decode_stream_data().unwrap(), xref_rows(20_000, 3));
+}

@@ -20,8 +20,10 @@ use std::io::Write;
 pub(crate) const MEMBERS: usize = 128;
 
 /// Queued bytes that close a batch before it holds [`MEMBERS`] objects, so a
-/// run of large objects never sits whole in memory.
-const BATCH_BYTES: usize = 16 * 1024;
+/// run of large objects never sits whole in memory. Large enough that the
+/// member count closes a batch of ordinary objects (a batch closed early
+/// costs a stream wrapper and a fresh deflate window).
+const BATCH_BYTES: usize = 256 * 1024;
 
 /// The serialized non-stream objects waiting for an object stream.
 pub(crate) struct ObjectPacker {
@@ -197,9 +199,11 @@ pub(crate) fn field_width(max: u64) -> usize {
 
 /// The `/Type /XRef` stream object for `rows` (object 0 first, one row per
 /// object number), with `trailer` entries in its dictionary. Rows are
-/// `[type, field2 (width bytes), field3 (2 bytes)]`; compressed, they go
-/// through the PNG Up predictor, which turns the steadily growing offsets
-/// into small differences.
+/// `[type, field2 (width bytes), field3 (2 bytes)]`. Compressed, they are
+/// written twice over, as they are and through the PNG Up predictor (which
+/// turns the steadily growing offsets of a large table into small
+/// differences), and the smaller stream is kept: on a table of a few dozen
+/// rows the predictor and its `/DecodeParms` cost more than they save.
 pub(crate) fn xref_stream(
     rows: impl Iterator<Item = Row>,
     width: usize,
@@ -210,11 +214,12 @@ pub(crate) fn xref_stream(
     let width = width.max(1);
     let mut stride = crate::cancel::Stride::new(cancel);
     let row_len = 1 + width + 2;
-    let compress = deflate.is_some();
-    let mut out = match deflate {
-        Some(level) => Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::new(level))),
+    let new_sink = |level: u32| Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::new(level)));
+    let mut plain = match deflate {
+        Some(level) => new_sink(level),
         None => Sink::Plain(Vec::new()),
     };
+    let mut predicted = deflate.map(new_sink);
     let mut previous = vec![0u8; row_len];
     let mut row = vec![0u8; row_len];
     let mut filtered = vec![0u8; row_len + 1];
@@ -231,18 +236,17 @@ pub(crate) fn xref_stream(
         }
         row[1 + width] = (third >> 8) as u8;
         row[2 + width] = third as u8;
-        if compress {
+        plain.put(&row);
+        if let Some(predicted) = predicted.as_mut() {
             filtered[0] = 2;
             for i in 0..row_len {
                 filtered[1 + i] = row[i].wrapping_sub(previous[i]);
             }
-            out.put(&filtered);
-        } else {
-            out.put(&row);
+            predicted.put(&filtered);
         }
         std::mem::swap(&mut previous, &mut row);
     }
-    let data = out.finish();
+    let mut data = plain.finish();
 
     trailer.insert("Type".to_string(), Object::Name("XRef".to_string()));
     trailer.insert(
@@ -253,12 +257,20 @@ pub(crate) fn xref_stream(
             Object::Integer(2),
         ]),
     );
-    if compress {
+    if deflate.is_some() {
         trailer.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
-        let mut parms = HashMap::new();
-        parms.insert("Predictor".to_string(), Object::Integer(12));
-        parms.insert("Columns".to_string(), Object::Integer(row_len as i64));
-        trailer.insert("DecodeParms".to_string(), Object::Dictionary(parms));
+    }
+    if let Some(predicted) = predicted {
+        let predicted = predicted.finish();
+        // The dictionary entry the predictor adds, as the compact writer spells it.
+        let parms = format!("/DecodeParms<</Columns {row_len}/Predictor 12>>").len();
+        if predicted.len() + parms < data.len() {
+            data = predicted;
+            let mut parms = HashMap::new();
+            parms.insert("Predictor".to_string(), Object::Integer(12));
+            parms.insert("Columns".to_string(), Object::Integer(row_len as i64));
+            trailer.insert("DecodeParms".to_string(), Object::Dictionary(parms));
+        }
     }
     Ok(Object::stream(trailer, data))
 }

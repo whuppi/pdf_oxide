@@ -234,3 +234,134 @@ fn a_higher_level_saves_smaller_and_a_level_above_nine_is_refused() {
         editor.save_to_bytes_with_options(SaveOptions { deflate_level: 10, ..SaveOptions::full_rewrite() });
     assert!(matches!(refused, Err(crate::error::Error::InvalidOperation(_))), "{refused:?}");
 }
+
+/// A one-page document whose `/Contents` is stream object 4.
+fn source_with_page_content(dict: &str, data: &[u8]) -> Vec<u8> {
+    pdf_from_objects(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n"
+            .to_vec(),
+        stream_object(4, dict, data),
+    ])
+}
+
+/// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell a re-encoded page content from the source's own bytes.
+#[test]
+fn a_page_content_stream_is_redeflated_smaller_and_decodes_the_same() {
+    let data = text(40_000);
+    let weak = deflate(&data, 1);
+    let raw_source = source_with_page_content("", &data);
+    let weak_source = source_with_page_content("/Filter /FlateDecode", &weak);
+
+    let after = saved(weak_source);
+    let object = stream_of(&after);
+    let (dict, bytes) = parts(&object);
+    assert!(bytes.len() < weak.len(), "{} bytes, source {}", bytes.len(), weak.len());
+    assert_eq!(dict.get("Filter"), Some(&Object::Name("FlateDecode".to_string())));
+    assert_eq!(object.decode_stream_data().unwrap(), data);
+
+    let after = saved(raw_source);
+    let object = stream_of(&after);
+    let (dict, bytes) = parts(&object);
+    assert_eq!(dict.get("Filter"), Some(&Object::Name("FlateDecode".to_string())));
+    assert!(bytes.len() < data.len());
+    assert_eq!(object.decode_stream_data().unwrap(), data);
+}
+
+/// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell a copy from a re-encode.
+#[test]
+fn a_page_content_stream_the_save_cannot_shrink_keeps_its_source_bytes() {
+    let best = deflate(&text(40_000), 9);
+    let after = saved(source_with_page_content("/Filter /FlateDecode", &best));
+    assert_eq!(parts(&stream_of(&after)).1, best.as_slice());
+}
+
+fn lzw(data: &[u8], early_change: bool) -> Vec<u8> {
+    use weezl::{encode::Encoder, BitOrder};
+    let mut encoder = if early_change {
+        Encoder::with_tiff_size_switch(BitOrder::Msb, 8)
+    } else {
+        Encoder::new(BitOrder::Msb, 8)
+    };
+    encoder.encode(data).unwrap()
+}
+
+/// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell a Flate stream from the LZW one it replaced.
+#[test]
+fn an_lzw_stream_is_written_as_flate_smaller_and_decodes_the_same() {
+    let data = text(40_000);
+    let encoded = lzw(&data, true);
+    let source = source_with_stream("/Filter /LZWDecode", &encoded);
+    let after = saved(source);
+    let object = stream_of(&after);
+    let (dict, bytes) = parts(&object);
+
+    assert!(bytes.len() < encoded.len(), "{} bytes, source {}", bytes.len(), encoded.len());
+    assert_eq!(dict.get("Filter"), Some(&Object::Name("FlateDecode".to_string())));
+    assert_eq!(object.decode_stream_data().unwrap(), data);
+}
+
+/// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell a Flate stream from the LZW one it replaced.
+#[test]
+fn an_lzw_stream_keeps_its_predictor_and_loses_only_its_early_change() {
+    let rows = predictor_rows(64, 400);
+    let encoded = lzw(&rows, false);
+    let dict = "/Filter [/LZWDecode] /DecodeParms [<< /Predictor 12 /Columns 64 /EarlyChange 0 >>]";
+    let source = source_with_stream(dict, &encoded);
+    let before = PdfDocument::from_bytes(source.clone()).unwrap().load_object(ObjectRef::new(4, 0)).unwrap();
+    let after = saved(source);
+    let object = stream_of(&after);
+    let (dict, bytes) = parts(&object);
+
+    assert!(bytes.len() < encoded.len(), "{} bytes, source {}", bytes.len(), encoded.len());
+    assert_eq!(dict.get("Filter"), Some(&Object::Array(vec![Object::Name("FlateDecode".to_string())])));
+    let Some(Object::Array(parms)) = dict.get("DecodeParms") else { panic!("{dict:?}") };
+    let Some(Object::Dictionary(parms)) = parms.first() else { panic!("{dict:?}") };
+    assert_eq!(parms.get("Predictor"), Some(&Object::Integer(12)));
+    assert_eq!(parms.get("Columns"), Some(&Object::Integer(64)));
+    assert!(!parms.contains_key("EarlyChange"), "{parms:?}");
+    assert_eq!(object.decode_stream_data().unwrap(), before.decode_stream_data().unwrap());
+}
+
+/// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell a copy from a re-encode.
+#[test]
+fn an_lzw_stream_that_does_not_decode_or_has_indirect_parameters_keeps_its_bytes() {
+    let data = text(3000);
+    let mut broken = lzw(&data, true);
+    broken.truncate(broken.len() / 2);
+    let after = saved(source_with_stream("/Filter /LZWDecode", &broken));
+    let object = stream_of(&after);
+    let (dict, bytes) = parts(&object);
+    assert_eq!(bytes, broken.as_slice());
+    assert_eq!(dict.get("Filter"), Some(&Object::Name("LZWDecode".to_string())));
+
+    let encoded = lzw(&data, true);
+    let source = pdf_from_objects(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra 4 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n".to_vec(),
+        stream_object(4, "/Filter /LZWDecode /DecodeParms 5 0 R", &encoded),
+        b"5 0 obj\n<< /EarlyChange 1 >>\nendobj\n".to_vec(),
+    ]);
+    let after = saved(source);
+    let object = stream_of(&after);
+    let (dict, bytes) = parts(&object);
+    assert_eq!(bytes, encoded.as_slice());
+    assert_eq!(dict.get("Filter"), Some(&Object::Name("LZWDecode".to_string())));
+}
+
+/// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell a counted, streamed re-encode from the source's own bytes.
+#[test]
+fn an_lzw_stream_over_the_memory_limit_is_counted_then_written_as_flate() {
+    let data = [noise(MEMORY_STREAM as usize + 50_000), text(MEMORY_STREAM as usize * 3)].concat();
+    let encoded = lzw(&data, true);
+    assert!(encoded.len() as u64 > MEMORY_STREAM, "the fixture must take the counting path");
+    let after = saved(source_with_stream("/Filter /LZWDecode", &encoded));
+    let object = stream_of(&after);
+    let (dict, bytes) = parts(&object);
+
+    assert!(bytes.len() < encoded.len(), "{} bytes, source {}", bytes.len(), encoded.len());
+    assert_eq!(dict.get("Filter"), Some(&Object::Name("FlateDecode".to_string())));
+    assert_eq!(object.decode_stream_data().unwrap(), data);
+}

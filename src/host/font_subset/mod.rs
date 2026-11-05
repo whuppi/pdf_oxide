@@ -559,7 +559,8 @@ impl<'a> Collector<'a> {
         // source holds, or the program deflated, whichever is smaller.
         let deflated = |bytes: &[u8]| -> Option<Vec<u8>> {
             let mut out = Vec::new();
-            crate::host::deflate::recode(std::io::Cursor::new(bytes), false, level, &mut out).ok()?;
+            let raw = crate::host::deflate::Encoding::Raw;
+            crate::host::deflate::recode(std::io::Cursor::new(bytes), raw, level, &mut out).ok()?;
             Some(out)
         };
         let packed = deflated(&cut)?;

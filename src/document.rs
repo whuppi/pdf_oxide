@@ -2436,7 +2436,14 @@ impl PdfDocument {
                 Object::Reference(r) => out.push(r.id),
                 Object::Array(arr) => arr.iter().for_each(|o| push_refs(o, out)),
                 Object::Dictionary(d) => d.values().for_each(|o| push_refs(o, out)),
-                Object::Stream { dict, .. } => dict.values().for_each(|o| push_refs(o, out)),
+                // The save states an extent's /Length itself, so the integer
+                // object a source /Length names is not reached through it.
+                Object::Stream { dict, body } => dict
+                    .iter()
+                    .filter(|(key, _)| {
+                        !(key.as_str() == "Length" && matches!(body, StreamBody::Extent(_)))
+                    })
+                    .for_each(|(_, o)| push_refs(o, out)),
                 _ => {}
             }
         }
@@ -2454,7 +2461,10 @@ impl PdfDocument {
         // A stream's references live in its dictionary: read only that, so
         // the walk never loads (or caches) the stream data.
         if let Ok(Some(head)) = self.stream_head(obj_ref) {
-            head.dict.values().for_each(|o| push_refs(o, out));
+            head.dict
+                .iter()
+                .filter(|(key, _)| key.as_str() != "Length")
+                .for_each(|(_, o)| push_refs(o, out));
             return;
         }
         // Cold path: read the references from the object the load returned.

@@ -3314,7 +3314,14 @@ impl DocumentEditor {
                 Object::Reference(r) => out.push(r.id),
                 Object::Array(arr) => arr.iter().for_each(|o| push_refs(o, out)),
                 Object::Dictionary(d) => d.values().for_each(|o| push_refs(o, out)),
-                Object::Stream { dict, .. } => dict.values().for_each(|o| push_refs(o, out)),
+                // The save states an extent's /Length itself: the integer
+                // object a source /Length names is not reached through it.
+                Object::Stream { dict, body } => dict
+                    .iter()
+                    .filter(|(key, _)| {
+                        !(key.as_str() == "Length" && matches!(body, StreamBody::Extent(_)))
+                    })
+                    .for_each(|(_, o)| push_refs(o, out)),
                 _ => {}
             }
         }
@@ -3848,7 +3855,7 @@ impl DocumentEditor {
                 let mut counter = Counter::default();
                 let counted = deflate::recode(
                     stored.raw_reader()?,
-                    encoding == Encoding::Flate,
+                    encoding,
                     level,
                     &mut counter,
                 );
@@ -3867,8 +3874,14 @@ impl DocumentEditor {
         if let Some((id_map, page_id)) = remap {
             Self::remap_dict_refs(&mut dict, id_map, page_id);
         }
-        if !matches!(body, Body::Copy) && encoding == Encoding::Raw {
-            dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
+        if !matches!(body, Body::Copy) {
+            match encoding {
+                Encoding::Raw => {
+                    dict.insert("Filter".to_string(), Object::Name("FlateDecode".to_string()));
+                },
+                Encoding::Lzw { .. } => deflate::lzw_to_flate(&mut dict),
+                _ => {},
+            }
         }
         let length_id = match &body {
             Body::Copy => {
@@ -3913,7 +3926,7 @@ impl DocumentEditor {
                 let start = writer.position();
                 deflate::recode(
                     stored.raw_reader()?,
-                    encoding == Encoding::Flate,
+                    encoding,
                     level,
                     &mut *writer,
                 )?;
@@ -5015,11 +5028,15 @@ impl DocumentEditor {
                     let Some(compressed) = smaller(&raw, kind, level) else {
                         return Object::Stream { dict, body };
                     };
-                    if kind == Encoding::Raw {
-                        dict.insert(
-                            "Filter".to_string(),
-                            Object::Name("FlateDecode".to_string()),
-                        );
+                    match kind {
+                        Encoding::Raw => {
+                            dict.insert(
+                                "Filter".to_string(),
+                                Object::Name("FlateDecode".to_string()),
+                            );
+                        },
+                        Encoding::Lzw { .. } => crate::host::deflate::lzw_to_flate(&mut dict),
+                        _ => {},
                     }
                     dict.insert(
                         "Length".to_string(),
@@ -6719,9 +6736,7 @@ impl DocumentEditor {
                                                 // Loading it from source yields
                                                 // null, poisons the xref, and the
                                                 // real stream is then skipped as
-                                                // "already written". The copy never
-                                                // deflates: this stream was never
-                                                // compressed by the save.
+                                                // "already written".
                                                 let staged = self.modified_objects.get(&contents_ref.id);
                                                 if staged.is_some()
                                                     || !Self::write_source_stream(
@@ -6732,7 +6747,7 @@ impl DocumentEditor {
                                                         writer,
                                                         &serializer,
                                                         encryption_handler.is_some(),
-                                                        None,
+                                                        deflate,
                                                         &mut xref_entries,
                                                     )?
                                                 {
