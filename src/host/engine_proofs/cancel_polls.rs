@@ -557,3 +557,33 @@ fn page_images_of_a_long_page_cancelled_at_any_poll_caches_nothing() {
     );
     assert!(editor_polls >= 2);
 }
+
+/// No Dart battery sees it: `get_page_images` lexes the page's whole content
+/// stream before it walks one operator, and a cancel that lands in that parse
+/// must leave the editor as it was, with nothing cached for the next read.
+#[test]
+fn get_page_images_cancelled_in_the_parse_of_a_long_page_changes_nothing() {
+    let bytes = graphics_pdf(8_000);
+    let polls = editor_at_every_poll(
+        || editor_of(&bytes),
+        |editor, cancel| {
+            let _job = crate::cancel::enter(cancel);
+            editor.get_page_images(0).map(|_| ())
+        },
+        false,
+        // 72,000 tokens (nine to a triple): 17 strides of 4,096 in the parse and 5 in the walk of 24,000 operators
+        22,
+    );
+    assert!(polls >= 22, "the parse and the walk both poll: {polls}");
+    let mut editor = editor_of(&bytes);
+    let whole = editor.get_page_images(0).expect("an uncancelled read");
+    let mut cancelled = editor_of(&bytes);
+    {
+        let _job = crate::cancel::enter(&CancelCheck::tripping_at(1));
+        assert!(cancelled.get_page_images(0).is_err());
+    }
+    assert_eq!(
+        cancelled.get_page_images(0).expect("the editor still reads").len(),
+        whole.len()
+    );
+}

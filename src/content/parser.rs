@@ -116,6 +116,10 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
     let mut operators = Vec::with_capacity(estimated_capacity.min(100_000));
     let mut input = data;
     let mut consecutive_errors: usize = 0;
+    // ── pdf_manipulator patch: a cancel stops the parse within a stride of tokens ──
+    let mut stride = crate::cancel::Stride::job();
+    let mut cancelled = None;
+    // ── end pdf_manipulator patch ──
 
     // Parse until we consume all input
     while !input.is_empty() {
@@ -130,7 +134,13 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
         }
 
         // Parse one operator with its operands
-        match parse_operator_with_operands(input) {
+        // ── pdf_manipulator patch: a cancel stops the parse within a stride of tokens ──
+        let parsed = parse_operator_with_operands(input, &mut stride, &mut cancelled);
+        if let Some(error) = cancelled.take() {
+            return Err(error);
+        }
+        match parsed {
+            // ── end pdf_manipulator patch ──
             Ok((rest, op)) => {
                 operators.push(op);
                 input = rest;
@@ -143,6 +153,9 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
             },
             Err(_) => {
                 consecutive_errors += 1;
+                // ── pdf_manipulator patch: a cancel stops the parse within a stride of tokens ──
+                stride.tick()?;
+                // ── end pdf_manipulator patch ──
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                     log::warn!(
                         "Content stream had {} consecutive parse errors, bailing out ({} bytes remaining)",
@@ -178,7 +191,17 @@ pub fn parse_content_stream(data: &[u8]) -> Result<Vec<Operator>> {
 /// Uses `SmallVec<[Object; 6]>` for the operand buffer to avoid heap
 /// allocation for the common case (most PDF operators have 0-6 operands).
 /// Only spills to the heap for rare operators with more than 6 operands.
-fn parse_operator_with_operands(input: &[u8]) -> IResult<&[u8], Operator> {
+// ── pdf_manipulator patch: a cancel stops the parse within a stride of tokens ──
+///
+/// Polls `stride` once per operand and per operator; a cancel is left in
+/// `cancelled` and ends the read with a nom failure, which the nom error type
+/// has no room to carry.
+fn parse_operator_with_operands<'a>(
+    input: &'a [u8],
+    stride: &mut crate::cancel::Stride<'_>,
+    cancelled: &mut Option<crate::error::Error>,
+) -> IResult<&'a [u8], Operator> {
+    // ── end pdf_manipulator patch ──
     // Collect operands until we hit an operator name.
     // SmallVec<[Object; 6]>: stack-allocated for <= 6 operands (covers all
     // standard PDF operators: cm/Tm need 6, most need 0-4). Only spills to
@@ -187,6 +210,15 @@ fn parse_operator_with_operands(input: &[u8]) -> IResult<&[u8], Operator> {
     let mut remaining = input;
 
     loop {
+        // ── pdf_manipulator patch: a cancel stops the parse within a stride of tokens ──
+        if let Err(error) = stride.tick() {
+            *cancelled = Some(error);
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                remaining,
+                nom::error::ErrorKind::Eof,
+            )));
+        }
+        // ── end pdf_manipulator patch ──
         // Skip whitespace
         let (inp, _) = multispace0.parse(remaining)?;
         remaining = inp;

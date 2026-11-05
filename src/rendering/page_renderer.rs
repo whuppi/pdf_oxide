@@ -1035,7 +1035,11 @@ impl PageRenderer {
         let mut ext_g_state_cache: std::collections::HashMap<String, ParsedExtGState> =
             std::collections::HashMap::new();
         // ── pdf_manipulator patch: operators are consumed as a stream ──
+        // A form, glyph or pattern cell reads its operators with no check of
+        // its own, so the loop polls the running job's.
+        let mut stride = crate::cancel::Stride::job();
         for item in operators {
+            stride.tick()?;
             let op_owned = item?;
             let op: &Operator = &op_owned;
             // ── end pdf_manipulator patch ──
@@ -4085,7 +4089,9 @@ impl PageRenderer {
         // is held back; a glyph that has none is read whole and is a `d0` one.
         let mut leading: Vec<Operator> = Vec::new();
         let mut is_d1 = false;
+        let mut stride = crate::cancel::Stride::job();
         for op in source.by_ref() {
+            stride.tick()?;
             let Ok(op) = op else {
                 return Ok(());
             };
@@ -5608,9 +5614,12 @@ impl PageRenderer {
                 );
                 // A knockout group replays the operators before each element,
                 // so its content is the one a form holds whole.
-                let held = operators
-                    .map(|op| op.map(std::borrow::Cow::into_owned))
-                    .collect::<Result<Vec<Operator>>>()?;
+                let mut held = Vec::new();
+                let mut stride = crate::cancel::Stride::job();
+                for op in &mut operators {
+                    stride.tick()?;
+                    held.push(op?.into_owned());
+                }
                 // ── end pdf_manipulator patch ──
                 self.execute_knockout_group(
                     &mut group_pixmap,
