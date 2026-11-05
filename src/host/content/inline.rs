@@ -30,6 +30,8 @@
 //! image's own size.
 
 use super::lexer::{is_delim, is_space, Lexer};
+use crate::cancel::{poll, Stride, STRIDE};
+use crate::error::Result;
 use crate::object::Object;
 use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::HashMap;
@@ -37,6 +39,9 @@ use std::io::{self, Read};
 
 /// Bytes after `EI` the fallback rule looks at.
 const LOOKAHEAD: usize = 32;
+
+/// Bytes of the data a codec rule reads between two polls.
+const CHUNK: usize = STRIDE as usize;
 
 /// Component count of a named colour space (the name is a key of the page's
 /// `/ColorSpace` resource); `None` when it does not resolve.
@@ -261,31 +266,43 @@ enum Feed {
     Failed,
 }
 
-fn feed(codec: &mut Codec, input: &[u8]) -> Feed {
-    match codec {
+/// Feeds `input` to the codec, polling every [`CHUNK`] bytes of it.
+fn feed(codec: &mut Codec, input: &[u8]) -> Result<Feed> {
+    Ok(match codec {
         Codec::None => Feed::Failed,
-        Codec::AsciiHex => match input.iter().position(|&b| b == b'>') {
-            Some(i) => Feed::End(i + 1),
-            None => Feed::Pending,
+        Codec::AsciiHex => {
+            for (n, chunk) in input.chunks(CHUNK).enumerate() {
+                poll()?;
+                if let Some(i) = chunk.iter().position(|&b| b == b'>') {
+                    return Ok(Feed::End(n * CHUNK + i + 1));
+                }
+            }
+            Feed::Pending
         },
         Codec::Ascii85 { after_tilde } => {
-            for (i, &b) in input.iter().enumerate() {
-                if *after_tilde && b == b'>' {
-                    return Feed::End(i + 1);
+            for (n, chunk) in input.chunks(CHUNK).enumerate() {
+                poll()?;
+                for (i, &b) in chunk.iter().enumerate() {
+                    if *after_tilde && b == b'>' {
+                        return Ok(Feed::End(n * CHUNK + i + 1));
+                    }
+                    *after_tilde = b == b'~';
                 }
-                *after_tilde = b == b'~';
             }
             Feed::Pending
         },
         Codec::RunLength(state) => {
-            for (i, &b) in input.iter().enumerate() {
-                *state = match state {
-                    RunState::Length if b == 128 => return Feed::End(i + 1),
-                    RunState::Length if b < 128 => RunState::Literal(u16::from(b) + 1),
-                    RunState::Length => RunState::Repeat,
-                    RunState::Literal(1) | RunState::Repeat => RunState::Length,
-                    RunState::Literal(n) => RunState::Literal(*n - 1),
-                };
+            for (c, chunk) in input.chunks(CHUNK).enumerate() {
+                poll()?;
+                for (i, &b) in chunk.iter().enumerate() {
+                    *state = match state {
+                        RunState::Length if b == 128 => return Ok(Feed::End(c * CHUNK + i + 1)),
+                        RunState::Length if b < 128 => RunState::Literal(u16::from(b) + 1),
+                        RunState::Length => RunState::Repeat,
+                        RunState::Literal(1) | RunState::Repeat => RunState::Length,
+                        RunState::Literal(n) => RunState::Literal(*n - 1),
+                    };
+                }
             }
             Feed::Pending
         },
@@ -294,23 +311,26 @@ fn feed(codec: &mut Codec, input: &[u8]) -> Feed {
             let mut input = input;
             let mut out = [0u8; 4096];
             loop {
+                poll()?;
                 let (in_before, out_before) = (inflater.total_in(), inflater.total_out());
                 match inflater.decompress(input, &mut out, FlushDecompress::None) {
-                    Err(_) => return Feed::Failed,
-                    Ok(Status::StreamEnd) => return Feed::End((inflater.total_in() - start) as usize),
+                    Err(_) => return Ok(Feed::Failed),
+                    Ok(Status::StreamEnd) => {
+                        return Ok(Feed::End((inflater.total_in() - start) as usize))
+                    },
                     Ok(_) => {
                         let used = (inflater.total_in() - in_before) as usize;
                         let produced = (inflater.total_out() - out_before) as usize;
                         input = &input[used..];
                         if (used == 0 && produced == 0) || (input.is_empty() && produced < out.len())
                         {
-                            return Feed::Pending;
+                            return Ok(Feed::Pending);
                         }
                     },
                 }
             }
         },
-    }
+    })
 }
 
 struct Candidate {
@@ -337,6 +357,8 @@ struct Scan {
     fed: u64,
     fallback_next: u64,
     fallback_found: Option<u64>,
+    /// Counts the bytes the fallback rule walks.
+    stride: Stride<'static>,
 }
 
 impl Scan {
@@ -366,15 +388,17 @@ impl Scan {
             fed: 0,
             fallback_next: 0,
             fallback_found: None,
+            stride: Stride::job(),
         }
     }
 
-    fn step(&mut self, w: &[u8], eof: bool) -> Step {
+    fn step(&mut self, w: &[u8], eof: bool) -> Result<Step> {
+        self.stride.tick()?;
         if let Some(index) = self.codec_candidate {
             let candidate = &mut self.candidates[index];
             if candidate.at.is_none() && !candidate.failed {
                 let from = (self.fed - self.base) as usize;
-                match feed(&mut self.codec, &w[from..]) {
+                match feed(&mut self.codec, &w[from..])? {
                     Feed::End(n) => candidate.at = Some(self.fed + n as u64),
                     Feed::Failed => candidate.failed = true,
                     Feed::Pending => {
@@ -386,6 +410,7 @@ impl Scan {
         }
 
         while self.fallback_found.is_none() {
+            self.stride.tick()?;
             let at = (self.fallback_next - self.base) as usize;
             if at >= w.len() {
                 break;
@@ -406,23 +431,19 @@ impl Scan {
                 continue;
             }
             let Some(at) = self.candidates[index].at else {
-                return self.more();
+                return Ok(self.more());
             };
             match ei_at(w, self.base, at, eof) {
-                Verdict::Yes => return Step::End(at),
+                Verdict::Yes => return Ok(Step::End(at)),
                 Verdict::No => self.candidates[index].failed = true,
-                Verdict::Wait => return self.more(),
+                Verdict::Wait => return Ok(self.more()),
             }
         }
 
         if let Some(at) = self.fallback_found {
-            return Step::End(at);
+            return Ok(Step::End(at));
         }
-        if eof {
-            Step::Unended
-        } else {
-            self.more()
-        }
+        Ok(if eof { Step::Unended } else { self.more() })
     }
 
     fn more(&self) -> Step {
@@ -440,31 +461,35 @@ impl<R: Read> Lexer<R> {
     /// Reads the data of an inline image, after its `ID` and the one
     /// white-space byte that follows it, and consumes it with the `EI`.
     /// Returns the data when `collect` is set and an empty vector otherwise,
-    /// or `None` when the source ends before the data does.
+    /// or `None` when the source ends before the data does. The outer `Err`
+    /// is a cancel, polled every [`STRIDE`] bytes the scan walks; the inner
+    /// one a read that failed.
     pub(super) fn read_inline_data(
         &mut self,
         spec: &ImageSpec,
         collect: bool,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> Result<io::Result<Option<Vec<u8>>>> {
         let mut scan = Scan::new(spec);
         loop {
-            match scan.step(self.window(), self.at_eof()) {
+            match scan.step(self.window(), self.at_eof())? {
                 Step::End(at) => {
                     let data = if collect { self.window()[..at as usize].to_vec() } else { Vec::new() };
                     self.discard((at + 3 - scan.base) as usize);
-                    return Ok(Some(data));
+                    return Ok(Ok(Some(data)));
                 },
                 Step::Unended => {
                     let rest = self.window().len();
                     self.discard(rest);
-                    return Ok(None);
+                    return Ok(Ok(None));
                 },
                 Step::More { keep } => {
                     if !collect && keep > scan.base {
                         self.discard((keep - scan.base) as usize);
                         scan.base = keep;
                     }
-                    self.refill()?;
+                    if let Err(e) = self.refill() {
+                        return Ok(Err(e));
+                    }
                 },
             }
         }

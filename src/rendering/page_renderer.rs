@@ -3630,6 +3630,9 @@ impl PageRenderer {
                         ) {
                             log::warn!("Skipping unrenderable inline image: {}", e);
                         }
+                        // ── pdf_manipulator patch: a cancel inside the paint is not an image that failed to draw ──
+                        crate::cancel::poll()?;
+                        // ── end pdf_manipulator patch ──
                     }
                 },
 
@@ -4917,6 +4920,9 @@ impl PageRenderer {
                                         // Restore caches
                                         self.fonts = old_fonts;
                                         self.color_spaces = old_cs;
+                                        // ── pdf_manipulator patch: a cancel inside the form is not a form that was malformed ──
+                                        crate::cancel::poll()?;
+                                        // ── end pdf_manipulator patch ──
                                     },
                                     _ => {},
                                 }
@@ -4991,7 +4997,7 @@ impl PageRenderer {
             obj_ref,
             xobject,
             [transform.sx, transform.kx, transform.tx, transform.ky, transform.sy, transform.ty],
-        );
+        )?;
         let mut cursor = match self.image_cursors.take(&key) {
             Some(cursor) => cursor,
             None => ImageCursor::open(
@@ -5367,7 +5373,7 @@ impl PageRenderer {
             None,
             xobject,
             [transform.sx, transform.kx, transform.tx, transform.ky, transform.sy, transform.ty],
-        );
+        )?;
         let mut cursor = match self.stencil_cursors.take(&key) {
             Some(cursor) => cursor,
             None => StencilCursor::open(doc, xobject, footprint)?,
@@ -9165,6 +9171,9 @@ impl PageRenderer {
         let mut sidecar_accum_spots: Option<Vec<u8>> = sidecar_backdrop_spots.clone();
 
         for &end_idx in &paint_indices {
+            // ── pdf_manipulator patch: a cancel reaches the replay between two paints ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             // Cumulative replay: graphics-state operators 0..end_idx
             // plus the paint at end_idx, with all PRIOR paint operators
             // filtered out. Filtering keeps the state side effects

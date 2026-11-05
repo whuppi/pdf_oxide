@@ -587,3 +587,143 @@ fn get_page_images_cancelled_in_the_parse_of_a_long_page_changes_nothing() {
         whole.len()
     );
 }
+
+/// `q`, one inline image and `Q`, the image's data `data`.
+fn inline_content(dict: &str, data: &[u8]) -> Vec<u8> {
+    let mut content = format!("q BI {dict} ID ").into_bytes();
+    content.extend_from_slice(data);
+    content.extend_from_slice(b"\nEI Q");
+    content
+}
+
+/// The operators of `content` read to the end under the job check `cancel`.
+fn read_operators(content: &[u8], cancel: &CancelCheck) -> Result<usize> {
+    use crate::host::content::{Mode, Operators};
+    let _job = crate::cancel::enter(cancel);
+    let mut count = 0;
+    for operator in Operators::new(std::io::Cursor::new(content.to_vec()), Mode::Full) {
+        operator?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// No Dart battery sees it: the data of an inline image is scanned for its end
+/// inside one token, a battery's image of a few hundred bytes ends before the
+/// scan has walked one stride, and a cancel in the scan must come out as the
+/// cancelled error, not as damage that ends the stream quietly. Each end rule
+/// walks its own loop: the byte-wise fallback, `ASCIIHexDecode`,
+/// `ASCII85Decode`, `RunLengthDecode` and `FlateDecode`.
+#[test]
+fn inline_image_data_cancelled_at_any_poll_of_its_scan_ends_cancelled() {
+    use std::io::Write;
+    const BYTES: usize = 100_000;
+    let mut lcg = 11u32;
+    let noise: Vec<u8> = (0..BYTES)
+        .map(|_| {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (lcg >> 24) as u8
+        })
+        .collect();
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    z.write_all(&vec![0u8; BYTES]).expect("deflates");
+    let flate = z.finish().expect("finishes");
+    let hex = [b"00".repeat(BYTES / 2), b">".to_vec()].concat();
+    let ascii85 = [b"!".repeat(BYTES), b"~>".to_vec()].concat();
+    let run_length = [[255u8, 0].repeat(BYTES / 2), vec![128]].concat();
+    let cases: [(&str, String, Vec<u8>, usize); 6] = [
+        // a stride of 4,096 bytes of the fallback rule's walk, which every rule runs beside its own
+        ("the dimensions", format!("/W {BYTES} /H 1 /BPC 8 /CS /G"), noise.clone(), BYTES / 4096),
+        ("the fallback", "/W 1 /H 1 /BPC 8 /CS /G /F /DCT".into(), noise, BYTES / 4096),
+        ("ASCIIHexDecode", "/W 1 /H 1 /BPC 8 /CS /G /F /AHx".into(), hex, BYTES / 4096),
+        ("ASCII85Decode", "/W 1 /H 1 /BPC 8 /CS /G /F /A85".into(), ascii85, BYTES / 4096),
+        ("RunLengthDecode", "/W 1 /H 1 /BPC 8 /CS /G /F /RL".into(), run_length, BYTES / 4096),
+        // one poll for each 4,096 bytes the inflater produces
+        ("FlateDecode", "/W 1 /H 1 /BPC 8 /CS /G /F /Fl".into(), flate, BYTES / 4096),
+    ];
+    for (rule, dict, data, min_polls) in cases {
+        let content = inline_content(&dict, &data);
+        let counting = CancelCheck::tripping_at(usize::MAX);
+        let whole = read_operators(&content, &counting).expect("an uncancelled read");
+        assert_eq!(whole, 3, "{rule}: q, the image and Q");
+        let polls = counting.polls();
+        assert!(polls >= min_polls, "{rule}: a full read polls at least {min_polls} times: {polls}");
+        for n in 1..=polls {
+            match read_operators(&content, &CancelCheck::tripping_at(n)) {
+                Ok(_) => panic!("{rule}: a cancel at poll {n} of {polls} did not stop the read"),
+                Err(error) => assert!(is_cancelled(&error), "{rule}: poll {n} of {polls} ended with {error:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rendering")]
+fn render_png(doc: &PdfDocument, cancel: &CancelCheck) -> Result<Vec<u8>> {
+    use crate::host::render_stream::{render_pages_streamed, RenderFormat, RenderSize};
+    let _job = crate::cancel::enter(cancel);
+    let mut out = Vec::new();
+    render_pages_streamed(doc, &[0], RenderSize::Dpi(72), RenderFormat::Png, &mut out, cancel)?;
+    Ok(out)
+}
+
+/// One page of 100 x 100 points showing `content`, with `resources` and the
+/// objects from 5 on.
+#[cfg(feature = "rendering")]
+fn render_pdf(content: &[u8], resources: &str, extra: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut objects = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+             /Resources << {resources} >> >>\nendobj\n"
+        )
+        .into_bytes(),
+        stream_object(4, "", content),
+    ];
+    objects.extend(extra);
+    pdf_from_objects(&objects)
+}
+
+#[cfg(feature = "rendering")]
+/// No Dart battery sees it: a page of one inline image of several megabytes
+/// is one operator, and its data is scanned for its end, hashed for the table
+/// of open images and drawn row by row. A cancel at any poll of that must end
+/// the render cancelled and leave the document drawing the same page again.
+#[test]
+fn render_of_an_inline_image_cancelled_at_any_poll_leaves_nothing_behind() {
+    const WIDTH: usize = 40_000;
+    const ROWS: usize = 3;
+    let data: Vec<u8> = (0..WIDTH * ROWS).map(|i| (i / 7 % 251) as u8).collect();
+    let mut content = format!("q 100 0 0 100 0 0 cm BI /W {WIDTH} /H {ROWS} /BPC 8 /CS /G ID ").into_bytes();
+    content.extend_from_slice(&data);
+    content.extend_from_slice(b"\nEI\n");
+    let bytes = render_pdf(&content, "", Vec::new());
+    // 120,000 bytes: 29 strides in the scan and 29 in the hash of the image's key, over the few polls of its rows
+    let polls = read_at_every_poll(|| open(&bytes), |doc, cancel| render_png(doc, cancel), 58);
+    assert!(polls >= 58, "{polls}");
+}
+
+#[cfg(feature = "rendering")]
+/// No Dart battery sees it: a knockout group replays the operators before each
+/// of its paints, one scratch page at a time, and a battery's group of a few
+/// paints finishes before the replay would poll twice. A cancel between two
+/// paints must end the render cancelled, the group's pixels and the sidecar
+/// lanes of the page left where the next render of the same document finds
+/// them.
+#[test]
+fn render_of_a_knockout_group_cancelled_at_any_poll_leaves_nothing_behind() {
+    const PAINTS: usize = 40;
+    let mut form = String::new();
+    for i in 0..PAINTS {
+        form.push_str(&format!("{} 0 0 rg {} {} 20 20 re f\n", i % 2, i % 80, i % 70));
+    }
+    let objects = vec![stream_object(
+        5,
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency /K true >>",
+        form.as_bytes(),
+    )];
+    let bytes = render_pdf(b"/Fm1 Do\n", "/XObject << /Fm1 5 0 R >>", objects);
+    // one poll for each paint of the replay, over the polls of the page's own operators and of the form's
+    let polls = read_at_every_poll(|| open(&bytes), |doc, cancel| render_png(doc, cancel), PAINTS);
+    assert!(polls >= PAINTS, "{polls}");
+}

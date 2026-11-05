@@ -1715,21 +1715,33 @@ enum Source {
 }
 
 impl CursorKey {
-    pub(crate) fn new(obj_ref: Option<ObjectRef>, xobject: &Object, transform: [f32; 6]) -> Self {
+    /// An inline image's key hashes all of its data, polling the job's check
+    /// every [`STRIDE`](crate::cancel::STRIDE) bytes.
+    pub(crate) fn new(
+        obj_ref: Option<ObjectRef>,
+        xobject: &Object,
+        transform: [f32; 6],
+    ) -> crate::error::Result<Self> {
         use std::hash::{Hash, Hasher};
         let source = match (obj_ref, xobject) {
             (Some(r), _) => Source::Reference(r),
             (None, Object::Stream { body, .. }) => {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 match body.inline() {
-                    Some(bytes) => bytes.hash(&mut hasher),
+                    Some(bytes) => {
+                        bytes.len().hash(&mut hasher);
+                        for chunk in bytes.chunks(crate::cancel::STRIDE as usize) {
+                            crate::cancel::poll()?;
+                            hasher.write(chunk);
+                        }
+                    },
                     None => format!("{body:?}").hash(&mut hasher),
                 }
                 Source::Stream(hasher.finish())
             },
             (None, _) => Source::Stream(0),
         };
-        Self { source, transform: transform.map(f32::to_bits) }
+        Ok(Self { source, transform: transform.map(f32::to_bits) })
     }
 }
 

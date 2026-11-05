@@ -543,7 +543,7 @@ impl<R: Read> Operators<R> {
         self.active = false;
         self.lexer.skip_one_space();
         let collect = self.images == InlineImages::Collect;
-        match self.lexer.read_inline_data(&spec, collect) {
+        match self.lexer.read_inline_data(&spec, collect)? {
             Ok(Some(data)) => self.emit(Operator::InlineImage { dict: Box::new(dict), data }, true),
             Ok(None) => {
                 self.inline_unended = true;
