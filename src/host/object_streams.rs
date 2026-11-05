@@ -113,7 +113,10 @@ pub(crate) fn object_stream(batch: Vec<(u32, Vec<u8>)>, deflate: Option<u32>) ->
         at += body.len() + 1;
     }
     let mut sink = match deflate {
-        Some(level) => Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::new(level))),
+        Some(level) => Sink::Zlib(ZlibEncoder::new(
+            Vec::new(),
+            Compression::new(crate::host::deflate::zlib_level(level)),
+        )),
         None => Sink::Plain(Vec::new()),
     };
     sink.put(table.as_bytes());
@@ -214,7 +217,12 @@ pub(crate) fn xref_stream(
     let width = width.max(1);
     let mut stride = crate::cancel::Stride::new(cancel);
     let row_len = 1 + width + 2;
-    let new_sink = |level: u32| Sink::Zlib(ZlibEncoder::new(Vec::new(), Compression::new(level)));
+    let new_sink = |level: u32| {
+        Sink::Zlib(ZlibEncoder::new(
+            Vec::new(),
+            Compression::new(crate::host::deflate::zlib_level(level)),
+        ))
+    };
     let mut plain = match deflate {
         Some(level) => new_sink(level),
         None => Sink::Plain(Vec::new()),

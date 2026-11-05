@@ -113,6 +113,19 @@ pub(crate) fn lzw_to_flate(dict: &mut HashMap<String, Object>) {
     }
 }
 
+/// The zlib level a save level runs at. The largest level runs zlib-rs level
+/// 8: level 9 hashes three bytes and so takes length-3 matches, which cost
+/// more than the literals they replace in text-like data (page content), and
+/// level 8 hashes four. The zlib of `dart:io` at level 9 takes none either,
+/// and level 8 here matches its output byte for byte on content streams.
+pub(crate) fn zlib_level(level: u32) -> u32 {
+    if level == MAX_LEVEL {
+        level - 1
+    } else {
+        level
+    }
+}
+
 /// Deflates `input`, which is encoded as `source`, into `out` at `level`:
 /// first inflating it for Flate, or decoding it for LZW (a stream that stops
 /// without its end code is an error, not a short stream). An error from
@@ -144,7 +157,7 @@ pub(crate) fn recode<'a, R: Read + 'a>(
         },
         _ => Box::new(input),
     };
-    let mut enc = ZlibEncoder::new(out, Compression::new(level));
+    let mut enc = ZlibEncoder::new(out, Compression::new(zlib_level(level)));
     let mut buf = vec![0u8; CHUNK];
     loop {
         let n = input.read(&mut buf)?;

@@ -4115,8 +4115,10 @@ impl DocumentEditor {
         let deflated = |out: &mut dyn Write| -> Result<()> {
             match deflate {
                 Some(level) => {
-                    let mut zlib =
-                        flate2::write::ZlibEncoder::new(out, flate2::Compression::new(level));
+                    let mut zlib = flate2::write::ZlibEncoder::new(
+                        out,
+                        flate2::Compression::new(crate::host::deflate::zlib_level(level)),
+                    );
                     body(&mut zlib)?;
                     zlib.finish()?;
                     Ok(())

@@ -132,7 +132,7 @@ fn a_raw_stream_that_compresses_is_deflated() {
 #[test]
 fn a_flate_stream_the_new_level_cannot_shrink_keeps_its_source_bytes() {
     let data = text(3000);
-    let encoded = deflate(&data, 9);
+    let encoded = deflate(&data, 8);
     let after = saved(source_with_stream("/Filter /FlateDecode", &encoded));
     let object = stream_of(&after);
     let (_, bytes) = parts(&object);
@@ -176,7 +176,7 @@ fn a_stream_over_the_memory_limit_is_counted_then_written_or_copied() {
     assert!(bytes.len() < slack.len(), "{} bytes, source {}", bytes.len(), slack.len());
     assert_eq!(object.decode_stream_data().unwrap(), data);
 
-    let best = deflate(&data, 9);
+    let best = deflate(&data, 8);
     let after = saved(source_with_stream("/Filter /FlateDecode", &best));
     assert_eq!(parts(&stream_of(&after)).1, best.as_slice());
 
@@ -235,6 +235,43 @@ fn a_higher_level_saves_smaller_and_a_level_above_nine_is_refused() {
     assert!(matches!(refused, Err(crate::error::Error::InvalidOperation(_))), "{refused:?}");
 }
 
+/// Text operators with numbers, as a page's content stream holds them.
+fn content_like(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut out = Vec::with_capacity(len + 40);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let line = format!(
+            "BT /F{} {} Tf {}.{} {}.{} Td ({}) Tj ET\n",
+            state % 5,
+            8 + state % 7,
+            (state >> 8) % 600,
+            (state >> 20) % 100,
+            (state >> 28) % 800,
+            (state >> 40) % 100,
+            ["alpha", "bravo", "charlie", "delta", "echo"][(state >> 50) as usize % 5],
+        );
+        out.extend_from_slice(line.as_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell one deflate of the same data from another.
+#[test]
+fn the_largest_level_saves_a_content_stream_smaller_than_zlib_level_nine() {
+    let data = content_like(20_000);
+    let zlib = deflate(&data, 9);
+    let after = saved(source_with_stream("/Filter /FlateDecode", &zlib));
+    let object = stream_of(&after);
+    let (_, bytes) = parts(&object);
+
+    assert!(bytes.len() < zlib.len(), "{} bytes, zlib level 9 {}", bytes.len(), zlib.len());
+    assert_eq!(object.decode_stream_data().unwrap(), data);
+}
+
 /// A one-page document whose `/Contents` is stream object 4.
 fn source_with_page_content(dict: &str, data: &[u8]) -> Vec<u8> {
     pdf_from_objects(&[
@@ -272,7 +309,7 @@ fn a_page_content_stream_is_redeflated_smaller_and_decodes_the_same() {
 /// No Dart battery sees it: Dart reads a stream decoded, and a decoded read cannot tell a copy from a re-encode.
 #[test]
 fn a_page_content_stream_the_save_cannot_shrink_keeps_its_source_bytes() {
-    let best = deflate(&text(40_000), 9);
+    let best = deflate(&text(40_000), 8);
     let after = saved(source_with_page_content("/Filter /FlateDecode", &best));
     assert_eq!(parts(&stream_of(&after)).1, best.as_slice());
 }
