@@ -2,8 +2,6 @@ compliance::converter::add_pdfa_identification
 decoders::stream::decode_slice
 document::cached_page_content
 document::compute_output_intent_cmyk_profile
-document::extract_embedded_files
-document::extract_text_from_ap_stream
 extractors::images::decode_jbig2_bits # the JBIG2 bitstream is the decoder's input; the bitmap is kept at one bit a pixel
 extractors::images::decode_jbig2_image # the off-render image extraction (reducer, PNG export) wants one 8-bit raster; the render path reads decode_jbig2_bits
 extractors::images::decode_jpx_image # the codestream is the codec's input, and its decoder returns the raster at the reduction the footprint covers

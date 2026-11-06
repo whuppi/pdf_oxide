@@ -3921,6 +3921,9 @@ impl<'doc> TextExtractor<'doc> {
         // PDF Y coordinates increase upward, so higher Y = top of page.
         // We need to sort by Y descending (top first), then X ascending (left to right).
         self.sort_by_reading_order();
+        // ── pdf_manipulator patch: a cancel the glyph sort ended on is reported here ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
 
         // BUG FIX #3: Deduplicate overlapping characters
         // Some PDFs render text multiple times (for effects like boldness, shadowing).
@@ -5660,50 +5663,111 @@ impl<'doc> TextExtractor<'doc> {
     }
 
     // ── pdf_manipulator patch: one order for both kinds of glyph ──
-    fn sort_glyphs<T: GlyphRow>(glyphs: &mut [T]) {
-        glyphs.sort_by(|a, b| {
-            // Handle NaN/Inf values - treat them as at the end
-            if !a.y().is_finite() {
-                return if b.y().is_finite() {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Equal
-                };
+    /// Puts the glyphs in reading order: top line first, left to right. A
+    /// stable merge sort over indices that polls for a cancel between its runs
+    /// and every 4,096 steps of a merge, so a page of a million glyphs stops
+    /// within a bounded amount of work; on a cancel the glyphs are left partly
+    /// ordered and the caller reports it. Without one the order is the standard
+    /// stable sort's by [`Self::glyph_order`]; no glyph is copied.
+    pub(crate) fn sort_glyphs<T: GlyphRow>(glyphs: &mut [T]) {
+        const STEP: usize = 4096;
+        let len = glyphs.len();
+        let mut order: Vec<u32> = (0..len as u32).collect();
+        for run in order.chunks_mut(STEP) {
+            if crate::cancel::poll().is_err() {
+                return;
             }
-            if !b.y().is_finite() {
-                return std::cmp::Ordering::Less;
+            run.sort_by(|&a, &b| Self::glyph_order(&glyphs[a as usize], &glyphs[b as usize]));
+        }
+        let mut merged: Vec<u32> = Vec::with_capacity(len);
+        let mut width = STEP;
+        while width < len {
+            merged.clear();
+            for start in (0..len).step_by(2 * width) {
+                let mid = (start + width).min(len);
+                let end = (start + 2 * width).min(len);
+                let (mut i, mut j) = (start, mid);
+                while i < mid || j < end {
+                    if merged.len() % STEP == 0 && crate::cancel::poll().is_err() {
+                        return;
+                    }
+                    let take_left = j == end
+                        || (i < mid
+                            && Self::glyph_order(&glyphs[order[i] as usize], &glyphs[order[j] as usize])
+                                != std::cmp::Ordering::Greater);
+                    if take_left {
+                        merged.push(order[i]);
+                        i += 1;
+                    } else {
+                        merged.push(order[j]);
+                        j += 1;
+                    }
+                }
             }
+            std::mem::swap(&mut order, &mut merged);
+            width *= 2;
+        }
+        // Apply the order in place: position k takes the glyph at order[k],
+        // following each cycle once.
+        for k in 0..len {
+            if k % STEP == 0 && crate::cancel::poll().is_err() {
+                return;
+            }
+            let mut cur = k;
+            while order[cur] as usize != k {
+                let next = order[cur] as usize;
+                glyphs.swap(cur, next);
+                order[cur] = cur as u32;
+                cur = next;
+            }
+            order[cur] = cur as u32;
+        }
+    }
 
-            // Sort by Y descending (top first), then by X ascending (left to right)
-            // Round Y coordinates to ensure transitivity of the comparison function
-            let a_y_rounded = a.y().round() as i32;
-            let b_y_rounded = b.y().round() as i32;
+    /// Reading order of two glyphs: y descending (rounded, so the order is
+    /// transitive), then x ascending; a non-finite coordinate sorts last.
+    fn glyph_order<T: GlyphRow>(a: &T, b: &T) -> std::cmp::Ordering {
+        // Handle NaN/Inf values - treat them as at the end
+        if !a.y().is_finite() {
+            return if b.y().is_finite() {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            };
+        }
+        if !b.y().is_finite() {
+            return std::cmp::Ordering::Less;
+        }
 
-            match b_y_rounded.cmp(&a_y_rounded) {
-                std::cmp::Ordering::Equal => {
-                    // Same line: sort by X ascending (left to right)
-                    if !a.x().is_finite() {
-                        return if b.x().is_finite() {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Equal
-                        };
-                    }
-                    if !b.x().is_finite() {
-                        return std::cmp::Ordering::Less;
-                    }
+        // Sort by Y descending (top first), then by X ascending (left to right)
+        // Round Y coordinates to ensure transitivity of the comparison function
+        let a_y_rounded = a.y().round() as i32;
+        let b_y_rounded = b.y().round() as i32;
 
-                    if a.x() < b.x() {
-                        std::cmp::Ordering::Less
-                    } else if a.x() > b.x() {
+        match b_y_rounded.cmp(&a_y_rounded) {
+            std::cmp::Ordering::Equal => {
+                // Same line: sort by X ascending (left to right)
+                if !a.x().is_finite() {
+                    return if b.x().is_finite() {
                         std::cmp::Ordering::Greater
                     } else {
                         std::cmp::Ordering::Equal
-                    }
-                },
-                other => other,
-            }
-        });
+                    };
+                }
+                if !b.x().is_finite() {
+                    return std::cmp::Ordering::Less;
+                }
+
+                if a.x() < b.x() {
+                    std::cmp::Ordering::Less
+                } else if a.x() > b.x() {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            },
+            other => other,
+        }
     }
     // ── end pdf_manipulator patch ──
 

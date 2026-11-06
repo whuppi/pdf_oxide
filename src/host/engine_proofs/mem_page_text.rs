@@ -547,31 +547,39 @@ fn tagged_and_spans_of(runs: usize) -> (PdfDocument, Vec<TextSpan>) {
 }
 
 /// What the stamping pass takes at its peak over what the document held
-/// before it, for a tagged page of `runs` runs.
-fn stamping_peak(runs: usize) -> usize {
+/// before it, for a tagged page of `runs` runs, and the glyphs of its spans.
+fn stamping_peak_and_glyphs(runs: usize) -> (usize, usize) {
     let (doc, mut spans) = tagged_and_spans_of(runs);
+    let glyphs = spans.iter().map(|s| s.text.chars().count()).sum();
     let ((), growth) =
         heap::growth(|| doc.stamp_char_x_offsets(0, &mut spans, &CancelCheck::none()));
-    growth
+    (growth, glyphs)
 }
 
-/// The stamping pass of a page grows with the page, not with the room a list
-/// of glyphs was given: at 85,000 runs the page's 499,000 glyphs fit a list of
-/// 524,288, and at 170,000 runs its 1,079,000 glyphs did not fit one of
-/// 1,048,576, so a list that doubles held 2,097,152 for them, and the peak
-/// at twice the runs was 3.35 times the peak at the runs. Now a list grows by
-/// a sixteenth of itself and the peak at 2N is at most 2.1 times the peak at N.
-/// No Dart battery can observe this: the offsets stamped are the same at every
-/// size, and only the allocator counter of the engine sees the peak.
+fn stamping_peak(runs: usize) -> usize {
+    stamping_peak_and_glyphs(runs).0
+}
+
+/// The stamping pass of a page grows with its glyphs, not with the room a
+/// list of glyphs was given: a list that doubles held 2,097,152 slots for the
+/// 1,079,000 glyphs of 170,000 runs, and the peak at twice the runs was 3.35
+/// times the peak at the runs. The fixture's glyphs grow faster than its runs
+/// (about 499,000 at 85,000 runs), so the peak is compared per glyph: at twice
+/// the runs it is at most 1.05 times what it is at the runs. No Dart battery
+/// can observe this: the offsets stamped are the same at every size, and only
+/// the allocator counter of the engine sees the peak.
 #[test]
 fn the_stamping_pass_grows_linearly_with_the_page() {
     alone(module_path!(), "the_stamping_pass_grows_linearly_with_the_page", || {
-        let at_n = stamping_peak(85_000);
-        let at_2n = stamping_peak(170_000);
-        println!("stamping peak: {at_n} bytes at 85000 runs, {at_2n} at 170000");
+        let (at_n, glyphs_n) = stamping_peak_and_glyphs(85_000);
+        let (at_2n, glyphs_2n) = stamping_peak_and_glyphs(170_000);
+        let (per_n, per_2n) = (at_n as f64 / glyphs_n as f64, at_2n as f64 / glyphs_2n as f64);
+        println!(
+            "stamping peak: {at_n} bytes for {glyphs_n} glyphs ({per_n:.1} a glyph), {at_2n} for {glyphs_2n} ({per_2n:.1})"
+        );
         assert!(
-            at_2n as f64 <= 2.1 * at_n as f64,
-            "{at_2n} bytes at twice the runs is over 2.1 times {at_n}"
+            per_2n <= 1.05 * per_n,
+            "{per_2n:.1} bytes a glyph at twice the runs is over 1.05 times {per_n:.1}"
         );
     });
 }

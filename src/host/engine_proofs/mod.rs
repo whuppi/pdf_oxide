@@ -132,6 +132,7 @@ mod text_render_modes;
 mod text_tj_chunks;
 #[cfg(feature = "rendering")]
 mod watermark_positions;
+mod sort_cancel;
 mod whole_reads;
 #[cfg(feature = "rendering")]
 mod redact_extra_type3;

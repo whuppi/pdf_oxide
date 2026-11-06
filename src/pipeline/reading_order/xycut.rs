@@ -512,6 +512,12 @@ impl XYCutStrategy {
             return Vec::new();
         }
 
+        // ── pdf_manipulator patch: a cancelled job ends the recursion; the caller's next poll reports it ──
+        if crate::cancel::poll().is_err() {
+            return vec![self.sort_indices(all_spans, indices)];
+        }
+        // ── end pdf_manipulator patch ──
+
         // Base case: small region, don't split further via the recursive
         // partitioner. Below `min_spans_for_split`, the statistical
         // prose/table classifiers (`classify_region_kind`,
@@ -1946,28 +1952,31 @@ impl XYCutStrategy {
             left.iter()
                 .any(|&j| j != i && band_of(j) == a && all_spans[j].bbox.left() < x)
         };
-        let full_width_left_rows = left
-            .iter()
-            .filter(|&&i| {
-                if !shares_a_row_with_right(i) && !is_labelled_from_the_left(i) {
-                    return false;
-                }
-                let s = &all_spans[i];
-                // Count EVERY character, not just the non-whitespace ones. An
-                // inter-word space consumes an advance exactly as a glyph does,
-                // so excluding spaces under-measures justified prose by about a
-                // ninth of its width — enough that a full-measure body line
-                // reaching the right margin scored short of it and was not
-                // counted. Clamping to `bbox.right()` keeps the estimate from
-                // over-reaching instead: the result is never wider than the ink
-                // actually is, which is what the trailing-whitespace concern
-                // above is really about.
-                let chars = s.text.chars().count().max(1) as f32;
-                let approx_char_width = (s.font_size * 0.45).max(2.5);
-                let core_right = (s.bbox.left() + chars * approx_char_width).min(s.bbox.right());
-                core_right >= right_x_max - overlap_tol
-            })
-            .count();
+        // ── pdf_manipulator patch: each left run scans both sides, so the scan polls per run ──
+        let mut full_width_left_rows = 0usize;
+        for &i in left.iter() {
+            crate::cancel::poll().ok()?;
+            if !shares_a_row_with_right(i) && !is_labelled_from_the_left(i) {
+                continue;
+            }
+            let s = &all_spans[i];
+            // Count EVERY character, not just the non-whitespace ones. An
+            // inter-word space consumes an advance exactly as a glyph does,
+            // so excluding spaces under-measures justified prose by about a
+            // ninth of its width — enough that a full-measure body line
+            // reaching the right margin scored short of it and was not
+            // counted. Clamping to `bbox.right()` keeps the estimate from
+            // over-reaching instead: the result is never wider than the ink
+            // actually is, which is what the trailing-whitespace concern
+            // above is really about.
+            let chars = s.text.chars().count().max(1) as f32;
+            let approx_char_width = (s.font_size * 0.45).max(2.5);
+            let core_right = (s.bbox.left() + chars * approx_char_width).min(s.bbox.right());
+            if core_right >= right_x_max - overlap_tol {
+                full_width_left_rows += 1;
+            }
+        }
+        // ── end pdf_manipulator patch ──
         // The count has to be read against the side it came from, not on its
         // own: three rows out of a hundred is a heading, a footnote and a
         // caption over two columns of prose, and vetoing there costs those

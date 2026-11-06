@@ -7915,15 +7915,27 @@ impl PdfDocument {
         // as that would emit every annotation a second time.
 
         // Filter leaked PDF metadata
+        // ── pdf_manipulator patch: a poll between the passes over the page's text ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let final_text = Self::filter_leaked_metadata(&text);
 
         // Normalize Kangxi Radicals
+        // ── pdf_manipulator patch: a poll between the passes over the page's text ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let final_text = Self::normalize_kangxi_radicals(&final_text);
 
         // Normalize Arabic Presentation Forms
+        // ── pdf_manipulator patch: a poll between the passes over the page's text ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let final_text = Self::normalize_arabic_presentation_forms(&final_text);
 
         // Apply whitespace cleanup
+        // ── pdf_manipulator patch: a poll between the passes over the page's text ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let cleaned_text = crate::converters::whitespace::cleanup_plain_text(&final_text);
 
         // For tagged PDFs, the structure-tree traversal at line 4306 already
@@ -7940,6 +7952,9 @@ impl PdfDocument {
         // because the producing font had no ToUnicode CMap and the
         // /Differences / AGL lookup returned the UTF-8 byte sequence
         // re-interpreted as Latin-1. Re-decode those runs in place.
+        // ── pdf_manipulator patch: a poll between the passes over the page's text ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let cleaned_text = Self::repair_utf8_mojibake(&cleaned_text);
 
         // Optionally expand Latin ligature characters to their component letters.
@@ -7957,10 +7972,16 @@ impl PdfDocument {
 
         // Drop stray spaces a producer inserted between a CJK ideograph and an
         // embedded ASCII number (e.g. "公元前 1000 年" → "公元前1000年").
+        // ── pdf_manipulator patch: a poll between the passes over the page's text ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let cleaned_text = crate::extractors::text::strip_cjk_digit_boundary_spaces(&cleaned_text);
 
         // Drop a space the word-break heuristic injected inside a prime-notation
         // number (e.g. "0′′ .28" / "0′′. 28" → "0′′.28").
+        // ── pdf_manipulator patch: a poll between the passes over the page's text ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let cleaned_text =
             crate::extractors::text::strip_prime_decimal_boundary_spaces(&cleaned_text);
 
@@ -11250,25 +11271,38 @@ impl PdfDocument {
         // Get /N (Normal appearance) — can be a stream ref or a dictionary of states
         let n_obj = ap_dict.get("N")?;
         // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-        let n_stream = match n_obj {
-            Object::Reference(r) => self.load_object(*r).ok()?,
+        let (n_ref, n_stream) = match n_obj {
+            Object::Reference(r) => (*r, self.load_object(*r).ok()?),
             _ => return None, // N must be a reference to a stream
         };
 
         // Verify it's a stream (has a dict with stream data)
         let n_dict = n_stream.as_dict()?;
-
-        // Decode the AP/N stream
-        let stream_data = match n_stream.decode_stream_data() {
         // ── end pdf_manipulator patch ──
-            Ok(data) => data,
-            Err(_) => return None,
-        };
 
-        // Quick check: does the stream contain text operators?
-        if !Self::may_contain_text(&stream_data) {
+        // ── pdf_manipulator patch: the appearance stream is read as its operators, not decoded whole ──
+        let source: Arc<crate::extractors::text::OperatorSource<'_>> = Arc::new(move || {
+            Ok(Box::new(self.form_operators(n_ref)?.with_mode(crate::host::content::Mode::Text))
+                as Box<dyn crate::host::content::OperatorStream>)
+        });
+
+        // Quick check: does the stream show text, or invoke a form that may?
+        let mut stride = crate::cancel::Stride::job();
+        let mut may_show_text = false;
+        for op in source().ok()? {
+            stride.tick().ok()?;
+            match op {
+                Ok(crate::content::Operator::BeginText | crate::content::Operator::Do { .. }) | Err(_) => {
+                    may_show_text = true;
+                    break;
+                },
+                Ok(_) => {},
+            }
+        }
+        if !may_show_text {
             return None;
         }
+        // ── end pdf_manipulator patch ──
 
         // Create a temporary text extractor for this AP stream
         let mut extractor = TextExtractor::new();
@@ -11291,7 +11325,9 @@ impl PdfDocument {
         }
 
         // Extract text spans from the AP stream
-        let spans = extractor.extract_text_spans(&stream_data).ok()?;
+        // ── pdf_manipulator patch: spans are read from the stream's operator source ──
+        let spans = extractor.extract_text_spans_from(source).ok()?;
+        // ── end pdf_manipulator patch ──
         if spans.is_empty() {
             return None;
         }
@@ -13810,6 +13846,9 @@ impl PdfDocument {
     ) -> Result<Vec<crate::layout::TextSpan>> {
         let mut spans = raw_spans;
 
+        // ── pdf_manipulator patch: a poll between the passes over the page's spans ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         self.drop_offpage_spans(page_index, &mut spans);
 
         // Recover decimal points mis-decoded as `¬` (U+00AC) in Computer-Modern
@@ -13825,6 +13864,9 @@ impl PdfDocument {
 
         // Re-attach oversized lone leading capitals to their word before the
         // reading-order sort can strand them (drop-cap / table-title initials).
+        // ── pdf_manipulator patch: a poll between the passes over the page's spans ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         Self::merge_drop_cap_initials(&mut spans);
 
         // Apply page /Rotate to span geometry BEFORE reading-order sorting.
@@ -13890,6 +13932,9 @@ impl PdfDocument {
         // scramble vertical text; per-span wmode lets us route just those
         // pages through a tategaki comparator while leaving every existing
         // horizontal corpus untouched.
+        // ── pdf_manipulator patch: a poll between the passes over the page's spans ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         let vertical_count = spans.iter().filter(|s| s.wmode == 1).count();
         if !spans.is_empty() && vertical_count * 2 >= spans.len() {
             // See `crate::utils::sort_vertical_tategaki` for the
@@ -13922,6 +13967,10 @@ impl PdfDocument {
             cancel.check()?;
             // ── end pdf_manipulator patch ──
         }
+
+        // ── pdf_manipulator patch: the cancel the partition ended on is reported here ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
 
         // Per-span rotation firewall. Runs drawn with a rotated text matrix
         // (the vertical `arXiv:…` margin stamp, figure/axis labels, rotated
@@ -13977,6 +14026,7 @@ impl PdfDocument {
         // bottom of the page are flagged as artifacts so downstream filters
         // drop them.
         // ── pdf_manipulator patch: the cancel check rides to the pre-pass ──
+        crate::cancel::poll()?;
         self.mark_running_artifact_spans(page_index, &mut spans, cancel)?;
         // ── end pdf_manipulator patch ──
 
@@ -13985,6 +14035,9 @@ impl PdfDocument {
         // or thin-space variants in ToUnicode CMaps (e.g. justified text layouts);
         // normalising here gives consistent word boundaries to every downstream
         // consumer (extract_text, word-F1 scoring, etc.).
+        // ── pdf_manipulator patch: a poll between the passes over the page's spans ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         for span in &mut spans {
             if span
                 .text
@@ -14021,6 +14074,9 @@ impl PdfDocument {
         // ground truth keeps in ASCII; gating on token-internal
         // context keeps the desired cases without regressing the
         // affiliation-block pages.
+        // ── pdf_manipulator patch: a poll between the passes over the page's spans ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         Self::apply_super_sub_script_substitutions(&mut spans);
 
         // Fold spacing-diacritic spans (´, `, ^, ~, ¨, …) into the
@@ -14030,6 +14086,9 @@ impl PdfDocument {
         // the marks as separate `Tj` ops at the base glyph's X
         // coordinate. Without this pass extract_text returns the
         // raw two-glyph order "´Ecole" instead of "École".
+        // ── pdf_manipulator patch: a poll between the passes over the page's spans ──
+        crate::cancel::poll()?;
+        // ── end pdf_manipulator patch ──
         Self::apply_combining_mark_composition(&mut spans);
 
         // Stamp accurate per-glyph x-origins onto the finalized spans so that
@@ -14040,6 +14099,8 @@ impl PdfDocument {
         // consumers do.
         // ── pdf_manipulator patch: the cancel check rides to the char extraction ──
         self.stamp_char_x_offsets(page_index, &mut spans, cancel);
+        // A cancel the stamping swallowed is reported here.
+        crate::cancel::poll()?;
         // ── end pdf_manipulator patch ──
 
         Ok(spans)
@@ -24965,107 +25026,6 @@ impl PdfDocument {
             })
             .map(|line| line.bbox)
             .collect()
-    }
-
-    /// Extract embedded files / attachments (WS1.8a, ISO 32000-1 §7.11.4).
-    ///
-    /// Walks the catalog's `/Names /EmbeddedFiles` name tree and returns
-    /// `(filename, decoded bytes)` for each `/Filespec`'s `/EF /F` (or `/UF`)
-    /// embedded-file stream. Complements the existing embedded-file writer.
-    /// Returns an empty vector when the document has no attachments.
-    pub fn extract_embedded_files(&self) -> Result<Vec<(String, Vec<u8>)>> {
-        self.require_authenticated()?;
-        let catalog = self.catalog()?;
-        let Some(cat_dict) = catalog.as_dict() else {
-            return Ok(Vec::new());
-        };
-        // catalog → /Names → /EmbeddedFiles (name-tree root).
-        let names = cat_dict
-            .get("Names")
-            .and_then(|n| self.resolve_object(n).ok());
-        let Some(ef_root) = names
-            .as_ref()
-            .and_then(|n| n.as_dict())
-            .and_then(|d| d.get("EmbeddedFiles"))
-            .and_then(|e| self.resolve_object(e).ok())
-        else {
-            return Ok(Vec::new());
-        };
-
-        let mut filespecs: Vec<Object> = Vec::new();
-        self.collect_embedded_filespecs(&ef_root, &mut filespecs, 0);
-
-        let mut out = Vec::new();
-        for fs in &filespecs {
-            let Some(fs_dict) = fs.as_dict() else {
-                continue;
-            };
-            // Prefer the Unicode filename /UF, fall back to /F.
-            let filename = fs_dict
-                .get("UF")
-                .or_else(|| fs_dict.get("F"))
-                .and_then(|n| self.resolve_object(n).ok())
-                .and_then(|n| {
-                    n.as_string()
-                        .map(|s| String::from_utf8_lossy(s).into_owned())
-                })
-                .unwrap_or_else(|| "attachment".to_string());
-            // /EF → { /F <stream ref> } (or /UF).
-            let Some(ef) = fs_dict.get("EF").and_then(|e| self.resolve_object(e).ok()) else {
-                continue;
-            };
-            let Some(ef_dict) = ef.as_dict() else {
-                continue;
-            };
-            let Some(stream_ref) = ef_dict
-                .get("F")
-                .or_else(|| ef_dict.get("UF"))
-                .and_then(|r| r.as_reference())
-            else {
-                continue;
-            };
-            if let Ok(stream_obj) = self.load_object(stream_ref) {
-                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                if let Ok(bytes) = stream_obj.decode_stream_data() {
-                // ── end pdf_manipulator patch ──
-                    out.push((filename, bytes));
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Recursively collect `/Filespec` objects from an `/EmbeddedFiles`
-    /// name-tree node: leaf `/Names [key filespec …]` pairs plus `/Kids`.
-    fn collect_embedded_filespecs(&self, node: &Object, out: &mut Vec<Object>, depth: u8) {
-        if depth > 32 {
-            return;
-        }
-        let Ok(node) = self.resolve_object(node) else {
-            return;
-        };
-        let Some(dict) = node.as_dict() else {
-            return;
-        };
-        if let Some(names) = dict.get("Names").and_then(|n| self.resolve_object(n).ok()) {
-            if let Some(arr) = names.as_array() {
-                // Flat [key1 filespec1 key2 filespec2 …]: the odd indices.
-                let mut i = 1;
-                while i < arr.len() {
-                    if let Ok(fs) = self.resolve_object(&arr[i]) {
-                        out.push(fs);
-                    }
-                    i += 2;
-                }
-            }
-        }
-        if let Some(kids) = dict.get("Kids").and_then(|k| self.resolve_object(k).ok()) {
-            if let Some(arr) = kids.as_array() {
-                for kid in arr {
-                    self.collect_embedded_filespecs(kid, out, depth + 1);
-                }
-            }
-        }
     }
 
     /// Build the resource-name → colour-space-object map from a resolved
