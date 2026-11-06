@@ -50,3 +50,61 @@ fn output_index_follows_removes_and_moves() {
 }
 
 // ── a merge records ids and streams the merged document at save ──
+
+/// One page whose /Contents is `contents`, with the content streams `parts` as objects 4, 5, ….
+fn page_with_contents(contents: &str, parts: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    use super::support::{pdf_from_objects, stream_object};
+    let mut objects = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        format!("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents {contents} >>\nendobj\n")
+            .into_bytes(),
+    ];
+    for (i, (dict, data)) in parts.iter().enumerate() {
+        objects.push(stream_object(4 + i as u32, dict, data));
+    }
+    pdf_from_objects(&objects)
+}
+
+fn flate(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(1));
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// No Dart battery sees it: the page's images come back the same whether its content was held whole or read as operators, and the heap one call raises is reported by no wire op.
+#[test]
+fn the_images_of_a_page_with_a_huge_content_are_found_without_holding_the_content() {
+    let image = b"q 10 0 0 20 5 6 cm /Im1 Do Q\n";
+    let filler = b"q Q\n".repeat(4 * 1024 * 1024);
+    let mut content = image.to_vec();
+    content.extend_from_slice(&filler);
+    let mut editor =
+        open_editor_from_bytes(&page_with_contents("4 0 R", &[("/Filter /FlateDecode", flate(&content))]), "huge_content");
+    let (images, grew) = crate::host::heap::growth(|| editor.get_page_images(0).unwrap());
+    assert!(grew < content.len() / 4, "the read held {grew} bytes for a content of {}", content.len());
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].name, "Im1");
+    assert_eq!(images[0].bounds, [5.0, 6.0, 10.0, 20.0]);
+}
+
+/// No Dart battery sees it: the parts of a page's /Contents array join the same whether they were concatenated or read in turn; a part that cannot be decoded is skipped, as it always was.
+#[test]
+fn the_images_of_a_page_with_a_contents_array_are_found_and_a_broken_part_is_skipped() {
+    let mut editor = open_editor_from_bytes(
+        &page_with_contents(
+            "[4 0 R 5 0 R 6 0 R]",
+            &[
+                ("", b"q 10 0 0 20 5 6 cm /Im1 Do".to_vec()),
+                ("/Filter /FlateDecode", b"not a zlib stream".to_vec()),
+                ("", b"Q q 3 0 0 4 1 2 cm /Im2 Do Q".to_vec()),
+            ],
+        ),
+        "contents_array",
+    );
+    let images = editor.get_page_images(0).unwrap();
+    let names: Vec<_> = images.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["Im1", "Im2"]);
+    assert_eq!(images[1].bounds, [1.0, 2.0, 3.0, 4.0]);
+}

@@ -402,3 +402,50 @@ fn an_lzw_stream_over_the_memory_limit_is_counted_then_written_as_flate() {
     assert_eq!(dict.get("Filter"), Some(&Object::Name("FlateDecode".to_string())));
     assert_eq!(object.decode_stream_data().unwrap(), data);
 }
+
+/// A document whose catalog reaches object 4, which the editor then stages as the stream `dict` and `data`.
+fn editor_staging(dict: &str, data: Vec<u8>) -> DocumentEditor {
+    let mut editor = DocumentEditor::from_bytes(source_with_stream("", b"x")).unwrap();
+    let parsed = PdfDocument::from_bytes(source_with_stream(dict, b"x")).unwrap();
+    let Object::Stream { mut dict, .. } = stream_of(&parsed) else { panic!("not a stream") };
+    dict.insert("Length".to_string(), Object::Integer(data.len() as i64));
+    editor.insert_modified(4, Object::stream(dict, bytes::Bytes::from(data)));
+    editor
+}
+
+/// No Dart battery sees it: Dart cannot stage a stream of a given size, and the proof is the heap one save raises, which no wire op reports.
+#[test]
+fn a_staged_stream_over_the_memory_limit_is_deflated_without_a_copy_of_it() {
+    let len = 16 * 1024 * 1024;
+    let data = text(len);
+    let mut editor = editor_staging("", data.clone());
+    let (bytes, grew) =
+        crate::host::heap::growth(|| editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap());
+    assert!(grew < len / 4, "the save held {grew} bytes more for a staged stream of {len}");
+
+    let after = PdfDocument::from_bytes(bytes).unwrap();
+    let object = stream_of(&after);
+    let (dict, stored) = parts(&object);
+    assert_eq!(dict.get("Filter"), Some(&Object::Name("FlateDecode".to_string())));
+    assert!(stored.len() < len / 4, "{} bytes stored", stored.len());
+    assert_eq!(object.decode_stream_data().unwrap(), data);
+}
+
+/// No Dart battery sees it: Dart cannot stage a stream of a given size, and a decoded read cannot tell a copy from a re-encode.
+#[test]
+fn a_staged_stream_over_the_memory_limit_that_does_not_shrink_is_written_as_it_is() {
+    let data = noise(MEMORY_STREAM as usize * 3);
+    let mut editor = editor_staging("", data.clone());
+    let bytes = editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap();
+    let after = PdfDocument::from_bytes(bytes).unwrap();
+    let object = stream_of(&after);
+    let (dict, stored) = parts(&object);
+    assert!(!dict.contains_key("Filter"));
+    assert_eq!(stored, data.as_slice());
+
+    let flate = deflate(&noise(MEMORY_STREAM as usize * 3), 9);
+    let mut editor = editor_staging("/Filter /FlateDecode", flate.clone());
+    let bytes = editor.save_to_bytes_with_options(SaveOptions::full_rewrite()).unwrap();
+    let after = PdfDocument::from_bytes(bytes).unwrap();
+    assert_eq!(parts(&stream_of(&after)).1, flate.as_slice());
+}

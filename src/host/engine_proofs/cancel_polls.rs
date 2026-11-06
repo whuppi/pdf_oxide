@@ -558,11 +558,11 @@ fn page_images_of_a_long_page_cancelled_at_any_poll_caches_nothing() {
     assert!(editor_polls >= 2);
 }
 
-/// No Dart battery sees it: `get_page_images` lexes the page's whole content
-/// stream before it walks one operator, and a cancel that lands in that parse
+/// No Dart battery sees it: `get_page_images` lexes the page's content one
+/// operator at a time inside its walk, and a cancel that lands in that walk
 /// must leave the editor as it was, with nothing cached for the next read.
 #[test]
-fn get_page_images_cancelled_in_the_parse_of_a_long_page_changes_nothing() {
+fn get_page_images_cancelled_in_the_walk_of_a_long_page_changes_nothing() {
     let bytes = graphics_pdf(8_000);
     let polls = editor_at_every_poll(
         || editor_of(&bytes),
@@ -571,10 +571,10 @@ fn get_page_images_cancelled_in_the_parse_of_a_long_page_changes_nothing() {
             editor.get_page_images(0).map(|_| ())
         },
         false,
-        // 72,000 tokens (nine to a triple): 17 strides of 4,096 in the parse and 5 in the walk of 24,000 operators
-        22,
+        // 24,000 operators (three to a triple), lexed in the walk: 5 strides of 4,096
+        5,
     );
-    assert!(polls >= 22, "the parse and the walk both poll: {polls}");
+    assert!(polls >= 5, "the walk polls: {polls}");
     let mut editor = editor_of(&bytes);
     let whole = editor.get_page_images(0).expect("an uncancelled read");
     let mut cancelled = editor_of(&bytes);
