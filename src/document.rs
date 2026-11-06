@@ -13066,7 +13066,9 @@ impl PdfDocument {
         );
 
         // Step 4: Assemble text in structure order
-        let mut text = String::with_capacity(mcid_map.len() * 50);
+        // ── pdf_manipulator patch: the text grows as it is written, not sized for 50 bytes a marked-content id ──
+        let mut text = String::new();
+        // ── end pdf_manipulator patch ──
         let mut prev_span: Option<TextSpan> = None;
         let mut prev_in_table = false;
         let mut consumed_mcids: HashSet<(crate::structure::McidScope, u32)> = HashSet::new();
@@ -13282,7 +13284,11 @@ impl PdfDocument {
         usize,
     ) {
         const UNMARKED: u32 = u32::MAX;
-        let mut slots: HashMap<(crate::structure::McidScope, u32), u32> = HashMap::new();
+        // One map serves both passes: while the runs are counted a key's
+        // `start` is its slot, and once the ranges are known the same entry
+        // holds its range, so the page never holds a second map of its ids.
+        let mut ranges: HashMap<(crate::structure::McidScope, u32), std::ops::Range<usize>> =
+            HashMap::new();
         let mut counts: Vec<usize> = Vec::new();
         let mut destination: Vec<u32> = Vec::with_capacity(spans.len());
         for span in &spans {
@@ -13291,13 +13297,13 @@ impl PdfDocument {
                 continue;
             };
             let key = (span.mcid_scope.clone().unwrap_or(default_scope.clone()), mcid);
-            let next = counts.len() as u32;
-            let slot = *slots.entry(key).or_insert(next);
+            let next = counts.len();
+            let slot = ranges.entry(key).or_insert(next..next).start;
             if slot == next {
                 counts.push(0);
             }
-            counts[slot as usize] += 1;
-            destination.push(slot);
+            counts[slot] += 1;
+            destination.push(slot as u32);
         }
         let mut starts: Vec<usize> = Vec::with_capacity(counts.len());
         let mut marked = 0usize;
@@ -13305,7 +13311,11 @@ impl PdfDocument {
             starts.push(marked);
             marked += count;
         }
-        let mut fill = starts.clone();
+        for range in ranges.values_mut() {
+            let slot = range.start;
+            *range = starts[slot]..starts[slot] + counts[slot];
+        }
+        let mut fill = starts;
         let mut unmarked = marked;
         for slot in destination.iter_mut() {
             let at = if *slot == UNMARKED {
@@ -13318,13 +13328,6 @@ impl PdfDocument {
             *slot = at as u32;
         }
         Self::permute_in_place(&mut spans, &mut destination);
-        let ranges = slots
-            .into_iter()
-            .map(|(key, slot)| {
-                let start = starts[slot as usize];
-                (key, start..start + counts[slot as usize])
-            })
-            .collect();
         (spans, ranges, marked)
     }
     // ── end pdf_manipulator patch ──
@@ -14106,9 +14109,9 @@ impl PdfDocument {
             return;
         }
 
-        // ── pdf_manipulator patch: the characters are read for this pass alone and freed with it, not kept beside the spans ──
+        // ── pdf_manipulator patch: the glyphs are read for this pass alone, as compact records, and freed with it, not kept beside the spans ──
         let accurate = match self
-            .extract_chars_impl(page_index, HashSet::new(), HashSet::new(), cancel)
+            .extract_aligned_impl(page_index, cancel)
             .and_then(|chars| cancel.check().map(|()| chars))
         {
             Ok(chars) if !chars.is_empty() => chars,
@@ -19170,7 +19173,7 @@ impl PdfDocument {
         // ── end pdf_manipulator patch ──
     }
 
-    fn extract_chars_impl(
+    pub(crate) fn extract_chars_impl(
         &self,
         page_index: usize,
         excluded_layers: HashSet<String>,
@@ -19179,6 +19182,59 @@ impl PdfDocument {
         cancel: &crate::cancel::CancelCheck,
         // ── end pdf_manipulator patch ──
     ) -> Result<Vec<crate::layout::TextChar>> {
+        // ── pdf_manipulator patch: the page's setup is shared with the stamping pass's read ──
+        self.read_page_glyphs(page_index, excluded_layers, excluded_inks, cancel, |extractor, source| {
+            // The page's text operators are read as its content is decoded.
+            let mut chars = extractor.extract_owned_from(source)?;
+
+            chars.sort_by(|a, b| {
+                let y_cmp = crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y);
+                if y_cmp != std::cmp::Ordering::Equal {
+                    return y_cmp;
+                }
+                crate::utils::safe_float_cmp(a.bbox.x, b.bbox.x)
+            });
+
+            Ok(chars)
+        })
+        // ── end pdf_manipulator patch ──
+    }
+
+    // ── pdf_manipulator patch: the stamping pass reads compact glyphs ──
+    /// The glyphs of a page as [`crate::extractors::text::AlignedChar`]s, in
+    /// the order `extract_chars_impl` puts its `TextChar`s.
+    pub(crate) fn extract_aligned_impl(
+        &self,
+        page_index: usize,
+        cancel: &crate::cancel::CancelCheck,
+    ) -> Result<Vec<crate::extractors::text::AlignedChar>> {
+        self.read_page_glyphs(page_index, HashSet::new(), HashSet::new(), cancel, |extractor, source| {
+            let mut glyphs = extractor.extract_aligned_from(source)?;
+            glyphs.sort_by(|a, b| {
+                let y_cmp = crate::utils::safe_float_cmp(b.origin_y, a.origin_y);
+                if y_cmp != std::cmp::Ordering::Equal {
+                    return y_cmp;
+                }
+                crate::utils::safe_float_cmp(a.origin_x, b.origin_x)
+            });
+            Ok(glyphs)
+        })
+    }
+
+    /// Reads a page's operators with an extractor that has the page's fonts,
+    /// and hands it to `read`; a page whose content cannot be decoded reads as
+    /// nothing.
+    fn read_page_glyphs<R: Default>(
+        &self,
+        page_index: usize,
+        excluded_layers: HashSet<String>,
+        excluded_inks: HashSet<String>,
+        cancel: &crate::cancel::CancelCheck,
+        read: impl for<'e> FnOnce(
+            &mut crate::extractors::TextExtractor<'e>,
+            Arc<crate::extractors::text::OperatorSource<'e>>,
+        ) -> Result<R>,
+    ) -> Result<R> {
         use crate::extractors::TextExtractor;
 
         let page = self.get_page(page_index)?;
@@ -19187,7 +19243,7 @@ impl PdfDocument {
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
+        // The page's text operators are read as its content is decoded.
         let source = match self.page_text_source_cancellable(page_index, cancel) {
             Ok(source) => source,
             Err(e) => {
@@ -19196,10 +19252,9 @@ impl PdfDocument {
                     page_index,
                     e
                 );
-                return Ok(Vec::new());
+                return Ok(R::default());
             },
         };
-        // ── end pdf_manipulator patch ──
 
         let mut extractor = TextExtractor::new();
         // Stamp the page index the span path already stamps. The form /BBox
@@ -19229,20 +19284,9 @@ impl PdfDocument {
             }
         }
 
-        // ── pdf_manipulator patch: the page's text operators are read as its content is decoded ──
-        let mut chars = extractor.extract_owned_from(source)?;
-        // ── end pdf_manipulator patch ──
-
-        chars.sort_by(|a, b| {
-            let y_cmp = crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y);
-            if y_cmp != std::cmp::Ordering::Equal {
-                return y_cmp;
-            }
-            crate::utils::safe_float_cmp(a.bbox.x, b.bbox.x)
-        });
-
-        Ok(chars)
+        read(&mut extractor, source)
     }
+    // ── end pdf_manipulator patch ──
 
     /// Extract words from a page.
     ///
@@ -22366,11 +22410,15 @@ impl PdfDocument {
         use crate::fonts::FontInfo;
 
         // Resources can be a reference or a dictionary
-        let resources_obj = if let Some(res_ref) = resources.as_reference() {
-            self.load_object(res_ref)?
+        // ── pdf_manipulator patch: a dictionary the caller holds is read where it is, not cloned ──
+        let loaded_resources;
+        let resources_obj: &Object = if let Some(res_ref) = resources.as_reference() {
+            loaded_resources = self.load_object(res_ref)?;
+            &loaded_resources
         } else {
-            resources.clone()
+            resources
         };
+        // ── end pdf_manipulator patch ──
 
         let resources_dict = match resources_obj.as_dict() {
             Some(d) => d,
@@ -22387,11 +22435,15 @@ impl PdfDocument {
         if let Some(font_obj) = resources_dict.get("Font") {
             // Font can be a reference or direct dictionary - need to dereference
             let font_dict_ref = font_obj.as_reference();
-            let font_dict_obj = if let Some(font_ref) = font_dict_ref {
-                self.load_object(font_ref)?
+            // ── pdf_manipulator patch: a /Font dictionary inside the resources is read where it is ──
+            let loaded_font_dict;
+            let font_dict_obj: &Object = if let Some(font_ref) = font_dict_ref {
+                loaded_font_dict = self.load_object(font_ref)?;
+                &loaded_font_dict
             } else {
-                font_obj.clone()
+                font_obj
             };
+            // ── end pdf_manipulator patch ──
 
             // Layer 2: Check font set cache for the /Font dictionary.
             // Pages sharing the same /Font dict skip the entire per-font loop.
@@ -22416,23 +22468,22 @@ impl PdfDocument {
                 // not just the sets separately. This prevents false cache hits
                 // when two font dicts have the same set of refs and names but
                 // different name-to-ref assignments.
+                // ── pdf_manipulator patch: the entries are combined in any order, so none is copied or sorted for it ──
                 let fingerprint = {
                     use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    let mut name_ref_pairs: Vec<(&str, Option<ObjectRef>)> = font_dict
-                        .iter()
-                        .map(|(name, fo)| (name.as_str(), fo.as_reference()))
-                        .collect();
-                    name_ref_pairs.sort_by(|a, b| a.0.cmp(b.0));
-                    for (name, obj_ref) in &name_ref_pairs {
-                        name.hash(&mut hasher);
-                        if let Some(r) = obj_ref {
+                    let mut combined = 0u64;
+                    for (name, fo) in font_dict.iter() {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        name.as_str().hash(&mut hasher);
+                        if let Some(r) = fo.as_reference() {
                             r.id.hash(&mut hasher);
                             r.gen.hash(&mut hasher);
                         }
+                        combined = combined.wrapping_add(hasher.finish());
                     }
-                    hasher.finish()
+                    combined
                 };
+                // ── end pdf_manipulator patch ──
 
                 let cached_fingerprint_opt = self
                     .font_fingerprint_cache
@@ -22453,14 +22504,18 @@ impl PdfDocument {
                 // creating T1_0→Helvetica, T1_1→Times-Roman with unique object numbers).
                 // Cache the resolved font set by sorted font names, then on subsequent
                 // pages verify ONE font via load+hash to confirm the mapping is the same.
+                // ── pdf_manipulator patch: the names are combined in any order, so none is copied or sorted for it ──
                 let name_hash = {
                     use std::hash::{Hash, Hasher};
-                    let mut font_names: Vec<&str> = font_dict.keys().map(|k| k.as_str()).collect();
-                    font_names.sort();
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    font_names.hash(&mut hasher);
-                    hasher.finish()
+                    let mut combined = font_dict.len() as u64;
+                    for name in font_dict.keys() {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        name.as_str().hash(&mut hasher);
+                        combined = combined.wrapping_add(hasher.finish());
+                    }
+                    combined
                 };
+                // ── end pdf_manipulator patch ──
 
                 let cached_name_set = self
                     .font_name_set_cache
@@ -22509,11 +22564,14 @@ impl PdfDocument {
                 // Layer 4 must store only the delta so that a cache hit never injects
                 // parent-page fonts into a different page's extractor context, which
                 // would overwrite correctly-loaded fonts with wrong versions.
-                let extractor_names_before: std::collections::HashSet<String> = extractor
-                    .get_font_set()
-                    .into_iter()
-                    .map(|(k, _)| k)
-                    .collect();
+                // ── pdf_manipulator patch: an extractor with no fonts has no names to snapshot ──
+                let extractor_names_before: std::collections::HashSet<String> =
+                    if extractor.has_fonts() {
+                        extractor.get_font_set().into_iter().map(|(k, _)| k).collect()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+                // ── end pdf_manipulator patch ──
 
                 let mut all_from_cache = true;
                 // ── pdf_manipulator patch: a page past its font budget reads the rest of its fonts when its content selects them ──
@@ -22578,6 +22636,11 @@ impl PdfDocument {
                 }
                 // ── end pdf_manipulator patch ──
 
+                // ── pdf_manipulator patch: a set no cache would keep is not built to be handed to one ──
+                if !extractor.font_set_fits(crate::host::font_budget::DOCUMENT_FONT_BYTES) {
+                    return Ok(());
+                }
+                // ── end pdf_manipulator patch ──
                 // Cache font set by both ObjectRef and fingerprint
                 let font_set = extractor.get_font_set();
                 if let Some(fdr) = font_dict_ref {

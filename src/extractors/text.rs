@@ -2327,6 +2327,87 @@ struct MarkedContentContext {
     own_mcid: Option<u32>,
 }
 
+// ── pdf_manipulator patch: the stamping pass reads a glyph as a compact record, not a TextChar ──
+/// What the stamping pass (`stamp_char_x_offsets`) reads of a glyph: the
+/// character, where it starts, the box the reading-order sort, the
+/// overlap filter and the Form clip measure, and its advance. A page holds
+/// one of these per glyph for the length of the pass, so its size is declared:
+/// [`ALIGNED_CHAR_BYTES`], with no heap object behind it. (`TextChar`
+/// is 128 bytes and owns a font name.) Declared: 24 bytes. The origin and the box start are
+/// the same point at both places a glyph is read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AlignedChar {
+    pub(crate) char: char,
+    pub(crate) origin_x: f32,
+    pub(crate) origin_y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    pub(crate) advance_width: f32,
+}
+
+/// Bytes one [`AlignedChar`] takes in a page's list of them.
+pub(crate) const ALIGNED_CHAR_BYTES: usize = std::mem::size_of::<AlignedChar>();
+const _: () = assert!(ALIGNED_CHAR_BYTES == 24);
+
+/// The most a list of glyphs holds beyond its glyphs, as a fraction: a full
+/// list grows by this share of itself (and at least 4096), not by doubling, so
+/// the room a page holds past its glyphs is bounded by `1 / GLYPH_GROWTH_DIVISOR`.
+const GLYPH_GROWTH_DIVISOR: usize = 16;
+
+/// Pushes `glyph`, growing a full list by a sixteenth of itself.
+fn push_glyph<T>(list: &mut Vec<T>, glyph: T) {
+    if list.len() == list.capacity() {
+        list.reserve_exact((list.capacity() / GLYPH_GROWTH_DIVISOR).max(4096));
+    }
+    list.push(glyph);
+}
+
+/// A glyph as the reading-order sort and the overlap filter read it.
+pub(crate) trait GlyphRow {
+    fn glyph(&self) -> char;
+    fn x(&self) -> f32;
+    fn y(&self) -> f32;
+    fn width(&self) -> f32;
+    fn advance(&self) -> f32;
+}
+
+impl GlyphRow for TextChar {
+    fn glyph(&self) -> char {
+        self.char
+    }
+    fn x(&self) -> f32 {
+        self.bbox.x
+    }
+    fn y(&self) -> f32 {
+        self.bbox.y
+    }
+    fn width(&self) -> f32 {
+        self.bbox.width
+    }
+    fn advance(&self) -> f32 {
+        self.advance_width
+    }
+}
+
+impl GlyphRow for AlignedChar {
+    fn glyph(&self) -> char {
+        self.char
+    }
+    fn x(&self) -> f32 {
+        self.origin_x
+    }
+    fn y(&self) -> f32 {
+        self.origin_y
+    }
+    fn width(&self) -> f32 {
+        self.width
+    }
+    fn advance(&self) -> f32 {
+        self.advance_width
+    }
+}
+// ── end pdf_manipulator patch ──
+
 /// Text extractor that processes content streams.
 ///
 /// This structure maintains the graphics state stack and font information
@@ -2358,6 +2439,12 @@ pub struct TextExtractor<'doc> {
     spans: Vec<TextSpan>,
     /// Extracted characters (for backward compatibility)
     chars: Vec<TextChar>,
+    // ── pdf_manipulator patch: the glyphs of the stamping pass ──
+    /// The glyphs read in aligned mode, in place of `chars`.
+    aligned: Vec<AlignedChar>,
+    /// Whether glyphs go to `aligned` and not to `chars`.
+    aligned_mode: bool,
+    // ── end pdf_manipulator patch ──
     /// Resources dictionary (for accessing XObjects and fonts)
     resources: Option<Object>,
     /// Reference to the document (for loading XObjects)
@@ -2578,6 +2665,10 @@ impl<'doc> TextExtractor<'doc> {
             // ── end pdf_manipulator patch ──
             spans: Vec::new(),
             chars: Vec::new(),
+            // ── pdf_manipulator patch: the glyphs of the stamping pass ──
+            aligned: Vec::new(),
+            aligned_mode: false,
+            // ── end pdf_manipulator patch ──
             resources: None,
             document: None,
             processed_xobjects: HashSet::new(),
@@ -3482,6 +3573,19 @@ impl<'doc> TextExtractor<'doc> {
     }
     // ── end pdf_manipulator patch ──
 
+    // ── pdf_manipulator patch: the font set is sized before it is built ──
+    /// Whether the extractor holds any font it has read.
+    pub(crate) fn has_fonts(&self) -> bool {
+        !self.fonts.is_empty()
+    }
+
+    /// Whether the fonts the extractor holds, charged as a cache charges a
+    /// set of them, take at most `budget` bytes.
+    pub(crate) fn font_set_fits(&self, budget: usize) -> bool {
+        crate::host::font_budget::set_fits(self.fonts.iter(), budget)
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Return the current font set for caching purposes.
     pub fn get_font_set(&self) -> Vec<(String, Arc<FontInfo>)> {
         self.fonts
@@ -3794,6 +3898,8 @@ impl<'doc> TextExtractor<'doc> {
         // Enable character extraction mode
         self.extract_spans = false;
         self.chars.clear();
+        // The compact glyphs start empty too.
+        self.aligned.clear();
         self.spans.clear(); // Ensure spans are clear so they don't poison xobject_spans_cache
         self.begin_page(&source);
 
@@ -3815,6 +3921,22 @@ impl<'doc> TextExtractor<'doc> {
 
         Ok(())
     }
+
+    // ── pdf_manipulator patch: the stamping pass reads compact glyphs ──
+    /// The glyphs of the page as [`AlignedChar`]s, in the order and with the
+    /// overlaps dropped that [`Self::extract_owned_from`] gives its
+    /// `TextChar`s.
+    pub(crate) fn extract_aligned_from(
+        &mut self,
+        source: Arc<OperatorSource<'doc>>,
+    ) -> Result<Vec<AlignedChar>> {
+        self.aligned_mode = true;
+        let read = self.extract_into_self(source);
+        self.aligned_mode = false;
+        read?;
+        Ok(std::mem::take(&mut self.aligned))
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Same extraction as [`Self::extract`], but hands the buffer over instead
     /// of copying it. Every `TextChar` owns a `font_name` String, so `extract`'s
@@ -3859,11 +3981,19 @@ impl<'doc> TextExtractor<'doc> {
     /// back to `bbox.width` when `advance_width` is missing from the font
     /// dictionary.
     fn deduplicate_overlapping_chars(&mut self) {
-        if self.chars.is_empty() {
+        Self::deduplicate_glyphs(&mut self.chars);
+        // ── pdf_manipulator patch: the compact glyphs are filtered the same way ──
+        Self::deduplicate_glyphs(&mut self.aligned);
+        // ── end pdf_manipulator patch ──
+    }
+
+    // ── pdf_manipulator patch: one filter for both kinds of glyph ──
+    fn deduplicate_glyphs<T: GlyphRow>(glyphs: &mut Vec<T>) {
+        if glyphs.is_empty() {
             return;
         }
 
-        let before = self.chars.len();
+        let before = glyphs.len();
         let mut prev_y_rounded: Option<i32> = None;
         let mut prev_x: Option<f32> = None;
         let mut prev_char: Option<char> = None;
@@ -3872,9 +4002,9 @@ impl<'doc> TextExtractor<'doc> {
         // KEPT glyph, which `retain`'s in-order visit preserves. Building a
         // second Vec instead deep-cloned every glyph — and `TextChar` owns a
         // `font_name` String, so that was one malloc per glyph, per page.
-        self.chars.retain(|ch| {
-            let y_rounded = ch.bbox.y.round() as i32;
-            let x = ch.bbox.x;
+        glyphs.retain(|ch| {
+            let y_rounded = ch.y().round() as i32;
+            let x = ch.x();
 
             // Check if this char overlaps with the previous one
             let should_skip = if let (Some(prev_y), Some(prev_x_val), Some(prev_ch)) =
@@ -3883,17 +4013,17 @@ impl<'doc> TextExtractor<'doc> {
                 // Reference width: advance_width if known, else bbox.width,
                 // else the legacy cap (keeps behaviour for pathological
                 // inputs without advance metrics).
-                let ref_width = if ch.advance_width > 0.0 {
-                    ch.advance_width
-                } else if ch.bbox.width > 0.0 {
-                    ch.bbox.width
+                let ref_width = if ch.advance() > 0.0 {
+                    ch.advance()
+                } else if ch.width() > 0.0 {
+                    ch.width()
                 } else {
                     Self::DEDUP_OVERLAP_CAP_PT
                 };
                 let threshold =
                     (ref_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
                 // Same character, same line, and within `threshold` horizontally
-                ch.char == prev_ch && y_rounded == prev_y && (x - prev_x_val).abs() < threshold
+                ch.glyph() == prev_ch && y_rounded == prev_y && (x - prev_x_val).abs() < threshold
             } else {
                 false
             };
@@ -3901,25 +4031,28 @@ impl<'doc> TextExtractor<'doc> {
             if !should_skip {
                 prev_y_rounded = Some(y_rounded);
                 prev_x = Some(x);
-                prev_char = Some(ch.char);
+                prev_char = Some(ch.glyph());
             } else {
                 log::trace!(
                     "Deduplicating overlapping char '{}' at X={:.1}, Y={:.1} (too close to previous)",
-                    ch.char,
+                    ch.glyph(),
                     x,
-                    ch.bbox.y
+                    ch.y()
                 );
             }
             !should_skip
         });
+        // The list keeps the room of the glyphs it dropped unless it gives it back.
+        glyphs.shrink_to_fit();
 
         log::debug!(
             "Deduplicated {} overlapping characters ({} -> {} chars)",
-            before - self.chars.len(),
+            before - glyphs.len(),
             before,
-            self.chars.len()
+            glyphs.len()
         );
     }
+    // ── end pdf_manipulator patch ──
 
     /// Snap super/subscript glyph spans onto the baseline of an
     /// adjacent base span so downstream row-aware sorting keeps
@@ -4328,13 +4461,16 @@ impl<'doc> TextExtractor<'doc> {
         // whose bbox overlaps an earlier one by >= 70 % is dropped.
         self.dedup_stroke_fill_overlap();
 
-        // Take ownership of spans to avoid cloning during iteration
-        let old_len = self.spans.len();
-        let spans = std::mem::take(&mut self.spans);
-        let mut deduplicated = Vec::with_capacity(old_len);
+        // ── pdf_manipulator patch: the kept spans are packed in place, and the places a text was kept are flat vectors found by hash ──
+        Self::dedup_positional_spans(&mut self.spans);
+    }
+
+    pub(crate) fn dedup_positional_spans(spans: &mut Vec<TextSpan>) {
+        use crate::host::group_table::{hash_bytes, GroupTable};
+        let old_len = spans.len();
+        let mut kept = 0usize;
         let mut prev_y_rounded: Option<i32> = None;
         let mut prev_x: Option<f32> = None;
-        let mut prev_text: Option<String> = None;
         // Every place a given string has been kept, not merely the last one.
         //
         // One slot per string cannot see an overprint. A page that draws each
@@ -4344,21 +4480,39 @@ impl<'doc> TextExtractor<'doc> {
         // overwrites it with the `S` at the end of the same word. The second
         // pass then compares its `S` against the wrong one and finds no
         // duplicate.
-        const MAX_TRACKED_POSITIONS: usize = 32;
-        let mut seen_content: std::collections::HashMap<String, Vec<(f32, f32)>> =
-            std::collections::HashMap::new();
+        //
+        // A string is one `Text` in `texts`, found through `table` by the hash
+        // of the string and told from another string with an equal hash by
+        // comparing the strings; its positions are a chain of `Place`s.
+        const MAX_TRACKED_POSITIONS: u32 = 32;
+        const NONE: u32 = u32::MAX;
+        struct Text {
+            span: u32,
+            head: u32,
+            count: u32,
+        }
+        struct Place {
+            x: f32,
+            y: f32,
+            next: u32,
+        }
+        let mut table = GroupTable::new();
+        let mut texts: Vec<Text> = Vec::new();
+        let mut places: Vec<Place> = Vec::new();
 
         let mut geometric_skips = 0;
         let mut content_skips = 0;
 
-        for span in spans {
+        for at in 0..old_len {
+            let span = &spans[at];
             let y_rounded = span.bbox.y.round() as i32;
             let x = span.bbox.x;
 
             // PHASE 1: Geometric deduplication — require BOTH position AND text match
-            let geometric_duplicate = if let (Some(prev_y), Some(prev_x_val), Some(ref prev_txt)) =
-                (prev_y_rounded, prev_x, &prev_text)
+            let geometric_duplicate = if let (Some(prev_y), Some(prev_x_val), true) =
+                (prev_y_rounded, prev_x, kept > 0)
             {
+                let prev_txt = &spans[kept - 1].text;
                 // Threshold scales with the span's per-glyph advance so that
                 // single-glyph narrow spans (`l`, `r`, `I`) are never wrongly
                 // treated as overlapping with their legitimate neighbour.
@@ -4388,6 +4542,7 @@ impl<'doc> TextExtractor<'doc> {
             // legitimate repeats of one letter — the `ll` in `callibrator`, an
             // `SS` — stand a full advance apart and are never confused with a
             // pair that differs by a fraction of one.
+            let text_hash = hash_bytes(span.text.bytes(), 0);
             let content_duplicate = {
                 let char_count = span.text.chars().count().max(1) as f32;
                 let per_glyph_width = (span.bbox.width / char_count).max(0.1);
@@ -4396,14 +4551,24 @@ impl<'doc> TextExtractor<'doc> {
                 } else {
                     (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT)
                 };
-                seen_content.get(&span.text).is_some_and(|seen| {
-                    seen.iter().any(|(prev_x_val, prev_y_val)| {
-                        (span.bbox.y - prev_y_val).abs() < 2.0
-                            && (span.bbox.x - prev_x_val).abs() < x_bar
+                table
+                    .find(text_hash, |g| spans[texts[g as usize].span as usize].text == span.text)
+                    .is_some_and(|g| {
+                        let mut place = texts[g as usize].head;
+                        while place != NONE {
+                            let seen = &places[place as usize];
+                            place = seen.next;
+                            if (span.bbox.y - seen.y).abs() < 2.0
+                                && (span.bbox.x - seen.x).abs() < x_bar
+                            {
+                                return true;
+                            }
+                        }
+                        false
                     })
-                })
             };
 
+            let (bbox_x, bbox_y) = (span.bbox.x, span.bbox.y);
             if geometric_duplicate {
                 geometric_skips += 1;
             } else if content_duplicate {
@@ -4411,18 +4576,31 @@ impl<'doc> TextExtractor<'doc> {
             } else {
                 prev_y_rounded = Some(y_rounded);
                 prev_x = Some(x);
-                prev_text = Some(span.text.clone());
 
+                if at != kept {
+                    spans.swap(kept, at);
+                }
                 // Track content for duplicate detection. Bounded, so a page
                 // repeating one string thousands of times cannot grow this
                 // without limit; the positions that matter for an overprint are
                 // the recent ones.
-                let at = seen_content.entry(span.text.clone()).or_default();
-                if at.len() < MAX_TRACKED_POSITIONS {
-                    at.push((span.bbox.x, span.bbox.y));
+                let group = match table.find(text_hash, |g| {
+                    spans[texts[g as usize].span as usize].text == spans[kept].text
+                }) {
+                    Some(group) => group,
+                    None => {
+                        let group = table.insert(text_hash);
+                        texts.push(Text { span: kept as u32, head: NONE, count: 0 });
+                        group
+                    },
+                };
+                let text = &mut texts[group as usize];
+                if text.count < MAX_TRACKED_POSITIONS {
+                    places.push(Place { x: bbox_x, y: bbox_y, next: text.head });
+                    text.head = (places.len() - 1) as u32;
+                    text.count += 1;
                 }
-                // Move span instead of cloning
-                deduplicated.push(span);
+                kept += 1;
             }
         }
 
@@ -4432,11 +4610,12 @@ impl<'doc> TextExtractor<'doc> {
             geometric_skips,
             content_skips,
             old_len,
-            deduplicated.len()
+            kept
         );
 
-        self.spans = deduplicated;
+        spans.truncate(kept);
     }
+    // ── end pdf_manipulator patch ──
 
     /// Drop same-text spans whose bounding boxes overlap heavily with an
     /// earlier span. This is the canonical stroke+fill pattern on maps,
@@ -4449,45 +4628,76 @@ impl<'doc> TextExtractor<'doc> {
     /// lookup O(1) without quadratic bbox comparisons on large pages.
     /// The actual overlap check falls through to a real IoU on collision.
     fn dedup_stroke_fill_overlap(&mut self) {
-        use std::collections::HashMap;
+        Self::dedup_stroke_fill_spans(&mut self.spans);
+    }
 
-        if self.spans.len() < 2 {
+    // ── pdf_manipulator patch: the pass is over a list, so a proof can compare it with the pass it replaced ──
+    pub(crate) fn dedup_stroke_fill_spans(spans: &mut Vec<TextSpan>) {
+        use crate::host::group_table::{hash_bytes, GroupTable};
+
+        if spans.len() < 2 {
             return;
         }
-        let old_len = self.spans.len();
-        let spans = std::mem::take(&mut self.spans);
+        let old_len = spans.len();
         // Bucket each text key into a coarse (cx,cy) grid instead of one flat
         // Vec (O(k²) when a short label repeats N times). The IoU ≥ 0.7 test is
         // unchanged: a partner with that overlap is within ≈0.176·width, so it
         // falls in this cell or a neighbour — querying the 3×3 neighbourhood
         // finds every match the full scan would. Only runs for text ≥ 2 chars
         // (shorter candidates rely on downstream positional dedup).
+        //
+        // The grid is flat vectors found by hash, and the kept spans are packed in place.
+        // A cell of a text is one `Cell` in `cells` found through `table` (the
+        // hash of the lowercased text and the cell), told from another cell
+        // with an equal hash by comparing the text and the cell themselves,
+        // and its rectangles are a chain of `Node`s: a few tens of bytes for
+        // each kept span, and no string or map of its own. The spans kept are
+        // moved to the front of the list, so the list is not copied.
         const CELL: f32 = 16.0;
-        type Grid = HashMap<(i32, i32), Vec<crate::geometry::Rect>>;
-        let mut seen: HashMap<String, Grid> = HashMap::new();
-        let mut kept: Vec<TextSpan> = Vec::with_capacity(old_len);
+        struct Cell {
+            span: u32,
+            at: (i32, i32),
+            head: u32,
+        }
+        struct Node {
+            rect: crate::geometry::Rect,
+            next: u32,
+        }
+        const NONE: u32 = u32::MAX;
+        let mut table = GroupTable::new();
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut nodes: Vec<Node> = Vec::new();
+        let cell_hash = |text_hash: u64, gx: i32, gy: i32| {
+            hash_bytes(gx.to_le_bytes().into_iter().chain(gy.to_le_bytes()), text_hash)
+        };
+        let mut kept = 0usize;
         let mut skipped = 0usize;
-        for span in spans {
+        for at in 0..old_len {
+            let span = &spans[at];
             let trimmed = span.text.trim();
-            if trimmed.chars().count() < 2 {
-                kept.push(span);
-                continue;
-            }
-            let key = trimmed.to_ascii_lowercase();
-            let b = span.bbox;
-            let cx = ((b.x + b.width * 0.5) / CELL).floor() as i32;
-            let cy = ((b.y + b.height * 0.5) / CELL).floor() as i32;
-            let mut is_dup = false;
-            if let Some(grid) = seen.get(&key) {
+            let mut long = None;
+            if trimmed.chars().count() >= 2 {
+                let b = span.bbox;
+                let cx = ((b.x + b.width * 0.5) / CELL).floor() as i32;
+                let cy = ((b.y + b.height * 0.5) / CELL).floor() as i32;
+                let text_hash = hash_bytes(trimmed.bytes().map(|c| c.to_ascii_lowercase()), 0);
+                let mut is_dup = false;
                 // Saturating bounds: a span with an extreme/out-of-page bbox can
                 // push cx/cy to the i32 limits, where `cx + 1` would overflow in
                 // an overflow-checked build (observed on 1008.3918v2.pdf).
                 'outer: for gx in cx.saturating_sub(1)..=cx.saturating_add(1) {
                     for gy in cy.saturating_sub(1)..=cy.saturating_add(1) {
-                        let Some(others) = grid.get(&(gx, gy)) else {
+                        let Some(cell) = table.find(cell_hash(text_hash, gx, gy), |g| {
+                            let cell = &cells[g as usize];
+                            cell.at == (gx, gy)
+                                && spans[cell.span as usize].text.trim().eq_ignore_ascii_case(trimmed)
+                        }) else {
                             continue;
                         };
-                        for other in others {
+                        let mut node = cells[cell as usize].head;
+                        while node != NONE {
+                            let other = &nodes[node as usize].rect;
+                            node = nodes[node as usize].next;
                             // IoU — intersection over union. >= 0.7 means the
                             // two bboxes are almost the same rectangle, which is
                             // what stroke+fill produces.
@@ -4509,23 +4719,41 @@ impl<'doc> TextExtractor<'doc> {
                         }
                     }
                 }
+                if is_dup {
+                    skipped += 1;
+                    continue;
+                }
+                long = Some((b, cx, cy, text_hash));
             }
-            if is_dup {
-                skipped += 1;
-            } else {
-                seen.entry(key)
-                    .or_default()
-                    .entry((cx, cy))
-                    .or_default()
-                    .push(b);
-                kept.push(span);
+            if at != kept {
+                spans.swap(kept, at);
             }
+            if let Some((b, cx, cy, text_hash)) = long {
+                let hash = cell_hash(text_hash, cx, cy);
+                let trimmed = spans[kept].text.trim();
+                let cell = match table.find(hash, |g| {
+                    let cell = &cells[g as usize];
+                    cell.at == (cx, cy)
+                        && spans[cell.span as usize].text.trim().eq_ignore_ascii_case(trimmed)
+                }) {
+                    Some(cell) => cell,
+                    None => {
+                        let cell = table.insert(hash);
+                        cells.push(Cell { span: kept as u32, at: (cx, cy), head: NONE });
+                        cell
+                    },
+                };
+                nodes.push(Node { rect: b, next: cells[cell as usize].head });
+                cells[cell as usize].head = (nodes.len() - 1) as u32;
+            }
+            kept += 1;
         }
         if skipped > 0 {
             log::debug!("Stroke+fill dedup: dropped {skipped} duplicate spans of {old_len}");
         }
-        self.spans = kept;
+        spans.truncate(kept);
     }
+    // ── end pdf_manipulator patch ──
 
     /// Merge adjacent text spans on the same line to reconstruct complete words.
     ///
@@ -5415,41 +5643,49 @@ impl<'doc> TextExtractor<'doc> {
     /// This is critical for proper text extraction as PDF content streams are
     /// organized for rendering efficiency, not reading order.
     fn sort_by_reading_order(&mut self) {
-        self.chars.sort_by(|a, b| {
+        Self::sort_glyphs(&mut self.chars);
+        // ── pdf_manipulator patch: the compact glyphs are put in the same order ──
+        Self::sort_glyphs(&mut self.aligned);
+        // ── end pdf_manipulator patch ──
+    }
+
+    // ── pdf_manipulator patch: one order for both kinds of glyph ──
+    fn sort_glyphs<T: GlyphRow>(glyphs: &mut [T]) {
+        glyphs.sort_by(|a, b| {
             // Handle NaN/Inf values - treat them as at the end
-            if !a.bbox.y.is_finite() {
-                return if b.bbox.y.is_finite() {
+            if !a.y().is_finite() {
+                return if b.y().is_finite() {
                     std::cmp::Ordering::Greater
                 } else {
                     std::cmp::Ordering::Equal
                 };
             }
-            if !b.bbox.y.is_finite() {
+            if !b.y().is_finite() {
                 return std::cmp::Ordering::Less;
             }
 
             // Sort by Y descending (top first), then by X ascending (left to right)
             // Round Y coordinates to ensure transitivity of the comparison function
-            let a_y_rounded = a.bbox.y.round() as i32;
-            let b_y_rounded = b.bbox.y.round() as i32;
+            let a_y_rounded = a.y().round() as i32;
+            let b_y_rounded = b.y().round() as i32;
 
             match b_y_rounded.cmp(&a_y_rounded) {
                 std::cmp::Ordering::Equal => {
                     // Same line: sort by X ascending (left to right)
-                    if !a.bbox.x.is_finite() {
-                        return if b.bbox.x.is_finite() {
+                    if !a.x().is_finite() {
+                        return if b.x().is_finite() {
                             std::cmp::Ordering::Greater
                         } else {
                             std::cmp::Ordering::Equal
                         };
                     }
-                    if !b.bbox.x.is_finite() {
+                    if !b.x().is_finite() {
                         return std::cmp::Ordering::Less;
                     }
 
-                    if a.bbox.x < b.bbox.x {
+                    if a.x() < b.x() {
                         std::cmp::Ordering::Less
-                    } else if a.bbox.x > b.bbox.x {
+                    } else if a.x() > b.x() {
                         std::cmp::Ordering::Greater
                     } else {
                         std::cmp::Ordering::Equal
@@ -5459,6 +5695,7 @@ impl<'doc> TextExtractor<'doc> {
             }
         });
     }
+    // ── end pdf_manipulator patch ──
 
     /// ISSUE 1 FIX: Split fused words created by PDF authoring defects
     ///
@@ -5988,6 +6225,21 @@ impl<'doc> TextExtractor<'doc> {
                                         let rotation_degrees =
                                             final_matrix.b.atan2(final_matrix.a).to_degrees();
 
+                                        // ── pdf_manipulator patch: the stamping pass keeps the compact record ──
+                                        if self.aligned_mode && !self.is_content_suppressed() {
+                                            push_glyph(
+                                                &mut self.aligned,
+                                                AlignedChar {
+                                                    char: ' ',
+                                                    origin_x: pos.x,
+                                                    origin_y: pos.y,
+                                                    width: tx.abs(),
+                                                    height: effective_font_size,
+                                                    advance_width: tx.abs(),
+                                                },
+                                            );
+                                        }
+                                        // ── end pdf_manipulator patch ──
                                         let space_char = TextChar {
                                             char: ' ',
                                             bbox: Rect::new(
@@ -6022,7 +6274,9 @@ impl<'doc> TextExtractor<'doc> {
                                                 final_matrix.f,
                                             ]),
                                         };
-                                        if !self.is_content_suppressed() {
+                                        // ── pdf_manipulator patch: the stamping pass keeps the compact record ──
+                                        if !self.aligned_mode && !self.is_content_suppressed() {
+                                        // ── end pdf_manipulator patch ──
                                             self.chars.push(space_char);
                                         }
                                     }
@@ -7310,6 +7564,9 @@ impl<'doc> TextExtractor<'doc> {
                 // below can be applied to whichever layer this extraction is
                 // populating. Only one of the two grows per run.
                 let chars_before = self.chars.len();
+                // ── pdf_manipulator patch: the same mark for the compact glyphs ──
+                let aligned_before = self.aligned.len();
+                // ── end pdf_manipulator patch ──
 
                 // Save graphics state (implicit q per ISO 32000-1 §8.10.1)
                 self.state_stack.save();
@@ -7362,8 +7619,11 @@ impl<'doc> TextExtractor<'doc> {
                 // on every form whose painted text lies inside its BBox (the
                 // conformant majority) — only out-of-BBox marks are dropped.
                 if let Some([bx0, by0, bx1, by1]) = form_bbox {
-                    let painted_anything =
-                        self.spans.len() > spans_before || self.chars.len() > chars_before;
+                    // ── pdf_manipulator patch: a form that painted compact glyphs painted ──
+                    let painted_anything = self.spans.len() > spans_before
+                        || self.chars.len() > chars_before
+                        || self.aligned.len() > aligned_before;
+                    // ── end pdf_manipulator patch ──
                     if painted_anything && bx1 > bx0 && by1 > by0 {
                         // Map the BBox corners through the form CTM into page space
                         // and take the axis-aligned bound (a superset for rotated
@@ -7397,6 +7657,13 @@ impl<'doc> TextExtractor<'doc> {
                             };
                             let inside = |s: &TextSpan| inside_bbox(&s.bbox);
                             let inside_char = |c: &TextChar| inside_bbox(&c.bbox);
+                            // ── pdf_manipulator patch: the same test on the compact glyphs ──
+                            let inside_aligned = |c: &AlignedChar| {
+                                inside_bbox(&crate::geometry::Rect::new(
+                                    c.origin_x, c.origin_y, c.width, c.height,
+                                ))
+                            };
+                            // ── end pdf_manipulator patch ──
                             // Fast path: when every span this form painted is
                             // already inside its /BBox (the conformant majority —
                             // and where this clip is a no-op anyway), skip the
@@ -7407,7 +7674,11 @@ impl<'doc> TextExtractor<'doc> {
                             let spans_stray = self.spans[spans_before..].iter().any(|s| !inside(s));
                             let chars_stray =
                                 self.chars[chars_before..].iter().any(|c| !inside_char(c));
-                            if spans_stray || chars_stray {
+                            // ── pdf_manipulator patch: the same scan of the compact glyphs ──
+                            let aligned_stray =
+                                self.aligned[aligned_before..].iter().any(|c| !inside_aligned(c));
+                            if spans_stray || chars_stray || aligned_stray {
+                            // ── end pdf_manipulator patch ──
                                 // Out-of-BBox spans exist. Distinguish a real
                                 // figure form (whose stray out-of-BBox text is a
                                 // draft-galley underlay safe to drop) from a
@@ -7448,6 +7719,18 @@ impl<'doc> TextExtractor<'doc> {
                                             added.into_iter().filter(inside_char).collect();
                                         self.chars.extend(kept);
                                     }
+                                    // ── pdf_manipulator patch: the same clip of the compact glyphs, in place ──
+                                    if aligned_stray {
+                                        let mut at = aligned_before;
+                                        for i in aligned_before..self.aligned.len() {
+                                            if inside_aligned(&self.aligned[i]) {
+                                                self.aligned[at] = self.aligned[i];
+                                                at += 1;
+                                            }
+                                        }
+                                        self.aligned.truncate(at);
+                                    }
+                                    // ── end pdf_manipulator patch ──
                                 }
                             }
                         }
@@ -9408,6 +9691,24 @@ impl<'doc> TextExtractor<'doc> {
                     let char_origin_x = pos.x + x_offset_device;
                     let char_origin_y = pos.y;
 
+                    // ── pdf_manipulator patch: the stamping pass keeps the compact record ──
+                    if self.aligned_mode {
+                        if !self.is_content_suppressed() {
+                            push_glyph(
+                                &mut self.aligned,
+                                AlignedChar {
+                                    char: unicode_char,
+                                    origin_x: char_origin_x,
+                                    origin_y: char_origin_y,
+                                    width: char_width_device,
+                                    height: height_device_space,
+                                    advance_width: char_width_device,
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                    // ── end pdf_manipulator patch ──
                     let text_char = TextChar {
                         char: unicode_char,
                         bbox: Rect::new(

@@ -71,6 +71,7 @@ mod mem_page_text;
 mod mem_structure;
 mod mem_xfa;
 mod mem_xmp;
+mod span_dedupe_same;
 mod own_process;
 mod page_operators;
 #[cfg(feature = "rendering")]

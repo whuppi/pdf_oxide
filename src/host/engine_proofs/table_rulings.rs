@@ -13,6 +13,18 @@ use crate::layout::TextSpan;
 use crate::structure::spatial_table_detector::{detect_tables, TableDetectionConfig, TableStrategy};
 use std::time::Instant;
 
+/// This thread's CPU time in milliseconds. Wall time counts every other test
+/// the runner has in flight, so two sizes timed one after the other differed
+/// by the machine's load, not by the detector; a thread's own CPU time does not.
+#[cfg(unix)]
+fn thread_cpu_ms() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid out-pointer for the one call.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+    ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1_000_000.0
+}
+
 /// One-page document around a content stream, with a large page and Helvetica as F1.
 fn page_with(content: &str, size: u32) -> Vec<u8> {
     pdf_from_objects(&[
@@ -192,10 +204,11 @@ fn lattice(tables: usize) -> (RulingGrid, Vec<TextSpan>) {
     (grid, spans)
 }
 
-/// The tables found in a lattice of `tables` and the milliseconds the grid and
-/// the detector took together, per 10,000 primitives.
+/// The tables found in a lattice of `tables` and the CPU milliseconds the grid
+/// and the detector took together on this thread, per 10,000 primitives.
+#[cfg(unix)]
 fn milliseconds_per_ten_thousand(tables: usize) -> (usize, f64) {
-    let started = Instant::now();
+    let started = thread_cpu_ms();
     let (grid, spans) = lattice(tables);
     let primitives = grid.primitives();
     let found = detect_tables(
@@ -207,12 +220,13 @@ fn milliseconds_per_ten_thousand(tables: usize) -> (usize, f64) {
     .unwrap();
     let count = found.len();
     std::hint::black_box(&found);
-    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let ms = thread_cpu_ms() - started;
     (count, ms / (primitives as f64 / 10_000.0))
 }
 
 /// Milliseconds per 10,000 primitives at `tables` tables: the quicker of
 /// `runs` runs, so a slow start does not stand for the size. Every table must be found.
+#[cfg(unix)]
 fn best_milliseconds(tables: usize, runs: usize) -> f64 {
     (0..runs)
         .map(|_| {
@@ -223,7 +237,7 @@ fn best_milliseconds(tables: usize, runs: usize) -> f64 {
         .fold(f64::MAX, f64::min)
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(unix, not(debug_assertions)))]
 /// No Dart battery sees it: only a comparison of two sizes shows growth, and
 /// a million rulings is too many for a document test. Compiled for release
 /// only, since the debug profile runs it for minutes.
@@ -235,7 +249,7 @@ fn a_hundred_thousand_and_a_million_rulings_cost_the_same_per_primitive() {
     assert!(large / small < 1.3, "{small:.1} ms at 100k and {large:.1} ms at 1M per 10k primitives");
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(unix, debug_assertions))]
 /// No Dart battery sees it, as above. The debug profile reads a smaller pair.
 #[test]
 fn ten_thousand_and_a_hundred_thousand_rulings_cost_about_the_same_per_primitive() {

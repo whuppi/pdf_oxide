@@ -22,6 +22,8 @@ mod engine_proofs;
 pub(crate) mod flat_extras_seam;
 pub mod caches;
 pub mod heap;
+pub mod group_table;
+pub mod piece_budget;
 pub mod engine_state;
 /// Per-op dispatch units (entry + handler + linker anchor).
 pub mod ops;

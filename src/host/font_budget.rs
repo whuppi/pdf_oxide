@@ -165,6 +165,22 @@ fn set_bytes(set: &[(String, Arc<FontInfo>)]) -> usize {
     set.iter().map(|(name, font)| name.capacity() + MAP_SLOT + font_bytes(font)).sum()
 }
 
+/// Whether a set of fonts, charged as [`set_bytes`] charges it, takes at most
+/// `budget` bytes; stops counting once it does not.
+pub(crate) fn set_fits<'a>(
+    fonts: impl Iterator<Item = (&'a String, &'a Arc<FontInfo>)>,
+    budget: usize,
+) -> bool {
+    let mut bytes = 0usize;
+    for (name, font) in fonts {
+        bytes += name.len() + MAP_SLOT + font_bytes(font);
+        if bytes > budget {
+            return false;
+        }
+    }
+    true
+}
+
 impl Charge for Vec<(String, Arc<FontInfo>)> {
     fn charge(&self) -> usize {
         set_bytes(self)

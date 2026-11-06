@@ -184,7 +184,7 @@ fn extract_spans_holds_the_page_once() {
 
 /// Assembling the text of a tagged page of 20,000 runs in structure order,
 /// given its spans and with the elements it reads in the object cache, takes
-/// at most 420 bytes a run and 256 KiB over what it was given: the spans are
+/// at most [`crate::host::piece_budget::ASSEMBLY_BYTES_PER_PIECE`] bytes a run and 256 KiB over what it was given: the spans are
 /// grouped by marked-content id as ranges of one list, not a list of their
 /// own per id, and no copy of their text is kept per id. No Dart battery can
 /// observe this: the text is the same word for word, and only the allocator
@@ -195,7 +195,7 @@ fn tagged_assembly_holds_no_bucket_or_text_copy_per_marked_content_id() {
         module_path!(),
         "tagged_assembly_holds_no_bucket_or_text_copy_per_marked_content_id",
         || {
-            const K: usize = 420;
+            const K: usize = crate::host::piece_budget::ASSEMBLY_BYTES_PER_PIECE;
             const C: usize = 256 * 1024;
             let (doc, spans) = tagged_and_spans();
             let tree = doc.struct_tree_trustworthy().expect("the page is tagged");
@@ -534,5 +534,213 @@ fn the_runs_of_one_font_share_its_name() {
         assert_eq!(spans[0].font_name, "Helvetica");
         assert!(spans.iter().all(|s| s.font_name == spans[0].font_name));
         assert!(held <= RUNS * K + C, "{held} bytes held, over {RUNS}*{K}+{C}");
+    });
+}
+
+/// A tagged page of `runs` runs and the spans another copy of it extracts, so
+/// the document a proof measures starts with no page cached.
+fn tagged_and_spans_of(runs: usize) -> (PdfDocument, Vec<TextSpan>) {
+    let bytes = tagged_page(runs);
+    let spans = PdfDocument::from_bytes(bytes.clone()).unwrap().extract_spans(0).unwrap();
+    assert_eq!(spans.len(), runs);
+    (PdfDocument::from_bytes(bytes).unwrap(), spans)
+}
+
+/// What the stamping pass takes at its peak over what the document held
+/// before it, for a tagged page of `runs` runs.
+fn stamping_peak(runs: usize) -> usize {
+    let (doc, mut spans) = tagged_and_spans_of(runs);
+    let ((), growth) =
+        heap::growth(|| doc.stamp_char_x_offsets(0, &mut spans, &CancelCheck::none()));
+    growth
+}
+
+/// The stamping pass of a page grows with the page, not with the room a list
+/// of glyphs was given: at 85,000 runs the page's 499,000 glyphs fit a list of
+/// 524,288, and at 170,000 runs its 1,079,000 glyphs did not fit one of
+/// 1,048,576, so a list that doubles held 2,097,152 for them, and the peak
+/// at twice the runs was 3.35 times the peak at the runs. Now a list grows by
+/// a sixteenth of itself and the peak at 2N is at most 2.1 times the peak at N.
+/// No Dart battery can observe this: the offsets stamped are the same at every
+/// size, and only the allocator counter of the engine sees the peak.
+#[test]
+fn the_stamping_pass_grows_linearly_with_the_page() {
+    alone(module_path!(), "the_stamping_pass_grows_linearly_with_the_page", || {
+        let at_n = stamping_peak(85_000);
+        let at_2n = stamping_peak(170_000);
+        println!("stamping peak: {at_n} bytes at 85000 runs, {at_2n} at 170000");
+        assert!(
+            at_2n as f64 <= 2.1 * at_n as f64,
+            "{at_2n} bytes at twice the runs is over 2.1 times {at_n}"
+        );
+    });
+}
+
+/// The stamping pass of a tagged page of 170,000 runs (about 1,079,000
+/// glyphs before the overlap filter) takes at its peak at most
+/// [`crate::host::piece_budget::STAMP_BYTES_PER_PIECE`] bytes a run and 256 KiB:
+/// each glyph is a record of
+/// [`crate::extractors::text::ALIGNED_CHAR_BYTES`] bytes with no heap object
+/// behind it, not a 128-byte `TextChar` with a font name of its own. No Dart
+/// battery can observe this: the offsets stamped are the same either way.
+#[test]
+fn the_stamping_pass_holds_a_declared_number_of_bytes_a_piece() {
+    alone(module_path!(), "the_stamping_pass_holds_a_declared_number_of_bytes_a_piece", || {
+        const RUNS_HERE: usize = 170_000;
+        const C: usize = 256 * 1024;
+        let growth = stamping_peak(RUNS_HERE);
+        let k = crate::host::piece_budget::STAMP_BYTES_PER_PIECE;
+        println!("{RUNS_HERE} runs: the stamping pass peaked {growth} bytes over what the document held");
+        assert!(growth <= RUNS_HERE * k + C, "{growth} bytes, over {RUNS_HERE}*{k}+{C}");
+    });
+}
+
+/// `load_fonts` of a page naming `fonts` fonts: what it takes at its peak over
+/// what the document held before.
+fn load_fonts_peak(fonts: usize) -> usize {
+    let doc = PdfDocument::from_bytes(fonts_page(fonts)).unwrap();
+    let page = doc.get_page(0).unwrap();
+    let resources = page.as_dict().unwrap().get("Resources").unwrap().clone();
+    let mut extractor = crate::extractors::TextExtractor::new();
+    extractor.set_document(&doc);
+    let (result, growth) = heap::growth(|| doc.load_fonts(&resources, &mut extractor));
+    result.unwrap();
+    growth
+}
+
+/// Naming N fonts costs `load_fonts` at most
+/// [`crate::host::piece_budget::LOAD_FONTS_BYTES_PER_FONT`] bytes a font and 1 MiB: the page's
+/// /Font dictionary is walked once, not cloned, and no copy of its names or
+/// entries is made beyond the sorted list of references the order of loading
+/// needs and the name a font left unread waits under. Before, it copied the
+/// dictionary and its names several times, about 1,200 bytes a font. No Dart
+/// battery can observe this: the fonts resolve the same either way.
+#[test]
+fn load_fonts_holds_a_declared_number_of_bytes_a_font() {
+    alone(module_path!(), "load_fonts_holds_a_declared_number_of_bytes_a_font", || {
+        const FONTS: usize = 20_000;
+        const C: usize = 1024 * 1024;
+        let growth = load_fonts_peak(FONTS);
+        let k = crate::host::piece_budget::LOAD_FONTS_BYTES_PER_FONT;
+        println!("{FONTS} fonts: load_fonts peaked {growth} bytes");
+        assert!(growth <= FONTS * k + C, "{growth} bytes, over {FONTS}*{k}+{C}");
+    });
+}
+
+/// `load_fonts` grows with the fonts the page names: the peak for 2N fonts is
+/// at most 2.1 times the peak for N.
+#[test]
+fn load_fonts_grows_linearly_with_the_fonts() {
+    alone(module_path!(), "load_fonts_grows_linearly_with_the_fonts", || {
+        let at_n = load_fonts_peak(10_000);
+        let at_2n = load_fonts_peak(20_000);
+        println!("load_fonts peak: {at_n} bytes for 10000 fonts, {at_2n} for 20000");
+        assert!(at_2n as f64 <= 2.1 * at_n as f64, "{at_2n} is over 2.1 times {at_n}");
+    });
+}
+
+/// A page that shows `AB` twice at nearly one place (the overlap filter drops
+/// the second), then a Form XObject whose /BBox is a corner of the page,
+/// painting one run inside it and one far outside it (the clip drops that one).
+fn overlap_and_clip_page() -> Vec<u8> {
+    pdf_from_objects(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 6 0 R >> /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+            .to_vec(),
+        stream_object(
+            4,
+            "",
+            b"BT /F1 12 Tf 100 700 Td (AB) Tj ET\nBT /F1 12 Tf 100.3 700 Td (AB) Tj ET\n\
+              BT /F1 12 Tf 100 650 Td (C D) Tj ET\n/Fm Do\n",
+        ),
+        stream_object(
+            5,
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+             /Resources << /Font << /F1 6 0 R >> >>",
+            b"BT /F1 10 Tf 10 10 Td (in) Tj ET\nBT /F1 10 Tf 300 300 Td (out) Tj ET\n",
+        ),
+        b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// The compact glyphs the stamping pass reads are the characters it read
+/// before, glyph for glyph: the same characters, at the same origins, in the
+/// same order, after the same sort, overlap filter and Form clip. Nothing a
+/// Dart battery sees could differ otherwise, but a battery cannot tell which
+/// of two paths read the page, so this compares the two.
+#[test]
+fn the_compact_glyphs_are_the_characters_the_stamping_pass_read_before() {
+    let pages = [
+        ("overlap and clip", overlap_and_clip_page()),
+        ("tagged", tagged_page(3_000)),
+        ("fonts", fonts_page(300)),
+    ];
+    for (name, bytes) in pages {
+        let doc = PdfDocument::from_bytes(bytes).unwrap();
+        let cancel = CancelCheck::none();
+        let chars = doc
+            .extract_chars_impl(0, Default::default(), Default::default(), &cancel)
+            .unwrap();
+        let glyphs = doc.extract_aligned_impl(0, &cancel).unwrap();
+        assert!(!glyphs.is_empty(), "{name}: no glyphs");
+        assert_eq!(glyphs.len(), chars.len(), "{name}: glyph count");
+        for (i, (g, c)) in glyphs.iter().zip(&chars).enumerate() {
+            assert_eq!(
+                (g.char, g.origin_x.to_bits(), g.origin_y.to_bits()),
+                (c.char, c.origin_x.to_bits(), c.origin_y.to_bits()),
+                "{name}: glyph {i}"
+            );
+        }
+        if name == "overlap and clip" {
+            let text: String = glyphs.iter().map(|g| g.char).collect();
+            assert!(text.contains("in") && !text.contains("out"), "the clip kept {text:?}");
+            assert_eq!(text.matches('A').count(), 1, "the overlap filter kept {text:?}");
+        }
+    }
+}
+
+/// A whole text extraction of a tagged page takes at its peak, over what the
+/// process held before it, at most
+/// [`crate::host::piece_budget::EXTRACT_BYTES_PER_PIECE`] bytes a run and 1 MiB;
+/// a page of twice the runs takes at most 2.1 times as much. The memprobe rows
+/// `extractAll tagged` and `tagged-2x` hold the engine to the same number.
+/// No Dart battery can observe this: the text is the same word for word, and
+/// only the allocator counter of the engine sees the peak.
+#[test]
+fn a_tagged_page_extracts_within_the_declared_bytes_a_piece() {
+    alone(module_path!(), "a_tagged_page_extracts_within_the_declared_bytes_a_piece", || {
+        const C: usize = 1024 * 1024;
+        let growth_for = |runs: usize| {
+            let doc = PdfDocument::from_bytes(tagged_page(runs)).unwrap();
+            let (text, growth) = heap::growth(|| doc.extract_text(0).unwrap());
+            assert!(text.starts_with("t0"), "{:?}", &text[..8]);
+            growth
+        };
+        let (n, at_n, at_2n) = (40_000, growth_for(40_000), growth_for(80_000));
+        println!("a tagged page: {at_n} bytes for {n} runs, {at_2n} for {}", 2 * n);
+        let bound = crate::host::piece_budget::page_extra(2 * n, 0) + C;
+        assert!(at_2n <= bound, "{at_2n} bytes for {} runs, over {bound}", 2 * n);
+        assert!(at_2n as f64 <= 2.1 * at_n as f64, "{at_2n} is over 2.1 times {at_n}");
+    });
+}
+
+/// The same for a page that names a font for each run: the fonts' own bytes
+/// are [`crate::host::piece_budget::EXTRACT_BYTES_PER_FONT`] a font on top.
+#[test]
+fn a_page_of_fonts_extracts_within_the_declared_bytes_a_font() {
+    alone(module_path!(), "a_page_of_fonts_extracts_within_the_declared_bytes_a_font", || {
+        let growth_for = |fonts: usize| {
+            let doc = PdfDocument::from_bytes(fonts_page(fonts)).unwrap();
+            heap::growth(|| doc.extract_text(0).unwrap()).1
+        };
+        let (n, at_n, at_2n) = (10_000, growth_for(10_000), growth_for(20_000));
+        println!("a fonts page: {at_n} bytes for {n} fonts, {at_2n} for {}", 2 * n);
+        // The caches a document holds fill during the first page (the object
+        // cache, the fonts, the text caches): the per-op ceiling of 16 MiB.
+        let bound = 16 * 1024 * 1024 + crate::host::piece_budget::page_extra(2 * n, 2 * n);
+        assert!(at_2n <= bound, "{at_2n} bytes for {} fonts, over {bound}", 2 * n);
+        assert!(at_2n as f64 <= 2.1 * at_n as f64, "{at_2n} is over 2.1 times {at_n}");
     });
 }
