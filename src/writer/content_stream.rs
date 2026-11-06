@@ -2000,6 +2000,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let mut builder = ContentStreamBuilder::new();
@@ -2068,6 +2071,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
         builder.add_element(&ContentElement::Image(image));
 
@@ -2102,6 +2108,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let mut builder = ContentStreamBuilder::new();

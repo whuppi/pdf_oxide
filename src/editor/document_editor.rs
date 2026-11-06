@@ -14077,6 +14077,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let obj = DocumentEditor::build_image_xobject(&image);
@@ -14107,6 +14110,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let obj = DocumentEditor::build_image_xobject(&image);
@@ -14137,6 +14143,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let obj = DocumentEditor::build_image_xobject(&image);
@@ -14167,6 +14176,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let obj = DocumentEditor::build_image_xobject(&image);
@@ -14197,6 +14209,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let obj = DocumentEditor::build_image_xobject(&image);
@@ -14227,6 +14242,9 @@ mod tests {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
 
         let obj = DocumentEditor::build_image_xobject(&image);

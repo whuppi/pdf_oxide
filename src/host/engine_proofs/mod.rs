@@ -55,6 +55,7 @@ mod reduce_proof;
 mod render_named_glyphs;
 mod editor_pages;
 mod editor_resource_prune;
+mod builder_image_stream;
 mod editor_save;
 mod kept_encryption;
 mod legacy_decoders;

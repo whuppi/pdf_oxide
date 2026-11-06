@@ -2094,6 +2094,34 @@ impl<'a> PageBuilder<'a> {
         if let Some(mask) = data.soft_mask {
             content = content.with_soft_mask(mask);
         }
+        // ── pdf_manipulator patch: a streamed image is placed the way a whole one is ──
+        self.place_image(content, alt_text, is_artifact)
+    }
+
+    /// Places an image that stays in its source until the save at `rect`,
+    /// with the alt text and artifact mark `image_with_options` gives.
+    pub(crate) fn image_streamed(
+        &mut self,
+        image: std::sync::Arc<crate::host::image_embed::StreamedImage>,
+        rect: Rect,
+        alt_text: Option<String>,
+        is_artifact: bool,
+    ) -> &mut Self {
+        use crate::elements::{ColorSpace as EColorSpace, ImageContent, ImageFormat as EImageFormat};
+        let (width, height) = image.size();
+        let mut content = ImageContent::new(rect, EImageFormat::Raw, Vec::new(), width, height);
+        content.color_space = EColorSpace::RGB;
+        content.streamed = Some(image);
+        self.place_image(content, alt_text, is_artifact)
+    }
+
+    fn place_image(
+        &mut self,
+        mut content: crate::elements::ImageContent,
+        alt_text: Option<String>,
+        is_artifact: bool,
+    ) -> &mut Self {
+        // ── end pdf_manipulator patch ──
         if let Some(alt) = alt_text {
             content = content.with_alt_text(alt);
         }

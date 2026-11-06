@@ -2503,6 +2503,7 @@ fn stamp_type_from_name(name: &str) -> Option<crate::writer::StampType> {
 // Uses upstream DocumentBuilder + FluentPageBuilder APIs.
 // ═══════════════════════════════════════════════════════════════════
 
+use crate::host::image_embed::ImageBytes;
 use crate::writer::{DocumentBuilder, FluentPageBuilder, PageSize};
 
 /// A parsed page-building operation, applied by [`apply_page_op`].
@@ -2524,8 +2525,8 @@ pub enum PageOp {
     HorizontalRule,
     /// Place an image at the given rect with alt text.
     Image {
-        /// Raw image bytes (JPEG or PNG).
-        data: Vec<u8>,
+        /// The image, whole or left in its source.
+        data: ImageBytes,
         /// X origin in points.
         x: f32,
         /// Y origin in points.
@@ -2822,8 +2823,8 @@ pub enum PageOp {
     /// Place an image as an artifact (marked, excluded from reading
     /// order), at the given rect.
     ImageArtifact {
-        /// Raw image bytes (JPEG or PNG).
-        data: Vec<u8>,
+        /// The image, whole or left in its source.
+        data: ImageBytes,
         /// X origin.
         x: f32,
         /// Y origin.
@@ -2879,10 +2880,13 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) -> Result<()> {
         PageOp::Space(pts) => page.space(pts),
         PageOp::HorizontalRule => page.horizontal_rule(),
         PageOp::Image { data, x, y, w, h, alt } => {
-            let img = page_image(&data)?;
             // `Rect::new` takes (x, y, width, height): the far
             // corner here scaled every image by its own origin.
-            page.image_with_alt(img, crate::geometry::Rect::new(x, y, w, h), &alt)
+            let rect = crate::geometry::Rect::new(x, y, w, h);
+            match data {
+                ImageBytes::Whole(bytes) => page.image_with_alt(page_image(&bytes)?, rect, &alt),
+                ImageBytes::Streamed(image) => page.image_streamed(image, rect, Some(alt), false),
+            }
         }
         PageOp::Watermark(text) => page.watermark(&text),
         PageOp::TextField { name, x, y, w, h, default_value } => page.text_field(name, x, y, w, h, default_value),
@@ -2969,8 +2973,11 @@ pub fn apply_page_op(builder: &mut DocumentBuilder, op: PageOp) -> Result<()> {
         PageOp::OnOpen(ref script) => page.on_open(script),
         PageOp::OnClose(ref script) => page.on_close(script),
         PageOp::ImageArtifact { data, x, y, w, h } => {
-            let img = page_image(&data)?;
-            page.image_with_artifact(img, crate::geometry::Rect::new(x, y, w, h))
+            let rect = crate::geometry::Rect::new(x, y, w, h);
+            match data {
+                ImageBytes::Whole(bytes) => page.image_with_artifact(page_image(&bytes)?, rect),
+                ImageBytes::Streamed(image) => page.image_streamed(image, rect, None, true),
+            }
         }
         PageOp::StreamingTableBlock {
             ref config_columns,

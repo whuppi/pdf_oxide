@@ -469,6 +469,9 @@ fn paint_page<'sty>(
                     soft_mask: img.data.soft_mask.clone(),
                     matrix: None,
                     is_artifact: false,
+                    // ── pdf_manipulator patch: the image streams from its source ──
+                    streamed: None,
+                    // ── end pdf_manipulator patch ──
                 };
                 page_builder.add_element(&ContentElement::Image(content));
             }

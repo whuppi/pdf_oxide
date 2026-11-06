@@ -4,8 +4,9 @@ use crate::host::binary_codec::{ErrorKind, FieldValue, Request, ResponseWriter};
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
 use crate::host::engine_state::EngineState;
+use crate::host::image_embed::{self, ImageBytes, Taken};
 use crate::host::ops::op_unit;
-use crate::host::ops::support::{ok_flag, read_all_from_reader, req_handle};
+use crate::host::ops::support::{ok_flag, req_handle};
 
 use crate::writer::{DocumentBuilder, PageSize};
 
@@ -129,7 +130,7 @@ fn handle_builder_add_page(state: &mut EngineState, req: &Request<'_>) -> Vec<u8
 /// Image pixel dimensions read straight from the file header — no decode.
 /// A PNG's IHDR carries width/height at bytes 16/20; a JPEG's first SOFn
 /// frame (C0–CF but DHT C4 / JPG C8 / DAC CC) does after its payload length.
-fn image_pixel_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn image_pixel_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     if data.len() >= 24 && data[..8] == PNG_MAGIC && data[12..16] == *b"IHDR" {
         let w = u32::from_be_bytes(data[16..20].try_into().ok()?);
@@ -175,6 +176,28 @@ fn image_pixel_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+/// What a page op that places an image says of bytes that are no image.
+const PAGE_IMAGE_UNUSABLE: &str = "image data is not a usable image";
+
+/// The image of an op: left in its source when the source holds a JPEG or a
+/// PNG that can be read in pieces, else read whole; with no source, the
+/// request's own `data`. `Err` is the response to send: the source could not
+/// be read, the op was cancelled, or the bytes are no image (`unreadable`).
+fn take_image(
+    reader: Option<BoxedReader>,
+    req: &Request<'_>,
+    unreadable: &str,
+) -> Result<ImageBytes, Vec<u8>> {
+    let Some(reader) = reader else {
+        return Ok(ImageBytes::Whole(req.get_bytes("data").unwrap_or(&[]).to_vec()));
+    };
+    match image_embed::take(reader) {
+        Ok(Taken::Image(image)) => Ok(image),
+        Ok(Taken::Unreadable) => Err(ResponseWriter::error_kind(ErrorKind::InvalidArgument, unreadable)),
+        Err(e) => Err(ResponseWriter::error_of(&e)),
+    }
+}
+
 /// One page holding one image, sized from the image's pixel dimensions unless
 /// the request names a page size. The image is placed by [fit] inside the
 /// content rect the margin leaves; `cover` may overflow the media box, which
@@ -182,18 +205,15 @@ fn image_pixel_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 fn handle_builder_add_image_page(
     state: &mut EngineState,
     req: &Request<'_>,
-    mut data_reader: Option<BoxedReader>,
+    data_reader: Option<BoxedReader>,
 ) -> Vec<u8> {
-    let image_data = if let Some(ref mut reader) = data_reader {
-        read_all_from_reader(reader).unwrap_or_default()
-    } else {
-        req.get_bytes("data").unwrap_or(&[]).to_vec()
+    const UNREADABLE: &str = "addImagePage: the bytes are not a readable PNG or JPEG image";
+    let image = match take_image(data_reader, req, UNREADABLE) {
+        Ok(image) => image,
+        Err(response) => return response,
     };
-    let Some((px_width, px_height)) = image_pixel_dimensions(&image_data) else {
-        return ResponseWriter::error_kind(
-            ErrorKind::InvalidArgument,
-            "addImagePage: the bytes are not a readable PNG or JPEG image",
-        );
+    let Some((px_width, px_height)) = image.pixel_dimensions() else {
+        return ResponseWriter::error_kind(ErrorKind::InvalidArgument, UNREADABLE);
     };
     // No explicit page size → one point per pixel, so the page is the image
     // at its native size.
@@ -233,7 +253,7 @@ fn handle_builder_add_image_page(
         return ResponseWriter::error("builder not found");
     };
     builder.begin_page(size);
-    let op = dispatch::PageOp::Image { data: image_data, x, y, w, h, alt: String::new() };
+    let op = dispatch::PageOp::Image { data: image, x, y, w, h, alt: String::new() };
     match dispatch::apply_page_op(builder, op) {
         Ok(()) => ok_flag("added"),
         Err(e) => ResponseWriter::error_of(&e),
@@ -297,13 +317,12 @@ fn handle_builder_page_op(
         "horizontalRule" => dispatch::PageOp::HorizontalRule,
         "watermark" => dispatch::PageOp::Watermark(req.get_str("text").unwrap_or("").to_string()),
         "image" => {
-            let image_data = if let Some(ref mut reader) = data_reader {
-                read_all_from_reader(reader).unwrap_or_default()
-            } else {
-                req.get_bytes("data").unwrap_or(&[]).to_vec()
+            let image = match take_image(data_reader.take(), req, PAGE_IMAGE_UNUSABLE) {
+                Ok(image) => image,
+                Err(response) => return response,
             };
             dispatch::PageOp::Image {
-                data: image_data,
+                data: image,
                 x: req.get_f64("x").unwrap_or(0.0) as f32,
                 y: req.get_f64("y").unwrap_or(0.0) as f32,
                 w: req.get_f64("width").unwrap_or(0.0) as f32,
@@ -520,13 +539,12 @@ fn handle_builder_page_op(
         "onOpen" => dispatch::PageOp::OnOpen(req.get_str("script").unwrap_or("").to_string()),
         "onClose" => dispatch::PageOp::OnClose(req.get_str("script").unwrap_or("").to_string()),
         "imageArtifact" => {
-            let image_data = if let Some(ref mut reader) = data_reader {
-                read_all_from_reader(reader).unwrap_or_default()
-            } else {
-                req.get_bytes("data").unwrap_or(&[]).to_vec()
+            let image = match take_image(data_reader.take(), req, PAGE_IMAGE_UNUSABLE) {
+                Ok(image) => image,
+                Err(response) => return response,
             };
             dispatch::PageOp::ImageArtifact {
-                data: image_data,
+                data: image,
                 x: req.get_f64("x").unwrap_or(0.0) as f32,
                 y: req.get_f64("y").unwrap_or(0.0) as f32,
                 w: req.get_f64("width").unwrap_or(0.0) as f32,
@@ -788,6 +806,7 @@ fn refuse_unattached(builder: &DocumentBuilder, op: &dispatch::PageOp) -> Option
 #[cfg(test)]
 mod tests {
     use crate::host::dispatch::{apply_page_op, PageOp};
+    use crate::host::image_embed::ImageBytes;
     use crate::writer::DocumentBuilder;
 
     /// `op`'s refusal on a real builder after `queued` was applied to it.
@@ -960,8 +979,8 @@ mod tests {
     fn unusable_image_bytes_are_an_invalid_argument() {
         let mut builder = DocumentBuilder::new();
         for op in [
-            PageOp::Image { data: vec![1, 2, 3], x: 0.0, y: 0.0, w: 10.0, h: 10.0, alt: String::new() },
-            PageOp::ImageArtifact { data: vec![1, 2, 3], x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
+            PageOp::Image { data: ImageBytes::Whole(vec![1, 2, 3]), x: 0.0, y: 0.0, w: 10.0, h: 10.0, alt: String::new() },
+            PageOp::ImageArtifact { data: ImageBytes::Whole(vec![1, 2, 3]), x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
         ] {
             let err = apply_page_op(&mut builder, op).unwrap_err();
             assert_eq!(

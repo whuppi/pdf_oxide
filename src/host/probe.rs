@@ -107,3 +107,30 @@ pub fn open_source(bytes: Vec<u8>, cancel: &CancelCheck) -> Result<PdfDocument> 
     let _job = crate::cancel::enter(cancel);
     PdfDocument::from_external_reader_cancellable(Box::new(std::io::Cursor::new(bytes)), cancel)
 }
+
+/// `builderAddImagePage` then `builderSave`: the PNG or JPEG in `image` is
+/// taken from a source as the op takes it, placed on a page of its own size,
+/// and the builder saved to `writer`, which is where the save reads it.
+pub fn build_image_page(
+    image: Vec<u8>,
+    writer: &mut impl crate::host::positioned_write::PositionedWrite,
+    cancel: &CancelCheck,
+) -> Result<()> {
+    use crate::host::dispatch::{self, PageOp};
+    use crate::host::image_embed::{take, Taken};
+    use crate::writer::PageSize;
+    let _job = crate::cancel::enter(cancel);
+    let source = BoxedReader(Box::new(std::io::Cursor::new(image)));
+    let Taken::Image(image) = take(source)? else {
+        return Err(crate::error::Error::InvalidOperation("the bytes are no PNG or JPEG image".into()));
+    };
+    let Some((width, height)) = image.pixel_dimensions() else {
+        return Err(crate::error::Error::InvalidOperation("the image has no size".into()));
+    };
+    let mut builder = dispatch::builder_new();
+    builder.begin_page(PageSize::Custom(width as f32, height as f32));
+    let op = PageOp::Image { data: image, x: 0.0, y: 0.0, w: width as f32, h: height as f32, alt: String::new() };
+    dispatch::apply_page_op(&mut builder, op)?;
+    builder.end_page();
+    dispatch::builder_save_to_writer(builder.compress_streams(true), writer)
+}

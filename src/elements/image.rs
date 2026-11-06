@@ -53,6 +53,12 @@ pub struct ImageContent {
     /// `/Artifact` in the content stream so assistive technology ignores it.
     /// PDF/UA-1 §7.1 (F-3). Mutually exclusive with `alt_text`.
     pub is_artifact: bool,
+    // ── pdf_manipulator patch: the image streams from its source ──
+    /// An image the save reads from its source, a row or a piece at a time:
+    /// `data` and `soft_mask` are then empty and the writer takes the pixels
+    /// from here. Set by a host builder op, never by a parsed document.
+    pub(crate) streamed: Option<std::sync::Arc<crate::host::image_embed::StreamedImage>>,
+    // ── end pdf_manipulator patch ──
 }
 
 impl ImageContent {
@@ -73,6 +79,9 @@ impl ImageContent {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
         image.calculate_dpi();
         image
@@ -228,6 +237,9 @@ impl ImageContent {
             soft_mask,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         };
         image.calculate_dpi();
         Ok(image)
@@ -251,6 +263,9 @@ impl Default for ImageContent {
             soft_mask: None,
             matrix: None,
             is_artifact: false,
+            // ── pdf_manipulator patch: the image streams from its source ──
+            streamed: None,
+            // ── end pdf_manipulator patch ──
         }
     }
 }

@@ -1463,9 +1463,28 @@ impl PdfWriter {
         // the bytes so both image APIs (image_from_bytes / ImageContent::new)
         // produce the same hash for the same logical image — fixes #443.
         let mut image_dedup: HashMap<(u64, usize), (u32, Option<u32>)> = HashMap::new();
+        let mut streamed_images: Vec<(
+            std::sync::Arc<crate::host::image_embed::StreamedImage>,
+            crate::host::image_embed::StreamedIds,
+        )> = Vec::new();
         for pending in &pending_per_page {
             let mut per_page_ids: Vec<(u32, Option<u32>)> = Vec::with_capacity(pending.len());
             for p in pending {
+                if let Some(streamed) = &p.image.streamed {
+                    let image = self.alloc_obj_id();
+                    let mask = streamed.has_mask().then(|| self.alloc_obj_id());
+                    let lengths = if streamed.has_length_objects() {
+                        [Some(self.alloc_obj_id()), mask.map(|_| self.alloc_obj_id())]
+                    } else {
+                        [None, None]
+                    };
+                    streamed_images.push((
+                        streamed.clone(),
+                        crate::host::image_embed::StreamedIds { image, mask, lengths },
+                    ));
+                    per_page_ids.push((image, mask));
+                    continue;
+                }
                 // Normalize first — both APIs converge to the same stream bytes
                 // here regardless of how the caller originally stored the pixels.
                 let (data, soft_mask) = image_content_to_xobject_stream(&p.image);
@@ -2024,6 +2043,9 @@ impl PdfWriter {
         for (obj_id, obj, _) in &image_objects {
             xref_offsets.push((*obj_id, output.position() as usize));
             output.write_all(&serializer.serialize_indirect(*obj_id, 0, obj))?;
+        }
+        for (image, ids) in &streamed_images {
+            image.write(&mut *output, &serializer, ids, &mut xref_offsets)?;
         }
 
         // Hoist any inline appearance streams (e.g. a watermark's `/AP /N`)

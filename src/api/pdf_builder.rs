@@ -3153,6 +3153,9 @@ impl PdfBuilder {
                 soft_mask: image.soft_mask.clone(),
                 matrix: None,
                 is_artifact: false,
+                // ── pdf_manipulator patch: the image streams from its source ──
+                streamed: None,
+                // ── end pdf_manipulator patch ──
             };
             image_content.calculate_dpi();
 
