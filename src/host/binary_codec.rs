@@ -305,7 +305,7 @@ impl ResponseWriter {
     }
 
     /// Encode a complete cancelled response (status 2). Posted for
-    /// every job killed by dispose or PdfTask.cancel — hosts map it
+    /// every job cancelled by dispose or PdfTask.cancel — hosts map it
     /// to their typed cancellation error, never by message matching.
     pub fn cancelled() -> Vec<u8> {
         vec![2]

@@ -3,7 +3,7 @@
 use super::support::{pdf_from_objects, stream_object};
 use crate::document::PdfDocument;
 use crate::host::engine_state::EngineState;
-use crate::host::native::lane::{reset_lane, ExecutorController, Mail};
+use crate::host::native::executor::{reset_executor, ExecutorController, Mail};
 use crate::host::heap;
 use crate::rendering::{PageRenderer, RenderOptions};
 use std::thread;
@@ -52,7 +52,7 @@ fn a_machine_font_the_lane_cached_is_not_the_lanes_heap() {
         let (sender, _mailbox) = crossbeam_channel::unbounded::<Mail>();
         let controller = ExecutorController::new(sender);
         render(&blank);
-        reset_lane(&mut state, &controller);
+        reset_executor(&mut state, &controller);
         let before = heap::live();
         let process_before = heap::process_live();
 
@@ -61,7 +61,7 @@ fn a_machine_font_the_lane_cached_is_not_the_lanes_heap() {
             heap::process_live() > process_before + 1024,
             "the render cached no machine font, so the test proves nothing"
         );
-        reset_lane(&mut state, &controller);
+        reset_executor(&mut state, &controller);
         let after = heap::live();
         assert!(
             after.abs_diff(before) <= 4096,

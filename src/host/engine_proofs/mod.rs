@@ -17,13 +17,13 @@ mod determinism;
 mod encrypted_streams;
 mod executor_state;
 #[cfg(feature = "native-bridge")]
-mod executor_lanes;
+mod executor_isolation;
 mod heap_counts;
 mod shared_state;
 #[cfg(all(feature = "native-bridge", feature = "rendering"))]
 mod machine_font_caches;
 #[cfg(feature = "native-bridge")]
-mod lane_boundary;
+mod executor_boundary;
 mod document_pages;
 mod editor_deflate;
 mod editor_duplicates;

@@ -13,7 +13,7 @@
 //!
 //! ## The no-exhaustion budget
 //!
-//! At most `MAX_LANES_GLOBAL` executor threads exist process-wide, across
+//! At most `MAX_EXECUTORS_GLOBAL` executor threads exist process-wide, across
 //! ALL instances. Hitting the cap never errors and never spins:
 //! the executor is created immediately (its mailbox accepts and buffers
 //! jobs), but its THREAD starts later — the boot request waits in a
@@ -23,13 +23,13 @@
 //! ## Terminate semantics
 //!
 //! `terminate` is instant and idempotent: set the executor's cancel flag, wake
-//! every parked I/O channel (lock-ordered — see `lane.rs`), drop the
+//! every parked I/O channel (lock-ordered — see `executor.rs`), drop the
 //! mailbox sender, remove from the table. It never joins the thread.
 //! After `terminate` returns, no notify callback will ever fire for this
 //! executor, and the Dart Router owns the completion of its pending jobs.
 
 use crate::host::binary_codec::ResponseWriter;
-use crate::host::native::lane::{
+use crate::host::native::executor::{
     executor_main, post_result, Job, ExecutorController, Mail, SinkChannel, SourceChannel,
     ENGINE_DEAD_MESSAGE,
 };
@@ -41,13 +41,13 @@ use std::thread;
 
 /// Hard cap on executor threads across the whole process. Far above what
 /// any sane workload runs concurrently, far below any OS thread limit.
-pub const MAX_LANES_GLOBAL: usize = 128;
+pub const MAX_EXECUTORS_GLOBAL: usize = 128;
 
 // ── Global state: the table and the budget ─────────────────────────
 
 /// Monotonic key source. Starts at 1 (0 reads as "no executor" on the
 /// wire). Never reused — ABA-proof by construction.
-static NEXT_LANE_KEY: AtomicU64 = AtomicU64::new(1);
+static NEXT_EXECUTOR_KEY: AtomicU64 = AtomicU64::new(1);
 
 fn table() -> &'static Mutex<HashMap<u64, Arc<ExecutorController>>> {
     static TABLE: OnceLock<Mutex<HashMap<u64, Arc<ExecutorController>>>> = OnceLock::new();
@@ -114,12 +114,12 @@ impl Drop for SlotGuard {
 
 fn start_thread(key: u64, mailbox: Receiver<Mail>, controller: Arc<ExecutorController>) {
     thread::Builder::new()
-        .name(format!("pdf-lane-{key}"))
+        .name(format!("pdf-executor-{key}"))
         .spawn(move || {
             let _slot = SlotGuard;
             executor_main(mailbox, controller);
         })
-        .expect("failed to start executor thread (under MAX_LANES_GLOBAL — OS misconfigured?)");
+        .expect("failed to start executor thread (under MAX_EXECUTORS_GLOBAL — OS misconfigured?)");
 }
 
 // ── Public operations (called by the FFI surface and by tests) ─────
@@ -131,11 +131,11 @@ pub fn boot() -> u64 {
     let (sender, receiver) = unbounded::<Mail>();
     let controller = Arc::new(ExecutorController::new(sender));
 
-    let key = NEXT_LANE_KEY.fetch_add(1, Ordering::Relaxed);
+    let key = NEXT_EXECUTOR_KEY.fetch_add(1, Ordering::Relaxed);
     table().lock().unwrap().insert(key, controller.clone());
 
     let mut b = budget().lock().unwrap();
-    if b.live < MAX_LANES_GLOBAL {
+    if b.live < MAX_EXECUTORS_GLOBAL {
         b.live += 1;
         start_thread(key, receiver, controller);
     } else {
@@ -245,7 +245,7 @@ pub fn heap_peak(executor_key: u64) -> usize {
 
 /// Terminate an executor. Instant, idempotent, never joins. After this returns
 /// no notify callback will ever fire for this executor (see the terminate
-/// protocol in `lane.rs`); the thread drains and frees its state in
+/// protocol in `executor.rs`); the thread drains and frees its state in
 /// the background; the budget slot is handed on when it exits.
 pub fn terminate(executor_key: u64) {
     let Some(controller) = table().lock().unwrap().remove(&executor_key) else {
@@ -264,7 +264,7 @@ pub fn terminate(executor_key: u64) {
 
 /// Number of started executor threads (running or draining). Diagnostics
 /// and tests only — never used for decisions.
-pub fn live_lane_count() -> usize {
+pub fn live_executor_count() -> usize {
     budget().lock().unwrap().live
 }
 
@@ -409,7 +409,7 @@ pub extern "C" fn executor_hold_release(executor_key: u64, lease: u64, buf: *mut
 /// Started executor threads, process-wide. Diagnostics only.
 #[no_mangle]
 pub extern "C" fn executor_live_count() -> u32 {
-    live_lane_count() as u32
+    live_executor_count() as u32
 }
 
 // ── Channel buffer FFI helpers (Dart allocates, Rust syncs) ────────
@@ -767,7 +767,7 @@ mod tests {
         terminate(key);
         assert!(
             wait_until(Duration::from_secs(5), || tickets_empty(&controller)),
-            "parked job did not unwind after kill"
+            "parked job did not unwind after terminate"
         );
         // Promptly — far inside the 30s heartbeat, proving the wake
         // came from the terminate, not the safety-net timer.
@@ -839,7 +839,7 @@ mod tests {
         // via the dequeue-time executor-cancel check.
         assert!(
             wait_until(Duration::from_secs(5), || tickets_empty(&controller)),
-            "queued jobs were not drained after kill"
+            "queued jobs were not drained after terminate"
         );
     }
 
@@ -856,15 +856,15 @@ mod tests {
     #[test]
     fn churn_spawn_kill_releases_all_threads() {
         // Rapid create/dispose cycles must never exhaust anything.
-        let before = live_lane_count();
+        let before = live_executor_count();
         for _ in 0..500 {
             let key = boot();
             terminate(key);
         }
         assert!(
-            wait_until(Duration::from_secs(10), || live_lane_count() <= before),
+            wait_until(Duration::from_secs(10), || live_executor_count() <= before),
             "lane threads leaked after churn: live={}",
-            live_lane_count()
+            live_executor_count()
         );
     }
 
@@ -872,8 +872,8 @@ mod tests {
     fn budget_cap_holds_and_waiters_start_fifo() {
         // Fill the budget past the cap; waiting executors must still
         // accept jobs and must start once slots free up.
-        let keys: Vec<u64> = (0..MAX_LANES_GLOBAL + 8).map(|_| boot()).collect();
-        assert!(live_lane_count() <= MAX_LANES_GLOBAL);
+        let keys: Vec<u64> = (0..MAX_EXECUTORS_GLOBAL + 8).map(|_| boot()).collect();
+        assert!(live_executor_count() <= MAX_EXECUTORS_GLOBAL);
 
         // An executor beyond the cap accepts a job (queued, not running).
         let last = *keys.last().unwrap();
@@ -895,8 +895,8 @@ mod tests {
 
         // Free slots; the waiter must start and run its job. (The
         // no-source "open" job completes immediately with an error
-        // result — completion == ticket removal.)
-        for &key in &keys[..MAX_LANES_GLOBAL] {
+        // result — completion == cancel flag removal.)
+        for &key in &keys[..MAX_EXECUTORS_GLOBAL] {
             terminate(key);
         }
         assert!(
@@ -914,14 +914,14 @@ mod tests {
 
     #[test]
     fn lane_killed_while_waiting_for_budget_is_skipped() {
-        let keys: Vec<u64> = (0..MAX_LANES_GLOBAL + 4).map(|_| boot()).collect();
+        let keys: Vec<u64> = (0..MAX_EXECUTORS_GLOBAL + 4).map(|_| boot()).collect();
 
         // Terminate the over-cap waiters before they ever start.
-        for &key in &keys[MAX_LANES_GLOBAL..] {
+        for &key in &keys[MAX_EXECUTORS_GLOBAL..] {
             terminate(key);
         }
         // Then everything else.
-        for &key in &keys[..MAX_LANES_GLOBAL] {
+        for &key in &keys[..MAX_EXECUTORS_GLOBAL] {
             terminate(key);
         }
 
@@ -932,7 +932,7 @@ mod tests {
             wait_until(Duration::from_secs(10), || {
                 keys.iter().all(|k| controller_for(*k).is_none())
             }),
-            "killed lanes still present in table"
+            "terminated executors still present in table"
         );
     }
 

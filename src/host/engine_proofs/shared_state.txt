@@ -21,7 +21,7 @@ src/host/heap.rs::OWNED  executor  how many process-owned calls the current thre
 src/host/heap.rs::PROCESS_LIVE  machine  what the whole process holds, a counter that holds no data
 src/host/heap.rs::PROCESS_PEAK  machine  the most the whole process held, a counter that holds no data
 src/host/native/executor_table.rs::BUDGET  registry  the executor thread budget and its waiters
-src/host/native/executor_table.rs::NEXT_LANE_KEY  registry  the next executor key
+src/host/native/executor_table.rs::NEXT_EXECUTOR_KEY  registry  the next executor key
 src/host/native/executor_table.rs::TABLE  registry  the table of live executors by key
 src/html_css/html/tokenizer.rs::NAMED_ENTITIES  machine  the HTML named-entity table, built once from literals
 src/pipeline/reading_order/xycut.rs::SMOOTH_SCRATCH  thread  a buffer one thread clears and refills on every call

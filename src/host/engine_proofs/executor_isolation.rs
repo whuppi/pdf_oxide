@@ -7,7 +7,7 @@ use crate::fonts::cmap::cmap_cache_size;
 use crate::fonts::form_fallback::Fallback;
 use crate::fonts::global_cache::global_font_cache_stats;
 use crate::host::engine_state::EngineState;
-use crate::host::native::lane::{reset_lane, ExecutorController, Mail};
+use crate::host::native::executor::{reset_executor, ExecutorController, Mail};
 use crate::host::{caches, heap};
 use std::sync::mpsc;
 use std::thread;
@@ -44,23 +44,23 @@ fn read_text(pdf: &[u8]) {
     doc.extract_text(0).unwrap();
 }
 
-/// Lane 1 registers a fallback font, reads a document and raises a warning;
-/// lane 2, made while lane 1 holds all of that, sees none of it; a reset of
-/// lane 1 through the lane's own reset path then empties the registration,
+/// Executor 1 registers a fallback font, reads a document and raises a warning;
+/// executor 2, made while executor 1 holds all of that, sees none of it; a reset of
+/// executor 1 through the executor's own reset path then empties the registration,
 /// both caches and the warning sink, and gives back the heap the job took.
 /// No Dart battery can observe this: the caches and the sink are engine
 /// statics behind no wire op, and the heap figure is the engine's own counter.
 #[test]
-fn a_lane_owns_its_caches_and_a_reset_empties_them() {
+fn an_executor_owns_its_caches_and_a_reset_empties_them() {
     let pdf = page_with_a_font();
     // The process-wide tables the first read builds are allocated by whichever
-    // thread reads first; building them here keeps them out of lane 1's heap.
+    // thread reads first; building them here keeps them out of executor 1's heap.
     read_text(&pdf);
 
     let (loaded_tx, loaded_rx) = mpsc::channel::<()>();
     let (checked_tx, checked_rx) = mpsc::channel::<()>();
 
-    let lane_1 = thread::spawn(move || {
+    let executor_1 = thread::spawn(move || {
         let mut state = EngineState::new();
         let (sender, _mailbox) = crossbeam_channel::unbounded::<Mail>();
         let controller = ExecutorController::new(sender);
@@ -68,14 +68,14 @@ fn a_lane_owns_its_caches_and_a_reset_empties_them() {
         // them (49 KiB, the same after one reset as after three); one read
         // and reset here put them in the figure the later reset is held to.
         read_text(&pdf);
-        reset_lane(&mut state, &controller);
+        reset_executor(&mut state, &controller);
         let before = heap::live();
 
         caches::with(|e| e.register(Fallback::Cjk, vec![7; 300]));
         push_global_warning(Warning {
             category: WarningCategory::Font,
             page: None,
-            message: "lane 1".into(),
+            message: "executor 1".into(),
             spec_section: None,
         });
         read_text(&pdf);
@@ -86,7 +86,7 @@ fn a_lane_owns_its_caches_and_a_reset_empties_them() {
 
         assert!(caches::with(|e| e.registered(Fallback::Cjk)).is_some());
         assert!(global_font_cache_stats().0 > 0);
-        reset_lane(&mut state, &controller);
+        reset_executor(&mut state, &controller);
 
         assert!(caches::with(|e| e.registered(Fallback::Cjk)).is_none());
         assert_eq!(global_font_cache_stats().0, 0, "the reset left fonts cached");
@@ -95,19 +95,19 @@ fn a_lane_owns_its_caches_and_a_reset_empties_them() {
         let after = heap::live();
         assert!(
             after.abs_diff(before) <= 4096,
-            "lane 1 held {before} bytes before its job and {after} after its reset"
+            "executor 1 held {before} bytes before its job and {after} after its reset"
         );
     });
 
-    let lane_2 = thread::spawn(move || {
+    let executor_2 = thread::spawn(move || {
         loaded_rx.recv().unwrap();
         let _state = EngineState::new();
         assert!(caches::with(|e| e.registered(Fallback::Cjk)).is_none());
-        assert_eq!(global_font_cache_stats().0, 0, "lane 2 sees lane 1's fonts");
-        assert_eq!(cmap_cache_size(), 0, "lane 2 sees lane 1's CMaps");
+        assert_eq!(global_font_cache_stats().0, 0, "executor 2 sees executor 1's fonts");
+        assert_eq!(cmap_cache_size(), 0, "executor 2 sees executor 1's CMaps");
         checked_tx.send(()).unwrap();
     });
 
-    lane_2.join().unwrap();
-    lane_1.join().unwrap();
+    executor_2.join().unwrap();
+    executor_1.join().unwrap();
 }

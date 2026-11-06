@@ -1,7 +1,7 @@
 //! A response the executor posts leaves the executor's heap figure, whether Dart takes it or not.
 
 use crate::host::heap;
-use crate::host::native::lane::post_result;
+use crate::host::native::executor::post_result;
 use allo_isolate::ffi::DartCObject;
 use std::sync::Mutex;
 use std::thread;
@@ -26,15 +26,15 @@ unsafe extern "C" fn dart_accepts(_port: i64, message: *mut DartCObject) -> bool
     true
 }
 
-/// A response posted to a closed port is freed on the lane's thread inside the
+/// A response posted to a closed port is freed on the executor's thread inside the
 /// post, and one Dart accepts is freed later by Dart's finalizer on another
-/// thread; either way the lane's figure ends where it began, the first because
+/// thread; either way the executor's figure ends where it began, the first because
 /// `post_result` counts the bytes again once the failed post has freed them, the
 /// second because it stops counting them before the post (and the Vec's shrink to
 /// its length and its box, which allo-isolate does on the posting thread, net to
 /// nothing). No Dart battery can observe this: the counter is the engine's own.
 #[test]
-fn a_posted_response_leaves_the_lane_heap_where_it_was() {
+fn a_posted_response_leaves_the_executor_heap_where_it_was() {
     let response = || {
         let mut bytes = Vec::with_capacity(2 * SIZE);
         bytes.resize(SIZE, 1u8);

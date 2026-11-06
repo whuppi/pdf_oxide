@@ -9,7 +9,7 @@
 //! executors; it is the decision-free request door that
 //! every executor body calls:
 //!
-//!   Native executor body: `host/native/lane.rs` (mailbox thread)
+//!   Native executor body: `host/native/executor.rs` (mailbox thread)
 //!   Web executor body:    `web_assets/executor_worker.js` (Worker + wasm_entry)
 //!
 //! ## Request routing
@@ -122,7 +122,7 @@ pub(crate) fn handle_request(
 // WASM executor body — one Worker = one executor = one EngineState
 // ═══════════════════════════════════════════════════════════════════
 //
-// The web twin of `host/native/lane.rs`. A Web Worker IS an executor: the
+// The web twin of `host/native/executor.rs`. A Web Worker IS an executor: the
 // browser provides the isolated thread; this module provides the
 // executor's owned state and the call into the request door.
 // Decision-free by design — routing, pinning, queuing, and cancel
@@ -163,7 +163,7 @@ mod wasm_entry {
     /// call those by name. Same allocator and layout as the glue's malloc,
     /// so buffers are interchangeable with glue-allocated ones.
     #[wasm_bindgen]
-    pub fn lane_alloc(size: u32) -> u32 {
+    pub fn executor_alloc(size: u32) -> u32 {
         if size == 0 {
             return 1; // non-null dangling, mirrors the glue's zero-size malloc
         }
@@ -174,10 +174,10 @@ mod wasm_entry {
         }
     }
 
-    /// Free a buffer from `lane_alloc` or a response buffer handed out by
+    /// Free a buffer from `executor_alloc` or a response buffer handed out by
     /// `execute` (both come from the same global allocator, align 1).
     #[wasm_bindgen]
-    pub fn lane_dealloc(ptr: u32, size: u32) {
+    pub fn executor_dealloc(ptr: u32, size: u32) {
         if size == 0 {
             return;
         }

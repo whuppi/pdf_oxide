@@ -335,7 +335,7 @@ impl ExecutorController {
         Some(lease)
     }
 
-    /// File a job's ticket when `lease` is the current lease, else leave
+    /// Register a job's cancel flag when `lease` is the current lease, else leave
     /// the executor untouched and return the refusal to post.
     pub(crate) fn admit_job(&self, lease: u64, job: &Job) -> Result<(), &'static str> {
         let mut cancel_flags = self.cancel_flags.lock().unwrap();
@@ -359,7 +359,7 @@ impl ExecutorController {
             return Err(ENGINE_DEAD_MESSAGE);
         }
         if !cancel_flags.is_empty() {
-            return Err(LANE_BUSY_MESSAGE);
+            return Err(EXECUTOR_BUSY_MESSAGE);
         }
         match self.mailbox.lock().unwrap().as_ref() {
             Some(sender) if sender.send(Mail::Reset { result_port }).is_ok() => Ok(()),
@@ -403,10 +403,10 @@ pub const ENGINE_DEAD_MESSAGE: &str = "the engine stopped after an operation pan
 
 /// Error a job, or a reset, posts when its lease is not the executor's current
 /// one. The message is dropped without touching the engine.
-pub const STALE_LEASE_MESSAGE: &str = "the lane's lease was replaced; this message is stale";
+pub const STALE_LEASE_MESSAGE: &str = "the executor's lease was replaced; this message is stale";
 
 /// Error a reset posts when a job is still outstanding on the executor.
-pub const LANE_BUSY_MESSAGE: &str = "the lane cannot reset while a job is outstanding";
+pub const EXECUTOR_BUSY_MESSAGE: &str = "the executor cannot reset while a job is outstanding";
 
 // ── The executor body ───────────────────────────────────────────────────
 
@@ -446,7 +446,7 @@ pub fn executor_main(mailbox: Receiver<Mail>, controller: Arc<ExecutorController
                         ResponseWriter::cancelled()
                     }
                     Some(live) => {
-                        reset_lane(live, &controller);
+                        reset_executor(live, &controller);
                         ResponseWriter::ok().finish()
                     }
                     None => ResponseWriter::error(ENGINE_DEAD_MESSAGE),
@@ -465,7 +465,7 @@ pub fn executor_main(mailbox: Receiver<Mail>, controller: Arc<ExecutorController
 /// channels that belonged to it. Runs between jobs on the executor thread, so
 /// no reader is parked on a channel and no other thread touches the state.
 /// Dart frees the held buffers after the reset's answer, never before.
-pub(crate) fn reset_lane(state: &mut EngineState, controller: &ExecutorController) {
+pub(crate) fn reset_executor(state: &mut EngineState, controller: &ExecutorController) {
     *state = EngineState::new();
     controller.channels.release_held();
     heap::reset_peak();
@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_is_reported_and_ends_the_lane_even_when_cancelled() {
+    fn a_panic_is_reported_and_ends_the_executor_even_when_cancelled() {
         let panicked = std::panic::catch_unwind(|| -> Vec<u8> { panic!("engine bug") });
         let (bytes, survives) = outcome(panicked, true);
         assert_eq!(bytes, ResponseWriter::error("internal error: engine operation panicked"));
@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn leases_count_up_from_one_and_start_only_on_an_idle_live_lane() {
+    fn leases_count_up_from_one_and_start_only_on_an_idle_live_executor() {
         let (sender, _receiver) = crossbeam_channel::unbounded::<Mail>();
         let controller = ExecutorController::new(sender);
         assert_eq!(controller.begin_lease(), Some(1));
@@ -831,7 +831,7 @@ mod tests {
         unsafe { sb::destroy_sync(buf.as_mut_ptr(), rc::OFFSET_SYNC_PTR) };
 
         controller.dead.store(true, Ordering::SeqCst);
-        assert_eq!(controller.begin_lease(), None, "a dead lane is never leased again");
+        assert_eq!(controller.begin_lease(), None, "a dead executor is never leased again");
     }
 
     #[test]
@@ -866,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_is_queued_only_for_the_current_lease_on_an_idle_live_lane() {
+    fn a_reset_is_queued_only_for_the_current_lease_on_an_idle_live_executor() {
         let (sender, receiver) = crossbeam_channel::unbounded::<Mail>();
         let controller = ExecutorController::new(sender);
         let stale = controller.begin_lease().unwrap();
@@ -877,7 +877,7 @@ mod tests {
 
         let job = bare_job(1);
         controller.admit_job(current, &job).unwrap();
-        assert_eq!(controller.request_reset(current, 7), Err(LANE_BUSY_MESSAGE));
+        assert_eq!(controller.request_reset(current, 7), Err(EXECUTOR_BUSY_MESSAGE));
         assert!(receiver.try_recv().is_err(), "a reset behind a running job was queued");
         controller.cancel_flags.lock().unwrap().remove(&1);
 

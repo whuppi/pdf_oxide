@@ -8,13 +8,13 @@
 //! - `callback_reader` — Read+Seek via condvar (O(1)-memory source I/O)
 //! - `callback_writer` — Write via condvar (O(1)-memory output I/O)
 //! - `cancel`          — CancelFlags (executor terminate + per-job cancel)
-//! - `lane`            — the executor body: thread + mailbox + owned state
+//! - `executor`        — the executor body: thread + mailbox + owned state
 //! - `executor_table`  — key registry, thread budget, FFI surface
 //! - `shared_buffer`   — shared memory byte layout (Rust ↔ Dart)
 
 pub mod callback_reader;
 pub mod callback_writer;
 pub mod cancel;
-pub mod lane;
+pub mod executor;
 pub mod executor_table;
 pub mod shared_buffer;
