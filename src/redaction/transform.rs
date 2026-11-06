@@ -580,6 +580,9 @@ impl<'a> RedactPass<'a> {
     ) -> Result<()> {
         let mut content = content.with_inline_images(InlineImages::Collect);
         for item in content.by_ref() {
+            // ── pdf_manipulator patch: a cancel stops the pass within one operator ──
+            crate::cancel::poll()?;
+            // ── end pdf_manipulator patch ──
             let op = item?;
             if is_path_op(&op) {
                 self.path.push(op);

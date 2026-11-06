@@ -60,7 +60,13 @@ pub fn find_inline_image_invocations(
     let mut stack: Vec<[f32; 6]> = Vec::new();
     let mut out = Vec::new();
     let mut inline_idx = 0usize;
+    // ── pdf_manipulator patch: a cancel ends the walk; the caller's next poll ends the job ──
+    let mut stride = crate::cancel::Stride::job();
     for op in ops {
+        if stride.tick().is_err() {
+            return Vec::new();
+        }
+        // ── end pdf_manipulator patch ──
         match op {
             Operator::SaveState => {
                 stack.push(ctm);
@@ -137,7 +143,13 @@ pub fn find_form_xobject_invocations(
     let mut ctm: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut stack: Vec<[f32; 6]> = Vec::new();
     let mut out = Vec::new();
+    // ── pdf_manipulator patch: a cancel ends the walk; the caller's next poll ends the job ──
+    let mut stride = crate::cancel::Stride::job();
     for op in ops {
+        if stride.tick().is_err() {
+            return Vec::new();
+        }
+        // ── end pdf_manipulator patch ──
         match op {
             Operator::SaveState => {
                 stack.push(ctm);

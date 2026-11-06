@@ -727,3 +727,128 @@ fn render_of_a_knockout_group_cancelled_at_any_poll_leaves_nothing_behind() {
     let polls = read_at_every_poll(|| open(&bytes), |doc, cancel| render_png(doc, cancel), PAINTS);
     assert!(polls >= PAINTS, "{polls}");
 }
+
+/// One page that shows `ops` text operators, in its own content or, with
+/// `in_form`, in the form it draws; either way a mark over the lower half of
+/// the page reaches them.
+fn redaction_pdf(ops: usize, in_form: bool) -> Vec<u8> {
+    let mut text = String::from("BT /F1 8 Tf\n");
+    for k in 0..ops {
+        text.push_str(&format!("1 0 0 1 {} {} Tm (w{k}) Tj\n", 20 + k % 200, 20 + k % 120));
+    }
+    text.push_str("ET\n");
+    let (page, form) = if in_form {
+        (b"q /Fm1 Do Q\n".to_vec(), Some(stream_object(
+            6,
+            "/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /Font << /F1 3 0 R >> >>",
+            text.as_bytes(),
+        )))
+    } else {
+        (text.into_bytes(), None)
+    };
+    let xobjects = if in_form { "/XObject << /Fm1 6 0 R >> " } else { "" };
+    let mut objects = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        format!(
+            "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R \
+             /Resources << /Font << /F1 3 0 R >> {xobjects}>> >>\nendobj\n"
+        )
+        .into_bytes(),
+        stream_object(5, "", &page),
+    ];
+    objects.extend(form);
+    pdf_from_objects(&objects)
+}
+
+fn apply(editor: &mut DocumentEditor, cancel: &CancelCheck) -> Result<()> {
+    let _job = crate::cancel::enter(cancel);
+    crate::host::dispatch::edit_apply_redactions(editor, cancel).map(|_| ())
+}
+
+/// An editor over [`redaction_pdf`] with its mark queued.
+fn marked_editor(ops: usize, in_form: bool) -> DocumentEditor {
+    let mut editor = editor_of(&redaction_pdf(ops, in_form));
+    editor.add_redaction(0, [0.0, 0.0, 300.0, 100.0], Some([0.0, 0.0, 0.0])).expect("the mark queues");
+    editor
+}
+
+fn full_save(editor: &mut DocumentEditor, cancel: &CancelCheck) -> Result<Vec<u8>> {
+    let _job = crate::cancel::enter(cancel);
+    let mut out = crate::host::positioned_write::CountingWriter::new(Vec::new());
+    crate::host::dispatch::edit_save_with_options(editor, &mut out, &SaveOptions::full_rewrite(), cancel)
+        .map(|()| out.into_inner())
+}
+
+/// No Dart battery sees it: a battery's page holds a few dozen operators and
+/// the redaction pass would finish before it polled twice, so a cancel that
+/// lands inside the pass only shows as a poll count that grows with the
+/// operators of the page and of each form it draws, in the apply that plans
+/// the pass and in the save that writes it again.
+#[test]
+fn redaction_polls_while_it_reads_the_operators_of_a_page_and_of_a_form() {
+    const OPS: usize = 20_000;
+    // one poll for every 256 operators of the stream read; half of that is the margin
+    const GROWTH: usize = OPS / 512;
+    for in_form in [false, true] {
+        let polls_of_apply = |ops: usize| {
+            let counting = CancelCheck::tripping_at(usize::MAX);
+            apply(&mut marked_editor(ops, in_form), &counting).expect("the redaction applies");
+            counting.polls()
+        };
+        let polls_of_save = |ops: usize| {
+            let mut editor = marked_editor(ops, in_form);
+            crate::host::dispatch::edit_apply_redactions(&mut editor, &CancelCheck::none())
+                .expect("the redaction applies");
+            let counting = CancelCheck::tripping_at(usize::MAX);
+            full_save(&mut editor, &counting).expect("the redacted editor saves");
+            counting.polls()
+        };
+        let (small, big) = (polls_of_apply(10), polls_of_apply(OPS));
+        assert!(big >= small + GROWTH, "apply, in_form {in_form}: {big} polls for {OPS} operators, {small} for 10");
+        let (small, big) = (polls_of_save(10), polls_of_save(OPS));
+        assert!(big >= small + GROWTH, "save, in_form {in_form}: {big} polls for {OPS} operators, {small} for 10");
+    }
+}
+
+/// No Dart battery sees it: a cancel from Dart lands wherever the timing
+/// reaches, so a battery never shows that each poll the redaction makes while
+/// it reads a page or a form is a safe place to stop. A cancel at any of
+/// them, in the apply or in the save, ends cancelled and leaves the editor
+/// applying and saving the same redaction again.
+#[test]
+fn redaction_cancelled_at_any_poll_of_its_stream_reads_changes_nothing() {
+    const OPS: usize = 40;
+    for in_form in [false, true] {
+        editor_at_every_poll(
+            || marked_editor(OPS, in_form),
+            apply,
+            true,
+            // the form's dry run adds its own two strides to the page's
+            3,
+        );
+        let baseline = {
+            let mut editor = marked_editor(OPS, in_form);
+            crate::host::dispatch::edit_apply_redactions(&mut editor, &CancelCheck::none()).unwrap();
+            full_save(&mut editor, &CancelCheck::none()).unwrap()
+        };
+        let counting = CancelCheck::tripping_at(usize::MAX);
+        let mut editor = marked_editor(OPS, in_form);
+        crate::host::dispatch::edit_apply_redactions(&mut editor, &CancelCheck::none()).unwrap();
+        full_save(&mut editor, &counting).unwrap();
+        let polls = counting.polls();
+        for n in 1..=polls {
+            let mut editor = marked_editor(OPS, in_form);
+            crate::host::dispatch::edit_apply_redactions(&mut editor, &CancelCheck::none()).unwrap();
+            match full_save(&mut editor, &CancelCheck::tripping_at(n)) {
+                Ok(_) => panic!("a cancel at poll {n} of {polls} did not stop the save, in_form {in_form}"),
+                Err(error) => assert!(is_cancelled(&error), "poll {n} of {polls} ended with {error:?}"),
+            }
+            assert!(
+                full_save(&mut editor, &CancelCheck::none()).unwrap() == baseline,
+                "after a cancel at poll {n} of {polls} the editor saves another file, in_form {in_form}"
+            );
+        }
+    }
+}

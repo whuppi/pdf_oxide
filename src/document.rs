@@ -18110,6 +18110,9 @@ impl PdfDocument {
         // ── end pdf_manipulator patch ──
 
         let mut extractor = TextExtractor::with_config(config);
+        // ── pdf_manipulator patch: the forms of the page are read under the job's cancel ──
+        extractor.set_cancel(cancel);
+        // ── end pdf_manipulator patch ──
         // Stamp the page index so spans carry McidScope::Page(page_index)
         // by default; Form XObject Do invocations push their own scope
         // on top of the stack inside the extractor.
@@ -19257,6 +19260,7 @@ impl PdfDocument {
         };
 
         let mut extractor = TextExtractor::new();
+        extractor.set_cancel(cancel);
         // Stamp the page index the span path already stamps. The form /BBox
         // clip below resolves the enclosing page through
         // `mcid_scope_stack.first()`, which defaults to `Page(0)`; without this

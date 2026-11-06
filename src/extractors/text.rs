@@ -2467,6 +2467,8 @@ pub struct TextExtractor<'doc> {
     page_source: Option<PageSource<'doc>>,
     /// `placed_pdf_keep` has been decided for this page.
     placed_pdf_decided: bool,
+    /// The running job's check, polled as the operators of a form are read.
+    cancel: crate::cancel::CancelCheck,
     // ── end pdf_manipulator patch ──
     /// Configuration for text extraction heuristics
     config: TextExtractionConfig,
@@ -2677,6 +2679,7 @@ impl<'doc> TextExtractor<'doc> {
             // ── pdf_manipulator patch: the page's operator source, for the placed-PDF count ──
             page_source: None,
             placed_pdf_decided: false,
+            cancel: crate::cancel::CancelCheck::none(),
             // ── end pdf_manipulator patch ──
             config,
             merging_config: SpanMergingConfig::default(),
@@ -2764,6 +2767,13 @@ impl<'doc> TextExtractor<'doc> {
     pub fn set_resources(&mut self, resources: Object) {
         self.resources = Some(resources);
     }
+
+    // ── pdf_manipulator patch: the forms of a page are read under the job's cancel ──
+    /// Polls `cancel` as the operators of every form the page draws are read.
+    pub fn set_cancel(&mut self, cancel: &crate::cancel::CancelCheck) {
+        self.cancel = cancel.clone();
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Set the document reference for loading XObjects.
     pub fn set_document(&mut self, document: &'doc crate::document::PdfDocument) {
@@ -7449,10 +7459,12 @@ impl<'doc> TextExtractor<'doc> {
                 }
 
                 // ── pdf_manipulator patch: the form's operators are read as its content is decoded ──
+                let cancel = self.cancel.clone();
                 let form_source = move || -> Result<Box<dyn crate::host::content::OperatorStream>> {
                     Ok(Box::new(
                         doc.form_operators(xobject_ref)?
-                            .with_mode(crate::host::content::Mode::Text),
+                            .with_mode(crate::host::content::Mode::Text)
+                            .with_cancel_every(cancel.clone(), 256),
                     ))
                 };
                 // ── end pdf_manipulator patch ──

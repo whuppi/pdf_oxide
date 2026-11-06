@@ -12468,7 +12468,9 @@ impl DocumentEditor {
             .page_operators(page_index)?
             .with_inline_images(crate::host::content::InlineImages::Collect);
         let mut stage = image_mods::ImageModStage::new(mods, out);
+        let mut stride = crate::cancel::Stride::job();
         for item in ops.by_ref() {
+            stride.tick()?;
             stage.push(&item?)?;
         }
         if !ops.damage().is_clean() {
