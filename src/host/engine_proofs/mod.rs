@@ -34,6 +34,7 @@ mod editor_orphans;
 mod editor_packed;
 mod editor_page_sets;
 mod editor_trailer;
+mod incremental_wall;
 #[cfg(feature = "rendering")]
 mod ext_gstate_lines;
 mod filter_readers;

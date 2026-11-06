@@ -915,6 +915,123 @@ struct Checkpoint {
 }
 // ── end pdf_manipulator patch ──
 
+// ── pdf_manipulator patch: every editor field is classified for the incremental save ──
+/// What an incremental save does with a [`DocumentEditor`] field.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum IncrementalClass {
+    /// What was opened, not an edit.
+    Source,
+    /// Derived or transient state the append never writes.
+    Cache,
+    /// An edit the append writes.
+    Carried,
+    /// An edit `incremental_refusal` names.
+    Refused,
+}
+
+#[cfg(test)]
+impl IncrementalClass {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Cache => "cache",
+            Self::Carried => "carried",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// The class of every field of [`DocumentEditor`]. The pattern names every
+/// field and has no `..`, so a field added without a row here does not
+/// compile; give it one row in the list below the pattern.
+#[cfg(test)]
+impl DocumentEditor {
+    /// `(field, class, why)` for every field of the editor; the class is
+    /// `source`, `cache`, `carried` or `refused`.
+    pub(crate) fn incremental_census(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        let DocumentEditor {
+            source: _,
+            source_path: _,
+            modified_objects: _,
+            new_objects: _,
+            next_object_id: _,
+            modified_info: _,
+            page_order: _,
+            original_page_count: _,
+            is_modified: _,
+            modified_content: _,
+            overlay_additions: _,
+            resource_manager: _,
+            structure_modified: _,
+            modified_annotations: _,
+            modified_page_props: _,
+            erase_regions: _,
+            flatten_annotations_pages: _,
+            apply_redactions_pages: _,
+            redaction_regions: _,
+            redacted_pages: _,
+            redacted_orphan_ids: _,
+            redacted_image_originals: _,
+            image_modifications: _,
+            flatten_forms_pages: _,
+            remove_acroform: _,
+            flatten_warnings: _,
+            embedded_files: _,
+            modified_form_fields: _,
+            deleted_form_fields: _,
+            acroform_modified: _,
+            merged_sources: _,
+            merged_page_props: _,
+            merged_form_fields: _,
+            merged_acroform_dr: _,
+            merged_acroform_da: _,
+            source_page_refs: _,
+            checkpoint: _,
+        } = self;
+        vec![
+            ("source", IncrementalClass::Source.name(), "the opened document; the append copies every original byte"),
+            ("source_path", IncrementalClass::Source.name(), "where the document was opened from"),
+            ("modified_objects", IncrementalClass::Carried.name(), "written as the append's replaced objects (incremental_objects)"),
+            ("new_objects", IncrementalClass::Refused.name(), "'form fields or objects were added'; no editor call stages it today"),
+            ("next_object_id", IncrementalClass::Cache.name(), "an id counter; the append reads it only for /Size and a new /Info id"),
+            ("modified_info", IncrementalClass::Carried.name(), "written as the append's /Info object (build_info_object)"),
+            ("page_order", IncrementalClass::Refused.name(), "'pages were removed or reordered' (the identity check)"),
+            ("original_page_count", IncrementalClass::Source.name(), "the page count at open; the identity check compares against it"),
+            ("is_modified", IncrementalClass::Cache.name(), "a dirty flag; the append writes what is staged, not this flag"),
+            ("modified_content", IncrementalClass::Refused.name(), "'page content was drawn, erased or rebuilt'"),
+            ("overlay_additions", IncrementalClass::Refused.name(), "'page content was drawn, erased or rebuilt'; no editor call stages it today"),
+            ("resource_manager", IncrementalClass::Cache.name(), "names resources for hand-built content; the save never reads it, and that content is staged in modified_content"),
+            ("structure_modified", IncrementalClass::Refused.name(), "'page content was drawn, erased or rebuilt'"),
+            ("modified_annotations", IncrementalClass::Refused.name(), "'annotations were changed or flattened'"),
+            ("modified_page_props", IncrementalClass::Carried.name(), "applied to the page object in the append (incremental_objects)"),
+            ("erase_regions", IncrementalClass::Refused.name(), "'page content was drawn, erased or rebuilt'"),
+            ("flatten_annotations_pages", IncrementalClass::Refused.name(), "'annotations were changed or flattened'"),
+            ("apply_redactions_pages", IncrementalClass::Refused.name(), "'content was redacted or scrubbed'"),
+            ("redaction_regions", IncrementalClass::Refused.name(), "'content was redacted or scrubbed'"),
+            ("redacted_pages", IncrementalClass::Refused.name(), "'content was redacted or scrubbed'"),
+            ("redacted_orphan_ids", IncrementalClass::Refused.name(), "'content was redacted or scrubbed'"),
+            ("redacted_image_originals", IncrementalClass::Refused.name(), "not named by the refusal; set only with redacted_pages, which is"),
+            ("image_modifications", IncrementalClass::Refused.name(), "'page content was drawn, erased or rebuilt'"),
+            ("flatten_forms_pages", IncrementalClass::Refused.name(), "'annotations were changed or flattened'"),
+            ("remove_acroform", IncrementalClass::Refused.name(), "'form fields were removed'"),
+            ("flatten_warnings", IncrementalClass::Cache.name(), "diagnostics of a flatten, which is refused"),
+            ("embedded_files", IncrementalClass::Refused.name(), "'files were embedded'"),
+            ("modified_form_fields", IncrementalClass::Carried.name(), "an existing field's edits flush into the append's replaced objects (flush_form_fields_to_modified_objects); a new field is refused ('form fields or objects were added')"),
+            ("deleted_form_fields", IncrementalClass::Refused.name(), "'form fields were removed'"),
+            ("acroform_modified", IncrementalClass::Carried.name(), "the flag that runs the form flush in incremental_objects"),
+            ("merged_sources", IncrementalClass::Refused.name(), "'pages were merged in'"),
+            ("merged_page_props", IncrementalClass::Refused.name(), "keyed by merged page, which exists only after a merge: 'pages were merged in'"),
+            ("merged_form_fields", IncrementalClass::Refused.name(), "'pages were merged in'"),
+            ("merged_acroform_dr", IncrementalClass::Refused.name(), "not named by the refusal; set only by a merge, which fills merged_sources"),
+            ("merged_acroform_da", IncrementalClass::Refused.name(), "not named by the refusal; set only by a merge, which fills merged_sources"),
+            ("source_page_refs", IncrementalClass::Cache.name(), "the source's page refs, computed on demand"),
+            ("checkpoint", IncrementalClass::Cache.name(), "the undo state of a running operation; empty between operations"),
+        ]
+    }
+}
+// ── end pdf_manipulator patch ──
+
 // ── pdf_manipulator patch: the written-id set follows every xref push ──
 /// The output xref entries `(id, offset, gen, in_use)` of a full rewrite,
 /// with the set of ids they hold. `push` is the only way to add an entry
