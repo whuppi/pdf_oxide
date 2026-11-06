@@ -138,17 +138,29 @@ impl Write for CallbackWriter {
     }
 }
 
+impl crate::host::bridge_api::BufferedSink for CallbackWriter {
+    fn discard(&mut self) {
+        self.pending = 0;
+    }
+}
+
 impl Drop for CallbackWriter {
+    /// Writes nothing: bytes still buffered are the request door's to flush
+    /// after an ok op, or to discard after a failed or cancelled one.
     fn drop(&mut self) {
-        let _ = self.flush_pending();
+        debug_assert!(
+            self.pending == 0 || std::thread::panicking(),
+            "a CallbackWriter was dropped with buffered bytes: flush or discard it first"
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     unsafe extern "C" fn noop_notify() {}
 
@@ -168,6 +180,69 @@ mod tests {
         assert!(err.to_string().contains("cancelled"));
 
         unsafe { sb::destroy_sync(buf.as_mut_ptr(), wc::OFFSET_SYNC_PTR); }
+    }
+
+    static CHUNKS: AtomicUsize = AtomicUsize::new(0);
+    static CHANNEL: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// The host's acknowledgement of the chunk just announced.
+    unsafe extern "C" fn acknowledging_notify() {
+        CHUNKS.fetch_add(1, Ordering::SeqCst);
+        let buf = CHANNEL.load(Ordering::SeqCst);
+        sb::host_respond(buf, wc::OFFSET_REQUEST_SEQ, wc::OFFSET_RESPONSE, sb::FLAG_ACK);
+    }
+
+    /// Runs `body` on a writer whose host acknowledges every chunk, and
+    /// returns how many chunks the host was sent.
+    fn chunks_sent_by(body: impl FnOnce(&mut Option<CallbackWriter>)) -> usize {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = vec![0u8; wc::TOTAL_SIZE];
+        unsafe { sb::init_sync(buf.as_mut_ptr(), wc::OFFSET_SYNC_PTR); }
+        CHANNEL.store(buf.as_mut_ptr(), Ordering::SeqCst);
+        CHUNKS.store(0, Ordering::SeqCst);
+        let mut writer = Some(unsafe {
+            CallbackWriter::new(buf.as_mut_ptr(), acknowledging_notify, CancelFlags::unconnected())
+        });
+        let outcome = catch_unwind(AssertUnwindSafe(|| body(&mut writer)));
+        drop(writer);
+        let sent = CHUNKS.load(Ordering::SeqCst);
+        unsafe { sb::destroy_sync(buf.as_mut_ptr(), wc::OFFSET_SYNC_PTR); }
+        if let Err(panic) = outcome {
+            resume_unwind(panic);
+        }
+        sent
+    }
+
+    #[test]
+    fn a_flush_sends_the_buffered_bytes_once() {
+        let sent = chunks_sent_by(|writer| {
+            let w = writer.as_mut().unwrap();
+            w.write_all(&[1, 2, 3]).unwrap();
+            w.flush().unwrap();
+        });
+        assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn a_discarded_writer_sends_nothing_when_dropped() {
+        let sent = chunks_sent_by(|writer| {
+            let w = writer.as_mut().unwrap();
+            w.write_all(&[1, 2, 3]).unwrap();
+            crate::host::bridge_api::BufferedSink::discard(w);
+            drop(writer.take());
+        });
+        assert_eq!(sent, 0, "a drop after a failed or cancelled op writes nothing");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "buffered bytes")]
+    fn dropping_buffered_bytes_after_an_ok_op_is_a_bug() {
+        chunks_sent_by(|writer| {
+            writer.as_mut().unwrap().write_all(&[1, 2, 3]).unwrap();
+            drop(writer.take());
+        });
     }
 
     #[test]

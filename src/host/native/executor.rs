@@ -567,7 +567,7 @@ fn run_job(state: &mut EngineState, controller: &ExecutorController, job: Job) -
                 let writer = unsafe {
                     CallbackWriter::new(s.buf as *mut u8, s.notify.unwrap(), token.clone())
                 };
-                sinks.push(BoxedWriter::new(writer));
+                sinks.push(BoxedWriter::buffered(writer));
             }
         }
 

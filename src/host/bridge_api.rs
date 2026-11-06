@@ -39,33 +39,105 @@ impl std::io::Seek for BoxedReader {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> { self.0.seek(pos) }
 }
 
-/// Concrete wrapper around a boxed Write+Send trait object.
-pub(crate) struct BoxedWriter {
-    inner: Box<dyn WriteSend>,
+/// A sink writer that buffers: it holds bytes back until `flush`, and
+/// `discard` drops what it holds. Neither writes on drop.
+pub(crate) trait BufferedSink: std::io::Write + Send {
+    fn discard(&mut self);
+}
+
+enum SinkWriter {
+    /// A writer that holds nothing back: the proofs' and the probe's sinks.
+    #[cfg(any(test, feature = "test-support"))]
+    Plain(Box<dyn WriteSend>),
+    Buffered(Box<dyn BufferedSink>),
+}
+
+struct SinkCore {
+    writer: SinkWriter,
     written: u64,
 }
 
+/// Concrete wrapper around a boxed Write+Send trait object.
+///
+/// The handle an op takes and the handle the request door keeps share one
+/// writer: the op's end drops its handle, the door's flush or discard is the
+/// last word on what the writer holds.
+pub(crate) struct BoxedWriter {
+    core: std::sync::Arc<std::sync::Mutex<SinkCore>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) trait WriteSend: std::io::Write + Send {}
+#[cfg(any(test, feature = "test-support"))]
 impl<T: std::io::Write + Send> WriteSend for T {}
 
 impl BoxedWriter {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new(w: impl std::io::Write + Send + 'static) -> Self {
-        Self { inner: Box::new(w), written: 0 }
+        Self::of(SinkWriter::Plain(Box::new(w)))
+    }
+
+    pub(crate) fn buffered(w: impl BufferedSink + 'static) -> Self {
+        Self::of(SinkWriter::Buffered(Box::new(w)))
+    }
+
+    fn of(writer: SinkWriter) -> Self {
+        let core = SinkCore { writer, written: 0 };
+        Self { core: std::sync::Arc::new(std::sync::Mutex::new(core)) }
+    }
+
+    /// Another handle to this writer.
+    fn share(&self) -> Self {
+        Self { core: self.core.clone() }
+    }
+
+    /// Drops the bytes the writer still holds.
+    fn discard(&mut self) {
+        match &mut self.core().writer {
+            SinkWriter::Buffered(w) => w.discard(),
+            #[cfg(any(test, feature = "test-support"))]
+            SinkWriter::Plain(_) => {}
+        }
+    }
+
+    fn core(&self) -> std::sync::MutexGuard<'_, SinkCore> {
+        self.core.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 impl std::io::Write for BoxedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.written += n as u64;
+        let mut core = self.core();
+        let n = match &mut core.writer {
+            #[cfg(any(test, feature = "test-support"))]
+            SinkWriter::Plain(w) => w.write(buf)?,
+            SinkWriter::Buffered(w) => w.write(buf)?,
+        };
+        core.written += n as u64;
         Ok(n)
     }
-    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.core().writer {
+            #[cfg(any(test, feature = "test-support"))]
+            SinkWriter::Plain(w) => w.flush(),
+            SinkWriter::Buffered(w) => w.flush(),
+        }
+    }
 }
 
 impl crate::host::positioned_write::PositionedWrite for BoxedWriter {
     fn position(&mut self) -> u64 {
-        self.written
+        self.core().written
+    }
+}
+
+/// The response for a sink that failed to take an op's last bytes: the one
+/// the op itself answers for a failed write.
+fn write_failure(error: std::io::Error) -> Vec<u8> {
+    if error.to_string() == "operation cancelled" {
+        ResponseWriter::cancelled()
+    } else {
+        ResponseWriter::error_of(&crate::Error::Io(error))
     }
 }
 
@@ -96,6 +168,10 @@ pub(crate) fn handle_request(
         Err(e) => return ResponseWriter::error(&format!("parse error: {e}")),
     };
 
+    // The ops take their sinks and drop them; these handles keep every
+    // writer alive to the end, where its last bytes are written or dropped.
+    let mut doors: Vec<BoxedWriter> = sinks.iter().map(BoxedWriter::share).collect();
+
     let mut ctx = crate::host::ops::OpCtx {
         state,
         req: &req,
@@ -104,10 +180,27 @@ pub(crate) fn handle_request(
         sinks: &mut sinks,
         cancel,
     };
-    let response = match crate::host::ops::registry::find(req.op()) {
+    let mut response = match crate::host::ops::registry::find(req.op()) {
         Some(entry) => (entry.handle)(&mut ctx),
         None => ResponseWriter::error(&format!("unknown op: {}", req.op())),
     };
+    // The op's last bytes are written here, by an explicit flush, never by a
+    // writer's drop: a drop cannot report that the write failed. An op that
+    // ended cancelled or failed holds no partial output, so its sinks write
+    // nothing more.
+    if ResponseWriter::is_ok(&response) {
+        for door in &mut doors {
+            if let Err(error) = std::io::Write::flush(door) {
+                response = write_failure(error);
+                break;
+            }
+        }
+    }
+    if !ResponseWriter::is_ok(&response) {
+        for door in &mut doors {
+            door.discard();
+        }
+    }
     // An op ends here: no open document keeps the object stream it decoded.
     for document in ctx.state.documents.values() {
         document.release_objstm_memo();
@@ -225,7 +318,7 @@ mod wasm_entry {
 
         let mut sinks = Vec::new();
         for i in 0..sink_count {
-            sinks.push(BoxedWriter::new(JsCallbackWriter::new(i)));
+            sinks.push(BoxedWriter::buffered(JsCallbackWriter::new(i)));
         }
 
         handle_request(state, request_bytes, None, sources, sinks, &crate::cancel::CancelCheck::from_host())
@@ -239,5 +332,144 @@ mod wasm_entry {
         unsafe {
             let _ = Box::from_raw(state_ptr as *mut EngineState);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// A request frame with integer fields, as the Dart codec lays it out.
+    fn frame(op: &str, fields: &[(&str, i32)]) -> Vec<u8> {
+        let mut out = vec![op.len() as u8];
+        out.extend_from_slice(op.as_bytes());
+        out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+        for (key, value) in fields {
+            out.push(key.len() as u8);
+            out.extend_from_slice(key.as_bytes());
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    /// A sink that buffers as the host writers do: `write` always succeeds,
+    /// the bytes are delivered only by `flush`, which fails with `refusal`
+    /// when one is set.
+    struct Buffered {
+        pending: Vec<u8>,
+        delivered: Arc<Mutex<Vec<u8>>>,
+        flushes: Arc<AtomicUsize>,
+        discards: Arc<AtomicUsize>,
+        refusal: Option<&'static str>,
+    }
+
+    impl BufferedSink for Buffered {
+        fn discard(&mut self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+            self.pending.clear();
+        }
+    }
+
+    impl Write for Buffered {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.pending.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            if let Some(message) = self.refusal {
+                return Err(std::io::Error::other(message));
+            }
+            self.delivered.lock().unwrap().append(&mut self.pending);
+            Ok(())
+        }
+    }
+
+    struct Probe {
+        delivered: Arc<Mutex<Vec<u8>>>,
+        flushes: Arc<AtomicUsize>,
+        discards: Arc<AtomicUsize>,
+    }
+
+    fn buffered(refusal: Option<&'static str>) -> (BoxedWriter, Probe) {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let discards = Arc::new(AtomicUsize::new(0));
+        let sink = Buffered {
+            pending: Vec::new(),
+            delivered: delivered.clone(),
+            flushes: flushes.clone(),
+            discards: discards.clone(),
+            refusal,
+        };
+        (BoxedWriter::buffered(sink), Probe { delivered, flushes, discards })
+    }
+
+    /// `builderSave` of a fresh builder into `sink`.
+    fn save_into(sink: BoxedWriter, handle: Option<i32>) -> Vec<u8> {
+        let mut state = EngineState::new();
+        let created = handle_request(
+            &mut state,
+            &frame("builderCreate", &[]),
+            None,
+            Vec::new(),
+            Vec::new(),
+            &crate::cancel::CancelCheck::none(),
+        );
+        assert_eq!(created[0], 1, "the builder is created");
+        let handle = handle.unwrap_or_else(|| {
+            let mut as_request = vec![0u8];
+            as_request.extend_from_slice(&created[1..]);
+            Request::parse(&as_request).unwrap().get_i32("handleId").unwrap()
+        });
+        handle_request(
+            &mut state,
+            &frame("builderSave", &[("handleId", handle)]),
+            None,
+            Vec::new(),
+            vec![sink],
+            &crate::cancel::CancelCheck::none(),
+        )
+    }
+
+    #[test]
+    fn an_ok_op_has_its_sinks_flushed() {
+        let (sink, probe) = buffered(None);
+        let answer = save_into(sink, None);
+        assert_eq!(answer[0], 1, "the save is ok");
+        assert_eq!(probe.flushes.load(Ordering::SeqCst), 1, "flushed once, by the door");
+        assert!(probe.delivered.lock().unwrap().starts_with(b"%PDF-"), "the output arrived");
+        assert_eq!(probe.discards.load(Ordering::SeqCst), 0, "nothing is dropped after an ok op");
+    }
+
+    #[test]
+    fn a_failed_last_flush_fails_the_op() {
+        let (sink, probe) = buffered(Some("host write failed"));
+        let answer = save_into(sink, None);
+        assert_eq!(answer[0], 0, "the response is an error, not ok");
+        assert_eq!(answer[1], crate::host::binary_codec::ErrorKind::Io as u8);
+        assert!(probe.delivered.lock().unwrap().is_empty());
+        assert_eq!(probe.discards.load(Ordering::SeqCst), 1, "the refused bytes are dropped");
+    }
+
+    #[test]
+    fn a_cancel_at_the_last_flush_cancels_the_op() {
+        let (sink, _probe) = buffered(Some("operation cancelled"));
+        let answer = save_into(sink, None);
+        assert_eq!(answer, ResponseWriter::cancelled());
+    }
+
+    #[test]
+    fn a_failed_op_does_not_flush_its_sinks() {
+        let (sink, probe) = buffered(None);
+        let answer = save_into(sink, Some(9999));
+        assert_eq!(answer[0], 0, "no such builder");
+        assert_eq!(probe.flushes.load(Ordering::SeqCst), 0);
+        assert!(probe.delivered.lock().unwrap().is_empty());
+        assert_eq!(probe.discards.load(Ordering::SeqCst), 1, "a failed op's sink is discarded");
     }
 }

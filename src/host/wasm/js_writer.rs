@@ -11,7 +11,7 @@
 //!
 //! Small writes accumulate in a fixed internal buffer (256KB, matching
 //! the native condvar write channel). A round-trip to JS only happens
-//! when the buffer is full or on flush/drop. O(1) memory — the buffer
+//! when the buffer is full or on flush. O(1) memory — the buffer
 //! is fixed-size, never grows with PDF size.
 
 use std::io::{self, Write};
@@ -87,8 +87,20 @@ impl Write for JsCallbackWriter {
     }
 }
 
+impl crate::host::bridge_api::BufferedSink for JsCallbackWriter {
+    fn discard(&mut self) {
+        self.buffer.clear();
+    }
+}
+
 impl Drop for JsCallbackWriter {
+    /// Writes nothing, so the drop glue never calls the pausing import:
+    /// bytes still buffered are the request door's to flush after an ok op,
+    /// or to discard after a failed or cancelled one.
     fn drop(&mut self) {
-        let _ = self.flush_buffer();
+        debug_assert!(
+            self.buffer.is_empty() || std::thread::panicking(),
+            "a JsCallbackWriter was dropped with buffered bytes: flush or discard it first"
+        );
     }
 }

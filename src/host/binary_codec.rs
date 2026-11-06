@@ -304,6 +304,11 @@ impl ResponseWriter {
         ResponseWriter { buf }
     }
 
+    /// True for a complete response whose status is ok.
+    pub fn is_ok(response: &[u8]) -> bool {
+        response.first() == Some(&1)
+    }
+
     /// Encode a complete cancelled response (status 2). Posted for
     /// every job cancelled by dispose or PdfTask.cancel — hosts map it
     /// to their typed cancellation error, never by message matching.
