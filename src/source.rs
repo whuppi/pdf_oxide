@@ -108,6 +108,15 @@ impl Source {
         }
     }
 
+    /// A source over a caller's reader, read where the reader stands and
+    /// never decrypted: the bytes of a file that is not a document.
+    pub(crate) fn over(reader: Box<dyn ReadSeek>) -> Arc<Self> {
+        Arc::new(Self::new(
+            PdfReader::External(BufReader::new(reader)),
+            Arc::new(WarningSink::new()),
+        ))
+    }
+
     pub(crate) fn warnings(&self) -> &Arc<WarningSink> {
         &self.warnings
     }

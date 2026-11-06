@@ -133,6 +133,8 @@ mod text_tj_chunks;
 #[cfg(feature = "rendering")]
 mod watermark_positions;
 mod sort_cancel;
+mod attachment_stream;
+mod editor_streamed_inputs;
 mod whole_reads;
 #[cfg(feature = "rendering")]
 mod redact_extra_type3;

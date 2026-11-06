@@ -48,6 +48,7 @@ pub(crate) mod font_budget;
 pub(crate) mod font_subset;
 pub mod images;
 pub mod image_embed;
+pub(crate) mod staged;
 pub(crate) mod incremental;
 #[cfg(feature = "rendering")]
 pub(crate) mod named_glyphs;

@@ -6,11 +6,16 @@
 //! document-level attachment lives (ISO 32000-1 §7.11.4). Listing walks
 //! the tree and reads each file spec's declared metadata; it never
 //! decodes a stream, so a listing costs nothing on a document with a
-//! 50 MB attachment. Extraction decodes exactly the one stream asked for.
+//! 50 MB attachment. Extraction runs the filters of exactly the one stream
+//! asked for, as a reader, and copies it out in pieces.
 
 use crate::document::PdfDocument;
 use crate::error::{Error, Result};
 use crate::object::Object;
+use std::io::{Read, Write};
+
+/// Bytes moved per read and per write when an attachment is copied.
+const PIECE: usize = 64 * 1024;
 
 /// One attachment in wire vocabulary.
 pub struct AttachmentRow {
@@ -45,8 +50,9 @@ pub fn list_attachments(doc: &PdfDocument) -> Result<Vec<AttachmentRow>> {
     Ok(rows)
 }
 
-/// The decoded bytes of the attachment named `name` (`/UF` or `/F`).
-pub fn attachment_bytes(doc: &PdfDocument, name: &str) -> Result<Vec<u8>> {
+/// Copies the decoded bytes of the attachment named `name` (`/UF` or `/F`) to
+/// `out`, a piece at a time.
+pub fn copy_attachment(doc: &PdfDocument, name: &str, out: &mut dyn Write) -> Result<()> {
     for spec in file_specs(doc)? {
         let Some(dict) = spec.as_dict() else { continue };
         if spec_name(doc, dict).as_deref() != Some(name) {
@@ -54,7 +60,20 @@ pub fn attachment_bytes(doc: &PdfDocument, name: &str) -> Result<Vec<u8>> {
         }
         let stream = embedded_stream(doc, dict)
             .ok_or_else(|| Error::InvalidPdf(format!("attachment {name} has no embedded stream")))?;
-        return stream.decode_stream_data();
+        let Object::Stream { dict, body } = &stream else {
+            return Err(Error::InvalidPdf(format!("attachment {name} has no embedded stream")));
+        };
+        let mut reader =
+            crate::decoders::stream::reader_in(dict, body.origin(), || body.raw_reader())?;
+        let mut piece = vec![0u8; PIECE];
+        loop {
+            crate::cancel::poll()?;
+            let n = reader.read(&mut piece).map_err(crate::encryption::stream::from_io)?;
+            if n == 0 {
+                return Ok(());
+            }
+            out.write_all(&piece[..n]).map_err(|e| Error::InvalidPdf(e.to_string()))?;
+        }
     }
     Err(Error::InvalidPdf(format!("no attachment named {name}")))
 }

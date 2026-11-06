@@ -5677,7 +5677,10 @@ impl DocumentEditor {
                 // Build and write embedded file stream
                 let stream_dict = file.build_stream_dict();
                 // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                let stream_obj = Object::stream(stream_dict, file.data.clone());
+                let stream_obj = match &file.staged {
+                    Some(staged) => Object::Stream { dict: stream_dict, body: staged.body.clone() },
+                    None => Object::stream(stream_dict, file.data.clone()),
+                };
                 // ── end pdf_manipulator patch ──
                 let offset = writer.position();
                 // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──

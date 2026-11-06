@@ -1168,19 +1168,32 @@ pub fn edit_unembed_standard_fonts(editor: &mut DocumentEditor) -> Result<usize>
     Ok(count)
 }
 
+/// The data of a file to embed.
+pub(crate) enum FileData {
+    /// Held in memory.
+    Whole(Vec<u8>),
+    /// Left in the caller's source: the save reads it from there in pieces.
+    Source(crate::host::bridge_api::BoxedReader),
+}
+
 /// Embed a file attachment into the document. `description`, `mime_type`
 /// and `relationship` are omitted from the file spec when empty.
-pub fn edit_embed_file(
+pub(crate) fn edit_embed_file(
     editor: &mut DocumentEditor,
     name: &str,
-    data: Vec<u8>,
+    data: FileData,
     description: &str,
     mime_type: &str,
     relationship: &str,
 ) -> Result<()> {
     use crate::writer::{AFRelationship, EmbeddedFile};
 
-    let mut file = EmbeddedFile::new(name, data);
+    let mut file = match data {
+        FileData::Whole(bytes) => EmbeddedFile::new(name, bytes),
+        FileData::Source(reader) => {
+            EmbeddedFile::staged(name, crate::host::staged::body_over(reader.0)?)?
+        },
+    };
     if !description.is_empty() {
         file.description = Some(description.to_string());
     }
@@ -1258,17 +1271,13 @@ pub fn doc_annotations(doc: &mut PdfDocument, page: usize) -> Result<Vec<Annotat
         .collect())
 }
 
-/// Write the attachment named `name` to the sink in bounded chunks.
+/// Write the attachment named `name` to the sink in pieces of 64 KiB.
 pub fn doc_extract_attachment<W: std::io::Write>(
     doc: &mut PdfDocument,
     name: &str,
     writer: &mut W,
 ) -> Result<()> {
-    let bytes = crate::host::attachments::attachment_bytes(doc, name)?;
-    for chunk in bytes.chunks(256 * 1024) {
-        writer.write_all(chunk).map_err(|e| Error::InvalidPdf(e.to_string()))?;
-    }
-    Ok(())
+    crate::host::attachments::copy_attachment(doc, name, writer)
 }
 
 
@@ -2331,45 +2340,49 @@ pub fn edit_add_stamp(
 }
 
 /// Add an image stamp to every page of `pages` — builds the appearance stream
-/// directly from image bytes, once: the pages share one image and one
+/// directly from the image, once: the pages share one image and one
 /// appearance, each with an annotation of its own. All or nothing: the image is
-/// decoded and every page checked before anything is staged, and an error
-/// after that puts the editor back as it was.
+/// read and every page checked before anything is staged, and an error
+/// after that puts the editor back as it was. An image left in its source
+/// stays there until the save.
 pub fn edit_add_image_stamp(
-    editor: &mut DocumentEditor, pages: &[usize], image_bytes: Vec<u8>,
+    editor: &mut DocumentEditor, pages: &[usize], image: impl Into<ImageBytes>,
     x: f32, y: f32, w: f32, h: f32, opacity: f32,
 ) -> Result<()> {
     use crate::writer::ImageData;
 
-    let img = ImageData::from_bytes(&image_bytes)
-        .map_err(|e| Error::InvalidPdf(format!("invalid image: {e}")))?;
+    let staged = match image.into() {
+        ImageBytes::Whole(bytes) => {
+            let img = ImageData::from_bytes(&bytes)
+                .map_err(|e| Error::InvalidPdf(format!("invalid image: {e}")))?;
+            crate::host::image_embed::Staged {
+                image: (img.build_xobject_dict(), img.data.clone().into()),
+                mask: img.build_soft_mask_dict().zip(img.soft_mask.clone()).map(|(dict, data)| (dict, data.into())),
+            }
+        },
+        ImageBytes::Streamed(image) => image.stage()?,
+    };
     check_editable_pages(editor, pages)?;
-    editor.undoable(|editor| stage_image_stamps(editor, pages, img, x, y, w, h, opacity))
+    editor.undoable(|editor| stage_image_stamps(editor, pages, staged, x, y, w, h, opacity))
 }
 
 /// The staging of [`edit_add_image_stamp`].
 fn stage_image_stamps(
-    editor: &mut DocumentEditor, pages: &[usize], img: crate::writer::ImageData,
+    editor: &mut DocumentEditor, pages: &[usize], staged: crate::host::image_embed::Staged,
     x: f32, y: f32, w: f32, h: f32, opacity: f32,
 ) -> Result<()> {
     use crate::object::Object;
 
-    // build_xobject_dict() carries the PNG DecodeParms/Predictor=15 that
-    // from_png()'s per-row filter bytes require; a hand-rolled FlateDecode
-    // dict without it misreads every scanline.
-    let mut img_dict = img.build_xobject_dict();
+    // The dictionary carries the PNG DecodeParms/Predictor=15 that the
+    // per-row filter bytes require; a hand-rolled FlateDecode dict without
+    // it misreads every scanline.
+    let (mut img_dict, img_body) = staged.image;
 
     // A PNG alpha channel must travel as a separate grayscale /SMask, or
-    // transparent pixels paint solid black over the page. from_png() has
-    // already split the alpha into img.soft_mask.
-    if let (Some(smask_dict), Some(smask_data)) =
-        (img.build_soft_mask_dict(), img.soft_mask.clone())
-    {
+    // transparent pixels paint solid black over the page.
+    if let Some((smask_dict, smask_body)) = staged.mask {
         let smask_id = editor.alloc_id();
-        editor.insert_modified(smask_id, Object::stream(
-            smask_dict,
-            bytes::Bytes::from(smask_data),
-        ));
+        editor.insert_modified(smask_id, Object::Stream { dict: smask_dict, body: smask_body });
         img_dict.insert(
             "SMask".into(),
             Object::Reference(crate::object::ObjectRef::new(smask_id, 0)),
@@ -2377,7 +2390,7 @@ fn stage_image_stamps(
     }
 
     let img_id = editor.alloc_id();
-    editor.insert_modified(img_id, Object::stream(img_dict, bytes::Bytes::from(img.data)));
+    editor.insert_modified(img_id, Object::Stream { dict: img_dict, body: img_body });
 
     // Form XObject (appearance stream) — draws the image scaled to rect
     let content = format!("q\n{} 0 0 {} 0 0 cm\n/Im0 Do\nQ\n", w, h);

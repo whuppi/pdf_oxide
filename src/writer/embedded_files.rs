@@ -42,7 +42,24 @@ pub struct EmbeddedFile {
     /// Associated File Relationship (AFRelationship)
     /// Per PDF 2.0 spec: Source, Data, Alternative, Supplement, etc.
     pub af_relationship: Option<AFRelationship>,
+    // ── pdf_manipulator patch: an embedded file can stay in its source until the save ──
+    /// The data when it is not held in `data`, which is then empty: the save
+    /// reads it from its source in pieces.
+    pub(crate) staged: Option<Staged>,
+    // ── end pdf_manipulator patch ──
 }
+
+// ── pdf_manipulator patch: an embedded file can stay in its source until the save ──
+/// The data of an embedded file that stays in its source.
+#[derive(Debug, Clone)]
+pub(crate) struct Staged {
+    /// An extent over the source.
+    pub(crate) body: crate::object::StreamBody,
+    /// The MD5 sum of the data, summed in pieces when the file was staged;
+    /// `None` without `legacy-crypto`.
+    pub(crate) checksum: Option<Vec<u8>>,
+}
+// ── end pdf_manipulator patch ──
 
 /// Associated File Relationship per PDF 2.0 spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +114,27 @@ impl EmbeddedFile {
             creation_date: None,
             modification_date: None,
             af_relationship: None,
+            // ── pdf_manipulator patch: an embedded file can stay in its source until the save ──
+            staged: None,
+            // ── end pdf_manipulator patch ──
         }
     }
+
+    // ── pdf_manipulator patch: an embedded file can stay in its source until the save ──
+    /// A new embedded file whose data stays in its source until the save.
+    pub(crate) fn staged(
+        name: impl Into<String>,
+        body: crate::object::StreamBody,
+    ) -> crate::error::Result<Self> {
+        #[cfg(feature = "legacy-crypto")]
+        let checksum = Some(crate::host::staged::md5_of(&body)?);
+        #[cfg(not(feature = "legacy-crypto"))]
+        let checksum = None;
+        let mut file = Self::new(name, Vec::new());
+        file.staged = Some(Staged { body, checksum });
+        Ok(file)
+    }
+    // ── end pdf_manipulator patch ──
 
     /// Set the description.
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
@@ -132,7 +168,12 @@ impl EmbeddedFile {
 
     /// Get the size of the embedded file data.
     pub fn size(&self) -> usize {
-        self.data.len()
+        // ── pdf_manipulator patch: an embedded file can stay in its source until the save ──
+        match &self.staged {
+            Some(staged) => staged.body.len() as usize,
+            None => self.data.len(),
+        }
+        // ── end pdf_manipulator patch ──
     }
 
     /// Build the embedded file stream dictionary.
@@ -157,7 +198,9 @@ impl EmbeddedFile {
 
         // Build Params dictionary
         let mut params = HashMap::new();
-        params.insert("Size".to_string(), Object::Integer(self.data.len() as i64));
+        // ── pdf_manipulator patch: an embedded file can stay in its source until the save ──
+        params.insert("Size".to_string(), Object::Integer(self.size() as i64));
+        // ── end pdf_manipulator patch ──
 
         if let Some(ref creation) = self.creation_date {
             params.insert(
@@ -179,8 +222,16 @@ impl EmbeddedFile {
 
         // CheckSum: MD5 per PDF spec (ISO 32000-1 §7.11.4). When legacy-crypto
         // is disabled we omit the optional field rather than fail.
-        #[cfg(feature = "legacy-crypto")]
-        params.insert("CheckSum".to_string(), Object::String(md5_hash(&self.data)));
+        // ── pdf_manipulator patch: an embedded file can stay in its source until the save ──
+        if let Some(staged) = &self.staged {
+            if let Some(checksum) = &staged.checksum {
+                params.insert("CheckSum".to_string(), Object::String(checksum.clone()));
+            }
+        } else {
+            #[cfg(feature = "legacy-crypto")]
+            params.insert("CheckSum".to_string(), Object::String(md5_hash(&self.data)));
+        }
+        // ── end pdf_manipulator patch ──
 
         dict.insert("Params".to_string(), Object::Dictionary(params));
 

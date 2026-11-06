@@ -4,13 +4,13 @@
 // not-enabled error when the office feature is off. XFA → AcroForm is
 // core and always built.
 
-use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
+use crate::host::binary_codec::{Request, ResponseWriter};
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
 use crate::host::engine_state::EngineState;
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
-    authenticate_or_refuse, ok_flag, open_source, read_all_from_reader, req_handle,
+    authenticate_or_refuse, ok_flag, open_source, req_handle,
 };
 
 use crate::document::PdfDocument;
@@ -131,46 +131,20 @@ fn handle_convert_to_pdf(
 ) -> Vec<u8> {
     let format = req.get_str("format").unwrap_or("docx");
 
-    if let Some(mut writer) = sink_writer {
-        // Streaming path: reader → converter → writer. O(1) memory.
-        if let Some(reader) = source_reader {
-            match dispatch::convert_from_format_writer(reader, format, &mut writer) {
-                Ok(()) => {
-                    ok_flag("streamed")
-                }
-                Err(e) => ResponseWriter::error_of(&e),
-            }
-        } else if let Some(bytes) = source_bytes {
-            match dispatch::convert_from_format_writer(std::io::Cursor::new(bytes.to_vec()), format, &mut writer) {
-                Ok(()) => {
-                    ok_flag("streamed")
-                }
-                Err(e) => ResponseWriter::error_of(&e),
-            }
-        } else {
-            ResponseWriter::error("no source for convertToPdf")
-        }
-    } else {
-        // Fallback: no sink, return bytes in response.
-        let data = if let Some(mut reader) = source_reader {
-            match read_all_from_reader(&mut reader) {
-                Ok(d) => d,
-                Err(e) => {
-                    return ResponseWriter::error_kind(ErrorKind::Io, &e.to_string())
-                }
-            }
-        } else if let Some(b) = source_bytes {
-            b.to_vec()
-        } else {
-            return ResponseWriter::error("no source for convertToPdf");
-        };
-        match dispatch::convert_from_format_to_bytes(&data, format) {
-            Ok(bytes) => {
-                let mut w = ResponseWriter::ok();
-                w.put_bytes("data", &bytes);
-                w.finish()
-            }
+    let Some(mut writer) = sink_writer else {
+        return ResponseWriter::error("convertToPdf requires a sink");
+    };
+    if let Some(reader) = source_reader {
+        match dispatch::convert_from_format_writer(reader, format, &mut writer) {
+            Ok(()) => ok_flag("streamed"),
             Err(e) => ResponseWriter::error_of(&e),
         }
+    } else if let Some(bytes) = source_bytes {
+        match dispatch::convert_from_format_writer(std::io::Cursor::new(bytes.to_vec()), format, &mut writer) {
+            Ok(()) => ok_flag("streamed"),
+            Err(e) => ResponseWriter::error_of(&e),
+        }
+    } else {
+        ResponseWriter::error("no source for convertToPdf")
     }
 }

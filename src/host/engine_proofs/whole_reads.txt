@@ -13,7 +13,6 @@ fonts::font_dict::extract_truetype_cmap_from_descriptor
 fonts::font_dict::from_dict
 fonts::font_dict::parse_descendant_fonts
 fonts::font_dict::resolve_encoding_writing_mode
-host::attachments::attachment_bytes
 host::image_embed::take # an interlaced (Adam7) PNG cannot be produced a row at a time, so its file is read whole; a JPEG and every other PNG stay in their source
 object::decode_stream_data
 object::read_whole_raw

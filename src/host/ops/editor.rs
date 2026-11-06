@@ -5,11 +5,12 @@ use crate::host::binary_codec::{ErrorKind, Request, ResponseWriter};
 use crate::host::bridge_api::{BoxedReader, BoxedWriter};
 use crate::host::dispatch;
 use crate::host::engine_state::EngineState;
+use crate::host::image_embed::{self, ImageBytes, Taken};
 use crate::host::positioned_write::{CountingWriter, PositionedWrite};
 use crate::host::ops::op_unit;
 use crate::host::ops::support::{
     authenticate_or_refuse, handle_with_editor, ok_flag, ok_response, open_source_cancellable, page_of,
-    page_set_of, pages_of, put_page_infos, read_all_from_reader, req_handle,
+    page_set_of, pages_of, put_page_infos, req_handle,
 };
 
 use crate::editor::DocumentEditor;
@@ -370,7 +371,7 @@ fn do_editor_mutate(
     editor: &mut DocumentEditor,
     edit_op: &str,
     req: &Request<'_>,
-    mut data_reader: Option<BoxedReader>,
+    data_reader: Option<BoxedReader>,
     cancel: &crate::cancel::CancelCheck,
 ) -> crate::error::Result<Vec<u8>> {
     use crate::error::Error;
@@ -566,11 +567,9 @@ fn do_editor_mutate(
         }
         "embedFile" => {
             let name = req.get_str("name").unwrap_or("file");
-            let data = if let Some(ref mut reader) = data_reader {
-                read_all_from_reader(reader)
-                    .map_err(|e| Error::InvalidPdf(e.to_string()))?
-            } else {
-                req.get_bytes("data").unwrap_or(&[]).to_vec()
+            let data = match data_reader {
+                Some(reader) => dispatch::FileData::Source(reader),
+                None => dispatch::FileData::Whole(req.get_bytes("data").unwrap_or(&[]).to_vec()),
             };
             dispatch::edit_embed_file(
                 editor,
@@ -625,11 +624,16 @@ fn do_editor_mutate(
             ok_response()
         }
         "addImageStamp" => {
-            let image_bytes = if let Some(ref mut reader) = data_reader {
-                read_all_from_reader(reader)
-                    .map_err(|e| Error::InvalidPdf(e.to_string()))?
-            } else {
-                req.get_bytes("imageData").unwrap_or(&[]).to_vec()
+            let image = match data_reader {
+                Some(reader) => match image_embed::take(reader)? {
+                    Taken::Image(image) => image,
+                    Taken::Unreadable => {
+                        return Err(Error::InvalidPdf(
+                            "invalid image: the bytes are not a readable PNG or JPEG image".to_string(),
+                        ))
+                    },
+                },
+                None => ImageBytes::Whole(req.get_bytes("imageData").unwrap_or(&[]).to_vec()),
             };
             let pages = match page_set_of(req, count) {
                 Ok(p) => p,
@@ -638,7 +642,7 @@ fn do_editor_mutate(
             dispatch::edit_add_image_stamp(
                 editor,
                 &pages,
-                image_bytes,
+                image,
                 req.get_f64("x").unwrap_or(0.0) as f32,
                 req.get_f64("y").unwrap_or(0.0) as f32,
                 req.get_f64("width").unwrap_or(100.0) as f32,
