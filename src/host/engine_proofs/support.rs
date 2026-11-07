@@ -2,8 +2,7 @@
 
 use crate::editor::DocumentEditor;
 
-#[cfg(unix)]
-pub(super) use crate::host::cpu_clock::thread_cpu_secs;
+pub(super) use crate::host::cpu_clock::{resolution_secs, thread_cpu_secs};
 
 /// Objects are numbered from 1 in the order given; offsets are computed.
 pub(super) fn pdf_from_objects(objs: &[Vec<u8>]) -> Vec<u8> {

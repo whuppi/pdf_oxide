@@ -1804,9 +1804,6 @@ fn qa_image_mask_negative_dimension_field_no_panic() {
 /// with a Device-family fill must complete inside a generous wall-clock
 /// budget. Coarse guard against an O(N) per-paint allocation spiral
 /// (e.g. a clone slipping into the short-circuit path).
-// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-#[cfg(all(unix, feature = "test-support"))]
-// ── end pdf_manipulator patch ──
 #[test]
 fn qa_image_mask_perf_thousand_paints_completes_within_budget() {
     let mask = solid_image_mask_bytes(2, 2);

@@ -149,9 +149,6 @@ fn build_sibling_form_collision_pdf() -> Vec<u8> {
     pdf
 }
 
-// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-#[cfg(all(unix, feature = "test-support"))]
-// ── end pdf_manipulator patch ──
 #[test]
 fn sibling_form_xobject_name_collision_does_not_hang() {
     let pdf_bytes = build_sibling_form_collision_pdf();

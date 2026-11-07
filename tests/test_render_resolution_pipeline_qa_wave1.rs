@@ -964,9 +964,6 @@ fn qa_scn_too_few_components_no_panic() {
 /// favours correctness (capability gain) over hot-path latency. It
 /// exists to surface a 100×-scale regression that would be visible to
 /// operators.
-// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-#[cfg(all(unix, feature = "test-support"))]
-// ── end pdf_manipulator patch ──
 #[test]
 fn qa_perf_thousand_fills_within_bound() {
     let mut content = String::with_capacity(20_000);

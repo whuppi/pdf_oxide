@@ -1487,9 +1487,6 @@ fn qa_adversarial_dangling_color_space_ref_no_panic() {
 /// Hard wall-clock budget on the 1000-shading run. A pipeline render of
 /// 1000 DeviceRGB shadings must complete inside the budget on the CI
 /// baseline — guards against an O(N) clone spiral in the helper.
-// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-#[cfg(all(unix, feature = "test-support"))]
-// ── end pdf_manipulator patch ──
 #[test]
 fn qa_shading_perf_thousand_invocations_within_five_seconds() {
     let mut content = String::new();

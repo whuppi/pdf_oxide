@@ -4,8 +4,7 @@
 //! public path (`extract_paths`, `extract_tables`), and as paths handed
 //! straight to a `RulingGrid`, for sizes no document test would read in time.
 
-#[cfg(unix)]
-use super::support::thread_cpu_secs;
+use super::support::{resolution_secs, thread_cpu_secs};
 use super::support::{pdf_from_objects, stream_object};
 use crate::document::PdfDocument;
 use crate::elements::PathContent;
@@ -195,7 +194,6 @@ fn lattice(tables: usize) -> (RulingGrid, Vec<TextSpan>) {
 
 /// The tables found in a lattice of `tables` and the CPU milliseconds the grid
 /// and the detector took together on this thread, per 10,000 primitives.
-#[cfg(unix)]
 fn milliseconds_per_ten_thousand(tables: usize) -> (usize, f64) {
     let started = thread_cpu_secs();
     let (grid, spans) = lattice(tables);
@@ -215,7 +213,6 @@ fn milliseconds_per_ten_thousand(tables: usize) -> (usize, f64) {
 
 /// Milliseconds per 10,000 primitives at `tables` tables: the quicker of
 /// `runs` runs, so a slow start does not stand for the size. Every table must be found.
-#[cfg(unix)]
 fn best_milliseconds(tables: usize, runs: usize) -> f64 {
     (0..runs)
         .map(|_| {
@@ -226,7 +223,7 @@ fn best_milliseconds(tables: usize, runs: usize) -> f64 {
         .fold(f64::MAX, f64::min)
 }
 
-#[cfg(all(unix, not(debug_assertions)))]
+#[cfg(not(debug_assertions))]
 /// No Dart battery sees it: only a comparison of two sizes shows growth, and
 /// a million rulings is too many for a document test. Compiled for release
 /// only, since the debug profile runs it for minutes.
@@ -238,7 +235,7 @@ fn a_hundred_thousand_and_a_million_rulings_cost_the_same_per_primitive() {
     assert!(large / small < 1.3, "{small:.1} ms at 100k and {large:.1} ms at 1M per 10k primitives");
 }
 
-#[cfg(all(unix, debug_assertions))]
+#[cfg(debug_assertions)]
 /// No Dart battery sees it, as above. The debug profile reads a smaller pair.
 #[test]
 fn ten_thousand_and_a_hundred_thousand_rulings_cost_about_the_same_per_primitive() {
@@ -596,7 +593,6 @@ const CANCEL_TABLES: usize = 1_250;
 #[cfg(not(debug_assertions))]
 const CANCEL_TABLES: usize = 12_500;
 
-#[cfg(unix)]
 /// No Dart battery sees it: a cancel arrives from the host while a lane is
 /// busy, and a battery only sees a job end; the proof is how soon.
 #[test]
@@ -618,10 +614,14 @@ fn a_cancel_set_before_detection_ends_it_at_once() {
     let message = result.expect_err("a cancelled detection is an error").to_string();
     eprintln!("cancel set first: ended in {stopped:.4} s, a whole run is {full:.4} s");
     assert!(message.contains("cancelled"), "{message}");
-    assert!(stopped < full * 0.05, "a cancel set first took {stopped:.4} s against {full:.4} s for the whole run");
+    // One clock tick on each reading: Windows charges CPU time a tick at a time.
+    let tick = resolution_secs();
+    assert!(
+        stopped < full * 0.05 + tick,
+        "a cancel set first took {stopped:.4} s against {full:.4} s for the whole run (a clock tick is {tick:.4} s)"
+    );
 }
 
-#[cfg(unix)]
 /// No Dart battery sees it, as above. A cancel lands a quarter of the way
 /// into a run, and the run must end soon after: the work between that poll
 /// and the next, read as the difference of two runs cancelled one poll apart,
@@ -648,9 +648,11 @@ fn a_cancel_in_the_middle_of_detection_ends_it_within_a_cluster() {
     assert!(at.is_err() && next.is_err(), "the run finished before the cancel landed: raise the lattice");
     let cluster = ended_next - ended;
     eprintln!("cancel a quarter in: ended after {ended:.4} s, one cluster is {cluster:.4} s, a whole run is {full:.4} s");
+    // A difference of two readings is off by up to two ticks.
+    let tick = resolution_secs();
     assert!(
-        cluster < 0.25_f64.min(full * 0.1),
-        "the work between two polls is {cluster:.4} s, a whole run is {full:.4} s"
+        cluster < 0.25_f64.min(full * 0.1) + 2.0 * tick,
+        "the work between two polls is {cluster:.4} s, a whole run is {full:.4} s (a clock tick is {tick:.4} s)"
     );
 }
 

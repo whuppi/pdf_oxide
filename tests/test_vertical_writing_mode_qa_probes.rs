@@ -1480,9 +1480,6 @@ end";
 /// Smoke benchmark: extract 1000-glyph horizontal page and assert wall
 /// clock under a generous bound. Not a strict perf test but pins that the
 /// hot path hasn't gained an obviously expensive op.
-// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-#[cfg(all(unix, feature = "test-support"))]
-// ── end pdf_manipulator patch ──
 #[test]
 fn probe37_horizontal_extraction_bulk_within_bound() {
     // 200 horizontal CIDs.

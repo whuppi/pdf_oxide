@@ -42,7 +42,8 @@ pub(crate) mod forward;
 pub(crate) mod span_index;
 #[cfg(feature = "test-support")]
 pub mod probe;
-#[cfg(all(unix, any(test, feature = "test-support")))]
+// Every host the tests run on has a thread CPU clock; wasm32 has none.
+#[cfg(any(unix, windows))]
 pub mod cpu_clock;
 pub mod positioned_write;
 pub mod font_optimizer;

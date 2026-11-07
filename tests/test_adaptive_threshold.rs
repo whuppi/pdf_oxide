@@ -974,9 +974,6 @@ mod performance_tests {
     ///
     /// Gap analysis should be O(n log n), so should be fast even with
     /// many spans.
-    // ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-    #[cfg(all(unix, feature = "test-support"))]
-    // ── end pdf_manipulator patch ──
     #[test]
     fn test_large_document_performance() {
         // Create document with many spans
@@ -1000,9 +997,6 @@ mod performance_tests {
     }
 
     /// Test with deeply nested document structure.
-    // ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-    #[cfg(all(unix, feature = "test-support"))]
-    // ── end pdf_manipulator patch ──
     #[test]
     fn test_multiline_document_performance() {
         let gaps_per_line = vec![vec![0.2, 0.2, 0.2]; 100]; // 100 lines

@@ -135,8 +135,6 @@ mod stream_extent;
 mod stream_head;
 mod support;
 mod table_rulings;
-// Its proofs read the thread CPU clock, which support.rs has on unix.
-#[cfg(unix)]
 mod text_dense_baseline;
 #[cfg(feature = "rendering")]
 mod text_render_modes;

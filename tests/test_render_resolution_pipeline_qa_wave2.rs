@@ -1402,9 +1402,6 @@ fn qa_text_tj_all_numeric_array_paints_zero_pixels() {
 /// one GS clone per Tj call, with 10 Tj calls each painting 100 glyphs,
 /// is 10 resolver calls and 10 clones, dwarfed by 1000 glyph
 /// rasterisations.
-// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
-#[cfg(all(unix, feature = "test-support"))]
-// ── end pdf_manipulator patch ──
 #[test]
 fn qa_text_perf_thousand_glyphs_completes_within_budget() {
     let mut content = String::from("BT 0 0 1 rg /F1 6 Tf 5 90 Td ");
