@@ -30,10 +30,10 @@ fn document(packet: &[u8]) -> PdfDocument {
 
 /// A packet of 20000 properties gives the same properties the string parser
 /// gives, from the stream alone, and keeps no copy of the packet. The
-/// whole-read wall (`whole_reads.rs`) is what fails when `extract` goes back
-/// to decoding the stream whole. No Dart battery can observe this: Dart
-/// reads the same title either way, and a whole copy of the packet is held
-/// only for the length of the call.
+/// whole-buffer lint (`tool/check_whole_buffers.sh`) is what fails when
+/// `extract` goes back to decoding the stream whole. No Dart battery can
+/// observe this: Dart reads the same title either way, and a whole copy of
+/// the packet is held only for the length of the call.
 #[test]
 fn a_large_xmp_packet_is_read_as_events_and_not_kept() {
     let bytes = packet(20_000);

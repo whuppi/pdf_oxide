@@ -22,8 +22,7 @@ use crate::document::PdfDocument;
 use crate::editor::DocumentEditor;
 use crate::error::{Error, Result};
 use crate::extractors::images::{
-    decode_cmyk_jpeg_to_raw_cmyk, extract_image_from_xobject_at, row_geometry, ImageData,
-    PdfFilter, PixelFormat,
+    extract_image_from_xobject_at, row_geometry, ImageData, PdfFilter, PixelFormat,
 };
 use crate::object::{Object, ObjectRef, StreamBody};
 
@@ -359,11 +358,10 @@ impl CmykRows {
         match kind.encoding {
             Encoding::Jpeg => {
                 let image = extract_image_from_xobject_at(Some(doc), object, None, None, None)?;
-                let ImageData::Jpeg(bytes) = image.data() else {
+                let (width, height) = (image.width(), image.height());
+                let ImageData::Raw { pixels, format: PixelFormat::CMYK } = image.into_data() else {
                     return Err(Error::Image("CMYK JPEG decoded to another model".to_string()));
                 };
-                let pixels = decode_cmyk_jpeg_to_raw_cmyk(bytes)?;
-                let (width, height) = (image.width(), image.height());
                 if width == 0 || height == 0 || pixels.len() != width as usize * height as usize * 4 {
                     return Err(Error::Image(format!(
                         "decoded {} bytes for {width}x{height}x4",

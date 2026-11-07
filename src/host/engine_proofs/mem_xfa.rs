@@ -48,9 +48,9 @@ fn document(acroform: &str, streams: Vec<Vec<u8>>) -> PdfDocument {
 
 /// A datasets packet of 64 MiB once decoded is analysed and parsed with the
 /// thread holding under 1 MiB over where it began, and the form still carries
-/// the value the packet gives its field. The whole-read wall
-/// (`whole_reads.rs`) fails when an XFA caller goes back to decoding a packet
-/// whole. No Dart battery can observe this: Dart reads the same field count
+/// the value the packet gives its field. The whole-buffer lint
+/// (`tool/check_whole_buffers.sh`) fails when an XFA caller goes back to
+/// decoding a packet whole. No Dart battery can observe this: Dart reads the same field count
 /// either way, and what the parse holds is visible only to the allocator
 /// counter.
 #[test]

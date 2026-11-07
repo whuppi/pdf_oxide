@@ -227,6 +227,13 @@ impl PdfImage {
         &self.data
     }
 
+    // ── pdf_manipulator patch: a caller that keeps the samples takes them without a copy ──
+    /// The image data, moved out.
+    pub fn into_data(self) -> ImageData {
+        self.data
+    }
+    // ── end pdf_manipulator patch ──
+
     /// Get the bounding box if available.
     pub fn bbox(&self) -> Option<&Rect> {
         self.bbox.as_ref()
@@ -1049,7 +1056,9 @@ pub fn extract_image_from_xobject(
     obj_ref: Option<ObjectRef>,
     color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
 ) -> Result<PdfImage> {
-    extract_image_from_xobject_at(doc, xobject, obj_ref, color_space_map, None)
+    // ── pdf_manipulator patch: the library's entry returns a JPEG as its file ──
+    extract_image(doc, xobject, obj_ref, color_space_map, None, true)
+    // ── end pdf_manipulator patch ──
 }
 
 /// Extract an image XObject, decoding no larger than `target` where the format
@@ -1083,6 +1092,22 @@ pub fn extract_image_from_xobject_at(
     color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
     target: Option<(u32, u32)>,
 ) -> Result<PdfImage> {
+    // ── pdf_manipulator patch: a JPEG is its raster here, never its file ──
+    extract_image(doc, xobject, _obj_ref, color_space_map, target, false)
+}
+
+/// The extraction both entries share. `jpeg_as_file` is the library's choice
+/// to return a DCT image as its file; a caller that decodes (every lane) never
+/// makes it.
+fn extract_image(
+    doc: Option<&crate::document::PdfDocument>,
+    xobject: &crate::object::Object,
+    _obj_ref: Option<ObjectRef>,
+    color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
+    target: Option<(u32, u32)>,
+    jpeg_as_file: bool,
+) -> Result<PdfImage> {
+    // ── end pdf_manipulator patch ──
     use crate::object::Object;
 
     // Set only by the JPX branch, which is the one format here that can honour
@@ -1280,15 +1305,15 @@ pub fn extract_image_from_xobject_at(
         jpx_decoded_dims = Some((dec_w, dec_h));
         data
     } else if is_jpeg_only || is_jpeg_chain {
-        match target.and_then(|painted| decode_dct_covering(xobject, painted, &color_space).transpose()) {
-            Some(reduced) => {
-                // The samples are the reduced raster, so their size is theirs, as
-                // for a reduced JPX decode.
-                let (pixels, format, reduced_w, reduced_h) = reduced?;
-                jpx_decoded_dims = Some((reduced_w, reduced_h));
-                ImageData::Raw { pixels, format }
-            },
-            None => ImageData::Jpeg(xobject.decode_stream_data()?),
+        if jpeg_as_file {
+            ImageData::Jpeg(jpeg_file(xobject)?)
+        } else {
+            // The samples are the decoded raster, so their size and depth are
+            // theirs, as for a reduced JPX decode.
+            let (pixels, format, decoded_w, decoded_h) = decode_dct_stream(xobject, target)?;
+            jpx_decoded_dims = Some((decoded_w, decoded_h));
+            stored_bpc = 8;
+            ImageData::Raw { pixels, format }
         }
     } else if is_ccitt {
         // A fax image is read from the line decoder, one gray byte a pixel. A fax the line decoder cannot take (not 1-bit DeviceGray, unreadable
@@ -2759,43 +2784,109 @@ fn fax_gray(
 }
 // ── end pdf_manipulator patch ──
 
-// ── pdf_manipulator patch: a JPEG painted smaller than itself is decoded from its stream ──
-/// A gray or RGB JPEG decoded from its stream through the inverse DCT at the
-/// largest reduction that still holds `painted` samples each way, with the
-/// file never held: its dimensions, samples and the reduced raster.
-/// `PdfImage::to_dynamic_image_covering` makes the same decode from the
-/// file's bytes. `None` when the JPEG needs no reduction, is not gray or RGB,
-/// or cannot be read, so that the caller keeps the file and decodes as it
-/// always has.
-fn decode_dct_covering(
+// ── pdf_manipulator patch: a JPEG on a lane is decoded from its stream ──
+/// The JPEG's file as the library returns it: a DCT image's bytes, whole.
+fn jpeg_file(xobject: &crate::object::Object) -> Result<Vec<u8>> {
+    xobject.decode_stream_data()
+}
+
+/// A gray, RGB or CMYK JPEG decoded from its stream, the file never held:
+/// the samples, their format and the raster's width and height. A gray or RGB
+/// JPEG painted at `painted` goes through the inverse DCT at the largest
+/// reduction that still holds that many samples each way, as
+/// `PdfImage::to_dynamic_image_covering` does for a file's bytes; with no
+/// target, or when no reduction covers, it is decoded at its own size. A CMYK
+/// JPEG is always decoded at its own size, to the samples
+/// `decode_cmyk_jpeg_to_raw_cmyk` gives. A header the decoder cannot read, or
+/// a pixel format this does not name, is an error: there is no file to fall
+/// back to.
+fn decode_dct_stream(
     xobject: &crate::object::Object,
-    painted: (u32, u32),
-    color_space: &ColorSpace,
-) -> Result<Option<(Vec<u8>, PixelFormat, u32, u32)>> {
-    if color_space.components() == 4 {
-        return Ok(None);
-    }
+    painted: Option<(u32, u32)>,
+) -> Result<(Vec<u8>, PixelFormat, u32, u32)> {
     let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX).max(1);
     let source = std::io::BufReader::with_capacity(64 * 1024, crate::decoders::stream::decoded_reader(xobject)?);
     let mut decoder = jpeg_decoder::Decoder::new(source);
-    if decoder.read_info().is_err() {
-        return Ok(None);
-    }
-    let Some(info) = decoder.info() else { return Ok(None) };
+    decoder
+        .read_info()
+        .map_err(|e| Error::Image(format!("Unreadable JPEG header: {e}")))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| Error::Image("JPEG info unavailable".to_string()))?;
     let format = match info.pixel_format {
         jpeg_decoder::PixelFormat::L8 => PixelFormat::Grayscale,
         jpeg_decoder::PixelFormat::RGB24 => PixelFormat::RGB,
-        _ => return Ok(None),
+        jpeg_decoder::PixelFormat::CMYK32 => PixelFormat::CMYK,
+        other => return Err(Error::Image(format!("JPEG pixel format {other:?} is not gray, RGB or CMYK"))),
     };
-    let full = (info.width, info.height);
-    let (w, h) = decoder
-        .scale(clamp(painted.0), clamp(painted.1))
-        .map_err(|e| Error::Decode(format!("Failed to scale JPEG: {e}")))?;
-    if (w, h) == full {
-        return Ok(None);
+    let inverted = format == PixelFormat::CMYK && {
+        let header = std::io::BufReader::with_capacity(64 * 1024, crate::decoders::stream::decoded_reader(xobject)?);
+        matches!(scan_app14_color_transform_stream(header), None | Some(0) | Some(2))
+    };
+    let (w, h) = match painted {
+        Some((want_w, want_h)) if format != PixelFormat::CMYK => decoder
+            .scale(clamp(want_w), clamp(want_h))
+            .map_err(|e| Error::Decode(format!("Failed to scale JPEG: {e}")))?,
+        _ => (info.width, info.height),
+    };
+    let mut pixels = decoder.decode().map_err(|e| Error::Decode(format!("Failed to decode JPEG: {e}")))?;
+    let channels = match format {
+        PixelFormat::Grayscale => 1,
+        PixelFormat::RGB => 3,
+        PixelFormat::CMYK => 4,
+    };
+    let expected = usize::from(w) * usize::from(h) * channels;
+    if pixels.len() < expected {
+        return Err(Error::Decode(format!("JPEG decoded {} bytes, expected {}", pixels.len(), expected)));
     }
-    let pixels = decoder.decode().map_err(|e| Error::Decode(format!("Failed to decode JPEG: {e}")))?;
-    Ok(Some((pixels, format, u32::from(w), u32::from(h))))
+    pixels.truncate(expected);
+    if inverted {
+        // jpeg-decoder returns the Adobe `255 - x` of the samples; the ink is the samples.
+        for b in &mut pixels {
+            *b = 255 - *b;
+        }
+    }
+    Ok((pixels, format, u32::from(w), u32::from(h)))
+}
+
+/// [`scan_app14_color_transform`] over a stream: the marker segments up to the
+/// scan are walked, and only an APP14 segment is held (a segment is 64 KiB at
+/// most).
+fn scan_app14_color_transform_stream(mut reader: impl std::io::Read) -> Option<u8> {
+    use std::io::Read;
+    fn byte(reader: &mut impl std::io::Read) -> Option<u8> {
+        let mut one = [0u8; 1];
+        reader.read_exact(&mut one).ok().map(|()| one[0])
+    }
+    loop {
+        if byte(&mut reader)? != 0xFF {
+            continue;
+        }
+        let marker = byte(&mut reader)?;
+        if marker == 0x00 || marker == 0xFF || matches!(marker, 0xD0..=0xD9) || marker == 0x01 {
+            continue;
+        }
+        if marker == 0xDA {
+            return None;
+        }
+        let length = usize::from(u16::from_be_bytes([byte(&mut reader)?, byte(&mut reader)?]));
+        if length < 2 {
+            return None;
+        }
+        let payload = length - 2;
+        if marker == 0xEE && length >= 14 {
+            let mut held = vec![0u8; payload];
+            reader.read_exact(&mut held).ok()?;
+            if held.starts_with(b"Adobe") {
+                return Some(held[11]);
+            }
+        } else {
+            let skipped = std::io::copy(&mut reader.by_ref().take(payload as u64), &mut std::io::sink()).ok()?;
+            if skipped < payload as u64 {
+                return None;
+            }
+        }
+    }
 }
 // ── end pdf_manipulator patch ──
 

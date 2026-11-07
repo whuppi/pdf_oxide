@@ -1768,13 +1768,9 @@ impl Pdf {
     /// For opened/modified PDFs, this serializes the current state.
     pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
         if let Some(ref mut editor) = self.editor {
-            // Use a temporary file to get bytes
-            let temp_path =
-                std::env::temp_dir().join(format!("pdf_oxide_temp_{}.pdf", std::process::id()));
-            editor.save(&temp_path)?;
-            let bytes = fs::read(&temp_path)?;
-            let _ = fs::remove_file(&temp_path);
-            Ok(bytes)
+            // ── pdf_manipulator patch: the same full rewrite, written to memory, with no temporary file ──
+            editor.save_to_bytes()
+            // ── end pdf_manipulator patch ──
         } else if !self.bytes.is_empty() {
             Ok(self.bytes.clone())
         } else {

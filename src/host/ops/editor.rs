@@ -926,14 +926,10 @@ fn handle_editor_save(
             ErrorKind::InvalidArgument,
             "editorSave: a measuring save takes no sink",
         ),
-        (None, false) => match editor.save_to_bytes_with_options(options) {
-            Ok(bytes) => {
-                let mut w = ResponseWriter::ok();
-                w.put_bytes("data", &bytes);
-                w.finish()
-            },
-            Err(e) => ResponseWriter::error_of(&e),
-        },
+        (None, false) => ResponseWriter::error_kind(
+            ErrorKind::InvalidArgument,
+            "editorSave: a save writes into a sink or measures",
+        ),
     }
 }
 

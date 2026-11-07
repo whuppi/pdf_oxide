@@ -144,7 +144,6 @@ mod watermark_positions;
 mod sort_cancel;
 mod attachment_stream;
 mod editor_streamed_inputs;
-mod whole_reads;
 #[cfg(all(feature = "signatures", feature = "tsa-client"))]
 mod tsa_reply_cap;
 #[cfg(feature = "rendering")]

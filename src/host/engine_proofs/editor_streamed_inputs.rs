@@ -245,6 +245,19 @@ fn an_embedded_file_is_copied_from_its_source_at_the_save() {
     }
 }
 
+/// A save with neither a sink nor `measure` would build the whole file in
+/// memory; the package always sends one of them, so the engine refuses it.
+#[test]
+fn a_save_with_no_sink_is_refused() {
+    let mut state = EngineState::new();
+    let handle = open(&mut state);
+    let request = frame("editorSave", &[("handleId", Field::Int(handle)), ("saveMode", Field::Int(0))]);
+    let answer = run(&mut state, request, Vec::new(), Vec::new(), &CancelCheck::none());
+    assert_eq!(answer[0], 0, "refused, not saved into memory");
+    assert!(message_of(&answer).contains("a save writes into a sink or measures"), "{}", message_of(&answer));
+    dispose(&mut state, handle);
+}
+
 /// A cancel during the checksum pass at the embed leaves the editor as it was.
 #[test]
 fn a_cancelled_embed_changes_nothing() {
