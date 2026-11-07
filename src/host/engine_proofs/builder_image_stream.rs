@@ -796,3 +796,154 @@ fn the_save_of_a_jpeg_polls_for_a_cancel_at_every_piece() {
     assert_eq!(answer[0], 0, "the save was cancelled");
     assert!(tripping.polls() <= 4 + 2, "{} polls after the cancel", tripping.polls());
 }
+
+// ── Interlaced PNG ───────────────────────────────────────────────────────
+
+/// The Adam7 passes: x offset, y offset, x step, y step.
+const ADAM7: [(u32, u32, u32, u32); 7] =
+    [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+
+/// The interlaced PNG of `spec`: noise in every pass, written chunk by chunk
+/// because the encoder in use writes no interlaced images. A pass that no
+/// pixel of a small image falls in has no rows. Each row carries the filter
+/// `y % 5`, so the unfiltering of a pass is exercised too: the filtered bytes
+/// are what the decoder would unfilter, and noise is its own reconstruction,
+/// so the row written is the raw row filtered by `filter`.
+fn interlaced_png(spec: &PngSpec) -> Vec<u8> {
+    let samples = match spec.color {
+        png::ColorType::Grayscale | png::ColorType::Indexed => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+    };
+    let bits_per_pixel = samples * spec.depth as usize;
+    let bpp = bits_per_pixel.div_ceil(8);
+    let mut scanlines = Vec::new();
+    for (pass, (x0, y0, dx, dy)) in ADAM7.into_iter().enumerate() {
+        if x0 >= spec.width || y0 >= spec.height {
+            continue;
+        }
+        let pass_w = (spec.width + dx - 1 - x0) / dx;
+        let pass_h = (spec.height + dy - 1 - y0) / dy;
+        let row_bytes = (pass_w as usize * bits_per_pixel).div_ceil(8);
+        let mut above = vec![0u8; row_bytes];
+        for line in 0..pass_h {
+            let raw = noise_row(3 + pass as u64, line, row_bytes);
+            let filter = (line % 5) as u8;
+            scanlines.push(filter);
+            for (i, &x) in raw.iter().enumerate() {
+                let left = if i >= bpp { raw[i - bpp] } else { 0 };
+                let up = above[i];
+                let up_left = if i >= bpp { above[i - bpp] } else { 0 };
+                scanlines.push(match filter {
+                    0 => x,
+                    1 => x.wrapping_sub(left),
+                    2 => x.wrapping_sub(up),
+                    3 => x.wrapping_sub(((u16::from(left) + u16::from(up)) / 2) as u8),
+                    _ => {
+                        let p = i16::from(left) + i16::from(up) - i16::from(up_left);
+                        let (pa, pb, pc) =
+                            ((p - i16::from(left)).abs(), (p - i16::from(up)).abs(), (p - i16::from(up_left)).abs());
+                        let paeth = if pa <= pb && pa <= pc { left } else if pb <= pc { up } else { up_left };
+                        x.wrapping_sub(paeth)
+                    },
+                });
+            }
+            above = raw;
+        }
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&scanlines).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(kind);
+        crc.update(data);
+        out.extend_from_slice(&crc.finalize().to_be_bytes());
+    };
+    let colour_type = match spec.color {
+        png::ColorType::Grayscale => 0,
+        png::ColorType::Rgb => 2,
+        png::ColorType::Indexed => 3,
+        png::ColorType::GrayscaleAlpha => 4,
+        png::ColorType::Rgba => 6,
+    };
+    let mut header = Vec::new();
+    header.extend_from_slice(&spec.width.to_be_bytes());
+    header.extend_from_slice(&spec.height.to_be_bytes());
+    header.extend_from_slice(&[spec.depth as u8, colour_type, 0, 0, 1]);
+    chunk(b"IHDR", &header);
+    if let Some(palette) = &spec.palette {
+        chunk(b"PLTE", palette);
+    }
+    if let Some(trns) = &spec.trns {
+        chunk(b"tRNS", trns);
+    }
+    // Two IDATs, so a pass can begin and end inside a chunk and across one.
+    let (first, second) = compressed.split_at(compressed.len() / 3);
+    chunk(b"IDAT", first);
+    chunk(b"IDAT", second);
+    chunk(b"IEND", &[]);
+    out
+}
+
+/// An interlaced PNG embeds the pixels and the alpha that today's whole read
+/// of it gives, in every colour type and depth, in sizes that leave a pass
+/// without a pixel, a pass of one pixel and a row narrower than a byte. No
+/// Dart battery sees it: it compares two engine paths, the one that decodes
+/// the passes in step and the whole-image one that only the Rust builder API
+/// still takes.
+#[test]
+fn an_interlaced_png_of_each_colour_type_embeds_the_pixels_and_the_alpha_of_todays_path() {
+    for (name, mut spec) in spec_set() {
+        for (width, height) in [(37, 29), (1, 1), (3, 2), (8, 8), (9, 17), (1, 40)] {
+            spec.width = width;
+            spec.height = height;
+            let png = interlaced_png(&spec);
+            let reference = images_of(&today(&png, width, height));
+            let (saved, _, dropped) = through_ops(&png);
+            let streamed = images_of(&saved);
+            let what = format!("{name} {width}x{height}");
+            assert_eq!(streamed.len(), 1, "{what}: one image");
+            let (got, want) = (&streamed[0], &reference[0]);
+            assert_eq!(got.description, want.description, "{what}: the same description");
+            assert!(got.decoded == want.decoded, "{what}: the same pixels");
+            match (&got.mask, &want.mask) {
+                (None, None) => {},
+                (Some(got), Some(want)) => {
+                    assert_eq!(got.description, want.description, "{what}: the same mask description");
+                    assert!(got.decoded == want.decoded, "{what}: the same alpha");
+                },
+                _ => panic!("{what}: the soft mask differs from today's"),
+            }
+            assert!(dropped, "{what}: the source is released after the save");
+        }
+    }
+}
+
+/// An interlaced PNG of noise of 16 MiB embeds in the memory one of 8 MiB
+/// does: the passes are read in step a row at a time, whatever the height,
+/// and the image is not read whole. The seven decoders cost a few hundred KiB
+/// each, a floor that the first rows of a short image do not yet reach, so
+/// both heights are above it. No Dart battery sees it: the engine's heap is
+/// not on the wire, and tool/memprobe measures the process, not one op on one
+/// thread.
+#[test]
+fn an_interlaced_png_embeds_in_memory_that_does_not_grow_with_its_height() {
+    let write = |name: &str, height: u32| {
+        let scratch = Scratch::new(name);
+        let spec = PngSpec::new(1024, height, png::ColorType::Rgba, png::BitDepth::Eight);
+        std::fs::write(&scratch.0, interlaced_png(&spec)).unwrap();
+        scratch
+    };
+    let (short, tall) = (write("short-adam7.png", 2048), write("tall-adam7.png", 4096));
+    let (a, b) = (peak_of_embedding(&short, "interlaced png"), peak_of_embedding(&tall, "interlaced png"));
+    assert!(tall.len() > 16 * MIB, "the tall image is {} bytes", tall.len());
+    assert!(b < 3 * MIB, "a {} byte interlaced PNG took {b} bytes to embed", tall.len());
+    assert!(b <= a + 256 * KIB, "{b} bytes for 4096 rows against {a} for 2048");
+}

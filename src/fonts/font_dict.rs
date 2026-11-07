@@ -1769,8 +1769,8 @@ impl FontInfo {
                         // Handle Stream object (binary uint16 array)
                         match doc.load_object(stream_ref) {
                             Ok(stream_obj) => {
-                                // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-                                match stream_obj.decode_stream_data() {
+                                // ── pdf_manipulator patch: the map is read to its 65,536 entries, 2 bytes each ──
+                                match crate::decoders::stream::read_decoded_window(&stream_obj, 131_072) {
                                 // ── end pdf_manipulator patch ──
                                     Ok(stream_data) => {
                                         // Validate stream length (must be even)

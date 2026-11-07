@@ -1251,6 +1251,11 @@ impl PdfDocument {
                 }
             },
             Err(e) => {
+                // ── pdf_manipulator patch: a source that fails is not a damaged xref; the rebuild would read it again ──
+                if matches!(e, Error::Io(_)) {
+                    return Err(e);
+                }
+                // ── end pdf_manipulator patch ──
                 log::warn!("Regular xref parsing failed: {}, attempting reconstruction", e);
 
                 // Fall back to xref reconstruction
@@ -26794,7 +26799,9 @@ pub fn parse_header<R: Read + Seek>(reader: &mut R, lenient: bool) -> Result<(u8
                 }
                 false
             } else {
-                return Err(Error::InvalidHeader(format!("Failed to read file: {}", e)));
+                // ── pdf_manipulator patch: a source that fails is an I/O error, not a bad header ──
+                return Err(Error::Io(e));
+                // ── end pdf_manipulator patch ──
             }
         },
     };

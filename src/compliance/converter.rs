@@ -509,7 +509,9 @@ impl PdfAConverter {
     /// If the catalog already has a `/Metadata` stream, the `pdfaid:part` and
     /// `pdfaid:conformance` nodes are spliced in before `</rdf:RDF>`.  If the
     /// stream is absent or unreadable, falls back to [`add_xmp_metadata`].
-    fn add_pdfa_identification(
+    // ── pdf_manipulator patch: the engine proof stages the identification on its own ──
+    pub(crate) fn add_pdfa_identification(
+    // ── end pdf_manipulator patch ──
         &self,
         editor: &mut DocumentEditor,
         result: &mut ConversionResult,
@@ -527,35 +529,16 @@ impl PdfAConverter {
             .cloned()
             .or_else(|| editor.source().load_object(metadata_ref).ok());
 
-        // Decode the stream (may be FlateDecode-compressed) before parsing as XML.
-        let current_xml = match &current {
-            Some(obj @ Object::Stream { .. }) => {
-                let decoded = obj.decode_stream_data().unwrap_or_else(|_| {
-                    // ── pdf_manipulator patch: stream bodies are StreamBody ──
-                    if let Object::Stream { body, .. } = obj {
-                        body.read_whole_raw().unwrap_or_default()
-                        // ── end pdf_manipulator patch ──
-                    } else {
-                        vec![]
-                    }
-                });
-                String::from_utf8_lossy(&decoded).into_owned()
-            },
-            Some(_) | None => return self.add_xmp_metadata(editor, result),
-        };
-        let mut stream_dict = match current {
-            Some(Object::Stream { dict, .. }) => dict,
-            _ => unreachable!(),
-        };
-
-        let patched =
-            inject_pdfaid(&current_xml, self.level.xmp_part(), self.level.xmp_conformance());
-        // inject_pdfaid returns the input unchanged when </rdf:RDF> is absent.
-        // In that case, fall back to rebuilding XMP from scratch.
-        if patched == current_xml {
+        // ── pdf_manipulator patch: the packet is read as XML events and copied in pieces, never held as text ──
+        let Some(Object::Stream { dict: mut stream_dict, body }) = current else {
             return self.add_xmp_metadata(editor, result);
-        }
-        let patched_bytes = patched.into_bytes();
+        };
+        let block = pdfaid_block(self.level.xmp_part(), self.level.xmp_conformance());
+        // No RDF root to splice into: rebuild the packet from scratch.
+        let Some(patched_bytes) = splice_before_rdf_close(&stream_dict, &body, block.as_bytes())? else {
+            return self.add_xmp_metadata(editor, result);
+        };
+        // ── end pdf_manipulator patch ──
         stream_dict.insert("Length".to_string(), Object::Integer(patched_bytes.len() as i64));
         // Remove any compression filter — PDF/A requires plaintext XMP.
         stream_dict.remove("Filter");
@@ -564,7 +547,7 @@ impl PdfAConverter {
         editor.insert_modified(
             metadata_ref.id,
             // ── pdf_manipulator patch: stream bodies are StreamBody ──
-            Object::stream(stream_dict, bytes::Bytes::from(patched_bytes)),
+            Object::stream(stream_dict, patched_bytes),
             // ── end pdf_manipulator patch ──
         );
 
@@ -1645,32 +1628,84 @@ fn build_font_descriptor(
     id
 }
 
-/// Splice `pdfaid:part` and `pdfaid:conformance` into an existing XMP packet.
-///
-/// Inserts a fresh `<rdf:Description>` carrying the PDF/A identification
-/// immediately before the closing `</rdf:RDF>` tag.  Multiple `rdf:Description`
-/// elements in a single RDF block are legal per the RDF spec and used by all
-/// major PDF/A toolkits.  String-level splicing avoids a heavyweight XML
-/// dependency (KISS).
-fn inject_pdfaid(xml: &str, part: &str, conformance: &str) -> String {
-    let block = format!(
+// ── pdf_manipulator patch: the packet is read as XML events and copied in pieces, never held as text ──
+/// The `rdf:Description` that carries the PDF/A identification.
+fn pdfaid_block(part: &str, conformance: &str) -> String {
+    format!(
         "    <rdf:Description rdf:about=\"\" \
 xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">\n\
       <pdfaid:part>{part}</pdfaid:part>\n\
       <pdfaid:conformance>{conformance}</pdfaid:conformance>\n\
     </rdf:Description>\n"
-    );
-    if let Some(idx) = xml.rfind("</rdf:RDF>") {
-        let mut out = String::with_capacity(xml.len() + block.len());
-        out.push_str(&xml[..idx]);
-        out.push_str(&block);
-        out.push_str(&xml[idx..]);
-        out
-    } else {
-        // XMP has no RDF block — caller should have routed to add_xmp_metadata.
-        xml.to_string()
+    )
+}
+
+/// Counts the bytes read through it.
+struct Counted<R> {
+    inner: R,
+    bytes: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes += n as u64;
+        Ok(n)
     }
 }
+
+/// The decoded packet of the metadata stream `dict`/`body` with `block` ahead
+/// of its last `</rdf:RDF>` end tag, and nothing else changed. The packet is
+/// read twice as the stream decodes: once as XML events, as
+/// `extractors::xmp` reads it, for where that end tag begins and how long the
+/// packet is; once to copy it around the block into a buffer of exactly the
+/// patched size. `None` when the packet has no such end tag or cannot be read.
+fn splice_before_rdf_close(
+    dict: &std::collections::HashMap<String, Object>,
+    body: &crate::object::StreamBody,
+    block: &[u8],
+) -> Result<Option<bytes::Bytes>> {
+    use crate::error::Error;
+    use quick_xml::events::Event;
+    use std::io::Read;
+
+    let open = || crate::decoders::stream::reader_in(dict, body.origin(), || body.raw_reader());
+    let Ok(decoded) = open() else { return Ok(None) };
+    let counted = Counted { inner: decoded, bytes: 0 };
+    let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::with_capacity(64 * 1024, counted));
+    let mut event = Vec::new();
+    let mut close = None;
+    loop {
+        event.clear();
+        let at = reader.buffer_position();
+        match reader.read_event_into(&mut event) {
+            Ok(Event::End(end)) if end.name().as_ref() == "rdf:RDF" => close = Some(at),
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(_) => {},
+        }
+    }
+    let Some(close) = close else { return Ok(None) };
+    drop(event);
+    let mut rest = reader.into_inner();
+    if std::io::copy(&mut rest, &mut std::io::sink()).is_err() {
+        return Ok(None);
+    }
+    let size = usize::try_from(rest.get_ref().bytes)
+        .ok()
+        .and_then(|n| n.checked_add(block.len()))
+        .ok_or_else(|| Error::Decode("The XMP packet is too long to patch".to_string()))?;
+    let mut patched = Vec::new();
+    patched
+        .try_reserve_exact(size)
+        .map_err(|_| Error::Decode(format!("Unable to allocate {size} bytes for the XMP packet")))?;
+    let Ok(mut decoded) = open() else { return Ok(None) };
+    let copied = std::io::copy(&mut decoded.by_ref().take(close), &mut patched).and_then(|_| {
+        patched.extend_from_slice(block);
+        std::io::copy(&mut decoded, &mut patched)
+    });
+    Ok(copied.is_ok().then(|| bytes::Bytes::from(patched)))
+}
+// ── end pdf_manipulator patch ──
 
 /// Quick conversion function for common use cases.
 ///

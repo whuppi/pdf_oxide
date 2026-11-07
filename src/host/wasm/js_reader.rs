@@ -68,6 +68,13 @@ impl Read for JsCallbackReader {
             return Ok(0);
         }
 
+        // A read the host failed ends the op: the engine reads on only to be
+        // told the same thing, and never to be given bytes it would take for
+        // a source that recovered.
+        if let Some(error) = crate::host::bridge_api::source_failure() {
+            return Err(error);
+        }
+
         let in_window = self.position >= self.window_start
             && self.position < self.window_start + self.window_len as u64;
         if !in_window {
@@ -91,7 +98,7 @@ impl Read for JsCallbackReader {
                 return Err(io::Error::other("operation cancelled"));
             }
             if n < 0 {
-                return Err(io::Error::new(io::ErrorKind::Other, "host_read_at failed"));
+                return Err(crate::host::bridge_api::fail_source("host_read_at failed"));
             }
             self.window_start = self.position;
             self.window_len = n as usize;

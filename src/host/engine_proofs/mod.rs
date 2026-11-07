@@ -26,6 +26,7 @@ mod machine_font_caches;
 mod executor_boundary;
 mod document_pages;
 mod editor_deflate;
+mod editor_encrypted_compress;
 mod editor_duplicates;
 mod editor_merge;
 mod editor_nested;
@@ -40,6 +41,10 @@ mod ext_gstate_lines;
 mod filter_readers;
 #[cfg(feature = "rendering")]
 mod extract_1bit;
+#[cfg(feature = "rendering")]
+mod extract_jbig2_gray;
+#[cfg(feature = "rendering")]
+mod extract_jpeg_window;
 #[cfg(feature = "rendering")]
 mod extract_proof;
 #[cfg(feature = "rendering")]
@@ -61,6 +66,7 @@ mod editor_save;
 mod kept_encryption;
 mod legacy_decoders;
 mod lzw;
+mod mem_bounded_tables;
 mod mem_caps;
 mod mem_cmap;
 mod mem_declared;
@@ -69,9 +75,12 @@ mod mem_fixture;
 mod mem_fonts;
 mod mem_incremental;
 mod mem_page_text;
+#[cfg(feature = "pdfa")]
+mod mem_pdfa_xmp;
 mod mem_structure;
 mod mem_xfa;
 mod mem_xmp;
+mod source_failure;
 mod span_dedupe_same;
 mod own_process;
 mod page_operators;
@@ -136,6 +145,8 @@ mod sort_cancel;
 mod attachment_stream;
 mod editor_streamed_inputs;
 mod whole_reads;
+#[cfg(all(feature = "signatures", feature = "tsa-client"))]
+mod tsa_reply_cap;
 #[cfg(feature = "rendering")]
 mod redact_extra_type3;
 #[cfg(feature = "rendering")]

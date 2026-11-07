@@ -80,6 +80,13 @@ impl Read for CallbackReader {
             return Err(crate::host::native::cancel::cancelled());
         }
 
+        // A read the host failed ends the op: the engine reads on only to be
+        // told the same thing, and never to be given bytes it would take for
+        // a source that recovered.
+        if let Some(error) = crate::host::bridge_api::source_failure() {
+            return Err(error);
+        }
+
         if out.is_empty() {
             return Ok(0);
         }
@@ -147,7 +154,8 @@ impl Read for CallbackReader {
         }
 
         if flags & sb::FLAG_ERROR != 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "host read failed"));
+            self.window = (0, 0);
+            return Err(crate::host::bridge_api::fail_source("host read failed"));
         }
 
         Err(crate::host::native::cancel::cancelled())

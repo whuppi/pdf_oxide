@@ -604,19 +604,24 @@ impl ColorResolver {
             .doc
             .resolve_object(&arr[3])
             .unwrap_or_else(|_| arr[3].clone());
-        let palette: Vec<u8> = match &lookup {
-            Object::String(bytes) => bytes.clone(),
-            Object::Stream { .. } => match lookup.decode_stream_data() {
-                Ok(b) => b,
-                Err(_) => return Ok(first_as_gray(components, alpha)),
-            },
-            _ => return Ok(first_as_gray(components, alpha)),
-        };
-
         let n = base_component_count(&base, ctx);
         if n == 0 {
             return Ok(first_as_gray(components, alpha));
         }
+        // ── pdf_manipulator patch: the palette is read to the length hival declares ──
+        // The lookup is (hival + 1) * N bytes (§8.6.6.3); hival is at most 255.
+        let declared = (hival.min(255) + 1).saturating_mul(n) as u64;
+        let palette: Vec<u8> = match &lookup {
+            Object::String(bytes) => bytes.clone(),
+            Object::Stream { .. } => {
+                match crate::decoders::stream::read_decoded_window(&lookup, declared) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(first_as_gray(components, alpha)),
+                }
+            },
+            _ => return Ok(first_as_gray(components, alpha)),
+        };
+        // ── end pdf_manipulator patch ──
         let off = idx * n;
         if off + n > palette.len() {
             return Ok(first_as_gray(components, alpha));

@@ -1,19 +1,14 @@
-compliance::converter::add_pdfa_identification
 decoders::stream::decode_slice
 document::cached_page_content
 document::compute_output_intent_cmyk_profile
 extractors::images::decode_jbig2_bits # the JBIG2 bitstream is the decoder's input; the bitmap is kept at one bit a pixel
-extractors::images::decode_jbig2_image # the off-render image extraction (reducer, PNG export) wants one 8-bit raster; the render path reads decode_jbig2_bits
 extractors::images::decode_jpx_image # the codestream is the codec's input, and its decoder returns the raster at the reduction the footprint covers
 extractors::images::extract_image_from_xobject_at # a codec image's compressed bytes are the decoder's input (DCT, JPX, CCITT); a raw-sample image is read by the row cursor, not here
 extractors::images::resolve_icc_profile_from_obj
-extractors::images::resolve_indexed_palette
 fonts::font_dict::extract_embedded_font_from_descriptor
 fonts::font_dict::extract_truetype_cmap_from_descriptor
 fonts::font_dict::from_dict
-fonts::font_dict::parse_descendant_fonts
 fonts::font_dict::resolve_encoding_writing_mode
-host::image_embed::take # an interlaced (Adam7) PNG cannot be produced a row at a time, so its file is read whole; a JPEG and every other PNG stay in their source
 object::decode_stream_data
 object::read_whole_raw
 rendering::mesh_shading::eval_pdf_function
@@ -27,7 +22,6 @@ rendering::page_renderer::project_iccbased_to_rgb
 rendering::resolution::color::evaluate_type0_sampled
 rendering::resolution::color::evaluate_type4
 rendering::resolution::color::resolve_iccbased
-rendering::resolution::color::resolve_indexed
 rendering::resolution::pipeline::eval_separation_alt_cmyk
 rendering::separation_renderer::execute_separation_operators
 rendering::separation_renderer::paint_image_mask_to_plates

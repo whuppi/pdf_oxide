@@ -152,6 +152,35 @@ fn build<'a>(spec: &Rc<Spec<'a>>, upto: usize) -> Result<Box<dyn Read + 'a>> {
     })
 }
 
+/// The decoded data of the stream `object`, read as the stream decodes. A
+/// dictionary or a null where a stream is expected is an empty stream, as for
+/// `Object::decode_stream_data`.
+pub(crate) fn decoded_reader(object: &Object) -> Result<Box<dyn Read + '_>> {
+    match object {
+        Object::Stream { dict, body } => {
+            let filtered = dict.get("Filter").map(crate::object::extract_filter_names).unwrap_or_default();
+            if filtered.is_empty() {
+                body.raw_reader()
+            } else {
+                reader_in(dict, body.origin(), || body.raw_reader())
+            }
+        },
+        Object::Dictionary(_) | Object::Null => Ok(Box::new(io::empty())),
+        other => Err(Error::InvalidObjectType {
+            expected: "Stream".to_string(),
+            found: other.type_name().to_string(),
+        }),
+    }
+}
+
+/// The first `cap` bytes of the decoded data of the stream `object`, read as
+/// the stream decodes: the rest of the stream is never read.
+pub(crate) fn read_decoded_window(object: &Object, cap: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decoded_reader(object)?.take(cap).read_to_end(&mut out).map_err(crate::encryption::stream::from_io)?;
+    Ok(out)
+}
+
 /// Reads `r` to its end into one buffer, growing it in 64 KiB steps. A
 /// refused allocation is a typed decode error, not an abort. `hint` is the
 /// size to expect (0 when unknown) and is reserved first.

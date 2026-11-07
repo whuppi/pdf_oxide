@@ -1231,8 +1231,11 @@ pub fn extract_image_from_xobject_at(
     // applies it itself (plate routing) must still do so for those.
     let mut decode_folded_in = false;
     let data = if is_jbig2 {
-        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-        let decoded = decode_jbig2_image(xobject, dict, doc, width, height)?;
+        // ── pdf_manipulator patch: one JBIG2 decode, kept one bit a pixel and expanded to gray here ──
+        let decoded = ImageData::Raw {
+            pixels: bilevel_to_gray(&decode_jbig2_bits(xobject, dict, doc, width, height, false)?, width, height)?,
+            format: PixelFormat::Grayscale,
+        };
         // ── end pdf_manipulator patch ──
         // The JBIG2 decoder expands straight to 8-bit gray, bypassing the
         // packed-sample block below that is the only place /Decode is
@@ -1277,10 +1280,34 @@ pub fn extract_image_from_xobject_at(
         jpx_decoded_dims = Some((dec_w, dec_h));
         data
     } else if is_jpeg_only || is_jpeg_chain {
-        let decoded = xobject.decode_stream_data()?;
-        ImageData::Jpeg(decoded)
+        match target.and_then(|painted| decode_dct_covering(xobject, painted, &color_space).transpose()) {
+            Some(reduced) => {
+                // The samples are the reduced raster, so their size is theirs, as
+                // for a reduced JPX decode.
+                let (pixels, format, reduced_w, reduced_h) = reduced?;
+                jpx_decoded_dims = Some((reduced_w, reduced_h));
+                ImageData::Raw { pixels, format }
+            },
+            None => ImageData::Jpeg(xobject.decode_stream_data()?),
+        }
     } else {
-        let decoded_data = xobject.decode_stream_data()?;
+        // A raw-sample image is the rows it declares (`row_geometry` states the
+        // same size); what the stream holds past them is stray. A fax stream is
+        // the codec's input, not samples, and is read as it is.
+        let decoded_data = if is_ccitt {
+            xobject.decode_stream_data()?
+        } else {
+            // A depth outside the spec's set has no row size to read: the
+            // image is declined, as every other image this code cannot read.
+            if !matches!(bits_per_component, 1 | 2 | 4 | 8 | 16) {
+                return Err(Error::Image(format!("unsupported BitsPerComponent {bits_per_component}")));
+            }
+            let ink_count =
+                devicen_ink_count(&resolved_color_space).unwrap_or_else(|| color_space.components());
+            let row_bits = u64::from(width) * ink_count as u64 * u64::from(bits_per_component);
+            let declared = row_bits.div_ceil(8).saturating_mul(u64::from(height));
+            crate::decoders::stream::read_decoded_window(xobject, declared)?
+        };
             // ── end pdf_manipulator patch ──
         if let Some(ir) = indexed_resolution.as_ref() {
             // Build a Transform if the Indexed base has a profile so
@@ -1807,24 +1834,24 @@ fn resolve_indexed_palette(
     } else {
         arr[3].clone()
     };
+    // Per PDF 32000-1:2008 §8.6.6.3 the lookup is exactly (hival + 1) * N bytes;
+    // anything beyond that is stray data that must not be mapped to pixels, so
+    // it is not read. Indices greater than hival fall into the out-of-range
+    // branch of the expander. An unusable hival leaves the 256 entries an
+    // 8-bit index can name.
+    // ── pdf_manipulator patch: the palette is read to the length hival declares ──
+    let expected = (hival.unwrap_or(255) + 1).saturating_mul(n);
     let mut palette_bytes = match &lookup_obj {
         Object::String(s) => s.clone(),
-        Object::Stream { .. } => lookup_obj.decode_stream_data()?,
+        Object::Stream { .. } => crate::decoders::stream::read_decoded_window(&lookup_obj, expected as u64)?,
         _ => return Ok(None),
     };
+    // ── end pdf_manipulator patch ──
     if palette_bytes.is_empty() {
         return Ok(None);
     }
-
-    // Truncate palette to the logical length implied by hival so that indices
-    // greater than hival fall into the out-of-range branch of the expander.
-    // Per PDF 32000-1:2008 §8.6.6.3 the lookup is exactly (hival + 1) * N bytes;
-    // anything beyond that is stray data that must not be mapped to pixels.
-    if let Some(h) = hival {
-        let expected = (h + 1).saturating_mul(n);
-        if expected > 0 && palette_bytes.len() > expected {
-            palette_bytes.truncate(expected);
-        }
+    if hival.is_some() && expected > 0 && palette_bytes.len() > expected {
+        palette_bytes.truncate(expected);
     }
 
     // Device-independent colour-space palettes must be converted to
@@ -2579,7 +2606,7 @@ pub(crate) fn decode_jbig2_stencil(
 ///
 /// The decoder pushes its pixels, so the raster cannot be produced a row at a
 /// time on demand; kept at one bit a pixel it is an eighth of the 8-bit gray
-/// raster [`decode_jbig2_image`] builds. A row the decoder did not reach stays
+/// raster the whole-image extraction expands it to. A row the decoder did not reach stays
 /// 0xFF, white.
 #[cfg(feature = "rendering")]
 pub(crate) fn decode_jbig2_bits(
@@ -2671,86 +2698,77 @@ pub(crate) fn decode_jbig2_bits(
 }
 // ── end pdf_manipulator patch ──
 
-#[cfg(feature = "rendering")]
-fn decode_jbig2_image(
-    xobject: &crate::object::Object,
-    dict: &std::collections::HashMap<String, crate::object::Object>,
-    doc: Option<&crate::document::PdfDocument>,
-    width: u32,
-    height: u32,
-) -> Result<ImageData> {
-    // The Jbig2Decoder in src/decoders/jbig2.rs is a pass-through: it returns
-    // the raw compressed bitstream unchanged, which is exactly what hayro-jbig2
-    // needs as input.
-    // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-    let jbig2_bytes: Vec<u8> = xobject.decode_stream_data()?;
-    // ── end pdf_manipulator patch ──
-
-    // Load optional JBIG2Globals (shared symbol dictionaries referenced by multiple
-    // embedded JBIG2 streams in the same PDF).
-    let globals: Option<Vec<u8>> = (|| -> Option<Vec<u8>> {
-        let dp = dict.get("DecodeParms")?.as_dict()?;
-        let globals_ref = dp.get("JBIG2Globals")?.as_reference()?;
-        let d = doc.as_ref()?;
-        let globals_obj = d.load_object(globals_ref).ok()?;
-        // ── pdf_manipulator patch: a stream is its dictionary and an extent that reads itself ──
-        globals_obj.decode_stream_data()
-        // ── end pdf_manipulator patch ──
-            .ok()
-    })();
-
-    let image = hayro_jbig2::Image::new_embedded(&jbig2_bytes, globals.as_deref())
-        .map_err(|e| Error::Image(format!("JBIG2 decode error: {e}")))?;
-
-    struct PixelCollector {
-        pixels: Vec<u8>,
-        row_buf: Vec<u8>,
-    }
-
-    impl hayro_jbig2::Decoder for PixelCollector {
-        fn push_pixel(&mut self, black: bool) {
-            self.row_buf.push(if black { 0 } else { 255 });
-        }
-
-        // chunk_count is the number of 8-pixel groups, not individual pixels.
-        fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
-            let v = if black { 0u8 } else { 255u8 };
-            let n = chunk_count as usize * 8;
-            self.row_buf.extend(std::iter::repeat_n(v, n));
-        }
-
-        fn next_line(&mut self) {
-            self.pixels.append(&mut self.row_buf);
-        }
-    }
-
-    let mut collector = PixelCollector {
-        pixels: Vec::with_capacity((width * height) as usize),
-        row_buf: Vec::with_capacity(width as usize),
-    };
-
-    image
-        .decode(&mut collector)
-        .map_err(|e| Error::Image(format!("JBIG2 pixel decode error: {e}")))?;
-
-    Ok(ImageData::Raw {
-        pixels: collector.pixels,
-        format: PixelFormat::Grayscale,
-    })
-}
-
+// ── pdf_manipulator patch: one JBIG2 decode, kept one bit a pixel and expanded to gray here ──
 #[cfg(not(feature = "rendering"))]
-fn decode_jbig2_image(
+pub(crate) fn decode_jbig2_bits(
     _xobject: &crate::object::Object,
     _dict: &std::collections::HashMap<String, crate::object::Object>,
     _doc: Option<&crate::document::PdfDocument>,
     _width: u32,
     _height: u32,
-) -> Result<ImageData> {
+    _apply_decode: bool,
+) -> Result<Vec<u8>> {
     Err(Error::UnsupportedFilter(
         "JBIG2Decode — rebuild with the `rendering` feature to decode".to_string(),
     ))
 }
+
+/// [`decode_jbig2_bits`]' packed rows as one gray byte a pixel, a black pixel
+/// 0 and a white one 255, the form the whole-image extraction stores.
+fn bilevel_to_gray(packed: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let (w, row_bytes) = (width as usize, (width as usize).div_ceil(8));
+    let total = w
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::Image("JBIG2 raster size overflows".to_string()))?;
+    let mut gray = Vec::new();
+    gray.try_reserve_exact(total)
+        .map_err(|_| Error::Image(format!("Unable to allocate {total} JBIG2 bytes")))?;
+    for row in packed.chunks_exact(row_bytes).take(height as usize) {
+        gray.extend((0..w).map(|x| if (row[x / 8] >> (7 - x % 8)) & 1 == 0 { 0 } else { 255 }));
+    }
+    Ok(gray)
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: a JPEG painted smaller than itself is decoded from its stream ──
+/// A gray or RGB JPEG decoded from its stream through the inverse DCT at the
+/// largest reduction that still holds `painted` samples each way, with the
+/// file never held: its dimensions, samples and the reduced raster.
+/// `PdfImage::to_dynamic_image_covering` makes the same decode from the
+/// file's bytes. `None` when the JPEG needs no reduction, is not gray or RGB,
+/// or cannot be read, so that the caller keeps the file and decodes as it
+/// always has.
+fn decode_dct_covering(
+    xobject: &crate::object::Object,
+    painted: (u32, u32),
+    color_space: &ColorSpace,
+) -> Result<Option<(Vec<u8>, PixelFormat, u32, u32)>> {
+    if color_space.components() == 4 {
+        return Ok(None);
+    }
+    let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX).max(1);
+    let source = std::io::BufReader::with_capacity(64 * 1024, crate::decoders::stream::decoded_reader(xobject)?);
+    let mut decoder = jpeg_decoder::Decoder::new(source);
+    if decoder.read_info().is_err() {
+        return Ok(None);
+    }
+    let Some(info) = decoder.info() else { return Ok(None) };
+    let format = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => PixelFormat::Grayscale,
+        jpeg_decoder::PixelFormat::RGB24 => PixelFormat::RGB,
+        _ => return Ok(None),
+    };
+    let full = (info.width, info.height);
+    let (w, h) = decoder
+        .scale(clamp(painted.0), clamp(painted.1))
+        .map_err(|e| Error::Decode(format!("Failed to scale JPEG: {e}")))?;
+    if (w, h) == full {
+        return Ok(None);
+    }
+    let pixels = decoder.decode().map_err(|e| Error::Decode(format!("Failed to decode JPEG: {e}")))?;
+    Ok(Some((pixels, format, u32::from(w), u32::from(h))))
+}
+// ── end pdf_manipulator patch ──
 
 /// Decode a JPEG 2000 (`/JPXDecode`) image stream into raw interleaved samples.
 ///

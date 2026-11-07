@@ -39,6 +39,32 @@ impl std::io::Seek for BoxedReader {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> { self.0.seek(pos) }
 }
 
+thread_local! {
+    /// The message of the first read the host's source failed in the op
+    /// running on this thread. An executor runs one op at a time, on one
+    /// thread, and every read of a source happens on it.
+    static SOURCE_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records that the host's source failed a read, and returns the error the
+/// reader answers with. The first failure of an op is the one that is kept.
+pub(crate) fn fail_source(message: &str) -> std::io::Error {
+    SOURCE_FAILURE.with(|failure| {
+        failure.borrow_mut().get_or_insert_with(|| message.to_string());
+    });
+    std::io::Error::other(message)
+}
+
+/// The error of the op's first failed source read, if one failed: a reader
+/// answers every read after it with this, and never asks the host again.
+pub(crate) fn source_failure() -> Option<std::io::Error> {
+    SOURCE_FAILURE.with(|failure| failure.borrow().as_deref().map(std::io::Error::other))
+}
+
+fn take_source_failure() -> Option<String> {
+    SOURCE_FAILURE.with(|failure| failure.borrow_mut().take())
+}
+
 /// A sink writer that buffers: it holds bytes back until `flush`, and
 /// `discard` drops what it holds. Neither writes on drop.
 pub(crate) trait BufferedSink: std::io::Write + Send {
@@ -163,6 +189,7 @@ pub(crate) fn handle_request(
         "a lane's state is used on the thread that made it"
     );
     let _job = crate::cancel::enter(cancel);
+    take_source_failure();
     let req = match Request::parse(bytes) {
         Ok(r) => r,
         Err(e) => return ResponseWriter::error(&format!("parse error: {e}")),
@@ -171,6 +198,10 @@ pub(crate) fn handle_request(
     // The ops take their sinks and drop them; these handles keep every
     // writer alive to the end, where its last bytes are written or dropped.
     let mut doors: Vec<BoxedWriter> = sinks.iter().map(BoxedWriter::share).collect();
+
+    let documents_before = state.documents.keys().max().copied();
+    let editors_before = state.editors.keys().max().copied();
+    let builders_before = state.builders.keys().max().copied();
 
     let mut ctx = crate::host::ops::OpCtx {
         state,
@@ -184,6 +215,18 @@ pub(crate) fn handle_request(
         Some(entry) => (entry.handle)(&mut ctx),
         None => ResponseWriter::error(&format!("unknown op: {}", req.op())),
     };
+    // A source that failed a read ends the op, whatever the engine made of
+    // the error on its way up: a parser that took it for damage, a loop that
+    // skipped the object it was reading, a rebuild that read on. A cancel
+    // stays a cancel, and a handle the op made is dropped with the op.
+    if let Some(message) = take_source_failure() {
+        if response != ResponseWriter::cancelled() {
+            response = ResponseWriter::error_of(&crate::Error::Io(std::io::Error::other(message)));
+            ctx.state.documents.retain(|id, _| Some(*id) <= documents_before);
+            ctx.state.editors.retain(|id, _| Some(*id) <= editors_before);
+            ctx.state.builders.retain(|id, _| Some(*id) <= builders_before);
+        }
+    }
     // The op's last bytes are written here, by an explicit flush, never by a
     // writer's drop: a drop cannot report that the write failed. An op that
     // ended cancelled or failed holds no partial output, so its sinks write

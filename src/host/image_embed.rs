@@ -19,13 +19,16 @@
 //! The pixels are the ones `ImageData::from_png` gives: palette, `tRNS`
 //! and low bit depths expand as the PNG decoder expands them, and a 16 bit
 //! sample is rounded to 8 bits as `image` rounds it, `(v + 128) / 257`.
-//! An interlaced (Adam7) PNG cannot be produced a row at a time, so it is
-//! read whole and embedded as `ImageData::from_png` does.
+//! An interlaced (Adam7) PNG stores its seven passes one after the other, so
+//! no row of the image is complete until the last pass has been read. It is
+//! decoded by seven readers over the one source, each positioned on its own
+//! pass and pulled in step, one output row at a time: a reader holds the
+//! window and the rows of the decoder, and the seven hold no image.
 //!
 //! An editor's image stamp stages the same streams as objects whose data is
 //! an extent ([`StreamedImage::stage`]): the save reads a JPEG from its source
-//! in pieces, and a PNG through a reader that deflates its rows as they are
-//! asked for.
+//! in pieces, and a PNG, interlaced or not, through a reader that deflates its
+//! rows as they are asked for.
 
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -59,6 +62,8 @@ struct PngShape {
     height: u32,
     color: png::ColorType,
     depth: png::BitDepth,
+    /// Adam7: the rows come in seven passes.
+    interlaced: bool,
 }
 
 impl PngShape {
@@ -71,6 +76,11 @@ impl PngShape {
             png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => ColorSpace::DeviceGray,
             _ => ColorSpace::DeviceRGB,
         }
+    }
+
+    /// Bytes a pixel of the decoder's rows holds.
+    fn pixel_bytes(&self) -> usize {
+        self.samples() * if self.depth == png::BitDepth::Sixteen { 2 } else { 1 }
     }
 
     /// Samples a pixel of the decoder's rows holds.
@@ -143,8 +153,7 @@ fn read_head(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(filled)
 }
 
-/// Takes the image in `reader`: a JPEG or a PNG that rows can be read from
-/// stays in its source; an interlaced PNG is read whole.
+/// Takes the image in `reader`: a JPEG or a PNG stays in its source.
 pub(crate) fn take(mut reader: BoxedReader) -> Result<Taken> {
     let length = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
@@ -159,9 +168,8 @@ pub(crate) fn take(mut reader: BoxedReader) -> Result<Taken> {
         }
     } else if got >= 8 && magic == *b"\x89PNG\r\n\x1a\n" {
         match png_shape(&mut reader) {
-            PngHead::Rows(shape) => Shape::Png(shape),
-            PngHead::Interlaced => return read_whole(reader, length),
-            PngHead::Unreadable => return Ok(Taken::Unreadable),
+            Some(shape) => Shape::Png(shape),
+            None => return Ok(Taken::Unreadable),
         }
     } else {
         return Ok(Taken::Unreadable);
@@ -171,21 +179,6 @@ pub(crate) fn take(mut reader: BoxedReader) -> Result<Taken> {
         length,
         shape,
     }))))
-}
-
-fn read_whole(mut reader: BoxedReader, length: u64) -> Result<Taken> {
-    reader.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::with_capacity(length.min(usize::MAX as u64) as usize);
-    let mut piece = vec![0u8; PIECE];
-    loop {
-        crate::cancel::poll()?;
-        let n = reader.read(&mut piece)?;
-        if n == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&piece[..n]);
-    }
-    Ok(Taken::Image(ImageBytes::Whole(bytes)))
 }
 
 /// The frame of the JPEG at the start of `reader`, found by walking its
@@ -269,12 +262,6 @@ fn jpeg_frame(reader: &mut BoxedReader) -> Result<Option<(JpegShape, u64)>> {
     }
 }
 
-enum PngHead {
-    Rows(PngShape),
-    Interlaced,
-    Unreadable,
-}
-
 fn png_decoder<R: Read + Seek>(reader: R) -> png::Decoder<BufReader<R>> {
     let mut decoder = png::Decoder::new(BufReader::with_capacity(PIECE, reader));
     // Palette, `tRNS` and low bit depths expand as the `image` crate expands
@@ -285,22 +272,16 @@ fn png_decoder<R: Read + Seek>(reader: R) -> png::Decoder<BufReader<R>> {
 
 /// What the PNG at the start of `reader` decodes to, from the chunks up to
 /// its first `IDAT`.
-fn png_shape(reader: &mut BoxedReader) -> PngHead {
-    if reader.seek(SeekFrom::Start(0)).is_err() {
-        return PngHead::Unreadable;
-    }
-    let Ok(rows) = png_decoder(reader).read_info() else {
-        return PngHead::Unreadable;
-    };
-    if rows.info().interlaced {
-        return PngHead::Interlaced;
-    }
+fn png_shape(reader: &mut BoxedReader) -> Option<PngShape> {
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let rows = png_decoder(reader).read_info().ok()?;
+    let interlaced = rows.info().interlaced;
     let (width, height) = rows.info().size();
     let (color, depth) = rows.output_color_type();
     if width == 0 || height == 0 {
-        return PngHead::Unreadable;
+        return None;
     }
-    PngHead::Rows(PngShape { width, height, color, depth })
+    Some(PngShape { width, height, color, depth, interlaced })
 }
 
 fn image_error(what: &str, e: impl std::fmt::Display) -> Error {
@@ -460,15 +441,18 @@ impl StreamedImage {
 
     /// The rows of `pass`, each behind a `None` filter byte, to `out` as one
     /// zlib stream. Only the previous row of the decoder and the row being
-    /// converted are held.
+    /// converted are held; an interlaced image holds those of seven decoders.
     fn deflate_rows(&self, out: &mut dyn Write, shape: PngShape, pass: Pass) -> Result<()> {
-        let mut source = self.source();
-        source.seek(SeekFrom::Start(0))?;
-        let mut rows = png_decoder(&mut *source).read_info().map_err(|e| image_error("PNG", e))?;
-        if rows.info().size() != (shape.width, shape.height) || rows.output_color_type() != (shape.color, shape.depth)
-        {
-            return Err(Error::Image("PNG: the image changed under the save".into()));
-        }
+        let mut plain_source;
+        let mut rows = if shape.interlaced {
+            Rows::Adam7(Adam7::open(&self.source, self.length, shape)?)
+        } else {
+            plain_source = self.source();
+            plain_source.seek(SeekFrom::Start(0))?;
+            let rows = png_decoder(&mut *plain_source).read_info().map_err(|e| image_error("PNG", e))?;
+            check_unchanged(&rows, shape)?;
+            Rows::Plain(rows)
+        };
         let colours = match pass {
             Pass::Colour => shape.samples() - usize::from(shape.has_alpha()),
             Pass::Alpha => 1,
@@ -478,19 +462,202 @@ impl StreamedImage {
         let mut line = Vec::with_capacity(1 + shape.width as usize * colours);
         for _ in 0..shape.height {
             crate::cancel::poll()?;
-            let row = rows
-                .next_row()
-                .map_err(|e| image_error("PNG", e))?
-                .ok_or(Error::UnexpectedEof)?;
+            let row = rows.next()?;
             line.clear();
             line.push(0);
-            narrow_row(row.data(), shape, pass, &mut line);
+            narrow_row(row, shape, pass, &mut line);
             zlib.write_all(&line)?;
         }
         zlib.finish()?;
         Ok(())
     }
 }
+
+fn check_unchanged<R: std::io::BufRead + Seek>(rows: &png::Reader<R>, shape: PngShape) -> Result<()> {
+    if rows.info().size() != (shape.width, shape.height)
+        || rows.output_color_type() != (shape.color, shape.depth)
+        || rows.info().interlaced != shape.interlaced
+    {
+        return Err(Error::Image("PNG: the image changed under the save".into()));
+    }
+    Ok(())
+}
+
+/// A handle on the source of an image that several decoders share: a
+/// borrow of it while a save writes it, or the image itself when a stamp's
+/// stream outlives the op that staged it.
+trait ImageSource: std::ops::Deref<Target = Mutex<BoxedReader>> + Clone {}
+impl<S: std::ops::Deref<Target = Mutex<BoxedReader>> + Clone> ImageSource for S {}
+
+/// The image a stamp's stream reads, owned by the stream.
+#[derive(Clone)]
+struct OwnedSource(Arc<StreamedImage>);
+
+impl std::ops::Deref for OwnedSource {
+    type Target = Mutex<BoxedReader>;
+    fn deref(&self) -> &Mutex<BoxedReader> {
+        &self.0.source
+    }
+}
+
+/// The rows of the image, top to bottom, as the decoder gives them.
+enum Rows<R: Read + Seek, S: ImageSource> {
+    Plain(png::Reader<BufReader<R>>),
+    Adam7(Adam7<S>),
+}
+
+impl<R: Read + Seek, S: ImageSource> Rows<R, S> {
+    fn next(&mut self) -> Result<&[u8]> {
+        match self {
+            Rows::Plain(rows) => {
+                Ok(rows.next_row().map_err(|e| image_error("PNG", e))?.ok_or(Error::UnexpectedEof)?.data())
+            },
+            Rows::Adam7(passes) => passes.next(),
+        }
+    }
+}
+
+/// One Adam7 pass: its pixels sit `dx` apart from column `x0` and its rows
+/// `dy` apart from row `y0`.
+#[derive(Clone, Copy)]
+struct PassGrid {
+    x0: u32,
+    y0: u32,
+    dx: u32,
+    dy: u32,
+    /// Pixels in a row of the pass and rows in it.
+    width: u32,
+    height: u32,
+}
+
+/// The passes of a `width` x `height` image that have a pixel, in order.
+fn passes_of(width: u32, height: u32) -> Vec<PassGrid> {
+    const GRIDS: [(u32, u32, u32, u32); 7] =
+        [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+    GRIDS
+        .into_iter()
+        .filter(|&(x0, y0, _, _)| x0 < width && y0 < height)
+        .map(|(x0, y0, dx, dy)| PassGrid {
+            x0,
+            y0,
+            dx,
+            dy,
+            width: (width - x0).div_ceil(dx),
+            height: (height - y0).div_ceil(dy),
+        })
+        .collect()
+}
+
+/// A read position of its own in a source that several decoders share: each
+/// read seeks to where this decoder left off.
+struct Position<S: ImageSource> {
+    source: S,
+    at: u64,
+    length: u64,
+}
+
+impl<S: ImageSource> Read for Position<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut source = self.source.lock().unwrap_or_else(|e| e.into_inner());
+        source.seek(SeekFrom::Start(self.at))?;
+        let n = source.read(buf)?;
+        self.at += n as u64;
+        Ok(n)
+    }
+}
+
+impl<S: ImageSource> Seek for Position<S> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let at = match to {
+            SeekFrom::Start(n) => i128::from(n),
+            SeekFrom::Current(d) => i128::from(self.at) + i128::from(d),
+            SeekFrom::End(d) => i128::from(self.length) + i128::from(d),
+        };
+        self.at = u64::try_from(at)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before the start"))?;
+        Ok(self.at)
+    }
+}
+
+/// A decoder over the whole image, taking only the rows of one pass: the
+/// rows of the passes before it are read and dropped, the rows of the passes
+/// after it are never read.
+struct PassRows<S: ImageSource> {
+    rows: png::Reader<BufReader<Position<S>>>,
+    grid: PassGrid,
+    /// Rows of the earlier passes still to drop.
+    skip: u32,
+}
+
+impl<S: ImageSource> PassRows<S> {
+    /// Puts the pass's next row into `out`, each pixel at its place.
+    fn place_next(&mut self, out: &mut [u8], pixel: usize) -> Result<()> {
+        while self.skip > 0 {
+            crate::cancel::poll()?;
+            self.rows.next_interlaced_row().map_err(|e| image_error("PNG", e))?.ok_or(Error::UnexpectedEof)?;
+            self.skip -= 1;
+        }
+        let row = self.rows.next_interlaced_row().map_err(|e| image_error("PNG", e))?.ok_or(Error::UnexpectedEof)?;
+        let data = row.data();
+        let grid = self.grid;
+        if data.len() < grid.width as usize * pixel {
+            return Err(Error::Image("PNG: a pass row is shorter than its pixels".into()));
+        }
+        for (k, from) in data.chunks_exact(pixel).take(grid.width as usize).enumerate() {
+            let x = (grid.x0 + k as u32 * grid.dx) as usize;
+            out[x * pixel..(x + 1) * pixel].copy_from_slice(from);
+        }
+        Ok(())
+    }
+}
+
+/// The rows of an Adam7 image, each put together from the passes that have a
+/// pixel in it.
+struct Adam7<S: ImageSource> {
+    passes: Vec<PassRows<S>>,
+    pixel: usize,
+    /// The row being put together.
+    row: Vec<u8>,
+    /// The next row of the image.
+    next: u32,
+    height: u32,
+}
+
+impl<S: ImageSource> Adam7<S> {
+    fn open(source: S, length: u64, shape: PngShape) -> Result<Self> {
+        let mut passes = Vec::new();
+        let mut earlier = 0u32;
+        for grid in passes_of(shape.width, shape.height) {
+            let position = Position { source: source.clone(), at: 0, length };
+            let mut decoder = png::Decoder::new(BufReader::with_capacity(PASS_WINDOW, position));
+            decoder.set_transformations(png::Transformations::EXPAND);
+            let rows = decoder.read_info().map_err(|e| image_error("PNG", e))?;
+            check_unchanged(&rows, shape)?;
+            passes.push(PassRows { rows, grid, skip: earlier });
+            earlier += grid.height;
+        }
+        let pixel = shape.pixel_bytes();
+        Ok(Self { passes, pixel, row: vec![0; shape.width as usize * pixel], next: 0, height: shape.height })
+    }
+
+    fn next(&mut self) -> Result<&[u8]> {
+        let y = self.next;
+        if y >= self.height {
+            return Err(Error::UnexpectedEof);
+        }
+        for pass in &mut self.passes {
+            let grid = pass.grid;
+            if y >= grid.y0 && (y - grid.y0) % grid.dy == 0 {
+                pass.place_next(&mut self.row, self.pixel)?;
+            }
+        }
+        self.next += 1;
+        Ok(&self.row)
+    }
+}
+
+/// Bytes each pass of an interlaced PNG reads ahead of its decoder.
+const PASS_WINDOW: usize = 16 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pass {
@@ -583,7 +750,7 @@ struct Deflated {
 }
 
 struct Run {
-    rows: png::Reader<BufReader<Shared>>,
+    rows: Rows<Shared, OwnedSource>,
     zlib: Option<flate2::write::ZlibEncoder<Vec<u8>>>,
     line: Vec<u8>,
     row: u32,
@@ -602,13 +769,15 @@ impl Deflated {
     }
 
     fn open(&self) -> std::io::Result<Run> {
-        let shared = Shared { image: Arc::clone(&self.image), at: 0 };
-        let rows = png_decoder(shared).read_info().map_err(std::io::Error::other)?;
-        if rows.info().size() != (self.shape.width, self.shape.height)
-            || rows.output_color_type() != (self.shape.color, self.shape.depth)
-        {
-            return Err(std::io::Error::other("PNG: the image changed under the save"));
-        }
+        let rows = if self.shape.interlaced {
+            let source = OwnedSource(Arc::clone(&self.image));
+            Rows::Adam7(Adam7::open(source, self.image.length, self.shape).map_err(std::io::Error::other)?)
+        } else {
+            let shared = Shared { image: Arc::clone(&self.image), at: 0 };
+            let rows = png_decoder(shared).read_info().map_err(std::io::Error::other)?;
+            check_unchanged(&rows, self.shape).map_err(std::io::Error::other)?;
+            Rows::Plain(rows)
+        };
         Ok(Run {
             rows,
             zlib: Some(flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best())),
@@ -627,10 +796,10 @@ impl Deflated {
         let run = self.run.as_mut().expect("opened above");
         let Some(zlib) = run.zlib.as_mut() else { return Ok(()) };
         if run.row < shape.height {
-            let row = run.rows.next_row().map_err(std::io::Error::other)?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            let row = run.rows.next().map_err(std::io::Error::other)?;
             run.line.clear();
             run.line.push(0);
-            narrow_row(row.data(), shape, pass, &mut run.line);
+            narrow_row(row, shape, pass, &mut run.line);
             zlib.write_all(&run.line)?;
             run.row += 1;
             self.out = std::mem::take(zlib.get_mut());

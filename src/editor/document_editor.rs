@@ -3814,9 +3814,8 @@ impl DocumentEditor {
     // an unchanged source stream is copied, not loaded
     /// Writes unstaged source object `r` as a chunked copy of its stream
     /// data and returns `true`, or returns `false` having written nothing
-    /// when the object cannot be copied raw (not a plain stream, an
-    /// encrypted source or output, a container, a /Length that does not
-    /// hold); the caller then loads and serializes it. The caller checks
+    /// when the object cannot be copied raw (not a plain stream, a
+    /// container, a /Length that does not hold); the caller then loads and serializes it. The caller checks
     /// that no staged version of `r` exists; the prune plan's `cuts` of a
     /// stream apply to its dictionary and the data is still copied from the
     /// source. The dictionary goes through
@@ -3835,7 +3834,7 @@ impl DocumentEditor {
         cuts: Option<&[crate::host::resource_prune::Cut]>,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
-        encrypting_output: bool,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
         deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
@@ -3848,7 +3847,7 @@ impl DocumentEditor {
             cuts,
             writer,
             serializer,
-            encrypting_output,
+            handler,
             deflate,
             xref_entries,
         )
@@ -3865,7 +3864,7 @@ impl DocumentEditor {
         cuts: Option<&[crate::host::resource_prune::Cut]>,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
-        encrypting_output: bool,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
         deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
@@ -3878,7 +3877,7 @@ impl DocumentEditor {
             cuts,
             writer,
             serializer,
-            encrypting_output,
+            handler,
             deflate,
             xref_entries,
         )
@@ -3922,13 +3921,10 @@ impl DocumentEditor {
         cuts: Option<&[crate::host::resource_prune::Cut]>,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
-        encrypting_output: bool,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
         deflate: Option<u32>,
         xref_entries: &mut XrefEntries,
     ) -> Result<bool> {
-        if encrypting_output {
-            return Ok(false);
-        }
         let Some(head) = source.stream_head(r)? else {
             return Ok(false);
         };
@@ -3956,20 +3952,23 @@ impl DocumentEditor {
             next_object_id,
             writer,
             serializer,
+            handler,
             xref_entries,
         )?;
         Ok(true)
     }
 
     /// Writes stream object `out_id`: `dict` as given but for /Filter and
-    /// /Length, and the data of `stored` as the output holds it. Unencrypted
-    /// output only. Without `deflate` the data is copied. With it, a stream
+    /// /Length, and the data of `stored` as the output holds it. With a
+    /// `handler` the strings of `dict` and the data are enciphered as the
+    /// serializer enciphers any stream, /Length the enciphered length.
+    /// Without `deflate` the data is copied. With it, a stream
     /// with no /Filter, a single FlateDecode or a single LZWDecode is
     /// re-encoded at that level and written so only when strictly smaller
     /// than the source data. Data over `MEMORY_STREAM` is first re-encoded
     /// into a byte counter, and a smaller one is then deflated while
     /// streaming, /Length a reference to a fresh object holding the compressed
-    /// size, written right after.
+    /// (and enciphered) size, written right after.
     fn write_stream_body(
         out_id: u32,
         mut dict: HashMap<String, Object>,
@@ -3978,8 +3977,10 @@ impl DocumentEditor {
         next_object_id: &mut u32,
         writer: &mut impl crate::host::positioned_write::PositionedWrite,
         serializer: &ObjectSerializer,
+        handler: &Option<crate::encryption::EncryptionWriteHandler>,
         xref_entries: &mut XrefEntries,
     ) -> Result<()> {
+        use crate::encryption::stream::Cipher;
         use crate::host::deflate::{self, Encoding, MEMORY_STREAM};
         use crate::source::Counter;
 
@@ -4037,13 +4038,19 @@ impl DocumentEditor {
                 _ => {},
             }
         }
+        let cipher = match handler {
+            Some(h) => h.stream_cipher(out_id, 0),
+            None => Cipher::Identity,
+        };
         let length_id = match &body {
             Body::Copy => {
-                dict.insert("Length".to_string(), Object::Integer(data_len as i64));
+                let len = cipher.encrypted_len(data_len);
+                dict.insert("Length".to_string(), Object::Integer(len as i64));
                 None
             },
             Body::Memory(encoded) => {
-                dict.insert("Length".to_string(), Object::Integer(encoded.len() as i64));
+                let len = cipher.encrypted_len(encoded.len() as u64);
+                dict.insert("Length".to_string(), Object::Integer(len as i64));
                 None
             },
             Body::Streamed(_) => {
@@ -4054,10 +4061,28 @@ impl DocumentEditor {
             },
         };
 
+        if let Some(h) = handler {
+            fn encipher(object: &mut Object, h: &crate::encryption::EncryptionWriteHandler, id: u32) {
+                match object {
+                    Object::String(s) => *s = h.encrypt_string(s, id, 0),
+                    Object::Array(items) => items.iter_mut().for_each(|o| encipher(o, h, id)),
+                    Object::Dictionary(d) => d.values_mut().for_each(|o| encipher(o, h, id)),
+                    _ => {},
+                }
+            }
+            dict.values_mut().for_each(|o| encipher(o, h, out_id));
+        }
+
         let offset = writer.position();
         serializer.write_stream_open(&mut *writer, out_id, 0, &dict)?;
 
-        let compressed_len = match body {
+        let iv = match handler {
+            Some(_) => crate::encryption::EncryptionWriteHandler::generate_iv()?,
+            None => [0u8; 16],
+        };
+        let body_start = writer.position();
+        let mut sink = cipher.encrypting(&mut *writer, iv)?;
+        match body {
             Body::Copy => {
                 let mut data = stored.raw_reader()?;
                 let mut buf = vec![0u8; CHUNK];
@@ -4068,25 +4093,16 @@ impl DocumentEditor {
                     if n == 0 {
                         break;
                     }
-                    writer.write_all(&buf[..n])?;
+                    sink.write_all(&buf[..n])?;
                 }
-                None
             },
-            Body::Memory(encoded) => {
-                writer.write_all(&encoded)?;
-                None
-            },
+            Body::Memory(encoded) => sink.write_all(&encoded)?,
             Body::Streamed(level) => {
-                let start = writer.position();
-                deflate::recode(
-                    stored.raw_reader()?,
-                    encoding,
-                    level,
-                    &mut *writer,
-                )?;
-                Some(writer.position() - start)
+                deflate::recode(stored.raw_reader()?, encoding, level, &mut sink)?;
             },
-        };
+        }
+        sink.finish()?;
+        let compressed_len = length_id.map(|_| writer.position() - body_start);
         writer.write_all(b"\nendstream\nendobj\n")?;
         xref_entries.push((out_id, offset, 0, true));
 
@@ -4269,12 +4285,15 @@ impl DocumentEditor {
         let deflated = |out: &mut dyn Write| -> Result<()> {
             match deflate {
                 Some(level) => {
-                    let mut zlib = flate2::write::ZlibEncoder::new(
+                    // A body writes one operator at a time, a few bytes each; the
+                    // deflater takes them in pieces, which halves its work.
+                    let zlib = flate2::write::ZlibEncoder::new(
                         out,
                         flate2::Compression::new(crate::host::deflate::zlib_level(level)),
                     );
-                    body(&mut zlib)?;
-                    zlib.finish()?;
+                    let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, zlib);
+                    body(&mut buffered)?;
+                    buffered.into_inner().map_err(|e| e.into_error())?.finish()?;
                     Ok(())
                 },
                 None => body(out),
@@ -5176,10 +5195,9 @@ impl DocumentEditor {
             match obj {
                 Object::Stream { mut dict, body } => {
                     let kind = encoding(&dict);
-                    // A stream over MEMORY_STREAM is written by `write_stream_body`
-                    // when the output is not encrypted; here (an encrypted
-                    // output has no streamed recode) it keeps its data. A read
-                    // that fails keeps the stream; the write reports it.
+                    // A stream over MEMORY_STREAM is written by `write_stream_body`;
+                    // here it keeps its data. A read that fails keeps the stream;
+                    // the write reports it.
                     if !matches!(body.decrypted_len(), Ok(len) if len <= MEMORY_STREAM) {
                         return Object::Stream { dict, body };
                     }
@@ -6917,7 +6935,7 @@ impl DocumentEditor {
                                                         None,
                                                         writer,
                                                         &serializer,
-                                                        encryption_handler.is_some(),
+                                                        &encryption_handler,
                                                         deflate,
                                                         &mut xref_entries,
                                                     )?
@@ -7123,7 +7141,7 @@ impl DocumentEditor {
                                                                         prune.cuts.get(&ref_obj.id).map(|cuts| cuts.as_slice()),
                                                                         writer,
                                                                         &serializer,
-                                                                        encryption_handler.is_some(),
+                                                                        &encryption_handler,
                                                                         deflate,
                                                                         &mut xref_entries,
                                                                     )?
@@ -7194,7 +7212,7 @@ impl DocumentEditor {
                                                                         prune.cuts.get(&ref_obj.id).map(|cuts| cuts.as_slice()),
                                                                         writer,
                                                                         &serializer,
-                                                                        encryption_handler.is_some(),
+                                                                        &encryption_handler,
                                                                         deflate,
                                                                         &mut xref_entries,
                                                                     )?
@@ -7895,7 +7913,7 @@ impl DocumentEditor {
                         cuts,
                         writer,
                         &serializer,
-                        encryption_handler.is_some(),
+                        &encryption_handler,
                         deflate,
                         &mut xref_entries,
                     )? {
@@ -8126,7 +8144,7 @@ impl DocumentEditor {
                     prune.cuts.get(&obj_id).map(|cuts| cuts.as_slice()),
                     writer,
                     &serializer,
-                    encryption_handler.is_some(),
+                    &encryption_handler,
                     deflate,
                     &mut xref_entries,
                 )?
@@ -8160,9 +8178,7 @@ impl DocumentEditor {
                 // ── end pdf_manipulator patch ──
                 Ok(obj) => {
                     // ── pdf_manipulator patch: a staged stream over MEMORY_STREAM is counted, then recoded while streaming ──
-                    if let (Some(level), None, Object::Stream { dict, body }) =
-                        (deflate, &encryption_handler, &obj)
-                    {
+                    if let (Some(level), Object::Stream { dict, body }) = (deflate, &obj) {
                         if body.decrypted_len()? > crate::host::deflate::MEMORY_STREAM {
                             Self::write_stream_body(
                                 obj_id,
@@ -8172,6 +8188,7 @@ impl DocumentEditor {
                                 &mut self.next_object_id,
                                 writer,
                                 &serializer,
+                                &encryption_handler,
                                 &mut xref_entries,
                             )?;
                             continue;

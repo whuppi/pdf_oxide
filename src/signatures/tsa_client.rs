@@ -21,6 +21,12 @@ use der::asn1::OctetString;
 use der::{Any, Decode, Encode};
 use std::time::Duration;
 
+// ── pdf_manipulator patch: a timestamp reply is read up to a fixed window ──
+/// The most bytes of a timestamp server's reply that are read: a token is
+/// kilobytes.
+const MAX_TSA_REPLY: u64 = 1024 * 1024;
+// ── end pdf_manipulator patch ──
+
 /// Configuration for a [`TsaClient`].
 #[derive(Debug, Clone)]
 pub struct TsaClientConfig {
@@ -138,12 +144,20 @@ impl TsaClient {
         let mut resp = req
             .send(body)
             .map_err(|e| Error::Io(std::io::Error::other(format!("TSA HTTP error: {e}"))))?;
+        // ── pdf_manipulator patch: a timestamp reply is read up to a fixed window ──
         let mut out = Vec::new();
         resp.body_mut()
             .as_reader()
+            .take(MAX_TSA_REPLY + 1)
             .read_to_end(&mut out)
             .map_err(|e| Error::Io(std::io::Error::other(format!("TSA read error: {e}"))))?;
+        if out.len() as u64 > MAX_TSA_REPLY {
+            return Err(Error::InvalidPdf(format!(
+                "TSA reply exceeds {MAX_TSA_REPLY} bytes"
+            )));
+        }
         Ok(out)
+        // ── end pdf_manipulator patch ──
     }
 }
 
