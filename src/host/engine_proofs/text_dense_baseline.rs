@@ -6,9 +6,8 @@
 //! last (about a glyph's width, so neighbours overprint a little), all on one
 //! baseline.
 
-use super::support::{pdf_from_objects, stream_object};
+use super::support::{pdf_from_objects, stream_object, thread_cpu_secs};
 use crate::document::PdfDocument;
-use std::time::Instant;
 
 /// A one-page document of `chars` single-character runs on one baseline.
 fn dense_baseline_page(chars: usize) -> Vec<u8> {
@@ -32,15 +31,16 @@ fn dense_baseline_page(chars: usize) -> Vec<u8> {
     ])
 }
 
-/// Seconds `extract_text` and `extract_words` take on a fresh document.
+/// The CPU seconds `extract_text` and `extract_words` take on a fresh
+/// document, on this thread.
 fn extraction_time(chars: usize) -> (f64, usize) {
     let doc = PdfDocument::from_bytes(dense_baseline_page(chars)).unwrap();
-    let started = Instant::now();
+    let started = thread_cpu_secs();
     let text = doc.extract_text(0).unwrap();
     let words = doc.extract_words(0).unwrap();
     assert!(text.chars().filter(|c| !c.is_whitespace()).count() >= chars * 9 / 10, "the page's text comes back");
     assert!(!words.is_empty());
-    (started.elapsed().as_secs_f64(), text.len())
+    (thread_cpu_secs() - started, text.len())
 }
 
 /// No Dart battery sees it: a battery asserts a page's text, and a page this
@@ -49,7 +49,7 @@ fn extraction_time(chars: usize) -> (f64, usize) {
 #[test]
 fn four_times_the_characters_on_a_baseline_take_under_six_times_as_long() {
     let (small_chars, large_chars) = (15_000, 60_000);
-    // The quicker of two runs, so a slow start does not stand for the size.
+    // The quicker of two runs, so a cold cache does not stand for the size.
     let best = |chars| (0..2).map(|_| extraction_time(chars).0).fold(f64::MAX, f64::min);
     let small = best(small_chars);
     let large = best(large_chars);

@@ -42,6 +42,8 @@ pub(crate) mod forward;
 pub(crate) mod span_index;
 #[cfg(feature = "test-support")]
 pub mod probe;
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod cpu_clock;
 pub mod positioned_write;
 pub mod font_optimizer;
 pub(crate) mod font_budget;

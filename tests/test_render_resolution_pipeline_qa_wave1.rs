@@ -964,6 +964,9 @@ fn qa_scn_too_few_components_no_panic() {
 /// favours correctness (capability gain) over hot-path latency. It
 /// exists to surface a 100×-scale regression that would be visible to
 /// operators.
+// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+#[cfg(all(unix, feature = "test-support"))]
+// ── end pdf_manipulator patch ──
 #[test]
 fn qa_perf_thousand_fills_within_bound() {
     let mut content = String::with_capacity(20_000);
@@ -979,7 +982,9 @@ fn qa_perf_thousand_fills_within_bound() {
     // Warm up to amortise tiny_skia init.
     let _ = render_with_pipeline(&doc, true);
 
-    let t = std::time::Instant::now();
+    // ── pdf_manipulator patch: CPU time, not wall time ──
+    let t = pdf_oxide::host::cpu_clock::CpuInstant::now();
+    // ── end pdf_manipulator patch ──
     let _ = render_with_pipeline(&doc, true);
     let d = t.elapsed();
 

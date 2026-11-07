@@ -21,7 +21,9 @@
 //! one-second wall-clock guard reliably catches the regression.
 
 use pdf_oxide::document::PdfDocument;
-use std::time::{Duration, Instant};
+// ── pdf_manipulator patch: the guard reads the CPU clock ──
+use std::time::Duration;
+// ── end pdf_manipulator patch ──
 
 const N_SIBLINGS: u32 = 8;
 const N_OPS_PER_FORM: usize = 200;
@@ -147,6 +149,9 @@ fn build_sibling_form_collision_pdf() -> Vec<u8> {
     pdf
 }
 
+// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+#[cfg(all(unix, feature = "test-support"))]
+// ── end pdf_manipulator patch ──
 #[test]
 fn sibling_form_xobject_name_collision_does_not_hang() {
     let pdf_bytes = build_sibling_form_collision_pdf();
@@ -154,7 +159,9 @@ fn sibling_form_xobject_name_collision_does_not_hang() {
     let doc = PdfDocument::from_bytes(pdf_bytes).expect("doc should open");
     assert_eq!(doc.page_count().unwrap(), 1);
 
-    let start = Instant::now();
+    // ── pdf_manipulator patch: CPU time, not wall time ──
+    let start = pdf_oxide::host::cpu_clock::CpuInstant::now();
+    // ── end pdf_manipulator patch ──
     let text = doc.extract_text(0).expect("extract_text should succeed");
     let elapsed = start.elapsed();
 

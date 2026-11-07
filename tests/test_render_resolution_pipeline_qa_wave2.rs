@@ -30,7 +30,8 @@
 
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
-use std::time::Instant;
+// ── pdf_manipulator patch: std::time::Instant went with the wall-clock guard (host::cpu_clock) ──
+// ── end pdf_manipulator patch ──
 
 // ---------------------------------------------------------------------------
 // PDF construction helpers — self-contained so a fix-pass to the wave-1 QA
@@ -1401,6 +1402,9 @@ fn qa_text_tj_all_numeric_array_paints_zero_pixels() {
 /// one GS clone per Tj call, with 10 Tj calls each painting 100 glyphs,
 /// is 10 resolver calls and 10 clones, dwarfed by 1000 glyph
 /// rasterisations.
+// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+#[cfg(all(unix, feature = "test-support"))]
+// ── end pdf_manipulator patch ──
 #[test]
 fn qa_text_perf_thousand_glyphs_completes_within_budget() {
     let mut content = String::from("BT 0 0 1 rg /F1 6 Tf 5 90 Td ");
@@ -1412,7 +1416,9 @@ fn qa_text_perf_thousand_glyphs_completes_within_budget() {
     content.push_str("ET\n");
     let bytes = build_pdf_text(&content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let t = Instant::now();
+    // ── pdf_manipulator patch: CPU time, not wall time ──
+    let t = pdf_oxide::host::cpu_clock::CpuInstant::now();
+    // ── end pdf_manipulator patch ──
     let _ = render_with_pipeline(&doc, true);
     let dt = t.elapsed();
     assert!(

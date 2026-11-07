@@ -1480,6 +1480,9 @@ end";
 /// Smoke benchmark: extract 1000-glyph horizontal page and assert wall
 /// clock under a generous bound. Not a strict perf test but pins that the
 /// hot path hasn't gained an obviously expensive op.
+// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+#[cfg(all(unix, feature = "test-support"))]
+// ── end pdf_manipulator patch ──
 #[test]
 fn probe37_horizontal_extraction_bulk_within_bound() {
     // 200 horizontal CIDs.
@@ -1491,7 +1494,9 @@ fn probe37_horizontal_extraction_bulk_within_bound() {
     content.extend_from_slice(b"> Tj ET");
     let pdf = build_pdf("Identity-H", &content, 1000, (880, -1000), None, None);
     let doc = PdfDocument::from_bytes(pdf).expect("parse");
-    let start = std::time::Instant::now();
+    // ── pdf_manipulator patch: CPU time, not wall time ──
+    let start = pdf_oxide::host::cpu_clock::CpuInstant::now();
+    // ── end pdf_manipulator patch ──
     let _spans = doc.extract_spans(0).expect("extract_spans");
     let elapsed = start.elapsed();
     // A 200-glyph horizontal page should extract well under 200ms on any

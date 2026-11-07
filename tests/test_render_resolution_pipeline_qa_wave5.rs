@@ -821,6 +821,9 @@ fn qa_wave5_pipeline_resolve_components_shading_type4_separation() {
 
 /// Probe 19 — 1000 DeviceRGB fill rectangles. Pin wall-clock under a
 /// generous bound that tolerates parallel-scheduling pressure.
+// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+#[cfg(all(unix, feature = "test-support"))]
+// ── end pdf_manipulator patch ──
 #[test]
 fn qa_wave5_perf_thousand_device_rgb_fills_within_bound() {
     let mut content = String::from("1 0 0 rg\n");
@@ -831,7 +834,9 @@ fn qa_wave5_perf_thousand_device_rgb_fills_within_bound() {
     }
     let bytes = build_pdf(&content, "");
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let start = std::time::Instant::now();
+    // ── pdf_manipulator patch: CPU time, not wall time ──
+    let start = pdf_oxide::host::cpu_clock::CpuInstant::now();
+    // ── end pdf_manipulator patch ──
     let _ = render(&doc);
     let elapsed = start.elapsed();
     // Generous 5s budget — fine on developer hardware under load; well

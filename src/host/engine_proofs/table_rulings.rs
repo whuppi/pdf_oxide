@@ -4,6 +4,8 @@
 //! public path (`extract_paths`, `extract_tables`), and as paths handed
 //! straight to a `RulingGrid`, for sizes no document test would read in time.
 
+#[cfg(unix)]
+use super::support::thread_cpu_secs;
 use super::support::{pdf_from_objects, stream_object};
 use crate::document::PdfDocument;
 use crate::elements::PathContent;
@@ -11,19 +13,6 @@ use crate::geometry::Rect;
 use crate::host::ruling_grid::RulingGrid;
 use crate::layout::TextSpan;
 use crate::structure::spatial_table_detector::{detect_tables, TableDetectionConfig, TableStrategy};
-use std::time::Instant;
-
-/// This thread's CPU time in milliseconds. Wall time counts every other test
-/// the runner has in flight, so two sizes timed one after the other differed
-/// by the machine's load, not by the detector; a thread's own CPU time does not.
-#[cfg(unix)]
-fn thread_cpu_ms() -> f64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is a valid out-pointer for the one call.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
-    ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1_000_000.0
-}
 
 /// One-page document around a content stream, with a large page and Helvetica as F1.
 fn page_with(content: &str, size: u32) -> Vec<u8> {
@@ -208,7 +197,7 @@ fn lattice(tables: usize) -> (RulingGrid, Vec<TextSpan>) {
 /// and the detector took together on this thread, per 10,000 primitives.
 #[cfg(unix)]
 fn milliseconds_per_ten_thousand(tables: usize) -> (usize, f64) {
-    let started = thread_cpu_ms();
+    let started = thread_cpu_secs();
     let (grid, spans) = lattice(tables);
     let primitives = grid.primitives();
     let found = detect_tables(
@@ -220,7 +209,7 @@ fn milliseconds_per_ten_thousand(tables: usize) -> (usize, f64) {
     .unwrap();
     let count = found.len();
     std::hint::black_box(&found);
-    let ms = thread_cpu_ms() - started;
+    let ms = (thread_cpu_secs() - started) * 1000.0;
     (count, ms / (primitives as f64 / 10_000.0))
 }
 
@@ -607,6 +596,7 @@ const CANCEL_TABLES: usize = 1_250;
 #[cfg(not(debug_assertions))]
 const CANCEL_TABLES: usize = 12_500;
 
+#[cfg(unix)]
 /// No Dart battery sees it: a cancel arrives from the host while a lane is
 /// busy, and a battery only sees a job end; the proof is how soon.
 #[test]
@@ -615,59 +605,52 @@ fn a_cancel_set_before_detection_ends_it_at_once() {
     let (grid, spans) = lattice(CANCEL_TABLES);
     let config = TableDetectionConfig::default();
 
-    let started = Instant::now();
+    let started = thread_cpu_secs();
     let found = detect_tables(&spans, &grid, &config, &crate::cancel::CancelCheck::none()).unwrap();
-    let full = started.elapsed();
+    let full = thread_cpu_secs() - started;
     assert_eq!(found.len(), CANCEL_TABLES);
 
     let (job, cancel) = job_cancel();
     job.store(true, Ordering::Relaxed);
-    let started = Instant::now();
+    let started = thread_cpu_secs();
     let result = detect_tables(&spans, &grid, &config, &cancel);
-    let stopped = started.elapsed();
+    let stopped = thread_cpu_secs() - started;
     let message = result.expect_err("a cancelled detection is an error").to_string();
-    eprintln!("cancel set first: ended in {stopped:?}, a whole run is {full:?}");
+    eprintln!("cancel set first: ended in {stopped:.4} s, a whole run is {full:.4} s");
     assert!(message.contains("cancelled"), "{message}");
-    assert!(
-        stopped.as_secs_f64() < full.as_secs_f64() * 0.05,
-        "a cancel set first took {stopped:?} against {full:?} for the whole run"
-    );
+    assert!(stopped < full * 0.05, "a cancel set first took {stopped:.4} s against {full:.4} s for the whole run");
 }
 
-/// No Dart battery sees it, as above. The flag is flipped a quarter of the way
-/// into a run, from another thread, and the run must end soon after.
+#[cfg(unix)]
+/// No Dart battery sees it, as above. A cancel lands a quarter of the way
+/// into a run, and the run must end soon after: the work between that poll
+/// and the next, read as the difference of two runs cancelled one poll apart,
+/// is one cluster, never a large share of the run.
 #[test]
 fn a_cancel_in_the_middle_of_detection_ends_it_within_a_cluster() {
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
+    use crate::cancel::CancelCheck;
     let (grid, spans) = lattice(CANCEL_TABLES);
     let config = TableDetectionConfig::default();
-
-    let started = Instant::now();
-    detect_tables(&spans, &grid, &config, &crate::cancel::CancelCheck::none()).unwrap();
-    let full = started.elapsed();
-
-    let (job, cancel) = job_cancel();
-    let flipped: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-    let flipper = {
-        let (job, flipped) = (job.clone(), flipped.clone());
-        let wait = full / 4;
-        std::thread::spawn(move || {
-            std::thread::sleep(wait);
-            *flipped.lock().unwrap() = Some(Instant::now());
-            job.store(true, Ordering::Relaxed);
-        })
+    let run = |check: &CancelCheck| {
+        let started = thread_cpu_secs();
+        let result = detect_tables(&spans, &grid, &config, check);
+        (result, thread_cpu_secs() - started)
     };
-    let result = detect_tables(&spans, &grid, &config, &cancel);
-    let ended = Instant::now();
-    flipper.join().unwrap();
-    let flipped = flipped.lock().unwrap().expect("the flag was flipped");
-    assert!(result.is_err(), "the run finished before the cancel landed: raise the lattice");
-    let late = ended.duration_since(flipped);
-    eprintln!("cancel flipped a quarter in: ended {late:?} later, a whole run is {full:?}");
+
+    let counting = CancelCheck::tripping_at(usize::MAX);
+    let (found, full) = run(&counting);
+    assert_eq!(found.unwrap().len(), CANCEL_TABLES);
+    let quarter = counting.polls() / 4;
+    assert!(quarter > 0, "the detection polls for a cancel");
+
+    let (at, ended) = run(&CancelCheck::tripping_at(quarter));
+    let (next, ended_next) = run(&CancelCheck::tripping_at(quarter + 1));
+    assert!(at.is_err() && next.is_err(), "the run finished before the cancel landed: raise the lattice");
+    let cluster = ended_next - ended;
+    eprintln!("cancel a quarter in: ended after {ended:.4} s, one cluster is {cluster:.4} s, a whole run is {full:.4} s");
     assert!(
-        late.as_secs_f64() < 0.25_f64.min(full.as_secs_f64() * 0.1),
-        "the run ended {late:?} after the cancel, a whole run is {full:?}"
+        cluster < 0.25_f64.min(full * 0.1),
+        "the work between two polls is {cluster:.4} s, a whole run is {full:.4} s"
     );
 }
 

@@ -974,6 +974,9 @@ mod performance_tests {
     ///
     /// Gap analysis should be O(n log n), so should be fast even with
     /// many spans.
+    // ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+    #[cfg(all(unix, feature = "test-support"))]
+    // ── end pdf_manipulator patch ──
     #[test]
     fn test_large_document_performance() {
         // Create document with many spans
@@ -983,7 +986,9 @@ mod performance_tests {
             spans.push(create_test_span(&format!("w{}", i), x, 0.0, 10.0, 12.0));
         }
 
-        let start = std::time::Instant::now();
+        // ── pdf_manipulator patch: CPU time, not wall time ──
+        let start = pdf_oxide::host::cpu_clock::CpuInstant::now();
+        // ── end pdf_manipulator patch ──
         let result = analyze_document_gaps(&spans, None);
         let elapsed = start.elapsed();
 
@@ -995,12 +1000,17 @@ mod performance_tests {
     }
 
     /// Test with deeply nested document structure.
+    // ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+    #[cfg(all(unix, feature = "test-support"))]
+    // ── end pdf_manipulator patch ──
     #[test]
     fn test_multiline_document_performance() {
         let gaps_per_line = vec![vec![0.2, 0.2, 0.2]; 100]; // 100 lines
         let spans = create_multiline_document(gaps_per_line, 20.0);
 
-        let start = std::time::Instant::now();
+        // ── pdf_manipulator patch: CPU time, not wall time ──
+        let start = pdf_oxide::host::cpu_clock::CpuInstant::now();
+        // ── end pdf_manipulator patch ──
         let result = analyze_document_gaps(&spans, None);
         let elapsed = start.elapsed();
 

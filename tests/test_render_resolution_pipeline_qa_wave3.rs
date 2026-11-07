@@ -32,7 +32,8 @@
 
 use pdf_oxide::document::PdfDocument;
 use pdf_oxide::rendering::{render_page, ImageFormat, RenderOptions};
-use std::time::Instant;
+// ── pdf_manipulator patch: std::time::Instant went with the wall-clock guard (host::cpu_clock) ──
+// ── end pdf_manipulator patch ──
 
 // ===========================================================================
 // PDF construction helpers — self-contained so a fix-pass to the
@@ -1803,6 +1804,9 @@ fn qa_image_mask_negative_dimension_field_no_panic() {
 /// with a Device-family fill must complete inside a generous wall-clock
 /// budget. Coarse guard against an O(N) per-paint allocation spiral
 /// (e.g. a clone slipping into the short-circuit path).
+// ── pdf_manipulator patch: the guard reads this thread's CPU clock (host::cpu_clock, unix and test-support) ──
+#[cfg(all(unix, feature = "test-support"))]
+// ── end pdf_manipulator patch ──
 #[test]
 fn qa_image_mask_perf_thousand_paints_completes_within_budget() {
     let mask = solid_image_mask_bytes(2, 2);
@@ -1822,7 +1826,9 @@ fn qa_image_mask_perf_thousand_paints_completes_within_budget() {
     }
     let bytes = build_pdf_image_mask(&content, "", 2, 2, &mask);
     let doc = PdfDocument::from_bytes(bytes).expect("PDF parses");
-    let t = Instant::now();
+    // ── pdf_manipulator patch: CPU time, not wall time ──
+    let t = pdf_oxide::host::cpu_clock::CpuInstant::now();
+    // ── end pdf_manipulator patch ──
     let _ = render_with_pipeline(&doc, true);
     let dt = t.elapsed();
     assert!(
