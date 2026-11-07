@@ -19,7 +19,10 @@ use crate::object::StreamBody;
 // ── end pdf_manipulator patch ──
 use crate::writer::{hoist_appearance_streams, ContentStreamBuilder, ObjectSerializer};
 use std::collections::{HashMap, HashSet};
+// ── pdf_manipulator patch: only the path saves open a file, and wasm has none ──
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
+// ── end pdf_manipulator patch ──
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::BufWriter;
 use std::io::{Read, Write};

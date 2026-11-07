@@ -297,6 +297,7 @@ impl XfaParser {
     }
 
     /// Parse the datasets packet.
+    #[cfg(test)]
     fn parse_datasets(&mut self, xml: &str) -> Result<()> {
         self.drive(xml.as_bytes(), Some(Section::Datasets))
     }
