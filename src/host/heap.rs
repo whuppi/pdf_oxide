@@ -25,7 +25,12 @@
 //! The per-thread pair is a `thread_local!` `Cell` with a const initialiser
 //! and no destructor. An allocator may touch only that kind: a lazily
 //! initialised or `Drop` thread-local allocates, or registers a destructor, on
-//! first use, and that re-enters the allocator.
+//! first use, and that re-enters the allocator. Where a thread-local is a
+//! pthread key (Android), even this kind allocates its value on a thread's
+//! first use; Rust 1.93 takes that value from the system allocator, and before
+//! it, std took it from this one, which recursed until the stack overflowed.
+//! So the engine needs Rust 1.93 (`RUST_VERSION` in the package's
+//! tool/versions.env).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
