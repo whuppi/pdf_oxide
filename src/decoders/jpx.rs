@@ -10,7 +10,10 @@
 
 #[cfg(feature = "jpeg2000")]
 use crate::error::Error;
+// ── pdf_manipulator patch: every user of Result is behind jpeg2000 too ──
+#[cfg(feature = "jpeg2000")]
 use crate::error::Result;
+// ── end pdf_manipulator patch ──
 
 /// A decoded JPEG 2000 image: interleaved 8-bit samples plus component count.
 #[cfg(feature = "jpeg2000")]
