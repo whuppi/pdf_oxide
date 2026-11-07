@@ -670,8 +670,10 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
             BfSectionKind::Range => {
                 // Format: <srcCodeLo> <srcCodeHi> [<dstString0> <dstString1> ... <dstStringN>]
                 //     or: <srcCodeLo> <srcCodeHi> <dstString>
-                for line in section.lines() {
-                    if let Some(mappings) = parse_bfrange_line(line) {
+                // ── pdf_manipulator patch: every range entry is read, wherever the line breaks fall ──
+                for entry in range_entries(section) {
+                    if let Some(mappings) = parse_bfrange_line(entry) {
+                        // ── end pdf_manipulator patch ──
                         log::trace!("ToUnicode bfrange: {} mappings parsed", mappings.len());
                         for (src, dst) in mappings {
                             // ── pdf_manipulator patch: a mapping that cannot be stored is a typed error ──
@@ -688,8 +690,10 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
     // Format: <srcCodeLo> <srcCodeHi> <dstString>
     // Maps a range of codes to a single Unicode character (fallback for unmapped codes)
     for section in extract_sections(&content, "beginnotdefrange", "endnotdefrange") {
-        for line in section.lines() {
-            if let Some(mappings) = parse_notdefrange_line(line) {
+        // ── pdf_manipulator patch: every range entry is read, wherever the line breaks fall ──
+        for entry in range_entries(section) {
+            if let Some(mappings) = parse_notdefrange_line(entry) {
+                // ── end pdf_manipulator patch ──
                 log::trace!("ToUnicode notdefrange: {} mappings parsed", mappings.len());
                 for (src, dst) in mappings {
                     // Only insert if not already mapped (normal mappings take precedence)
@@ -782,7 +786,9 @@ fn parse_wmode_directive(content: &str) -> Option<u8> {
     // intact so any subsequent legitimate `/WMode` on a later line is
     // still matched.
     let cleaned: String = content
-        .lines()
+        // ── pdf_manipulator patch: a bare CR ends a CMap line ──
+        .split(['\r', '\n'])
+        // ── end pdf_manipulator patch ──
         .map(|line| match line.find('%') {
             Some(idx) => &line[..idx],
             None => line,
@@ -915,6 +921,20 @@ fn parse_bfchar_line(line: &str) -> Vec<(u32, String)> {
 
     results
 }
+
+// ── pdf_manipulator patch: every range entry is read, wherever the line breaks fall ──
+/// Each `<lo> <hi> <dst>` or `<lo> <hi> [<dst> ...]` entry of a bfrange or
+/// notdefrange section, wherever the line breaks fall. Entries are
+/// whitespace-separated tokens (ISO 32000-1:2008 §9.10.3), so one line may hold
+/// several, and a producer may end lines with a bare CR, which `str::lines`
+/// does not split on.
+fn range_entries(section: &str) -> impl Iterator<Item = &str> {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"<[^>]*>\s*<[^>]*>\s*(?:\[(?:\s*<[^>]*>\s*)*\]|<[^>]*>)").unwrap()
+    });
+    RE.find_iter(section).map(|m| m.as_str())
+}
+// ── end pdf_manipulator patch ──
 
 /// Parse a bfrange line: `<start> <end> <dst>`
 ///

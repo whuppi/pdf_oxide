@@ -450,29 +450,18 @@ impl ObjectSerializer {
     fn write_name<W: Write>(&self, w: &mut W, name: &str) -> std::io::Result<()> {
         write!(w, "/")?;
         for byte in name.bytes() {
-            match byte {
-                // Regular characters (no escaping needed)
-                b'!'
-                | b'"'
-                | b'$'..=b'&'
-                | b'\''..=b'.'
-                | b'0'..=b'9'
-                | b';'
-                | b'<'
-                | b'>'
-                | b'?'
-                | b'@'
-                | b'A'..=b'Z'
-                | b'^'..=b'z'
-                | b'|'
-                | b'~' => {
-                    w.write_all(&[byte])?;
-                },
-                // Characters that need escaping
-                _ => {
-                    write!(w, "#{:02X}", byte)?;
-                },
+            // ── pdf_manipulator patch: a delimiter, `#` and anything outside printable ASCII are escaped ──
+            let regular = (0x21..=0x7E).contains(&byte)
+                && !matches!(
+                    byte,
+                    b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#'
+                );
+            if regular {
+                w.write_all(&[byte])?;
+            } else {
+                write!(w, "#{:02X}", byte)?;
             }
+            // ── end pdf_manipulator patch ──
         }
         Ok(())
     }
