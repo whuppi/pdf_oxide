@@ -1,9 +1,13 @@
-//! The PDF/A identification is spliced into the XMP packet as it is read.
+//! The PDF/A identification is spliced into the XMP packet as it is read, and the
+//! conversion stages its edits.
 
 use super::filter_readers::thread_growth;
 use super::support::{open_editor_from_bytes, pdf_from_objects, stream_object};
-use crate::compliance::{ConversionResult, PdfAConverter, PdfALevel};
+use crate::cancel::CancelCheck;
+use crate::compliance::{validate_pdf_a, ConversionResult, PdfAConverter, PdfALevel};
 use crate::compliance::types::ValidationResult;
+use crate::document::PdfDocument;
+use crate::host::dispatch::edit_convert_to_pdf_a;
 use crate::object::Object;
 use std::io::Write;
 
@@ -109,4 +113,61 @@ fn a_64_mib_packet_is_identified_without_holding_it_as_text() {
         growth < size + 16 * 1024 * 1024,
         "identifying a {size} byte packet grew the thread by {growth} bytes"
     );
+}
+
+/// One page with a stream of `weight` incompressible bytes that the page holds
+/// under a key of its own, so it is written with the page and read by nothing.
+fn heavy_document(weight: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let noise: Vec<u8> = (0..weight)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        })
+        .collect();
+    pdf_from_objects(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Weight 4 0 R >>\nendobj\n".to_vec(),
+        stream_object(4, "", &noise),
+    ])
+}
+
+/// The conversion leaves what it changed staged in the editor, and holds
+/// nothing the size of the file: the editor was neither saved nor reopened.
+/// No Dart battery can observe this: the saved file is the same bytes whether
+/// the conversion saved the document once on the way or only the save did, and
+/// the memory rows measure the whole operation, not what the conversion alone
+/// holds.
+#[test]
+fn the_conversion_stages_its_edits_without_saving_the_document() {
+    let file = heavy_document(24 * 1024 * 1024);
+    let mut editor = open_editor_from_bytes(&file, "pdfa_staged");
+    let (done, growth) = thread_growth(|| edit_convert_to_pdf_a(&mut editor, 2, &CancelCheck::none()));
+    done.unwrap();
+    let Some(Object::Dictionary(catalog)) = editor.get_modified(1) else {
+        panic!("the catalog is staged, not committed")
+    };
+    assert!(catalog.contains_key("Metadata"), "the identification is staged");
+    assert!(catalog.contains_key("OutputIntents"), "the output intent is staged");
+    assert!(editor.is_modified());
+    assert!(
+        growth < 8 * 1024 * 1024,
+        "converting a {} byte file grew the thread by {growth} bytes",
+        file.len()
+    );
+}
+
+/// A converted document, saved and opened again, is PDF/A. The conversion
+/// itself checks nothing at its end: this is where the output is checked.
+/// No Dart battery can observe this: the Dart side has no validator, and the
+/// result of a conversion is its file.
+#[test]
+fn a_converted_file_saved_and_opened_again_validates() {
+    let mut editor = open_editor_from_bytes(&heavy_document(64 * 1024), "pdfa_staged_valid");
+    edit_convert_to_pdf_a(&mut editor, 2, &CancelCheck::none()).unwrap();
+    let saved = editor.save_to_bytes().unwrap();
+    let mut reopened = PdfDocument::from_bytes(saved).unwrap();
+    let validation = validate_pdf_a(&mut reopened, PdfALevel::A2b).unwrap();
+    assert!(validation.is_compliant, "{:?}", validation.errors);
 }

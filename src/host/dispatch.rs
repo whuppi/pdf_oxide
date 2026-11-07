@@ -1614,8 +1614,8 @@ pub fn edit_convert_to_pdf_a(
         _ => PdfALevel::A2b,
     };
     let converter = crate::compliance::PdfAConverter::new(pdf_level).with_cancel(cancel.clone());
-    // All or nothing: a cancel or an error at any point of the conversion, the
-    // commit and the final validation included, puts the editor back as it was.
+    // The edits are staged and the save writes them. All or nothing: a cancel
+    // or an error at any point of the conversion puts the editor back as it was.
     editor.undoable(|editor| converter.convert_with_editor(editor).map(|_| ()))
     }
 }

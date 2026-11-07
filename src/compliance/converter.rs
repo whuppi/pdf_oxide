@@ -278,14 +278,24 @@ impl PdfAConverter {
         // ── pdf_manipulator patch: the editor reads the source in windows ──
         let mut editor = DocumentEditor::from_document(document.reopen()?)?;
         // ── end pdf_manipulator patch ──
-        let result = self.convert_with_editor(&mut editor)?;
-        // Commit staged changes and propagate the updated document to the caller.
-        editor.commit_in_place()?;
+        // ── pdf_manipulator patch: staging and validating are separate steps ──
+        let mut result = self.convert_with_editor(&mut editor)?;
+        if !result.success {
+            // Commit staged mutations so the validator reads the updated document.
+            editor.commit_in_place()?;
+            self.validate_converted(&mut editor, &mut result)?;
+        }
+        // ── end pdf_manipulator patch ──
+        // Propagate the updated document to the caller.
         *document = editor.into_source();
         Ok(result)
     }
 
-    /// Core conversion logic operating on a [`DocumentEditor`].
+    /// Stages every fix on a [`DocumentEditor`] and nothing else: the editor
+    /// is neither saved nor reopened, and the result carries the validation
+    /// from before the fixes (`success` only when it was already compliant).
+    /// [`Self::convert`] validates the committed document; the host path
+    /// leaves the check to whoever opens the saved file.
     // ── pdf_manipulator patch: expose for PDF/A conversion via dispatch ──
     // (visibility change only — pub(crate) instead of private)
     // ── end pdf_manipulator patch ──
@@ -323,12 +333,19 @@ impl PdfAConverter {
             self.add_output_intent(editor, &mut result)?;
         }
 
-        // Commit staged mutations so the validator reads the updated document.
-        editor.commit_in_place()?;
-        // ── pdf_manipulator patch: cancellable validation ──
+        // ── pdf_manipulator patch: the staged edits are not validated here ──
+        result.validation = initial_validation;
+        Ok(result)
+    }
+
+    /// Validates the committed document and records the outcome in `result`.
+    fn validate_converted(
+        &self,
+        editor: &mut DocumentEditor,
+        result: &mut ConversionResult,
+    ) -> Result<()> {
         let mut final_validation =
             self.validator.validate_cancellable(editor.source_mut(), self.level, &self.cancel)?;
-        // ── end pdf_manipulator patch ──
 
         // Issue #451: certain standard-14 PostScript fonts have no open-source
         // equivalent in URW Base35 / SYSTEM_FONTDB and therefore can't be
@@ -340,9 +357,9 @@ impl PdfAConverter {
 
         result.validation = final_validation.clone();
         result.success = final_validation.is_compliant;
-
-        Ok(result)
+        Ok(())
     }
+    // ── end pdf_manipulator patch ──
 
     /// Try to fix a compliance error.
     fn try_fix_error(

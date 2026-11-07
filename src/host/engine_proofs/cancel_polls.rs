@@ -321,7 +321,7 @@ fn convert_to_pdf_a_with_fonts_cancelled_at_any_poll_changes_nothing() {
         || editor_of(&bytes),
         |editor, cancel| crate::host::dispatch::edit_convert_to_pdf_a(editor, 2, cancel),
         true,
-        38,
+        22,
     );
 }
 

@@ -1290,13 +1290,18 @@ pub fn extract_image_from_xobject_at(
             },
             None => ImageData::Jpeg(xobject.decode_stream_data()?),
         }
+    } else if is_ccitt {
+        // A fax image is read from the line decoder, one gray byte a pixel. A fax the line decoder cannot take (not 1-bit DeviceGray, unreadable
+        // /DecodeParms) is an image the engine cannot read, as it is for the
+        // row cursor.
+        let params = fax_params(doc, dict, color_space_map, width, height).ok_or_else(|| {
+            Error::Image("CCITT image is not 1-bit DeviceGray with readable /DecodeParms".to_string())
+        })?;
+        ImageData::Raw { pixels: fax_gray(xobject, params, width, height)?, format: PixelFormat::Grayscale }
     } else {
         // A raw-sample image is the rows it declares (`row_geometry` states the
-        // same size); what the stream holds past them is stray. A fax stream is
-        // the codec's input, not samples, and is read as it is.
-        let decoded_data = if is_ccitt {
-            xobject.decode_stream_data()?
-        } else {
+        // same size); what the stream holds past them is stray.
+        let decoded_data = {
             // A depth outside the spec's set has no row size to read: the
             // image is declined, as every other image this code cannot read.
             if !matches!(bits_per_component, 1 | 2 | 4 | 8 | 16) {
@@ -1481,7 +1486,7 @@ pub fn extract_image_from_xobject_at(
     // 16-bit samples were collapsed to their high byte above (and an Indexed
     // base always expands to 8-bit RGB), so the stored pixels are 8-bit per
     // component in those cases too.
-    let effective_bpc = if is_jbig2 || bits_per_component == 16 {
+    let effective_bpc = if is_jbig2 || is_ccitt || bits_per_component == 16 {
         8
     } else {
         stored_bpc
@@ -2727,6 +2732,30 @@ fn bilevel_to_gray(packed: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         gray.extend((0..w).map(|x| if (row[x / 8] >> (7 - x % 8)) & 1 == 0 { 0 } else { 255 }));
     }
     Ok(gray)
+}
+// ── end pdf_manipulator patch ──
+
+// ── pdf_manipulator patch: a fax image is read from the line decoder ──
+#[cfg(feature = "rendering")]
+fn fax_gray(
+    xobject: &crate::object::Object,
+    params: crate::decoders::CcittParams,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    crate::host::images::stream::fax_gray(xobject, params, width, height)
+}
+
+#[cfg(not(feature = "rendering"))]
+fn fax_gray(
+    _xobject: &crate::object::Object,
+    _params: crate::decoders::CcittParams,
+    _width: u32,
+    _height: u32,
+) -> Result<Vec<u8>> {
+    Err(Error::UnsupportedFilter(
+        "CCITTFaxDecode — rebuild with the `rendering` feature to decode".to_string(),
+    ))
 }
 // ── end pdf_manipulator patch ──
 
